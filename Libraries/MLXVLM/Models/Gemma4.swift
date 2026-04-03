@@ -421,7 +421,9 @@ private class VisionTower: Module {
 
     func callAsFunction(_ pixels: MLXArray) -> MLXArray {
         let (B, _, H, W) = (pixels.dim(0), pixels.dim(1), pixels.dim(2), pixels.dim(3))
-        let p = cfg.patchSize; let pH = H / p; let pW = W / p; let nReal = pH * pW; let nPad = maxPatches - nReal
+        let p = cfg.patchSize; let pH = H / p; let pW = W / p
+        // Clamp to maxPatches to prevent Range crash if image is larger than expected
+        let nReal = min(pH * pW, maxPatches); let nPad = maxPatches - nReal
 
         // Build position grid [nReal, 2] then expand to [B, nReal, 2]
         var posFlat = [Int32]()
@@ -449,8 +451,8 @@ private class VisionTower: Module {
 
         var h = encoder(emb, pos: patchPos, mask: mask)
         let (pooled, poolMask) = pooler(h, patchPos: patchPos, padPos: padPos)
-        let nValid = poolMask.asType(.int32).sum(axis: 1)[0].item(Int.self)
-        h = pooled[0..., ..<nValid].expandedDimensions(axis: 0)
+        let nValid = max(1, poolMask.asType(.int32).sum(axis: 1)[0].item(Int.self))
+        h = pooled[0..., ..<min(nValid, pooled.dim(1))].expandedDimensions(axis: 0)
         if cfg.standardize, let sb = stdBias, let ss = stdScale { h = (h - sb) * ss }
         return h
     }
