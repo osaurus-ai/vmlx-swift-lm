@@ -100,5 +100,38 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
 
+    // MoE optimization: convert float16 weights to bfloat16 to prevent Metal's
+    // automatic float16→float32 promotion on mixed-dtype operations.
+    // MoE gate routing runs at float32 for numerical stability, but if weights are
+    // float16, Metal promotes ALL ops to float32 (2x bandwidth, ~50% speed drop).
+    // bfloat16 shares float32's exponent range, avoiding the promotion.
+    let isMoE = weights.keys.contains { $0.contains("switch_mlp") || $0.contains("switch_glu")
+        || ($0.contains(".gate.weight") && !$0.contains("gate_proj")) }
+    if isMoE {
+        convertToBFloat16(model: model)
+    }
+
     eval(model)
+}
+
+/// Convert float16/float32 model parameters to bfloat16 for MoE performance.
+///
+/// Metal's kernel dispatcher promotes mixed float16/float32 operations to full float32,
+/// causing ~50% speed regression for MoE models where gate routing runs at float32.
+/// bfloat16 avoids this because it shares float32's exponent range.
+/// Quantization scales/biases are left as-is (they're used directly by Metal kernels).
+private func convertToBFloat16(model: Module) {
+    var converted = [String: MLXArray]()
+    for (key, array) in model.parameters().flattened() {
+        if key.hasSuffix(".scales") || key.hasSuffix(".biases") {
+            continue  // Leave quantization metadata unchanged
+        }
+        if array.dtype == .float16 || array.dtype == .float32 {
+            converted[key] = array.asType(.bfloat16)
+        }
+    }
+    if !converted.isEmpty {
+        let params = ModuleParameters.unflattened(converted)
+        try? model.update(parameters: params, verify: [])
+    }
 }
