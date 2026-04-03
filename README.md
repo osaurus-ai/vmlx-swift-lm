@@ -52,11 +52,11 @@ Both share: dual attention types (sliding window + full), per-layer RoPE configu
 
 ### LLMs (50+ architectures)
 
-Llama, Mistral, Phi, Phi-3, Phi-MoE, Gemma, Gemma 2, Gemma 3, Gemma 3n, **Gemma 4**, Qwen2, Qwen3, Qwen3-MoE, Qwen3.5, Qwen3.5-MoE, DeepSeek-V3, Cohere, OpenELM, InternLM2, Starcoder2, MiniCPM, Granite, Granite-MoE-Hybrid, MiMo, MiMo-V2-Flash, MiniMax, GLM-4, GLM-4-MoE, Falcon-H1, Bitnet, SmolLM3, ERNIE 4.5, LFM2, LFM2-MoE, Baichuan-M1, Exaone4, GPT-OSS, Lille-130m, OLMoE, OLMo2, OLMo3, Bailing-MoE, NanoChat, Nemotron-H, AF-MoE, Jamba, Mistral3, Apertus, and more.
+Llama, Mistral, Phi, Phi-3, Phi-MoE, Gemma, Gemma 2, Gemma 3, Gemma 3n, **Gemma 4**, Qwen2, Qwen3, Qwen3-MoE, Qwen3.5, Qwen3.5-MoE, DeepSeek-V3, Cohere, OpenELM, InternLM2, Starcoder2, MiniCPM, Granite, Granite-MoE-Hybrid, MiMo, MiMo-V2-Flash, MiniMax, GLM-4, GLM-4-MoE, Falcon-H1, Bitnet, SmolLM3, ERNIE 4.5, LFM2, LFM2-MoE, Baichuan-M1, Exaone4, GPT-OSS, Lille-130m, OLMoE, OLMo2, OLMo3, Bailing-MoE, NanoChat, Nemotron-H, AF-MoE, Jamba, **Mistral Small 4** (MLA + MoE), Mistral3, Apertus, and more.
 
 ### VLMs (15+ architectures)
 
-PaliGemma, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.5, Qwen3.5-MoE, Gemma 3, **Gemma 4**, SmolVLM2, FastVLM, Pixtral, Mistral3, LFM2-VL, GLM-OCR, Idefics3, and more.
+PaliGemma, Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.5, Qwen3.5-MoE, Gemma 3, **Gemma 4**, SmolVLM2, FastVLM, Pixtral, **Mistral Small 4** (MLA + Pixtral vision), Mistral3, LFM2-VL, GLM-OCR, Idefics3, and more.
 
 ### Embedders
 
@@ -150,6 +150,48 @@ For developers integrating JANG support into their own apps, here's what happens
 
 The entire pipeline is transparent. If `jang_config.json` doesn't exist, the standard MLX loading path runs unchanged.
 
+## Detecting VLM Models
+
+Check whether a loaded model supports vision/image input:
+
+```swift
+// From ModelContainer (async)
+let container = try await loadModelContainer(from: modelDirectory, using: TokenizersLoader())
+if await container.isVLM {
+    // Model supports image input — safe to pass images
+}
+
+// From ModelContext (sync, inside perform blocks)
+container.perform { context in
+    if context.isVLM {
+        // Model supports image input
+    }
+}
+```
+
+All VLM models return `true`, all text-only LLMs return `false`. No additional imports needed beyond `MLXLMCommon`.
+
+**VLM-capable model families:** Gemma 4, Gemma 3, Qwen 3.5 VL, Qwen 3 VL, Qwen 2.5 VL, Mistral Small 4 (Pixtral vision), Mistral 3, PaliGemma, Pixtral, SmolVLM2, FastVLM, Idefics3, LFM2-VL, GLM-OCR.
+
+## Speculative Decoding
+
+Use a smaller draft model to speed up generation by 29-79%:
+
+```swift
+let mainModel = try await loadModelContainer(
+    from: HubClient.default, using: TokenizersLoader(),
+    id: "mlx-community/Qwen3-14B-4bit")
+let draftModel = try await loadModelContainer(
+    from: HubClient.default, using: TokenizersLoader(),
+    id: "mlx-community/Qwen3-0.6B-4bit")
+
+// Generate with speculative decoding
+let result = try await mainModel.generate(
+    input: input, parameters: params, draft: draftModel)
+```
+
+The draft model proposes tokens that the main model verifies in batch. Accepted tokens are yielded immediately; rejected tokens are discarded and the cache is rewound. Larger gaps between main and draft model size yield bigger speedups.
+
 ## Roadmap
 
 Planned additions to this fork:
@@ -174,7 +216,7 @@ If you're switching from `ml-explore/mlx-swift-lm`, just change your package URL
 .package(url: "https://github.com/osaurus-ai/mlx-swift-lm", branch: "main"),
 ```
 
-Everything else stays the same. All upstream APIs, model architectures, and integrations are preserved. You gain JANG support and Gemma 4 for free.
+Everything else stays the same. All upstream APIs, model architectures, and integrations are preserved. You gain JANG support, Gemma 4, Mistral Small 4, speculative decoding, `isVLM`, and MoE performance boosts for free.
 
 If you're migrating from upstream 2.x to this fork (which is based on 3.x), see the [version 3 migration guide](#migrating-to-version-3) below.
 
@@ -235,18 +277,28 @@ let container = try await loadModelContainer(
 
 | File | Change | Purpose |
 |------|--------|---------|
-| `Libraries/MLXLLM/Models/Gemma4Text.swift` | New | Full Gemma 4 text model (dense + MoE, dual attention, v_norm, K=V) |
+| `Libraries/MLXLLM/Models/Gemma4Text.swift` | New | Gemma 4 text model (dense + MoE, dual attention, v_norm, K=V) |
 | `Libraries/MLXVLM/Models/Gemma4.swift` | New | Gemma 4 VLM (vision encoder, 2D RoPE, pooler, processor) |
-| `Libraries/MLXLMCommon/JangLoader.swift` | New | JANG detection, config parsing, per-layer quantization inference |
-| `Libraries/MLXLMCommon/Load.swift` | Modified | JANG integration, per-layer quantization key remapping |
-| `Libraries/MLXLLM/LLMModelFactory.swift` | Modified | JANG detection, `gemma4` / `gemma4_text` registration, model configs |
-| `Libraries/MLXVLM/VLMModelFactory.swift` | Modified | JANG detection, `gemma4` VLM + processor registration |
+| `Libraries/MLXLLM/Models/Mistral4.swift` | New | Mistral Small 4 text (MLA attention, 128-expert MoE, YaRN RoPE) |
+| `Libraries/MLXVLM/Models/Mistral4VLM.swift` | New | Mistral Small 4 VLM (MLA text + Pixtral vision) |
+| `Libraries/MLXLMCommon/JangLoader.swift` | New | JANG detection, config parsing, per-layer quant, gate dequant |
+| `Libraries/MLXLMCommon/Load.swift` | Modified | JANG pipeline, VLM key remap, bfloat16 MoE conversion |
+| `Libraries/MLXLMCommon/SwitchLayers.swift` | Modified | Compiled SwiGLU/GeGLU activation kernels (+5% perf) |
+| `Libraries/MLXLMCommon/LanguageModel.swift` | Modified | `VisionLanguageModelProtocol` marker for `isVLM` |
+| `Libraries/MLXLMCommon/ModelFactory.swift` | Modified | `ModelContext.isVLM` computed property |
+| `Libraries/MLXLMCommon/ModelContainer.swift` | Modified | `ModelContainer.isVLM` async property |
+| `Libraries/MLXLMCommon/Tool/ToolCallFormat.swift` | Modified | `.gemma4` tool call format |
+| `Libraries/MLXLLM/LLMModelFactory.swift` | Modified | gemma4, mistral4 registrations, mistral3->4 dispatch |
+| `Libraries/MLXVLM/VLMModelFactory.swift` | Modified | gemma4 VLM + processor, mistral3->4 VLM dispatch |
+| `Libraries/MLXLLM/Models/NemotronH.swift` | Modified | JANG key remap for Nemotron MoE |
+| `Libraries/MLXVLM/Models/Qwen35.swift` | Modified | JANG VLM sanitize fix |
 
 ## Known Limitations
 
-- **Raw HuggingFace checkpoints** — JANG and mlx-community pre-converted models are supported. Raw HF `transformers` checkpoints (with fused `gate_up_proj`) require conversion first.
-- **Audio input** — Gemma 4 supports audio natively, but the audio encoder is not yet implemented. Text and vision work fully.
-- **Gemma 4 2B/4B models** — The per-layer input gating and KV sharing features used by smaller Gemma 4 variants are not yet implemented. 26B and 31B work fully.
+- **Raw HuggingFace checkpoints** -- JANG and mlx-community pre-converted models are supported. Raw HF `transformers` checkpoints (with fused `gate_up_proj`) require conversion first.
+- **Audio input** -- Gemma 4 supports audio natively, but the audio encoder is not yet implemented. Text and vision work fully.
+- **Gemma 4 2B/4B models** -- The per-layer input gating and KV sharing features used by smaller Gemma 4 variants are not yet implemented. 26B and 31B work fully.
+- **Speculative decoding + RotatingKVCache** -- Speculative decoding requires trimmable caches. Models using `RotatingKVCache` (when `maxKVSize` is set) cannot use speculative decoding after the cache wraps.
 
 ## License
 
@@ -259,3 +311,4 @@ Based on [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm) by Apple's M
 - [Apple ML Explore](https://github.com/ml-explore) for MLX and mlx-swift-lm
 - [JANG](https://jangq.ai) mixed-precision quantization format
 - [Google DeepMind](https://deepmind.google) for the Gemma 4 architecture
+- [Mistral AI](https://mistral.ai) for the Mistral Small 4 architecture
