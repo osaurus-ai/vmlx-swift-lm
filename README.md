@@ -161,6 +161,17 @@ if await container.isVLM {
 }
 ```
 
+You can also check before loading, using the model type string from `config.json`:
+
+```swift
+import MLXVLM
+
+// Synchronous -- no actor isolation needed
+if VLMTypeRegistry.supportedModelTypes.contains(modelType) {
+    // This model_type is a known VLM architecture
+}
+```
+
 **VLM-capable families:** Gemma 4, Gemma 3, Qwen 3.5 VL, Qwen 3 VL, Qwen 2.5 VL, Mistral Small 4, Mistral 3, PaliGemma, Pixtral, SmolVLM2, FastVLM, Idefics3, LFM2-VL, GLM-OCR.
 
 ### Tokenizer and Downloader Integrations
