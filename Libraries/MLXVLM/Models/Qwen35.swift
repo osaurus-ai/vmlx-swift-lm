@@ -1182,17 +1182,29 @@ public class Qwen35: Module, VLMModel {
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
-        if metadata["format"]?.lowercased() == "mlx" {
-            return weights
-        }
-        return sanitize(weights: weights)
+        let isMLXFormat = metadata["format"]?.lowercased() == "mlx"
+        return sanitize(weights: weights, isMLXFormat: isMLXFormat)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        sanitize(weights: weights, isMLXFormat: false)
+    }
+
+    private func sanitize(weights: [String: MLXArray], isMLXFormat: Bool) -> [String: MLXArray] {
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
         if config.textConfiguration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
+        }
+
+        // MLX-native models (including JANG) have correctly formatted norms
+        // but may still need key remapping (JANG uses model.language_model.* prefix)
+        if isMLXFormat {
+            // Check if remapping is needed (JANG models have model.language_model.* keys)
+            let needsRemap = weights.keys.contains { $0.contains("model.language_model") || $0.contains("model.visual") }
+            if !needsRemap {
+                return weights
+            }
         }
 
         var sanitized: [String: MLXArray] = [:]
@@ -1224,7 +1236,9 @@ public class Qwen35: Module, VLMModel {
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
             }
-            if normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
+            // Norm +1 offset only for non-MLX formats (HF checkpoints)
+            // JANG/MLX models already have the offset baked into the weights
+            if !isMLXFormat && normKeys.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
                 value = value + MLXArray(1, dtype: value.dtype)
             }
 
