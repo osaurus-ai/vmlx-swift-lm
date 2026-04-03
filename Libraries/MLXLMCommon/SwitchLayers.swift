@@ -4,6 +4,18 @@ import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
+// Compiled activation kernels — fuses gate activation + element-wise multiply into
+// a single Metal dispatch. Matches Python's @partial(mx.compile, shapeless=True).
+private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
+    (gate: MLXArray, x: MLXArray) -> MLXArray in
+    silu(gate) * x
+}
+
+private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
+    (gate: MLXArray, x: MLXArray) -> MLXArray in
+    geluApproximate(gate) * x
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -36,6 +48,8 @@ public class SwitchGLU: Module {
     let hiddenDims: Int
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
+    let isSiluActivation: Bool
+    let isGeluActivation: Bool
 
     public init(
         inputDims: Int,
@@ -48,6 +62,14 @@ public class SwitchGLU: Module {
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
+        // Detect common activation types for compiled fast path
+        // Default activation is silu when none specified
+        let testInput = MLXArray([Float(1.0)])
+        let testOutput = activation(testInput)
+        let siluOutput = silu(testInput)
+        let geluOutput = geluApproximate(testInput)
+        self.isSiluActivation = (testOutput .== siluOutput).all().item(Bool.self)
+        self.isGeluActivation = !isSiluActivation && (testOutput .== geluOutput).all().item(Bool.self)
 
         self._gateProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
@@ -73,10 +95,16 @@ public class SwitchGLU: Module {
 
         let xUp = upProj(x, idx, sortedIndices: doSort)
         let xGate = gateProj(x, idx, sortedIndices: doSort)
-        x = downProj(
-            activation(xGate) * xUp,
-            idx,
-            sortedIndices: doSort)
+        // Use compiled fused activation when possible (2x fewer Metal dispatches)
+        let activated: MLXArray
+        if isSiluActivation {
+            activated = compiledSwiGLU(xGate, xUp)
+        } else if isGeluActivation {
+            activated = compiledGeGLU(xGate, xUp)
+        } else {
+            activated = activation(xGate) * xUp
+        }
+        x = downProj(activated, idx, sortedIndices: doSort)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
