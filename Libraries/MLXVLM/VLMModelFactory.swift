@@ -93,7 +93,25 @@ public enum VLMTypeRegistry {
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
-        "mistral3": create(Mistral3VLMConfiguration.self, Mistral3VLM.init),
+        "mistral3": { data in
+            // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
+            struct TextCheck: Codable {
+                let textConfig: TextType?
+                struct TextType: Codable {
+                    let modelType: String?
+                    enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+                }
+                enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
+            }
+            if let check = try? JSONDecoder.json5().decode(TextCheck.self, from: data),
+                check.textConfig?.modelType == "mistral4"
+            {
+                let config = try JSONDecoder.json5().decode(Mistral4VLMConfiguration.self, from: data)
+                return Mistral4VLM(config)
+            }
+            let config = try JSONDecoder.json5().decode(Mistral3VLMConfiguration.self, from: data)
+            return Mistral3VLM(config)
+        },
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),

@@ -84,56 +84,28 @@ public struct Mistral4VLMConfiguration: Codable, Sendable {
         _spatialMergeSize = try c.decodeIfPresent(Int.self, forKey: ._spatialMergeSize)
         _multimodalProjectorBias = try c.decodeIfPresent(Bool.self, forKey: ._multimodalProjectorBias)
 
-        // Extract MLA fields from nested text_config
-        struct MLATextConfig: Codable {
-            var kvLoraRank: Int?
-            var qLoraRank: Int?
-            var qkRopeHeadDim: Int?
-            var vHeadDim: Int?
-            var qkNopeHeadDim: Int?
-            var nRoutedExperts: Int?
-            var numExpertsPerTok: Int?
-            var nSharedExperts: Int?
-            var moeIntermediateSize: Int?
-            var routedScalingFactor: Float?
-            var normTopkProb: Bool?
-            var ropeInterleave: Bool?
-            enum CodingKeys: String, CodingKey {
-                case kvLoraRank = "kv_lora_rank"
-                case qLoraRank = "q_lora_rank"
-                case qkRopeHeadDim = "qk_rope_head_dim"
-                case vHeadDim = "v_head_dim"
-                case qkNopeHeadDim = "qk_nope_head_dim"
-                case nRoutedExperts = "n_routed_experts"
-                case numExpertsPerTok = "num_experts_per_tok"
-                case nSharedExperts = "n_shared_experts"
-                case moeIntermediateSize = "moe_intermediate_size"
-                case routedScalingFactor = "routed_scaling_factor"
-                case normTopkProb = "norm_topk_prob"
-                case ropeInterleave = "rope_interleave"
-            }
+        // Extract MLA fields directly from text_config nested container
+        struct MLACodingKeys: CodingKey {
+            var stringValue: String
+            init(stringValue: String) { self.stringValue = stringValue }
+            var intValue: Int? { nil }
+            init?(intValue: Int) { return nil }
         }
-        struct TextConfigWrapper: Codable {
-            let textConfig: MLATextConfig?
-            enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
-        }
-        let mla = try? JSONDecoder().decode(
-            TextConfigWrapper.self,
-            from: JSONEncoder().encode(
-                try decoder.container(keyedBy: CodingKeys.self)
-                    .decode([String: AnyCodable].self, forKey: .textConfig)))
-
-        // Fallback: decode directly from the decoder's data
-        _kvLoraRank = nil; _qLoraRank = nil; _qkRopeHeadDim = nil
-        _vHeadDim = nil; _qkNopeHeadDim = nil; _nRoutedExperts = nil
-        _numExpertsPerTok = nil; _nSharedExperts = nil
-        _moeIntermediateSize = nil; _routedScalingFactor = nil
-        _normTopkProb = nil; _ropeInterleave = nil
+        let textContainer = try c.nestedContainer(keyedBy: MLACodingKeys.self, forKey: .textConfig)
+        _kvLoraRank = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "kv_lora_rank"))
+        _qLoraRank = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "q_lora_rank"))
+        _qkRopeHeadDim = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "qk_rope_head_dim"))
+        _vHeadDim = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "v_head_dim"))
+        _qkNopeHeadDim = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "qk_nope_head_dim"))
+        _nRoutedExperts = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "n_routed_experts"))
+        _numExpertsPerTok = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "num_experts_per_tok"))
+        _nSharedExperts = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "n_shared_experts"))
+        _moeIntermediateSize = try? textContainer.decodeIfPresent(Int.self, forKey: MLACodingKeys(stringValue: "moe_intermediate_size"))
+        _routedScalingFactor = try? textContainer.decodeIfPresent(Float.self, forKey: MLACodingKeys(stringValue: "routed_scaling_factor"))
+        _normTopkProb = try? textContainer.decodeIfPresent(Bool.self, forKey: MLACodingKeys(stringValue: "norm_topk_prob"))
+        _ropeInterleave = try? textContainer.decodeIfPresent(Bool.self, forKey: MLACodingKeys(stringValue: "rope_interleave"))
     }
 }
-
-// Placeholder for complex codable
-private struct AnyCodable: Codable {}
 
 // MARK: - MLA Text Decoder (inline, since MLXVLM can't import MLXLLM)
 
