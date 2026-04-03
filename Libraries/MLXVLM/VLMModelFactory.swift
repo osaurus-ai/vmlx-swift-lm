@@ -355,7 +355,7 @@ public final class VLMModelFactory: ModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
+            perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 
         let tokenizer = try await tokenizerTask

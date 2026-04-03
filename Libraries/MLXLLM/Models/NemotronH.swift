@@ -767,7 +767,25 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             sanitized[key] = finalValue
         }
 
-        // Stack experts: backbone.layers.{l}.mixer.experts.{e}.{proj}.weight -> backbone.layers.{l}.mixer.switch_mlp.{proj}.weight
+        // JANG models have pre-stacked expert weights as switch_mlp.{down,up}_proj
+        // but the module tree expects switch_mlp.{fc2,fc1}. Remap key names.
+        let jangExpertRenames: [(String, String)] = [
+            (".switch_mlp.down_proj.", ".switch_mlp.fc2."),
+            (".switch_mlp.up_proj.", ".switch_mlp.fc1."),
+        ]
+        var remapped = [String: MLXArray]()
+        for (key, value) in sanitized {
+            var newKey = key
+            for (from, to) in jangExpertRenames {
+                if newKey.contains(from) {
+                    newKey = newKey.replacingOccurrences(of: from, with: to)
+                }
+            }
+            remapped[newKey] = value
+        }
+        sanitized = remapped
+
+        // Stack per-expert weights (HF format): backbone.layers.{l}.mixer.experts.{e}.{proj}.weight
         for l in 0 ..< configuration.numHiddenLayers {
             let prefix = "backbone.layers.\(l).mixer"
             for (m, n) in [("down_proj", "fc2"), ("up_proj", "fc1")] {

@@ -59,6 +59,7 @@ public enum LLMTypeRegistry {
             "mimo": create(MiMoConfiguration.self, MiMoModel.init),
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
+            "minimax_m2": create(MiniMaxConfiguration.self, MiniMaxModel.init),
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
@@ -626,9 +627,12 @@ public final class LLMModelFactory: ModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
+        // When JANG, skip config.json's perLayerQuantization — JANG infers correct
+        // per-layer bits from tensor shapes. This avoids creating QuantizedLinear at
+        // the wrong bit width (which can't be re-quantized later).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization,
+            perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 
         let tokenizer = try await tokenizerTask
