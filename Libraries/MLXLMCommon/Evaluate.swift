@@ -662,43 +662,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         return y
     }
 
-    // Compiled forward pass: fuses ~hundreds of Metal kernel dispatches into a single
-    // compiled graph execution. The single biggest performance optimization for MoE
-    // and large models (~2x speedup). Created lazily on first decode step.
-    //
-    // Disabled for models with complex state (SSM hybrid models produce
-    // LMOutput.State that compile can't trace).
-    var compiledForward: ((@Sendable (MLXArray) -> MLXArray))?
-    var compiledForwardInitialized = false
-
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
-        // Lazy init compiled forward on first decode step (not during prefill)
-        if !compiledForwardInitialized {
-            compiledForwardInitialized = true
-            // Only compile for pure forward models (no complex LMOutput.State)
-            if state == nil {
-                let capturedModel = model
-                let capturedCache = cache
-                compiledForward = compile(shapeless: true) { (input: MLXArray) -> MLXArray in
-                    let r = capturedModel(
-                        LMInput.Text(tokens: input),
-                        cache: capturedCache.isEmpty ? nil : capturedCache,
-                        state: nil)
-                    return r.logits
-                }
-            }
-        }
-
-        let result: LMOutput
-        if let cf = compiledForward, state == nil {
-            let logits = cf(previous[text: .newAxis].tokens)
-            result = LMOutput(logits: logits)
-        } else {
-            result = model(
-                previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
-            self.state = result.state
-        }
+        let result = model(
+            previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        self.state = result.state
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(
