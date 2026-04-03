@@ -53,17 +53,18 @@ public func loadWeights(
             weights: weights, jangConfig: jangConfig)
     } else if let perLayerQuantization {
         // Remap perLayerQuantization keys to match sanitized weight paths.
-        // Config.json may use VLM-prefixed keys like "language_model.model.layers.0..."
-        // but sanitize() strips these to "model.layers.0..."
-        var remappedPerLayer = [String: BaseConfiguration.QuantizationOption]()
+        // Config.json uses VLM-prefixed keys like "language_model.model.layers.0..."
+        // LLM sanitize strips to "model.layers.0..." but VLM keeps "language_model.model.layers.0..."
+        // Keep BOTH original and stripped keys so it works for both paths.
+        var remappedPerLayer = perLayerQuantization.perLayerQuantization
         for (key, value) in perLayerQuantization.perLayerQuantization {
-            var newKey = key
-            if newKey.hasPrefix("language_model.model.") {
-                newKey = String(newKey.dropFirst("language_model.".count))
-            } else if newKey.hasPrefix("language_model.") {
-                newKey = String(newKey.dropFirst("language_model.".count))
+            if key.hasPrefix("language_model.model.") {
+                let stripped = String(key.dropFirst("language_model.".count))
+                remappedPerLayer[stripped] = value
+            } else if key.hasPrefix("language_model.") {
+                let stripped = String(key.dropFirst("language_model.".count))
+                remappedPerLayer[stripped] = value
             }
-            remappedPerLayer[newKey] = value
         }
         effectivePerLayerQuantization = BaseConfiguration.PerLayerQuantization(
             quantization: perLayerQuantization.quantization,
