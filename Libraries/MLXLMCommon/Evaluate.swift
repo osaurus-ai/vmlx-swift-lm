@@ -580,10 +580,6 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
     let kvMode: KVQuantizationMode
 
-    /// Pre-computed cache state array references. Built once after prepare(),
-    /// reused every token to avoid per-token Swift array allocations.
-    /// Cache objects mutate in-place so references stay valid.
-    var cacheStateArrays: [MLXArray] = []
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -704,9 +700,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             asyncEval(y.tokens)
         }
 
-        // Build cache state references once after prefill.
-        // Cache objects mutate in-place so these refs stay valid.
-        cacheStateArrays = cache.flatMap { $0.innerState() }
+
     }
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
@@ -754,8 +748,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         let token = step(previous: previousY)
         y = .init(tokens: token)
 
-        // Submit token + all cache states together so GPU pipeline stays full.
-        asyncEval([token] + cacheStateArrays)
+        asyncEval(token)
 
         tokenCount += 1
 
