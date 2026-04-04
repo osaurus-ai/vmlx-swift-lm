@@ -72,42 +72,48 @@ Swift runs everything on the SAME stream:
 item() on the same stream as asyncEval blocks until ALL pending work completes.
 Python's item() on a different stream reads the PREVIOUS result without blocking.
 
-## Next Step: Stream-Split TokenIterator
+## Stream-Split TokenIterator (IMPLEMENTED)
 
-Replace next() with two-phase advance/materialize:
+Matches Python's `generation_stream = mx.new_stream(mx.default_device())` pattern:
 
-    mutating func advance() {
-        Stream.setDefault(generationStream)   // gen stream
-        let token = step(previous: y)
-        asyncEval(token)                      // submit N+1
+    // TokenIterator creates a dedicated generation stream once:
+    let generationStream = MLX.Stream(Device.defaultDevice())
+
+    // next() splits model forward (gen stream) from item() (default stream):
+    mutating public func next() -> Int? {
+        let previousY = y
+
+        MLX.Stream.setDefault(generationStream)   // gen stream
+        let token = step(previous: previousY)
+        y = .init(tokens: token)
+
+        MLX.Stream.restoreDefault()                // default stream
+        asyncEval(token)                           // submit N+1
+
+        return previousY.tokens.item(Int.self)     // read N (overlap!)
     }
 
-    func materializePrevious() -> Int {
-        Stream.restoreDefault()               // default stream
-        return previousY.tokens.item(Int.self) // read N (overlap!)
-    }
+    // prepare() also runs prefill on gen stream:
+    MLX.Stream.setDefault(generationStream)
+    model.prepare(input, cache: cache, windowSize: windowSize)
+    // ... step + asyncEval ...
+    MLX.Stream.restoreDefault()
 
-The generate loop:
+No changes to generateLoopTask or public API. `for token in iterator` works
+as before — the stream split is transparent inside next().
 
-    iterator.advance()                    // submit N+1 on gen stream
-    let token = iterator.materializePrevious() // read N on default (overlap!)
+## osaurus-ai/mlx-swift Fork (osaurus-0.31.3) — NOW ACTIVE
 
-This matches Python exactly. Requires updating generateLoopTask and
-any direct TokenIterator callers. Does NOT break the public generate() API.
-
-## osaurus-ai/mlx-swift Fork (osaurus-0.31.3)
-
-Available at github.com/osaurus-ai/mlx-swift branch osaurus-0.31.3.
+Package.swift now depends on github.com/osaurus-ai/mlx-swift branch osaurus-0.31.3.
 Contains Stream.setDefault, Stream.restoreDefault, Stream.runWith,
-mlx_stream_run_with C API, evalLock removal. NOT currently used by
-main branch (upstream mlx-swift 0.31.3). Will be needed for stream-split.
+mlx_stream_run_with C API. Used by TokenIterator for stream-split.
 
 ## Files Modified (from upstream mlx-swift-lm baseline)
 
-    Evaluate.swift       — clearCache, wired limit, skip quantize check
+    Evaluate.swift       — stream-split TokenIterator, clearCache, wired limit
     Load.swift           — symlink resolution for mlxstudio model dirs
     LLMModel.swift       — clearCache after prefill chunks
     Gemma4Text.swift     — remove asType, compiled softcap (+300%)
     Qwen35.swift         — compiled sigmoid gate
     Qwen3Next.swift      — compiled sigmoidMultiply, remove asType
-    Package.swift        — upstream ml-explore/mlx-swift 0.31.3
+    Package.swift        — osaurus-ai/mlx-swift fork (osaurus-0.31.3)
