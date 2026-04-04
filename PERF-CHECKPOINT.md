@@ -50,70 +50,43 @@
 | Stream.withDefaultStream per step | -6% | @TaskLocal allocation overhead per scope |
 | Stream.setDefault per step | -10% | Stream boundary sync between step/item |
 | stream.runWith (C-level) + restore for item | -10% | Per-token set/restore overhead > overlap gain |
+| **Full stream-split TokenIterator** | **-11%** | **54 vs 61 tok/s on Qwen3.5-35B (confirmed 2026-04-04)** |
+| asyncEval with cache state arrays | 0% | GPU pipeline already full from token-only asyncEval |
 | evalLock removal | 0% | Lock uncontended in single-thread generation |
 | compile with cache state tracking | -35% | State tracking overhead exceeds compile benefit |
 | compile(shapeless:true) on model forward | CRASH | KV cache mutation breaks tracer |
 
 ## Root Cause of Remaining 17% Gap (Qwen3.5: 61 vs 74)
 
-Python runs model forward on a DEDICATED stream and item() on the DEFAULT stream:
+Stream-split approach DISPROVED — confirmed -11% overhead (54 vs 61 tok/s).
+The gap is NOT caused by stream scheduling. Likely causes:
 
-    with mx.stream(generation_stream):     # gen stream
-        logits = model(y, cache=cache)
-        mx.async_eval(next_y)
-    yield y.item()                         # default stream -- DIFFERENT thread
+1. **Custom Metal GatedDelta kernels** — osa-jang has 4 vectorized Metal
+   kernel variants for Qwen3.5's SSM layers. Our GatedDeltaNet uses
+   standard MLX ops. Half of Qwen3.5's 64 layers are GatedDeltaNet.
 
-Swift runs everything on the SAME stream:
+2. **Auto-fused gate/up MoE projections** — osa-jang combines gate_proj +
+   up_proj into gate_up_proj during weight loading (1 matmul instead of 2).
 
-    let token = step(previous)             # default stream
-    asyncEval(token)                       # default stream
-    return previousY.tokens.item(Int.self) # default stream -- BLOCKS
+3. **Sorted expert indices in gatherMM** — osa-jang sorts expert indices
+   for memory locality before gather operations (when indices.size >= 64).
 
-item() on the same stream as asyncEval blocks until ALL pending work completes.
-Python's item() on a different stream reads the PREVIOUS result without blocking.
+4. **Python model code differences** — vmlx's Python model implementations
+   may have fewer MLX ops per forward pass than our Swift implementations.
 
-## Stream-Split TokenIterator (IMPLEMENTED)
+## osaurus-ai/mlx-swift Fork (osaurus-0.31.3) — NOT USED
 
-Matches Python's `generation_stream = mx.new_stream(mx.default_device())` pattern:
-
-    // TokenIterator creates a dedicated generation stream once:
-    let generationStream = MLX.Stream(Device.defaultDevice())
-
-    // next() splits model forward (gen stream) from item() (default stream):
-    mutating public func next() -> Int? {
-        let previousY = y
-
-        MLX.Stream.setDefault(generationStream)   // gen stream
-        let token = step(previous: previousY)
-        y = .init(tokens: token)
-
-        MLX.Stream.restoreDefault()                // default stream
-        asyncEval(token)                           // submit N+1
-
-        return previousY.tokens.item(Int.self)     // read N (overlap!)
-    }
-
-    // prepare() also runs prefill on gen stream:
-    MLX.Stream.setDefault(generationStream)
-    model.prepare(input, cache: cache, windowSize: windowSize)
-    // ... step + asyncEval ...
-    MLX.Stream.restoreDefault()
-
-No changes to generateLoopTask or public API. `for token in iterator` works
-as before — the stream split is transparent inside next().
-
-## osaurus-ai/mlx-swift Fork (osaurus-0.31.3) — NOW ACTIVE
-
-Package.swift now depends on github.com/osaurus-ai/mlx-swift branch osaurus-0.31.3.
+Available at github.com/osaurus-ai/mlx-swift branch osaurus-0.31.3.
 Contains Stream.setDefault, Stream.restoreDefault, Stream.runWith,
-mlx_stream_run_with C API. Used by TokenIterator for stream-split.
+mlx_stream_run_with C API. Stream-split confirmed unhelpful; fork NOT
+used by main branch (upstream ml-explore/mlx-swift 0.31.3).
 
 ## Files Modified (from upstream mlx-swift-lm baseline)
 
-    Evaluate.swift       — stream-split TokenIterator, clearCache, wired limit
+    Evaluate.swift       — asyncEval cache states, clearCache, wired limit
     Load.swift           — symlink resolution for mlxstudio model dirs
     LLMModel.swift       — clearCache after prefill chunks
     Gemma4Text.swift     — remove asType, compiled softcap (+300%)
     Qwen35.swift         — compiled sigmoid gate
     Qwen3Next.swift      — compiled sigmoidMultiply, remove asType
-    Package.swift        — osaurus-ai/mlx-swift fork (osaurus-0.31.3)
+    Package.swift        — upstream ml-explore/mlx-swift 0.31.3
