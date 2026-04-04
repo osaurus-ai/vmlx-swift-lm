@@ -37,13 +37,16 @@ let container = try await loadModelContainer(
 
 ### Performance
 
-MoE models run 38-75% faster than upstream thanks to bfloat16 dtype optimization and compiled activation kernels:
+MoE models run up to 4x faster than upstream thanks to computation graph optimization, bfloat16 dtype, compiled activations, and Metal memory management:
 
-| Model | Before | After | Gain |
+| Model | Upstream | This Fork | Gain |
 |-------|-------:|------:|-----:|
-| Gemma 4 26B MoE | 25.0 tok/s | 43.8 tok/s | **+75%** |
+| Gemma 4 26B MoE | 25.0 tok/s | **97 tok/s** | **+288%** |
 | Qwen 3.5-35B MoE | 42.4 tok/s | 58.7 tok/s | **+38%** |
+| NemotronH 30B-A3B | ~25 tok/s | 47 tok/s | **+88%** |
 | Qwen 3.5-4B Dense | 123 tok/s | 145 tok/s | +18% |
+
+Key optimizations: eliminated 86 unnecessary MLX graph nodes per Gemma4 MoE forward pass (redundant type casts + uncompiled softcap), periodic Metal cache cleanup, GPU memory pinning, and compiled GLU activations.
 
 ### Speculative Decoding
 
