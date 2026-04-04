@@ -1727,10 +1727,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            // Pin model weights in GPU VRAM via direct Cmlx call.
-            // Prevents macOS from paging weights to SSD between tokens.
-            // Critical for MoE models (+30-50% throughput).
-            // Matches osa-jang: mlx_set_wired_limit(&previous, size_t(physMem * 3/4))
+            // Pin model weights in GPU VRAM via Cmlx.
+            // Prevents macOS paging weights to SSD between tokens.
             var prevWired: size_t = 0
             let physMem = Int(ProcessInfo.processInfo.physicalMemory)
             mlx_set_wired_limit(&prevWired, size_t(physMem * 3 / 4))
