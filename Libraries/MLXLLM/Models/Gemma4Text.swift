@@ -12,6 +12,13 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Compiled logit softcap — fuses divide + tanh + multiply into one Metal dispatch.
+// Matches Python: @partial(mx.compile, shapeless=True) def logit_softcap(softcap, x)
+private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { (x: MLXArray, cap: MLXArray) -> MLXArray in
+        tanh(x / cap) * cap
+    }
+
 // MARK: - Norm Utilities
 
 /// Standard RMSNorm for Gemma4 — weight used directly, NO +1 offset.
@@ -320,11 +327,12 @@ class Gemma4Router: Module {
         h = h * routerScale
 
         let expertScores = proj(h)
-        let routerProbs = softmax(expertScores.asType(.float32), axis: -1)
+        // softmax already computes in float32 internally — no explicit cast needed
+        let routerProbs = softmax(expertScores, axis: -1)
 
         // Top-K via argPartition on negated scores (get highest scores)
         let topKIndices = argPartition(
-            MLXArray(0) - expertScores.asType(.float32),
+            MLXArray(0) - expertScores,
             kth: topK - 1, axis: -1
         )[.ellipsis, ..<topK]
 
@@ -465,8 +473,8 @@ class Gemma4DecoderLayer: Module {
         h = postFeedforwardLayernorm(h)
         h = residual + h
 
-        // Layer scalar
-        h = h * layerScalar.asType(h.dtype)
+        // Layer scalar — no type cast needed, MLX handles broadcasting
+        h = h * layerScalar
 
         return h
     }
@@ -557,7 +565,7 @@ public class Gemma4TextModel: Module, LLMModel {
         }
 
         if let cap = config.finalLogitSoftcapping, cap > 0 {
-            out = tanh(out / cap) * cap
+            out = compiledLogitSoftcap(out, MLXArray(cap))
         }
 
         return out
