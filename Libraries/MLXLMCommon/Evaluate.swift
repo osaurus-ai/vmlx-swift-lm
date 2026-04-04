@@ -715,20 +715,24 @@ public struct TokenIterator: TokenIteratorProtocol {
         return y
     }
 
+    // Whether cache quantization is needed (skip the function call entirely when not)
+    var needsCacheQuantization: Bool { kvBits != nil || kvMode != .none }
+
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
-        // Apply dynamic cache quantization/compression after each step
-        maybeQuantizeKVCache(
-            cache: &cache,
-            kvBits: kvBits,
-            kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart,
-            kvMode: kvMode
-        )
+        if needsCacheQuantization {
+            maybeQuantizeKVCache(
+                cache: &cache,
+                kvBits: kvBits,
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart,
+                kvMode: kvMode
+            )
+        }
 
         return convertToToken(logits: result.logits)
     }
@@ -738,25 +742,14 @@ public struct TokenIterator: TokenIteratorProtocol {
             return nil
         }
 
-        // save current value -- this will be returned
         let previousY = y
 
-        // Double-buffered decode: build NEXT token's graph before materializing CURRENT.
-        // Pre-compute cache state refs once and reuse (avoids per-step O(layers) allocation).
         let token = step(previous: previousY)
         y = .init(tokens: token)
-
-        // Eager eval: token + cache state together so GPU processes both in parallel.
-        // Pre-computing cacheStateArrays once per call avoids repeated innerState() allocation.
-        var evalArrays: [MLXArray] = [token]
-        for c in cache { evalArrays.append(contentsOf: c.innerState()) }
-        asyncEval(evalArrays)
+        asyncEval(token)
 
         tokenCount += 1
 
-        // Periodic Metal cache cleanup to reduce memory fragmentation.
-        // Critical for MoE models with 128 experts where allocation pressure
-        // causes significant slowdown. Matches Python mlx-lm's mx.clear_cache().
         if tokenCount % 256 == 0 {
             Memory.clearCache()
         }
@@ -1825,14 +1818,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 performIteration()
             }
         } else {
-            // Auto-wire model weights in GPU VRAM when no explicit ticket provided.
-            // Prevents macOS from paging weights to SSD between tokens, which adds
-            // 10-15ms latency per token on large MoE models. Uses 75% of physical
-            // memory as the wired limit, matching Python mlx-lm's wired_limit pattern.
-            let wiredLimit = Int(ProcessInfo.processInfo.physicalMemory * 3 / 4)
-            await Memory.withWiredLimit(wiredLimit) {
-                performIteration()
-            }
+            performIteration()
         }
     }
 
