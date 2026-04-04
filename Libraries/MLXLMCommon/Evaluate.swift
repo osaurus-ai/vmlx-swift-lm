@@ -614,7 +614,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
-
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
@@ -649,7 +648,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
-
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
@@ -683,7 +681,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
         self.kvMode = .none
-
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
