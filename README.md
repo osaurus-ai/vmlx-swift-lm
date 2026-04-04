@@ -41,12 +41,19 @@ MoE models run up to 4x faster than upstream thanks to computation graph optimiz
 
 | Model | Upstream | This Fork | Gain |
 |-------|-------:|------:|-----:|
-| Gemma 4 26B MoE | 25.0 tok/s | **97 tok/s** | **+288%** |
-| Qwen 3.5-35B MoE | 42.4 tok/s | 58.7 tok/s | **+38%** |
-| NemotronH 30B-A3B | ~25 tok/s | 47 tok/s | **+88%** |
+| Gemma 4 26B MoE | 25.0 tok/s | **101 tok/s** | **+304%** |
+| Qwen 3.5-35B MoE | 42.4 tok/s | **61 tok/s** | **+44%** |
+| NemotronH 30B-A3B | ~25 tok/s | **48 tok/s** | **+92%** |
 | Qwen 3.5-4B Dense | 123 tok/s | 145 tok/s | +18% |
 
-Key optimizations: eliminated 86 unnecessary MLX graph nodes per Gemma4 MoE forward pass (redundant type casts + uncompiled softcap), periodic Metal cache cleanup, GPU memory pinning, and compiled GLU activations.
+Key optimizations:
+- **Computation graph cleanup**: Eliminated 86 unnecessary `.asType()` MLX graph nodes per Gemma4 MoE forward pass. Each redundant type cast was a separate Metal kernel dispatch.
+- **Compiled logit softcap**: Fused divide + tanh + multiply into a single Metal dispatch via `compile(shapeless: true)`, matching Python's `@mx.compile` decorator.
+- **Periodic Metal cache cleanup**: `Memory.clearCache()` every 256 tokens reduces GPU allocator fragmentation from MoE expert weight cycling.
+- **GPU memory pinning**: `mlx_set_wired_limit` via Cmlx prevents macOS from paging model weights to SSD between tokens.
+- **bfloat16 MoE conversion**: Prevents Metal's automatic float16 to float32 promotion on mixed-dtype MoE operations.
+- **Compiled GLU activations**: Fused SwiGLU/GeGLU into single Metal dispatches.
+- **Symlink resolution**: Properly follows symlinked model directories (mlxstudio compatibility).
 
 ### Speculative Decoding
 
