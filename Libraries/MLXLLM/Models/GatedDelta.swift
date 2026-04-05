@@ -11,9 +11,17 @@ import MLXNN
 
 // MARK: - Compute G
 
+/// Compiled compute_g — fuses exp+exp+softplus+mul+neg into 1 Metal dispatch.
+/// Matches Python's @mx.compile(shapeless=True) def compute_g().
+/// Called per GatedDeltaNet layer per token (~30 layers per forward).
+private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+        let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+        return decay.asType(a.dtype)
+    }
+
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    _compiledComputeG(aLog, a, dtBias)
 }
 
 // MARK: - Metal Kernel
