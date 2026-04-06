@@ -907,8 +907,10 @@ public struct Gemma4Processor: UserInputProcessor {
                 return MediaProcessing.asMLXArray(resized) / 255.0
             }
             processedImage = LMInput.ProcessedImage(pixels: concatenated(arrays).transposed(0, 3, 1, 2))
-            let boiId = 255999; let imgId = 258880
-            var exp = [Int](); for t in tokens { if t == boiId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
+            // Chat template emits <|image|> which tokenizes to image_token_id (258880).
+            // Expand each single image token into imageSeqLength copies for the vision features.
+            let imgId = tokenizer.encode(text: "<|image|>").last ?? 258880
+            var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
             tokens = exp
         }
 
