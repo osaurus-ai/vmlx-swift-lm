@@ -255,7 +255,7 @@ private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, 
         let xPart = inputs[.ellipsis, (d * chPerDim) ..< ((d + 1) * chPerDim)]
         let freqExp = (2.0 / Float(chPerDim)) * MLXArray(0 ..< halfPerDim).asType(.float32)
         let timescale = pow(base, freqExp)
-        let sinInp = positions[0..., d ..< (d + 1)].asType(.float32) / timescale
+        let sinInp = positions[.ellipsis, d ..< (d + 1)].asType(.float32) / timescale
         var cosD = cos(sinInp)
         var sinD = sin(sinInp)
         cosD = concatenated([cosD, cosD], axis: -1).asType(inputs.dtype)
@@ -397,9 +397,9 @@ private class VisionPooler: Module {
         let k = Int(sqrt(Float(L / defaultLen)))
         let kSq = Float(k * k)
         let clamped = maximum(patchPos, MLXArray(Int32(0)))
-        let maxX = clamped[0..., 0].max(axis: -1, keepDims: true) + 1
+        let maxX = clamped[.ellipsis, 0].max(axis: -1, keepDims: true) + 1
         let ki = floor(clamped.asType(.float32) / Float(k)).asType(.int32)
-        let linearIdx = ki[0..., 0] + (maxX / MLXArray(Int32(k))) * ki[0..., 1]
+        let linearIdx = ki[.ellipsis, 0] + (maxX / MLXArray(Int32(k))) * ki[.ellipsis, 1]
         let w = oneHot(linearIdx, numClasses: defaultLen) / kSq
         let out = matmul(w.transposed(0, 2, 1), h)
         let mask = logicalNot(all(w .== Float(0), axis: 1))
@@ -468,9 +468,10 @@ private class VisionTower: Module {
         mask = expandedDimensions(mask, axis: 1)
 
         var h = encoder(emb, pos: patchPos, mask: mask)
-        let (pooled, poolMask) = pooler(h, patchPos: patchPos, padPos: padPos)
-        let nValid = max(1, poolMask.asType(.int32).sum(axis: 1)[0].item(Int.self))
-        h = pooled[0..., ..<min(nValid, pooled.dim(1))].expandedDimensions(axis: 0)
+        let (pooled, _) = pooler(h, patchPos: patchPos, padPos: padPos)
+        // Return all defaultOutputLength features — the processor inserts exactly
+        // that many image tokens, so maskedScatter needs them all to match.
+        h = pooled
         if cfg.standardize, let sb = stdBias, let ss = stdScale { h = (h - sb) * ss }
         return h
     }
@@ -765,8 +766,27 @@ private class MultimodalEmbedder: Module {
 }
 
 private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) -> MLXArray {
-    let mf = mask.flattened().asType(.int32); let idx = cumsum(mf) - 1; let sf = source.flattened()
-    return MLX.where(mf, sf[idx % sf.dim(0)], input.flattened()).reshaped(input.shape)
+    let inputShape = input.shape
+    let inputFlat = input.flattened()
+    let maskFlat = mask.flattened()
+    let sourceFlat = source.flattened()
+
+    let maskValues = maskFlat.asArray(Bool.self)
+    let positions = maskValues.enumerated().compactMap { i, v in v ? UInt32(i) : nil }
+
+    guard !positions.isEmpty else { return input }
+
+    let posArray = MLXArray(positions)
+    guard sourceFlat.shape[0] == posArray.shape[0] else {
+        fatalError(
+            """
+            Gemma4 maskedScatter: size mismatch between vision features and image token positions.
+            Vision features: \(sourceFlat.shape[0]), image positions: \(posArray.shape[0]).
+            Check that imageSeqLength in preprocessor_config matches vision tower output (defaultOutputLength).
+            """)
+    }
+    inputFlat[posArray] = sourceFlat
+    return inputFlat.reshaped(inputShape)
 }
 
 // MARK: - Gemma4 VLM
@@ -907,9 +927,11 @@ public struct Gemma4Processor: UserInputProcessor {
                 var tH = Int(floor(f * Float(h) / Float(sm))) * sm; var tW = Int(floor(f * Float(w) / Float(sm))) * sm
                 if tH == 0 { tH = sm }; if tW == 0 { tW = sm }
                 let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
-                return MediaProcessing.asMLXArray(resized) / 255.0
+                // asMLXArray returns [1, C, H, W] (NCHW) with float values in [0, 1]
+                // — no extra transpose or rescale needed
+                return MediaProcessing.asMLXArray(resized)
             }
-            processedImage = LMInput.ProcessedImage(pixels: concatenated(arrays).transposed(0, 3, 1, 2))
+            processedImage = LMInput.ProcessedImage(pixels: concatenated(arrays))
             // Chat template emits <|image|> which tokenizes to image_token_id (258880).
             // Expand each single image token into imageSeqLength copies for the vision features.
             let imgId = tokenizer.encode(text: "<|image|>").last ?? 258880
