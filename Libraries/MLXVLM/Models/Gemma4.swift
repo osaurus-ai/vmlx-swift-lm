@@ -827,8 +827,10 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         for (k, v) in weights {
             var nk = k
             if nk.hasPrefix("model.") { nk = String(nk.dropFirst("model.".count)) }
+            // Skip audio — Gemma4 VLM doesn't implement audio, these weights have no module
+            if nk.hasPrefix("audio_tower.") || nk.hasPrefix("embed_audio.") { continue }
             // Skip clipped linear params — training artifacts, not used in inference (we use plain Linear)
-            if nk.contains("vision_tower.") && (nk.contains("input_min") || nk.contains("input_max") || nk.contains("output_min") || nk.contains("output_max")) { continue }
+            if nk.contains("input_min") || nk.contains("input_max") || nk.contains("output_min") || nk.contains("output_max") { continue }
             if nk.contains("rotary_emb") { continue }
             // Remap language_model keys to include model. prefix
             if nk.hasPrefix("language_model.") && !nk.hasPrefix("language_model.model.") {
