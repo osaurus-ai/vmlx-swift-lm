@@ -87,16 +87,30 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || effectivePerLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let effectivePerLayerQuantization {
-                    return effectivePerLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
+        // Inline quantize with error logging instead of try! crash
+        let updates = model.leafModules().flattened().compactMap { (path, m) -> (String, Module)? in
+            guard weights["\(path).scales"] != nil else { return nil }
+            let tup: (groupSize: Int, bits: Int, mode: QuantizationMode)?
+            if let effectivePerLayerQuantization {
+                tup = effectivePerLayerQuantization.quantization(layer: path)?.asTuple
             } else {
-                return nil
+                tup = quantization?.asTuple
             }
+            guard let (gs, b, mode) = tup else { return nil }
+            if let q = quantizeSingle(layer: m, groupSize: gs, bits: b, mode: mode) {
+                return (path, q)
+            }
+            return nil
+        }
+        do {
+            try model.update(modules: ModuleChildren.unflattened(updates), verify: .none)
+        } catch {
+            print("[loadWeights] quantize model.update failed: \(error)")
+            // Log which paths were being updated
+            for (path, mod) in updates.prefix(5) {
+                print("  update path: \(path) → \(type(of: mod))")
+            }
+            throw error
         }
     }
 
