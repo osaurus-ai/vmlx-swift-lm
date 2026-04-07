@@ -386,7 +386,10 @@ private enum Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
+            let g = silu(gate(x))
+            let u = up(x)
+            let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+            return down(product)
         }
     }
 

@@ -467,6 +467,7 @@ private extension Mistral3VLMConfiguration {
                         "vocab_size": textConfig.vocabSize,
                     ] as [String: Any],
                     "vision_config": [
+                        "model_type": "pixtral",
                         "hidden_size": visionConfig.hiddenSize,
                         "num_hidden_layers": visionConfig.numHiddenLayers,
                         "num_attention_heads": visionConfig.numAttentionHeads,

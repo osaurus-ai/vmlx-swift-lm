@@ -606,11 +606,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             weights["lm_head.weight"] = nil
         }
 
-        // Only input/post-attention layernorms use (1+weight) in Qwen3.5.
-        // model.norm, q_norm, k_norm use standard weight*x — do NOT shift these.
+        // All 5 norm types use the (1+weight) convention in Qwen3.5.
+        // Matches Python mlx-lm and osa-jang reference implementations.
         let normKeysToShift = [
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
+            "model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
         ]
 
         for k in Array(weights.keys) {
