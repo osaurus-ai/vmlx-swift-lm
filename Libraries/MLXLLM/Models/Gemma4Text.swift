@@ -330,7 +330,17 @@ class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        // Upcast to bfloat16 before element-wise multiply to prevent float16 overflow.
+        // With mixed-precision JANG models, gelu(gate)*up can exceed float16 max (65504).
+        let g = geluApproximate(gateProj(x))
+        let u = upProj(x)
+        let product: MLXArray
+        if g.dtype == .float16 {
+            product = g.asType(.bfloat16) * u.asType(.bfloat16)
+        } else {
+            product = g * u
+        }
+        return downProj(product)
     }
 }
 

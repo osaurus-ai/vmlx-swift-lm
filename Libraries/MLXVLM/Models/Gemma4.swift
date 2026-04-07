@@ -557,7 +557,21 @@ private class TextMLP: Module {
         let iS = intermediateSize ?? cfg.intermediateSize
         _gP.wrappedValue = Linear(cfg.hiddenSize, iS, bias: false); _uP.wrappedValue = Linear(cfg.hiddenSize, iS, bias: false); _dP.wrappedValue = Linear(iS, cfg.hiddenSize, bias: false); super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { dP(geluApproximate(gP(x)) * uP(x)) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        // Compute gate and up projections, then upcast to bfloat16 before multiply.
+        // With mixed-precision JANG models, 8-bit attention produces larger activations
+        // that can cause gelu(gate)*up to overflow float16 (max 65504).
+        // bfloat16 shares float32's exponent range, preventing overflow.
+        let g = geluApproximate(gP(x))
+        let u = uP(x)
+        let product: MLXArray
+        if g.dtype == .float16 {
+            product = g.asType(.bfloat16) * u.asType(.bfloat16)
+        } else {
+            product = g * u
+        }
+        return dP(product)
+    }
 }
 
 private class TextRouter: Module {
@@ -976,11 +990,8 @@ public struct Gemma4Processor: UserInputProcessor {
             // Chat template emits <|image|> which tokenizes to image_token_id (258880).
             // Expand each single image token into imageSeqLength copies for the vision features.
             let imgId = tokenizer.encode(text: "<|image|>").last ?? 258880
-            let imgCount = tokens.filter { $0 == imgId }.count
-            print("[Gemma4Processor] images=\(input.images.count) imgId=\(imgId) tokenCount=\(tokens.count) imageTokensBefore=\(imgCount)")
             var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
             tokens = exp
-            print("[Gemma4Processor] tokensAfterExpansion=\(tokens.count) imageTokensAfter=\(tokens.filter { $0 == imgId }.count)")
         }
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)

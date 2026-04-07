@@ -106,7 +106,6 @@ public func loadWeights(
             try model.update(modules: ModuleChildren.unflattened(updates), verify: .none)
         } catch {
             print("[loadWeights] quantize model.update failed: \(error)")
-            // Log which paths were being updated
             for (path, mod) in updates.prefix(5) {
                 print("  update path: \(path) → \(type(of: mod))")
             }
