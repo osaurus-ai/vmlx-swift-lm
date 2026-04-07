@@ -384,6 +384,7 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
             let model = try await loader(factory)
             return model
         } catch {
+            print("[ModelFactory] \(type(of: factory)) failed: \(error)")
             lastError = error
         }
     }
