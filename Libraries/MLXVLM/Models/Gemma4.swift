@@ -976,8 +976,11 @@ public struct Gemma4Processor: UserInputProcessor {
             // Chat template emits <|image|> which tokenizes to image_token_id (258880).
             // Expand each single image token into imageSeqLength copies for the vision features.
             let imgId = tokenizer.encode(text: "<|image|>").last ?? 258880
+            let imgCount = tokens.filter { $0 == imgId }.count
+            print("[Gemma4Processor] images=\(input.images.count) imgId=\(imgId) tokenCount=\(tokens.count) imageTokensBefore=\(imgCount)")
             var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
             tokens = exp
+            print("[Gemma4Processor] tokensAfterExpansion=\(tokens.count) imageTokensAfter=\(tokens.filter { $0 == imgId }.count)")
         }
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)
