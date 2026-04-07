@@ -53,7 +53,8 @@ public func loadWeights(
     // than the body. Dequantizing resolves ambiguous bit/group_size inference.
     if let jangConfig {
         JangLoader.dequantizeMoEGates(
-            weights: &weights, groupSize: jangConfig.quantization.blockSize)
+            weights: &weights, groupSize: jangConfig.quantization.blockSize,
+            bitWidthsUsed: jangConfig.quantization.bitWidthsUsed)
     }
 
     // Determine quantization: JANG models infer per-layer bit widths from tensor shapes.

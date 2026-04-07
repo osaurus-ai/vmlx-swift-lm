@@ -346,17 +346,19 @@ public struct JangLoader: Sendable {
 
     /// Dequantize MoE gate/router weights from quantized uint32 to float.
     ///
-    /// JANG quantizes MoE gate weights at CRITICAL tier (8-bit) for routing precision,
-    /// but the model expects them as plain float Linear (not QuantizedLinear).
-    /// This function detects gate weights that have .scales/.biases companions and
-    /// dequantizes them in-place, removing the scales/biases entries.
+    /// JANG quantizes MoE gate weights at CRITICAL tier (highest available bits)
+    /// for routing precision, but the model expects them as plain float Linear
+    /// (not QuantizedLinear). This function detects gate weights that have
+    /// .scales/.biases companions and dequantizes them in-place.
     ///
     /// Gate patterns matched:
     /// - `.gate.weight` (not `.gate_proj.weight`) — Nemotron, MiniMax
     /// - `.mlp.gate.weight` — Qwen3.5 MoE, general MoE
     /// - `.mixer.gate.weight` — Nemotron-H
     /// - `.router.proj.weight` — Gemma4 (already handled separately)
-    public static func dequantizeMoEGates(weights: inout [String: MLXArray], groupSize: Int) {
+    public static func dequantizeMoEGates(
+        weights: inout [String: MLXArray], groupSize: Int, bitWidthsUsed: [Int] = []
+    ) {
         // Find gate weight keys that have .scales companion (meaning they're quantized)
         var gateBasePaths = Set<String>()
 
@@ -380,23 +382,31 @@ public struct JangLoader: Sendable {
 
             let gateBiases = weights[basePath + ".biases"]
 
-            // Infer bit width AND group size from tensor shapes (don't trust config block_size)
             let packedDim = gateWeight.shape.last ?? 0
             let numGroups = gateScales.shape.last ?? 1
 
-            // Try each valid bit width to find the one that produces consistent shapes
+            // Infer bits using bitWidthsUsed (highest first — gates are CRITICAL tier).
+            // Shape-only inference is ambiguous: multiple (bits, gs) produce the same
+            // packed shapes. Using the known bit widths resolves the ambiguity.
+            // For each candidate bits, compute inDim = packedDim * 32 / bits and check
+            // that numGroups divides it evenly.
             var inferredBits = 4
             var inferredGroupSize = groupSize
-            for bits in [8, 6, 5, 4, 3, 2] {
-                let elemPerU32 = 32 / bits
-                let realCols = packedDim * elemPerU32
-                if numGroups > 0 {
-                    let gs = realCols / numGroups
-                    if gs > 0 && gs * numGroups == realCols {
-                        inferredBits = bits
-                        inferredGroupSize = gs
-                        break
-                    }
+
+            let candidates = bitWidthsUsed.isEmpty
+                ? [8, 6, 5, 4, 3, 2]
+                : bitWidthsUsed.sorted(by: >)
+
+            for bits in candidates {
+                guard bits > 0 && (packedDim * 32) % bits == 0 else { continue }
+                let inDim = (packedDim * 32) / bits
+                guard numGroups > 0 && inDim % numGroups == 0 else { continue }
+                let gs = inDim / numGroups
+                // Verify round-trip: packing inDim at this bits produces packedDim
+                if (inDim * bits + 31) / 32 == packedDim || inDim * bits / 32 == packedDim {
+                    inferredBits = bits
+                    inferredGroupSize = gs
+                    break
                 }
             }
 
