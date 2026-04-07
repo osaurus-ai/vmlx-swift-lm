@@ -951,8 +951,11 @@ public struct Gemma4Processor: UserInputProcessor {
                 var tH = Int(floor(f * Float(h) / Float(sm))) * sm; var tW = Int(floor(f * Float(w) / Float(sm))) * sm
                 if tH == 0 { tH = sm }; if tW == 0 { tW = sm }
                 let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
+                // Convert to sRGB tone curve — CIImage may be in linear space, but the
+                // vision tower was trained on sRGB images (PIL/Python default).
+                let srgb = MediaProcessing.inSRGBToneCurveSpace(resized)
                 // asMLXArray returns [1, C, H, W] (NCHW) with float values in [0, 1]
-                return MediaProcessing.asMLXArray(resized)
+                return MediaProcessing.asMLXArray(srgb)
             }
             // Store per-image dimensions in frames so prepare() can extract each
             // image at its original size (before padding for batch storage).
