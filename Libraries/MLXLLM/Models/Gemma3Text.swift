@@ -227,7 +227,10 @@ class Gemma3MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return downProj(geluApproximate(gateProj(x)) * upProj(x))
+        let g = geluApproximate(gateProj(x))
+        let u = upProj(x)
+        let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+        return downProj(product)
     }
 }
 

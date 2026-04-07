@@ -604,7 +604,10 @@ enum Qwen35Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
+            let g = silu(gateProj(x))
+            let u = upProj(x)
+            let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+            return downProj(product)
         }
     }
 
