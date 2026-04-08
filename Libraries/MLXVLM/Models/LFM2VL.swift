@@ -68,7 +68,7 @@ private enum Vision {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            fc2(geluApproximate(fc1(x)))
+            fc2(safeGeluApproximate(fc1(x)))
         }
     }
 

@@ -330,9 +330,7 @@ class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Upcast to bfloat16 before element-wise multiply to prevent float16 overflow.
-        // With mixed-precision JANG models, gelu(gate)*up can exceed float16 max (65504).
-        let g = geluApproximate(gateProj(x))
+        let g = safeGeluApproximate(gateProj(x))
         let u = upProj(x)
         let product: MLXArray
         if g.dtype == .float16 {
@@ -423,7 +421,7 @@ class Gemma4Experts: Module {
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.numExperts,
-            activation: { geluApproximate($0) },
+            activation: { safeGeluApproximate($0) },
             bias: false)
         super.init()
     }
@@ -569,7 +567,7 @@ class Gemma4DecoderLayer: Module {
         {
             residual = h
             var gate = perLayerInputGate(h)
-            gate = geluApproximate(gate)
+            gate = safeGeluApproximate(gate)
             gate = gate * perLayerInput
             gate = perLayerProjection(gate)
             gate = postPerLayerInputNorm(gate)

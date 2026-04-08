@@ -21,6 +21,7 @@ private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray =
         tanh(x / cap) * cap
     }
 
+
 // MARK: - Shared Norm Utilities
 
 /// Standard Gemma4 RMSNorm — weight used directly, NO +1 offset
@@ -325,7 +326,7 @@ private class VisionMLP: Module {
         _downProj.wrappedValue = Linear(cfg.intermediateSize, cfg.hiddenSize, bias: false)
         super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { downProj(geluApproximate(gateProj(x)) * upProj(x)) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray { downProj(safeGeluApproximate(gateProj(x)) * upProj(x)) }
 }
 
 private class VisionBlock: Module {
@@ -558,11 +559,7 @@ private class TextMLP: Module {
         _gP.wrappedValue = Linear(cfg.hiddenSize, iS, bias: false); _uP.wrappedValue = Linear(cfg.hiddenSize, iS, bias: false); _dP.wrappedValue = Linear(iS, cfg.hiddenSize, bias: false); super.init()
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // Compute gate and up projections, then upcast to bfloat16 before multiply.
-        // With mixed-precision JANG models, 8-bit attention produces larger activations
-        // that can cause gelu(gate)*up to overflow float16 (max 65504).
-        // bfloat16 shares float32's exponent range, preventing overflow.
-        let g = geluApproximate(gP(x))
+        let g = safeGeluApproximate(gP(x))
         let u = uP(x)
         let product: MLXArray
         if g.dtype == .float16 {
@@ -595,7 +592,7 @@ private class TextRouter: Module {
 private class TextExperts: Module {
     @ModuleInfo(key: "switch_glu") var sg: SwitchGLU
     init(_ cfg: G4TextConfig) {
-        _sg.wrappedValue = SwitchGLU(inputDims: cfg.hiddenSize, hiddenDims: cfg.moeIntermediateSize, numExperts: cfg.numExperts, activation: { geluApproximate($0) }, bias: false)
+        _sg.wrappedValue = SwitchGLU(inputDims: cfg.hiddenSize, hiddenDims: cfg.moeIntermediateSize, numExperts: cfg.numExperts, activation: { safeGeluApproximate($0) }, bias: false)
         super.init()
     }
     func callAsFunction(_ x: MLXArray, idx: MLXArray, wts: MLXArray) -> MLXArray {
@@ -659,7 +656,7 @@ private class TextLayer: Module {
         } else { h = mlp(pfLN(h)) }
         h = pffLN(h); h = r + h
         if let pliGate, let pliProj, let pliNorm, let perLayerInput {
-            r = h; var g = geluApproximate(pliGate(h)); g = g * perLayerInput
+            r = h; var g = safeGeluApproximate(pliGate(h)); g = g * perLayerInput
             g = pliProj(g); g = pliNorm(g); h = r + g
         }
         h = h * ls

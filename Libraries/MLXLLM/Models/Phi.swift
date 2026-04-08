@@ -82,12 +82,12 @@ class PhiMLP: Module, UnaryLayer {
 
     @ModuleInfo var fc1: Linear
     @ModuleInfo var fc2: Linear
-    @ModuleInfo var act: GELU
+    @ModuleInfo var act: SafeGELU
 
     public init(_ config: PhiConfiguration) {
         self.fc1 = Linear(config.hiddenSize, config.intermediateSize)
         self.fc2 = Linear(config.intermediateSize, config.hiddenSize)
-        self.act = GELU(approximation: .precise)
+        self.act = SafeGELU()
     }
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {

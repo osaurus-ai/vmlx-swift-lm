@@ -4,6 +4,25 @@ import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
+// Safe GELU approximate — avoids MLXNN's compiledGeluApproximate which uses
+// the Power primitive (x ** 3). Power lacks output_shapes in the MLX C++ backend,
+// causing compile(shapeless:true) to crash on some Metal GPUs (returns 0 outputs).
+// Uses x * x * x instead, which decomposes to Multiply ops that have proper
+// output_shapes support.
+public let safeGeluApproximate: @Sendable (MLXArray) -> MLXArray =
+    compile(shapeless: true) { (x: MLXArray) -> MLXArray in
+        0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
+    }
+
+/// Drop-in replacement for MLXNN.GELU that avoids the Power primitive crash.
+/// Use this anywhere `GELU(approximation: .precise)` or `.tanh` would be used.
+public class SafeGELU: Module, UnaryLayer {
+    public override init() { super.init() }
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        safeGeluApproximate(x)
+    }
+}
+
 // Compiled activation kernels — fuses gate activation + element-wise multiply into
 // a single Metal dispatch. Matches Python's @partial(mx.compile, shapeless=True).
 private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
@@ -13,7 +32,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile
 
 private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
     (gate: MLXArray, x: MLXArray) -> MLXArray in
-    geluApproximate(gate) * x
+    (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * x
 }
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {

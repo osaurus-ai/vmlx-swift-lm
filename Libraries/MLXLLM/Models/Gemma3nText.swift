@@ -370,7 +370,7 @@ class Gemma3nMLP: Module {
         if activationSparsity > 0.0, let stdMultiplier = self._stdMultiplier {
             activations = geluTopK(gateProj, stdMultiplier: stdMultiplier)
         } else {
-            activations = geluApproximate(gateProj)
+            activations = safeGeluApproximate(gateProj)
         }
         let upProj = self.upProj(x)
         // Upcast to bfloat16 before multiply to prevent float16 overflow with mixed-precision JANG models
@@ -388,7 +388,7 @@ class Gemma3nMLP: Module {
         let inputsMean = mean(inputs, axis: -1, keepDims: true)
         let inputsStd = std(inputs, axis: -1, keepDims: true)
         let cutoffX = inputsMean + inputsStd * stdMultiplier.asType(inputsStd.dtype)
-        return geluApproximate(maximum(MLXArray(0), inputs - cutoffX))
+        return safeGeluApproximate(maximum(MLXArray(0), inputs - cutoffX))
     }
 }
 
@@ -642,7 +642,7 @@ class Gemma3nDecoderLayer: Module {
         }
 
         firstPrediction = perLayerInputGate(firstPrediction)
-        firstPrediction = geluApproximate(firstPrediction)
+        firstPrediction = safeGeluApproximate(firstPrediction)
 
         guard let perLayerInput = perLayerInput else {
             fatalError(

@@ -462,7 +462,7 @@ private enum Vision {
     fileprivate class MLP: Module, UnaryLayer {
         @ModuleInfo var fc1: Linear
         @ModuleInfo var fc2: Linear
-        let activation = GELU(approximation: .precise)
+        let activation = SafeGELU()
 
         init(_ config: Idefics3Configuration.VisionConfiguration) {
             self.fc1 = Linear(

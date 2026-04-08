@@ -243,7 +243,7 @@ private class MLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(safeGeluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
@@ -543,10 +543,10 @@ private class VisionAttention: Module {
 private class VisionMLP: Module, UnaryLayer {
     @ModuleInfo(key: "fc1") var fc1: Linear
     @ModuleInfo(key: "fc2") var fc2: Linear
-    @ModuleInfo var activationFn: GELU
+    @ModuleInfo var activationFn: SafeGELU
 
     init(config: Gemma3VisionConfiguration) {
-        self.activationFn = GELU(approximation: .precise)
+        self.activationFn = SafeGELU()
         self._fc1.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: true)
         self._fc2.wrappedValue = Linear(config.intermediateSize, config.hiddenSize, bias: true)
     }

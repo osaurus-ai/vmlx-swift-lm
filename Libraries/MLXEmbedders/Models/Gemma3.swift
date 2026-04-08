@@ -268,7 +268,7 @@ private class MLP: Module {
     /// - Parameter x: Input array of shape `[..., dimensions]`.
     /// - Returns: Processed array of shape `[..., dimensions]`.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        return downProj(geluApproximate(gateProj(x)) * upProj(x))
+        return downProj(safeGeluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
