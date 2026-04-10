@@ -15,6 +15,11 @@ import MLXNN
 /// keys = applyRotaryPosition(rope, to: keys, cache: cache)
 /// ```
 ///
+/// When the cache is a `CompilableKVCache`, the offset is passed as an `MLXArray`
+/// (via `offsetArray`) so the compile tracer can track it through the graph without
+/// triggering a synchronous GPU readback. For all other cache types, the standard
+/// `Int`-based offset path is used.
+///
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
 ///   - x: The input tensor to apply RoPE to.
@@ -23,5 +28,8 @@ import MLXNN
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
+    if let compilable = cache as? CompilableKVCache {
+        return rope(x, offset: compilable.offsetArray)
+    }
     return rope(x, offset: cache?.offset ?? 0)
 }
