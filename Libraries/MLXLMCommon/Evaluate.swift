@@ -744,21 +744,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         eval(cache)
 
         // KVCacheSimple → CompilableKVCache (static buffer, compile-traceable).
-        // ArraysCache/MambaCache — kept as-is, subscript uses _updateInternal
-        // to preserve reference identity for compile() tracing.
+        // ArraysCache/MambaCache — NOT compile-safe, bail.
         // RotatingKVCache, QuantizedKVCache — bail.
-        var converted = 0
+        // Only compile if ALL caches are KVCacheSimple.
         for i in 0..<cache.count {
             if cache[i] is KVCacheSimple {
-                cache[i] = CompilableKVCache(from: cache[i], maxLength: maxCacheLength)
-                converted += 1
-            } else if cache[i] is ArraysCache {
                 continue
             } else {
                 return
             }
         }
-        guard converted > 0 else { return }
 
         let capturedModel = model
         let cacheRef = cache

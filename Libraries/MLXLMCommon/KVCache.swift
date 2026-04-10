@@ -35,7 +35,7 @@ import MLXNN
 /// Interface for Key/Value cache for LLMs.
 ///
 /// See ``LanguageModel/newCache(parameters:)``
-public protocol KVCache: Evaluatable {
+public protocol KVCache: Evaluatable, Updatable {
     /// get the current offset
     var offset: Int { get }
 

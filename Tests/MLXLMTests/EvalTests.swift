@@ -138,6 +138,57 @@ public class EvalTests: XCTestCase {
         }
     }
 
+    func testCompiledDecodeBenchmark() throws {
+        let config = LlamaConfiguration(
+            hiddenSize: 64, hiddenLayers: 4, intermediateSize: 128, attentionHeads: 8,
+            rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4)
+        let model = LlamaModel(config)
+        quantize(model: model, groupSize: 64, bits: 4)
+        eval(model)
+
+        let prompt = MLXArray(Array(0..<20))[.newAxis, .ellipsis]
+        let input = LMInput(text: .init(tokens: prompt))
+        let maxTokens = 100
+
+        let baselineParams = GenerateParameters(maxTokens: maxTokens)
+        var baselineIterator = try TokenIterator(
+            input: input, model: model, parameters: baselineParams)
+
+        let baselineStart = CFAbsoluteTimeGetCurrent()
+        var baselineCount = 0
+        while let _ = baselineIterator.next() {
+            baselineCount += 1
+        }
+        let baselineElapsed = CFAbsoluteTimeGetCurrent() - baselineStart
+        let baselineTps = Double(baselineCount) / baselineElapsed
+
+        print("=== COMPILED DECODE BENCHMARK ===")
+        print("Model: Synthetic Llama (4 layers, 64 hidden, 100 vocab)")
+        print("Prompt: 20 tokens, Generate: \(baselineCount) tokens")
+        print(String(format: "Baseline: %.1f tok/s (%.3fs)", baselineTps, baselineElapsed))
+
+        var compiledParams = GenerateParameters(maxTokens: maxTokens)
+        compiledParams.enableCompiledDecode = true
+        compiledParams.compiledMaxCacheLength = 4096
+        var compiledIterator = try TokenIterator(
+            input: input, model: model, parameters: compiledParams)
+
+        let compiledStart = CFAbsoluteTimeGetCurrent()
+        var compiledCount = 0
+        while let _ = compiledIterator.next() {
+            compiledCount += 1
+        }
+        let compiledElapsed = CFAbsoluteTimeGetCurrent() - compiledStart
+        let compiledTps = Double(compiledCount) / compiledElapsed
+
+        print(String(format: "Compiled: %.1f tok/s (%.3fs)", compiledTps, compiledElapsed))
+        print(String(format: "Speedup: %.2fx", compiledTps / baselineTps))
+        print("=================================")
+
+        XCTAssertGreaterThan(baselineCount, 0)
+        XCTAssertGreaterThan(compiledCount, 0)
+    }
+
     func testRandomStateIsolation() async throws {
         // the logit sampler will not use shared random state
         let numSamplers = 5
