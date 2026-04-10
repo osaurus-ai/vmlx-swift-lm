@@ -111,6 +111,9 @@ public struct GenerateParameters: Sendable {
     /// The legacy `kvBits`/`kvGroupSize` fields continue to work for backward compatibility.
     public var kvMode: KVQuantizationMode = .none
 
+    public var enableCompiledDecode: Bool = false
+    public var compiledMaxCacheLength: Int? = nil
+
     /// Sampling temperature
     public var temperature: Float
 
@@ -148,6 +151,8 @@ public struct GenerateParameters: Sendable {
         kvGroupSize: Int = 64,
         quantizedKVStart: Int = 0,
         kvMode: KVQuantizationMode = .none,
+        enableCompiledDecode: Bool = false,
+        compiledMaxCacheLength: Int? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -166,6 +171,8 @@ public struct GenerateParameters: Sendable {
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
         self.kvMode = kvMode
+        self.enableCompiledDecode = enableCompiledDecode
+        self.compiledMaxCacheLength = compiledMaxCacheLength
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -579,6 +586,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
     let kvMode: KVQuantizationMode
 
+    private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
@@ -646,6 +655,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Fuses ~1000 ops into fewer Metal dispatches for ~10% speedup.
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
+        }
+
+        if parameters.enableCompiledDecode {
+            try setupCompiledDecode(
+                maxCacheLength: parameters.compiledMaxCacheLength ?? 4096)
         }
     }
 
@@ -720,8 +734,65 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Whether cache quantization is needed (skip the function call entirely when not)
     var needsCacheQuantization: Bool { kvBits != nil || kvMode != .none }
 
+    mutating func setupCompiledDecode(maxCacheLength: Int) throws {
+        guard HardwareInfo.isCompiledDecodeSupported else { return }
+        // Compiled decode requires no auxiliary state — models with state (e.g. vision
+        // encoder cross-attention) use the uncompiled path.
+        guard state == nil else { return }
+
+        // Materialize all pending cache operations before conversion.
+        eval(cache)
+
+        // KVCacheSimple → CompilableKVCache (static buffer, compile-traceable).
+        // ArraysCache/MambaCache — kept as-is, subscript uses _updateInternal
+        // to preserve reference identity for compile() tracing.
+        // RotatingKVCache, QuantizedKVCache — bail.
+        var converted = 0
+        for i in 0..<cache.count {
+            if cache[i] is KVCacheSimple {
+                cache[i] = CompilableKVCache(from: cache[i], maxLength: maxCacheLength)
+                converted += 1
+            } else if cache[i] is ArraysCache {
+                continue
+            } else {
+                return
+            }
+        }
+        guard converted > 0 else { return }
+
+        let capturedModel = model
+        let cacheRef = cache
+
+        self.compiledForward = compile(
+            inputs: cacheRef, outputs: cacheRef
+        ) { (args: [MLXArray]) -> [MLXArray] in
+            let result = capturedModel(
+                LMInput.Text(tokens: args[0])[text: .newAxis],
+                cache: cacheRef.isEmpty ? nil : cacheRef,
+                state: nil)
+            return [result.logits]
+        }
+    }
+
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        if self.compiledForward != nil {
+            let input = previous.tokens
+            let result = self.compiledForward!([input])
+
+            if result.count > 0 {
+                self.state = nil
+                if needsCacheQuantization {
+                    maybeQuantizeKVCache(
+                        cache: &cache, kvBits: kvBits,
+                        kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
+                        kvMode: kvMode)
+                }
+                return convertToToken(logits: result[0])
+            }
+            self.compiledForward = nil
+        }
+
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
