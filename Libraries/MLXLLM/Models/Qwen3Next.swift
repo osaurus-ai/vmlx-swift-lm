@@ -23,6 +23,18 @@ func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
     _compiledSigmoidMultiply(x, gate)
 }
 
+/// Compiled precise SwiGLU — matches Python `@mx.compile` `_precise_swiglu`.
+/// Fuses silu(gate) in float32 + cast-to-fp32 + multiply + cast-to-hdtype into
+/// ONE Metal dispatch. Without this, every GatedDeltaNet layer issues 5 separate
+/// Metal kernels (silu + asType + asType + multiply + asType) and at ~0.1ms per
+/// dispatch times ~30 layers, this is the dominant per-step overhead vs Python.
+private let _compiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { (h: MLXArray, gate: MLXArray, x: MLXArray) -> MLXArray in
+        let gateF32 = silu(gate.asType(.float32))
+        let xF32 = x.asType(.float32)
+        return (gateF32 * xF32).asType(h.dtype)
+    }
+
 // MARK: - Model Components
 
 final class Qwen3NextRMSNormGated: Module {
@@ -36,9 +48,10 @@ final class Qwen3NextRMSNormGated: Module {
     }
 
     func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-        var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+        let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
         if let gate {
-            x = x * silu(gate)
+            // Match Python's _precise_swiglu: float32 cast + silu + multiply, then cast back.
+            return _compiledPreciseSwiGLU(hiddenStates, gate, x)
         }
         return x
     }
