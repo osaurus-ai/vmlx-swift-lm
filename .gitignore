@@ -97,6 +97,7 @@ iOSInjectionProject/
 
 # Local development — never commit to public repo
 .claude/
+.sisyphus/
 TestRunner/
 *.local.md
 *-AUDIT.md
