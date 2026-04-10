@@ -1098,7 +1098,13 @@ public class ArraysCache: BaseKVCache {
 
     public subscript(index: Int) -> MLXArray? {
         get { cache[index] }
-        set { cache[index] = newValue }
+        set {
+            if let existing = cache[index], let newValue {
+                existing._updateInternal(newValue)
+            } else {
+                cache[index] = newValue
+            }
+        }
     }
 
     public override var state: [MLXArray] {
