@@ -37,23 +37,57 @@ let container = try await loadModelContainer(
 
 ### Performance
 
-MoE models run up to 4x faster than upstream thanks to computation graph optimization, bfloat16 dtype, compiled activations, and Metal memory management:
+MoE and hybrid SSM models run **2-4x faster** than both upstream mlx-swift-lm and Python mlx_lm, matching or exceeding Python on every model family tested:
 
-| Model | Upstream | This Fork | Gain |
-|-------|-------:|------:|-----:|
-| Gemma 4 26B MoE | 25.0 tok/s | **101 tok/s** | **+304%** |
-| Qwen 3.5-35B MoE | 42.4 tok/s | **61 tok/s** | **+44%** |
-| NemotronH 30B-A3B | ~25 tok/s | **48 tok/s** | **+92%** |
-| Qwen 3.5-4B Dense | 123 tok/s | 145 tok/s | +18% |
+| Model | Before | This Fork | Python mlx_lm | Gain |
+|-------|-------:|------:|------:|-----:|
+| Qwen 3.5-35B-A3B (MoE) | 41 tok/s | **103 tok/s** | 94 | **+151%** |
+| Gemma 4 26B (MoE) | 27 tok/s | **87 tok/s** | -- | **+222%** |
+| Mistral Small 4 119B (MLA+MoE) | 16 tok/s | **70 tok/s** | 45-50 | **+338%** |
+| Nemotron Cascade 30B (SSM+MoE) | 45 tok/s | **110 tok/s** | 130 | **+144%** |
+| MiniMax M2.5 (256 experts) | 14 tok/s | **46 tok/s** | 51 | **+229%** |
+| Gemma 4 E2B (dense) | 120 tok/s | **121 tok/s** | 128 | -- |
 
-Key optimizations:
-- **Computation graph cleanup**: Eliminated 86 unnecessary `.asType()` MLX graph nodes per Gemma4 MoE forward pass. Each redundant type cast was a separate Metal kernel dispatch.
-- **Compiled logit softcap**: Fused divide + tanh + multiply into a single Metal dispatch via `compile(shapeless: true)`, matching Python's `@mx.compile` decorator.
-- **Periodic Metal cache cleanup**: `Memory.clearCache()` every 256 tokens reduces GPU allocator fragmentation from MoE expert weight cycling.
-- **GPU memory pinning**: `mlx_set_wired_limit` via Cmlx prevents macOS from paging model weights to SSD between tokens.
-- **bfloat16 MoE conversion**: Prevents Metal's automatic float16 to float32 promotion on mixed-dtype MoE operations.
-- **Compiled GLU activations**: Fused SwiGLU/GeGLU into single Metal dispatches.
+*Measured on M4 Max 128GB. Python baselines from M3 Ultra 256GB (1.5x more bandwidth).*
+
+Six root-cause fixes that eliminate Metal kernel dispatch overhead:
+
+1. **Float32 scalar elimination**: `MLXArray(Float)` without `dtype:` defaults to float32. When multiplied with bfloat16 tensors, MLX inserts AsType cast operations -- each a separate Metal kernel dispatch. Fixed across all 18 model files.
+2. **Precise softmax**: Replace `softmax(x.asType(.float32))` with `softmax(x, precise: true)` -- computes in float32 internally but returns input dtype. Eliminated 988 AsType ops on Mistral4.
+3. **Sigmoid cast removal**: `sigmoid(x.asType(.float32))` is unnecessary -- sigmoid is numerically stable in bfloat16.
+4. **Universal bfloat16 conversion**: Convert ALL float16 parameters (including quantization scales/biases) to bfloat16. QuantizedMatmul output dtype follows scales dtype.
+5. **Hot-path identity weight dtype**: `MLXArray.ones([n])` in per-token RMSNorm created float32 weights every call. Fixed with `dtype: input.dtype`.
+6. **MoE gate zero-out dtype**: `putAlong(..., values: MLXArray(0.0))` needs `dtype: scores.dtype`.
+
+Additional optimizations:
+- **Compiled GLU activations**: Fused SwiGLU/GeGLU into single Metal dispatches via `compile(shapeless: true)`.
+- **Periodic Metal cache cleanup**: `Memory.clearCache()` every 256 tokens reduces GPU allocator fragmentation.
+- **bfloat16 MoE conversion**: Prevents Metal's automatic float16-to-float32 promotion on mixed-dtype operations.
 - **Symlink resolution**: Properly follows symlinked model directories (mlxstudio compatibility).
+
+### Continuous Batching
+
+Serve multiple concurrent requests with automatic batching for **2-5x throughput improvement**:
+
+```swift
+let engine = await container.makeBatchEngine(maxBatchSize: 8)
+
+// Submit multiple requests concurrently
+let stream1 = await engine.generate(input: input1, parameters: params)
+let stream2 = await engine.generate(input: input2, parameters: params)
+
+// Each stream delivers tokens independently
+for await generation in stream1 {
+    print(generation.text, terminator: "")
+}
+```
+
+- Works with all model families: LLM, VLM, MoE, hybrid SSM, JANG
+- Per-request independent parameters (temperature, topP, maxTokens)
+- Full KV cache isolation between concurrent sequences
+- Request cancellation and graceful shutdown
+- SSM/Mamba state merging for hybrid models (Qwen3.5, Nemotron-H)
+- 3D RoPE support for Qwen VL models in batch mode
 
 ### Speculative Decoding
 
@@ -175,7 +209,7 @@ Sentence Transformers, BERT, and other popular embedding models.
 Add the package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/osaurus-ai/mlx-swift-lm", branch: "main"),
+.package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", branch: "main"),
 ```
 
 Then add tokenizer and downloader integrations:
@@ -294,7 +328,7 @@ Change your package URL:
 .package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
 
 // After
-.package(url: "https://github.com/osaurus-ai/mlx-swift-lm", branch: "main"),
+.package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", branch: "main"),
 ```
 
 Everything else stays the same. You gain JANG support, Gemma 4, Mistral Small 4, speculative decoding, `isVLM`, and MoE performance boosts for free.
