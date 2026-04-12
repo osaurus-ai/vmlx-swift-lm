@@ -14,8 +14,8 @@ import MLXNN
 public func computeDt(_ dt: MLXArray, _ dtBias: MLXArray, _ timeStepLimit: (Float, Float))
     -> MLXArray
 {
-    let dt = softplus(dt + dtBias)
-    return MLX.clip(dt, min: timeStepLimit.0, max: timeStepLimit.1)
+    let dt = logAddExp(dt + dtBias, MLXArray(0, dtype: dt.dtype))
+    return MLX.clip(dt, min: MLXArray(timeStepLimit.0, dtype: dt.dtype), max: MLXArray(timeStepLimit.1, dtype: dt.dtype))
 }
 
 private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
