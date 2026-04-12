@@ -375,6 +375,8 @@ public final class ChatSession {
                     // are distinct.  In particular the KVCache cannot
                     // be shared and that is the lock that is held here.
 
+                    let cacheCoordinator = model.cacheCoordinator
+
                     let model = await model.perform { context in
                         SendableBox(context.model)
                     }.consume()
@@ -409,7 +411,8 @@ public final class ChatSession {
                         // generate output
                         let iterator = try TokenIterator(
                             input: input, model: model, cache: kvCache,
-                            parameters: generateParameters)
+                            parameters: generateParameters,
+                            cacheCoordinator: cacheCoordinator)
 
                         let (stream, task) = MLXLMCommon.generateTask(
                             promptTokenCount: input.text.tokens.size,
