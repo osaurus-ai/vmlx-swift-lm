@@ -95,8 +95,13 @@ public final class CacheBlock: @unchecked Sendable {
     ///   - parentHash: The hash of the preceding block in the chain, or `nil` for the first block.
     ///   - tokenIds: The token IDs to include in the hash.
     /// - Returns: A 64-character lowercase hex string.
-    public static func computeBlockHash(parentHash: String?, tokenIds: [Int]) -> String {
+    public static func computeBlockHash(parentHash: String?, tokenIds: [Int], modelKey: String? = nil) -> String {
         var hasher = SHA256()
+
+        // Feed model key first (prevents cross-model cache poisoning)
+        if let modelKey {
+            hasher.update(data: Data(modelKey.utf8))
+        }
 
         // Feed parent hash bytes (if any)
         if let parentHash {

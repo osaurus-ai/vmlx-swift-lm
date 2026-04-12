@@ -27,16 +27,12 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Maximum number of SSM state entries in the companion LRU cache.
     public var ssmMaxEntries: Int
 
-    /// Creates a new cache coordinator configuration.
-    ///
-    /// - Parameters:
-    ///   - usePagedCache: Enable the in-memory paged KV cache. Defaults to `true`.
-    ///   - enableDiskCache: Enable the on-disk L2 cache. Defaults to `false`.
-    ///   - pagedBlockSize: Tokens per paged cache block. Defaults to 64.
-    ///   - maxCacheBlocks: Maximum blocks in the paged cache pool. Defaults to 1000.
-    ///   - diskCacheMaxGB: Maximum disk cache size in GB. Defaults to 10.0.
-    ///   - diskCacheDir: Directory for disk cache files. Defaults to `nil`.
-    ///   - ssmMaxEntries: Maximum SSM state cache entries. Defaults to 50.
+    /// Model-specific key to prevent cross-model cache poisoning.
+    /// Include model path, type, or a unique identifier. When set, cache hashes
+    /// incorporate this key so different models with the same tokenizer cannot
+    /// return each other's cached KV state.
+    public var modelKey: String?
+
     public init(
         usePagedCache: Bool = true,
         enableDiskCache: Bool = false,
@@ -44,7 +40,8 @@ public struct CacheCoordinatorConfig: Sendable {
         maxCacheBlocks: Int = 1000,
         diskCacheMaxGB: Float = 10.0,
         diskCacheDir: URL? = nil,
-        ssmMaxEntries: Int = 50
+        ssmMaxEntries: Int = 50,
+        modelKey: String? = nil
     ) {
         self.usePagedCache = usePagedCache
         self.enableDiskCache = enableDiskCache
@@ -53,5 +50,6 @@ public struct CacheCoordinatorConfig: Sendable {
         self.diskCacheMaxGB = diskCacheMaxGB
         self.diskCacheDir = diskCacheDir
         self.ssmMaxEntries = ssmMaxEntries
+        self.modelKey = modelKey
     }
 }
