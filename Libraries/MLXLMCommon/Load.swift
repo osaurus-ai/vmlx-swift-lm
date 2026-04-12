@@ -133,15 +133,12 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.noUnusedKeys])
 
-    // Convert float16/float32 non-quantized parameters to bfloat16 to prevent AsType cascades.
-    // Mixed dtype causes Metal to insert AsType casts between every operation — each a
-    // separate kernel dispatch. Converting everything to bfloat16 eliminates these.
-    // Cases: JANG float16 scales + bfloat16 norms, MoE float32 gates + float16 weights,
-    // or any model with mixed float16/float32/bfloat16 parameters.
-    let floatDtypes = Set(weights.values.compactMap { w -> DType? in
-        (w.dtype == .float16 || w.dtype == .float32 || w.dtype == .bfloat16) ? w.dtype : nil
-    })
-    if floatDtypes.count > 1 {
+    // Convert all float16/float32 parameters to bfloat16 to prevent AsType cascades.
+    // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
+    // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
+    // This applies universally: JANG models, MoE gates, and standard models.
+    let hasFloat16 = weights.values.contains { $0.dtype == .float16 }
+    if hasFloat16 {
         convertToBFloat16(model: model)
     }
 
