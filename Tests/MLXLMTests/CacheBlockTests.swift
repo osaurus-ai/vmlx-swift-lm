@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import Testing
 
 @Test func blockHashChaining() {
