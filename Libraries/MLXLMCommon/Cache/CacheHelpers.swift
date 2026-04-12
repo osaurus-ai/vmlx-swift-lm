@@ -19,6 +19,14 @@ public func extractLayerData(from cache: [any KVCache]) -> [(keys: MLXArray, val
             guard state.count == 2 else { return nil }
             return (keys: state[0], values: state[1])
         }
+        if let quantized = layer as? QuantizedKVCache {
+            // QuantizedKVCache stores quantized tuples, not raw KV.
+            // Dequantize back to float keys/values for cache block storage.
+            let unquantized = quantized.toUnquantized()
+            let state = unquantized.state
+            guard state.count == 2 else { return nil }
+            return (keys: state[0], values: state[1])
+        }
         if let cacheList = layer as? CacheList {
             // CacheList: check sub-caches for KV data.
             // Sub-cache[0] is typically MambaCache, Sub-cache[1] is KVCacheSimple.
@@ -26,6 +34,11 @@ public func extractLayerData(from cache: [any KVCache]) -> [(keys: MLXArray, val
             for i in 0..<cacheList.count {
                 if let simple = cacheList[i] as? KVCacheSimple {
                     let state = simple.state
+                    if state.count == 2 { return (keys: state[0], values: state[1]) }
+                }
+                if let quantized = cacheList[i] as? QuantizedKVCache {
+                    let unquantized = quantized.toUnquantized()
+                    let state = unquantized.state
                     if state.count == 2 { return (keys: state[0], values: state[1]) }
                 }
             }
@@ -54,15 +67,17 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
     let numBlockLayers = firstData.count
 
     // Build mapping: block layer index → cache layer index
-    // Only KVCacheSimple and CacheList-with-KV layers are KV-bearing
+    // Only KVCacheSimple, QuantizedKVCache, and CacheList-with-KV layers are KV-bearing
     var kvCacheIndices: [Int] = []
     for (i, layer) in cache.enumerated() {
         if layer is KVCacheSimple {
             kvCacheIndices.append(i)
+        } else if layer is QuantizedKVCache {
+            kvCacheIndices.append(i)
         } else if let cacheList = layer as? CacheList {
-            // Check if any sub-cache is KVCacheSimple
+            // Check if any sub-cache is KV-bearing
             for j in 0..<cacheList.count {
-                if cacheList[j] is KVCacheSimple {
+                if cacheList[j] is KVCacheSimple || cacheList[j] is QuantizedKVCache {
                     kvCacheIndices.append(i)
                     break
                 }
@@ -91,10 +106,35 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
 
         if let simple = cache[cacheLayerIdx] as? KVCacheSimple {
             simple.state = [restoredKeys, restoredValues]
+        } else if let quantizedCache = cache[cacheLayerIdx] as? QuantizedKVCache {
+            // Restore into QuantizedKVCache: the stored data was dequantized during
+            // extraction, so we restore into a fresh KVCacheSimple-compatible state.
+            // The cache will re-quantize on the next updateQuantized call.
+            // For now, set the unquantized KV via the quantize-and-store path:
+            // We quantize the restored float KV back into the quantized format.
+            let qKeys = quantized(restoredKeys, groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+            let qValues = quantized(restoredValues, groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+            var stateArrays: [MLXArray] = [qKeys.wq, qKeys.scales]
+            if let biases = qKeys.biases { stateArrays.append(biases) }
+            stateArrays.append(contentsOf: [qValues.wq, qValues.scales])
+            if let biases = qValues.biases { stateArrays.append(biases) }
+            quantizedCache.state = stateArrays
+            quantizedCache.offset = restoredKeys.dim(2)
         } else if let cacheList = cache[cacheLayerIdx] as? CacheList {
             for i in 0..<cacheList.count {
                 if let simple = cacheList[i] as? KVCacheSimple {
                     simple.state = [restoredKeys, restoredValues]
+                    break
+                }
+                if let quantizedCache = cacheList[i] as? QuantizedKVCache {
+                    let qKeys = quantized(restoredKeys, groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+                    let qValues = quantized(restoredValues, groupSize: quantizedCache.groupSize, bits: quantizedCache.bits)
+                    var stateArrays: [MLXArray] = [qKeys.wq, qKeys.scales]
+                    if let biases = qKeys.biases { stateArrays.append(biases) }
+                    stateArrays.append(contentsOf: [qValues.wq, qValues.scales])
+                    if let biases = qValues.biases { stateArrays.append(biases) }
+                    quantizedCache.state = stateArrays
+                    quantizedCache.offset = restoredKeys.dim(2)
                     break
                 }
             }
