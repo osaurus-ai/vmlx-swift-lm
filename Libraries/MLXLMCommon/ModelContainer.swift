@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// Container for models that guarantees single threaded access.
 ///
@@ -31,6 +32,31 @@ import MLXNN
 /// ```
 public final class ModelContainer: Sendable {
     private let context: SerialAccessContainer<ModelContext>
+
+    // MARK: - Multi-tier KV Cache
+
+    /// Locked storage for the optional cache coordinator.
+    private let _cacheCoordinator = OSAllocatedUnfairLock<CacheCoordinator?>(initialState: nil)
+
+    /// Optional cache coordinator for multi-tier KV caching.
+    /// Enable via ``enableCaching(config:)`` after model loading.
+    public var cacheCoordinator: CacheCoordinator? {
+        _cacheCoordinator.withLock { $0 }
+    }
+
+    /// Enable multi-tier KV caching with the given configuration.
+    /// Call after model loading. Safe to call multiple times (replaces previous coordinator).
+    public func enableCaching(config: CacheCoordinatorConfig = CacheCoordinatorConfig()) {
+        _cacheCoordinator.withLock { $0 = CacheCoordinator(config: config) }
+    }
+
+    /// Disable caching and release all cached state.
+    public func disableCaching() {
+        _cacheCoordinator.withLock { coordinator in
+            coordinator?.clear()
+            coordinator = nil
+        }
+    }
 
     public var configuration: ModelConfiguration {
         get async {
