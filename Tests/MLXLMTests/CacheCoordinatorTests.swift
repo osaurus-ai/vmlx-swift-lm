@@ -36,14 +36,15 @@ import Testing
 
     // Store 8 tokens (2 full blocks of size 4)
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-    let dummyLayer: [(keys: MLXArray, values: MLXArray)] = [
-        (keys: MLXArray.zeros([1, 1, blockSize, 8]), values: MLXArray.zeros([1, 1, blockSize, 8]))
+    // Per-layer data covering the full 8-token sequence (coordinator splits into blocks)
+    let perLayerData: [(keys: MLXArray, values: MLXArray)?] = [
+        (keys: MLXArray.zeros([1, 1, tokens.count, 8]),
+         values: MLXArray.zeros([1, 1, tokens.count, 8]))
     ]
-    let layerData = [dummyLayer, dummyLayer]
 
     coordinator.storeAfterGeneration(
         promptTokens: tokens,
-        layerData: layerData,
+        perLayerData: perLayerData,
         ssmStates: nil
     )
 
@@ -79,15 +80,15 @@ import Testing
 
     // Store 8 tokens with SSM states
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-    let dummyLayer: [(keys: MLXArray, values: MLXArray)] = [
-        (keys: MLXArray.zeros([1, 1, blockSize, 8]), values: MLXArray.zeros([1, 1, blockSize, 8]))
+    let perLayerData: [(keys: MLXArray, values: MLXArray)?] = [
+        (keys: MLXArray.zeros([1, 1, tokens.count, 8]),
+         values: MLXArray.zeros([1, 1, tokens.count, 8]))
     ]
-    let layerData = [dummyLayer, dummyLayer]
     let ssmStates = [MLXArray.ones([2, 4]), MLXArray.zeros([2, 4])]
 
     coordinator.storeAfterGeneration(
         promptTokens: tokens,
-        layerData: layerData,
+        perLayerData: perLayerData,
         ssmStates: ssmStates
     )
 
@@ -117,12 +118,13 @@ import Testing
 
     // Store tokens
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-    let dummyLayer: [(keys: MLXArray, values: MLXArray)] = [
-        (keys: MLXArray.zeros([1, 1, blockSize, 8]), values: MLXArray.zeros([1, 1, blockSize, 8]))
+    let perLayerData: [(keys: MLXArray, values: MLXArray)?] = [
+        (keys: MLXArray.zeros([1, 1, tokens.count, 8]),
+         values: MLXArray.zeros([1, 1, tokens.count, 8]))
     ]
     coordinator.storeAfterGeneration(
         promptTokens: tokens,
-        layerData: [dummyLayer, dummyLayer],
+        perLayerData: perLayerData,
         ssmStates: nil
     )
 

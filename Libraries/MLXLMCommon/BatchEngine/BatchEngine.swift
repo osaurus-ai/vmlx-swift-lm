@@ -388,18 +388,24 @@ public actor BatchEngine {
         var slot = activeSlots[slotIndex]
 
         // Check multi-tier cache for a prefix match before running full prefill.
-        // For this initial integration, we log hits but still do full prefill —
-        // actual KV state restoration from cache blocks is future work.
+        // If we get a hit with blocks, restore KV state into the slot's cache.
         if let coordinator = cacheCoordinator {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
             let result = coordinator.fetch(tokens: tokenIds)
-            if case .hit(let matchedTokens, let remaining, let detail, _, _) = result {
-                Self.logger.info(
-                    "Cache \(detail.rawValue) hit for slot \(slot.id): \(matchedTokens) matched, \(remaining.count) remaining"
-                )
-                // TODO: Restore KV state from cache blocks into slot.cache
-                // This requires mapping CacheBlock data back into the [KVCache] protocol,
-                // which is a separate task. For now, fall through to full prefill.
+            if case .hit(let matchedTokens, let remaining, let detail, let blocks, let ssmStates) = result {
+                if !blocks.isEmpty {
+                    let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                    if let ssm = ssmStates {
+                        restoreSSMStates(ssm, into: slot.cache)
+                    }
+                    Self.logger.info(
+                        "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens (\(matchedTokens) matched, \(remaining.count) remaining)"
+                    )
+                } else {
+                    Self.logger.info(
+                        "Cache \(detail.rawValue) hit for slot \(slot.id): \(matchedTokens) matched but no blocks to restore"
+                    )
+                }
             }
         }
 
@@ -567,14 +573,16 @@ public actor BatchEngine {
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
 
         // Store prompt cache state for completed (non-cancelled) generations.
-        // Actual KV data extraction from [KVCache] is future work — for now we store
-        // the token sequence with empty layer data as a placeholder to exercise the path.
+        // Extract real KV data and SSM states from the slot's cache.
         if reason != .cancelled, let coordinator = cacheCoordinator {
             let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
+            let perLayerData = extractLayerData(from: slot.cache)
+            let ssmStates: [MLXArray]? = coordinator.isHybrid
+                ? extractSSMStates(from: slot.cache) : nil
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokens,
-                layerData: [],    // Placeholder — KV extraction from [KVCache] is future work
-                ssmStates: nil    // Placeholder — SSM state extraction is future work
+                perLayerData: perLayerData,
+                ssmStates: ssmStates
             )
             Self.logger.debug(
                 "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"

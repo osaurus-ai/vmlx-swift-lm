@@ -195,25 +195,37 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// 2. Disk cache receives flattened KV arrays keyed by token hash.
     /// 3. SSM companion cache receives states for hybrid models.
     ///
+    /// The `perLayerData` is the full-sequence per-layer output from
+    /// ``extractLayerData(from:)``. This method splits it into block-sized
+    /// chunks internally before passing to the paged cache.
+    ///
     /// - Parameters:
     ///   - promptTokens: The full prompt token sequence.
-    ///   - layerData: Per-block, per-layer KV tensors for the paged cache.
+    ///   - perLayerData: Per-layer KV tensors covering the entire prompt sequence.
+    ///     Layers without KV data (SSM layers) are `nil`.
     ///   - ssmStates: SSM layer states for hybrid models, or `nil`.
     public func storeAfterGeneration(
         promptTokens: [Int],
-        layerData: [[(keys: MLXArray, values: MLXArray)]],
+        perLayerData: [(keys: MLXArray, values: MLXArray)?],
         ssmStates: [MLXArray]?
     ) {
+        let totalTokens = promptTokens.count
+        let blockSize = config.pagedBlockSize
+
+        // Split per-layer full-sequence data into per-block chunks.
+        let blockLayerData = splitLayerDataIntoBlocks(
+            perLayerData, blockSize: blockSize, totalTokens: totalTokens)
+
         // Store in paged cache
         if let pagedCache {
-            pagedCache.storeTokenSequence(tokens: promptTokens, layerData: layerData)
+            pagedCache.storeTokenSequence(tokens: promptTokens, layerData: blockLayerData)
         }
 
         // Store in disk cache
         if let diskCache {
             // Flatten layer data into a dictionary keyed by layer/type
             var arrays: [String: MLXArray] = [:]
-            for (blockIdx, block) in layerData.enumerated() {
+            for (blockIdx, block) in blockLayerData.enumerated() {
                 for (layerIdx, kv) in block.enumerated() {
                     arrays["b\(blockIdx)_l\(layerIdx)_keys"] = kv.keys
                     arrays["b\(blockIdx)_l\(layerIdx)_values"] = kv.values
@@ -226,16 +238,56 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Store SSM companion states for hybrid models
         if isHybrid, let ssmStates, !ssmStates.isEmpty {
-            let boundary = min(
-                promptTokens.count,
-                layerData.count * config.pagedBlockSize
-            )
+            let boundary = min(totalTokens, blockLayerData.count * blockSize)
             ssmStateCache.store(
                 ssmStates: ssmStates,
                 tokens: promptTokens,
                 boundary: boundary
             )
         }
+    }
+
+    /// Split full-sequence per-layer KV data into block-sized chunks.
+    ///
+    /// Each block spans `blockSize` tokens along the sequence dimension (axis 2
+    /// for the standard `[B, H, T, D]` layout). The last block may be shorter
+    /// if `totalTokens` is not a multiple of `blockSize`.
+    ///
+    /// Layers that are `nil` (SSM layers without KV data) are skipped in
+    /// the output — only layers with actual KV data are included.
+    ///
+    /// - Parameters:
+    ///   - layerData: Per-layer `(keys, values)` for the full sequence, from ``extractLayerData(from:)``.
+    ///   - blockSize: Number of tokens per block.
+    ///   - totalTokens: Total number of tokens in the sequence.
+    /// - Returns: Per-block array of per-layer `(keys, values)` tuples (non-optional, nil layers filtered out).
+    private func splitLayerDataIntoBlocks(
+        _ layerData: [(keys: MLXArray, values: MLXArray)?],
+        blockSize: Int,
+        totalTokens: Int
+    ) -> [[(keys: MLXArray, values: MLXArray)]] {
+        guard totalTokens > 0, !layerData.isEmpty else { return [] }
+
+        var blocks: [[(keys: MLXArray, values: MLXArray)]] = []
+        var offset = 0
+
+        while offset < totalTokens {
+            let end = min(offset + blockSize, totalTokens)
+            var blockData: [(keys: MLXArray, values: MLXArray)] = []
+
+            for kv in layerData {
+                guard let kv else { continue }
+                // KV tensors are [B, H, T, D] — slice along axis 2 (sequence dim)
+                let slicedKeys = kv.keys[.ellipsis, offset ..< end, 0...]
+                let slicedValues = kv.values[.ellipsis, offset ..< end, 0...]
+                blockData.append((keys: slicedKeys, values: slicedValues))
+            }
+
+            blocks.append(blockData)
+            offset = end
+        }
+
+        return blocks
     }
 
     // MARK: - Clear

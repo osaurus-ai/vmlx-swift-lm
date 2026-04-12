@@ -679,10 +679,20 @@ public struct TokenIterator: TokenIteratorProtocol {
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
             let result = coordinator.fetch(tokens: promptTokenIds)
             switch result {
-            case .hit(let matchedTokens, let remainingTokens, let detail, _, _):
-                Self.logger.info(
-                    "Cache \(detail.rawValue) hit: matched \(matchedTokens) tokens, \(remainingTokens.count) remaining — full prepare (KV restore is future work)"
-                )
+            case .hit(let matchedTokens, _, let detail, let blocks, let ssmStates):
+                if !blocks.isEmpty {
+                    let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    if let ssm = ssmStates {
+                        restoreSSMStates(ssm, into: self.cache)
+                    }
+                    Self.logger.info(
+                        "Cache \(detail.rawValue) hit: restored \(restoredTokens) tokens into KV cache (\(matchedTokens) matched)"
+                    )
+                } else {
+                    Self.logger.info(
+                        "Cache \(detail.rawValue) hit: \(matchedTokens) matched but no blocks to restore"
+                    )
+                }
             case .miss:
                 let count = self.promptTokenIds.count
                 Self.logger.debug("Cache miss for \(count) prompt tokens")
@@ -1649,16 +1659,22 @@ public func generateTask(
     iterator: consuming TokenIterator,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
-    // Capture cache coordinator state before consuming the iterator.
+    // Capture cache coordinator state and extract KV data before consuming the iterator.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
+        let perLayerData = extractLayerData(from: iterator.cache)
+        let ssmStates: [MLXArray]? = coordinator.isHybrid
+            ? extractSSMStates(from: iterator.cache) : nil
+        // MLXArray is not Sendable but is safe after eval; suppress the diagnostic.
+        nonisolated(unsafe) let layerCapture = perLayerData
+        nonisolated(unsafe) let ssmCapture = ssmStates
         return {
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
-                layerData: [],  // Placeholder — real KV extraction is future work
-                ssmStates: nil
+                perLayerData: layerCapture,
+                ssmStates: ssmCapture
             )
         }
     }()
@@ -1821,16 +1837,21 @@ public func generateTokenTask(
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
-    // Capture cache coordinator state before consuming the iterator.
+    // Capture cache coordinator state and extract KV data before consuming the iterator.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
+        let perLayerData = extractLayerData(from: iterator.cache)
+        let ssmStates: [MLXArray]? = coordinator.isHybrid
+            ? extractSSMStates(from: iterator.cache) : nil
+        nonisolated(unsafe) let layerCapture = perLayerData
+        nonisolated(unsafe) let ssmCapture = ssmStates
         return {
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
-                layerData: [],  // Placeholder — real KV extraction is future work
-                ssmStates: nil
+                perLayerData: layerCapture,
+                ssmStates: ssmCapture
             )
         }
     }()
