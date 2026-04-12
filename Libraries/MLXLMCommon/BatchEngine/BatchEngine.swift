@@ -390,8 +390,10 @@ public actor BatchEngine {
         // Check multi-tier cache for a prefix match before running full prefill.
         // On cache hit, restore KV state and only prefill remaining tokens.
         var inputForPrepare = slot.originalInput
+        let hasRotatingCache = slot.cache.contains { $0 is RotatingKVCache }
         if let coordinator = cacheCoordinator,
-           slot.originalInput.image == nil, slot.originalInput.video == nil {
+           slot.originalInput.image == nil, slot.originalInput.video == nil,
+           !hasRotatingCache {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
             let result = coordinator.fetch(tokens: tokenIds)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates) = result,

@@ -678,9 +678,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.
         var inputForPrepare = input
+        let hasRotatingCache = self.cache.contains { $0 is RotatingKVCache }
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty,
-           input.image == nil, input.video == nil {
-            // Text-only cache (VLM inputs have image embeddings that can't be cached this way)
+           input.image == nil, input.video == nil,
+           !hasRotatingCache {
+            // Text-only cache, no RotatingKVCache (partial restore causes offset mismatch)
             let result = coordinator.fetch(tokens: promptTokenIds)
             switch result {
             case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates):
