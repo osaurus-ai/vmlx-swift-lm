@@ -1178,6 +1178,9 @@ public class MambaCache: ArraysCache {
 public class CacheList: BaseKVCache {
     private var caches: [KVCache]
 
+    /// The number of sub-caches in this composite cache.
+    public var count: Int { caches.count }
+
     public init(_ caches: KVCache...) {
         self.caches = caches
         super.init()
