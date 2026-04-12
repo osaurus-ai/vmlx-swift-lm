@@ -676,33 +676,41 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         // Multi-tier cache: attempt prefix fetch before prepare.
-        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
+        // On cache hit, restore KV state and only prefill remaining tokens.
+        var inputForPrepare = input
+        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty,
+           input.image == nil, input.video == nil {
+            // Text-only cache (VLM inputs have image embeddings that can't be cached this way)
             let result = coordinator.fetch(tokens: promptTokenIds)
             switch result {
-            case .hit(let matchedTokens, _, let detail, let blocks, let ssmStates):
+            case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates):
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
                     if let ssm = ssmStates {
                         restoreSSMStates(ssm, into: self.cache)
                     }
+                    // Truncate input to only the remaining (uncached) tokens.
+                    // The cache already has KV state for the prefix — prepare() only
+                    // needs to process the suffix that wasn't cached.
+                    if !remainingTokens.isEmpty {
+                        let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: remainingArray),
+                            image: nil, video: nil)
+                    }
                     Self.logger.info(
-                        "Cache \(detail.rawValue) hit: restored \(restoredTokens) tokens into KV cache (\(matchedTokens) matched)"
-                    )
-                } else {
-                    Self.logger.info(
-                        "Cache \(detail.rawValue) hit: \(matchedTokens) matched but no blocks to restore"
+                        "Cache \(detail.rawValue) hit: restored \(restoredTokens) tokens, prefilling \(remainingTokens.count) remaining"
                     )
                 }
             case .miss:
-                let count = self.promptTokenIds.count
+                let count = promptTokenIds.count
                 Self.logger.debug("Cache miss for \(count) prompt tokens")
             }
         }
 
-        // Compile model forward for greedy decode (no processor, no state).
-        // Fuses ~1000 ops into fewer Metal dispatches for ~10% speedup.
+        // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: parameters.prefillStepSize)
+            try prepare(input: inputForPrepare, windowSize: parameters.prefillStepSize)
         }
 
         if parameters.enableCompiledDecode {

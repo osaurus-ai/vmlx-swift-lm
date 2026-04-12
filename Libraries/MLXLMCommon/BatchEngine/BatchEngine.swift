@@ -388,33 +388,35 @@ public actor BatchEngine {
         var slot = activeSlots[slotIndex]
 
         // Check multi-tier cache for a prefix match before running full prefill.
-        // If we get a hit with blocks, restore KV state into the slot's cache.
-        if let coordinator = cacheCoordinator {
+        // On cache hit, restore KV state and only prefill remaining tokens.
+        var inputForPrepare = slot.originalInput
+        if let coordinator = cacheCoordinator,
+           slot.originalInput.image == nil, slot.originalInput.video == nil {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
             let result = coordinator.fetch(tokens: tokenIds)
-            if case .hit(let matchedTokens, let remaining, let detail, let blocks, let ssmStates) = result {
-                if !blocks.isEmpty {
-                    let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
-                    if let ssm = ssmStates {
-                        restoreSSMStates(ssm, into: slot.cache)
-                    }
-                    Self.logger.info(
-                        "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens (\(matchedTokens) matched, \(remaining.count) remaining)"
-                    )
-                } else {
-                    Self.logger.info(
-                        "Cache \(detail.rawValue) hit for slot \(slot.id): \(matchedTokens) matched but no blocks to restore"
-                    )
+            if case .hit(_, let remaining, let detail, let blocks, let ssmStates) = result,
+               !blocks.isEmpty {
+                let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                if let ssm = ssmStates {
+                    restoreSSMStates(ssm, into: slot.cache)
                 }
+                if !remaining.isEmpty {
+                    let remainingArray = MLXArray(remaining.map { Int32($0) })
+                    inputForPrepare = LMInput(
+                        text: LMInput.Text(tokens: remainingArray),
+                        image: nil, video: nil)
+                }
+                Self.logger.info(
+                    "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
+                )
             }
         }
 
-        // Use model.prepare() with the full original input (includes image/video for VLMs).
-        // This handles both LLM chunked prefill and VLM image embedding in one call.
+        // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         let prepareResult: PrepareResult
         do {
             prepareResult = try context.model.prepare(
-                slot.originalInput, cache: slot.cache, windowSize: slot.prefillStepSize)
+                inputForPrepare, cache: slot.cache, windowSize: slot.prefillStepSize)
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
             finishSlot(slot, reason: .cancelled)
