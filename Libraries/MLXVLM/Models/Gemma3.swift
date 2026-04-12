@@ -330,8 +330,7 @@ private class GemmaModel: Module {
         }
 
         // Apply embedding scaling
-        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: .bfloat16).asType(
-            inputs?.dtype ?? h.dtype)
+        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: inputs?.dtype ?? h.dtype)
         h = h * scale
 
         var layerCache = cache
@@ -409,7 +408,7 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
 
         // Apply final logit softcapping if configured
         if let softcap = config.finalLogitSoftcapping, softcap > 0 {
-            let scale = MLXArray(softcap)
+            let scale = MLXArray(softcap, dtype: finalLogits.dtype)
             finalLogits = tanh(finalLogits / scale) * scale
         }
 

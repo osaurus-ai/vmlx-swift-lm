@@ -161,7 +161,7 @@ class GLM4MoEGate: Module {
             let k = nGroup - topkGroup
             let groupIdx = argPartition(groupScores, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
             selectionScores = putAlong(
-                selectionScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
+                selectionScores, stopGradient(groupIdx), values: MLXArray(0.0, dtype: selectionScores.dtype), axis: -2)
             selectionScores = flattened(selectionScores, start: -2, end: -1)
         }
 

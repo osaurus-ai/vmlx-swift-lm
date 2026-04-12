@@ -223,7 +223,7 @@ class BailingMoeGate: Module, UnaryLayer {
         let topKGroup = top(groupScores, k: 2, axis: -1).sum(axis: -1, keepDims: true)
         var k = nGroup - topkGroup
         let groupIdx = argPartition(topKGroup, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
-        scores = putAlong(groupScores, groupIdx, values: MLXArray(0.0), axis: -2)
+        scores = putAlong(groupScores, groupIdx, values: MLXArray(0.0, dtype: groupScores.dtype), axis: -2)
         scores = flattened(scores, start: -2, end: -1)
 
         k = topK

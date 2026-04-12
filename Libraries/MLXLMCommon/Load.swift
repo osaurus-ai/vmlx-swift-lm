@@ -133,14 +133,15 @@ public func loadWeights(
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.noUnusedKeys])
 
-    // MoE optimization: convert float16 weights to bfloat16 to prevent Metal's
-    // automatic float16→float32 promotion on mixed-dtype operations.
-    // MoE gate routing runs at float32 for numerical stability, but if weights are
-    // float16, Metal promotes ALL ops to float32 (2x bandwidth, ~50% speed drop).
-    // bfloat16 shares float32's exponent range, avoiding the promotion.
-    let isMoE = weights.keys.contains { $0.contains("switch_mlp") || $0.contains("switch_glu")
-        || ($0.contains(".gate.weight") && !$0.contains("gate_proj")) }
-    if isMoE {
+    // Convert float16/float32 non-quantized parameters to bfloat16 to prevent AsType cascades.
+    // Mixed dtype causes Metal to insert AsType casts between every operation — each a
+    // separate kernel dispatch. Converting everything to bfloat16 eliminates these.
+    // Cases: JANG float16 scales + bfloat16 norms, MoE float32 gates + float16 weights,
+    // or any model with mixed float16/float32/bfloat16 parameters.
+    let floatDtypes = Set(weights.values.compactMap { w -> DType? in
+        (w.dtype == .float16 || w.dtype == .float32 || w.dtype == .bfloat16) ? w.dtype : nil
+    })
+    if floatDtypes.count > 1 {
         convertToBFloat16(model: model)
     }
 
@@ -152,13 +153,12 @@ public func loadWeights(
 /// Metal's kernel dispatcher promotes mixed float16/float32 operations to full float32,
 /// causing ~50% speed regression for MoE models where gate routing runs at float32.
 /// bfloat16 avoids this because it shares float32's exponent range.
-/// Quantization scales/biases are left as-is (they're used directly by Metal kernels).
+/// Quantization scales/biases are ALSO converted — QuantizedMatmul uses scales dtype to
+/// determine output dtype, so float16 scales → float16 output → AsType when multiplied
+/// with bfloat16 norms. Converting scales to bfloat16 eliminates this cascade.
 private func convertToBFloat16(model: Module) {
     var converted = [String: MLXArray]()
     for (key, array) in model.parameters().flattened() {
-        if key.hasSuffix(".scales") || key.hasSuffix(".biases") {
-            continue  // Leave quantization metadata unchanged
-        }
         if array.dtype == .float16 || array.dtype == .float32 {
             converted[key] = array.asType(.bfloat16)
         }

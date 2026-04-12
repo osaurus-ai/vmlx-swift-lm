@@ -379,7 +379,7 @@ private class VisionPatchEmbedder: Module {
         let oh = oneHot(patchPos, numClasses: posEmbSize)
             .transposed(0, 2, 1, 3).asType(posTable.dtype)
         var posEmb = matmul(oh, posTable).sum(axis: 1)
-        posEmb = MLX.where(expandedDimensions(padPos, axis: -1), MLXArray(Float(0)), posEmb)
+        posEmb = MLX.where(expandedDimensions(padPos, axis: -1), MLXArray(Float(0), dtype: posEmb.dtype), posEmb)
         return embedded + posEmb
     }
 }
@@ -463,9 +463,9 @@ private class VisionTower: Module {
 
         let valid = logicalNot(padPos).asType(.float32)
         var mask = expandedDimensions(valid, axis: 1) * expandedDimensions(valid, axis: 2)
-        let zeroVal = MLXArray(Float(0)).asType(emb.dtype)
-        let negInfVal = MLXArray(Float(-1e9)).asType(emb.dtype)
-        mask = MLX.where(mask .> MLXArray(Float(0)), zeroVal, negInfVal)
+        let zeroVal = MLXArray(Float(0), dtype: emb.dtype)
+        let negInfVal = MLXArray(Float(-1e9), dtype: emb.dtype)
+        mask = MLX.where(mask .> MLXArray(Float(0), dtype: mask.dtype), zeroVal, negInfVal)
         mask = expandedDimensions(mask, axis: 1)
 
         var h = encoder(emb, pos: patchPos, mask: mask)
@@ -720,7 +720,7 @@ private class TextModel: Module {
         if let ie = inputEmbedding {
             h = ie.ndim == 2 ? ie.expandedDimensions(axis: 0) : ie
         } else {
-            h = emb(inputs!) * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: .bfloat16).asType(emb.weight.dtype)
+            h = emb(inputs!) * MLXArray(sqrt(Float(cfg.hiddenSize)), dtype: emb.weight.dtype)
         }
 
         var pliList: [MLXArray?]
@@ -839,7 +839,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
         var emb = languageModel.model.emb(input.text.tokens)
-        emb = emb * MLXArray(sqrt(Float(config.textConfig.hiddenSize)), dtype: .bfloat16).asType(emb.dtype)
+        emb = emb * MLXArray(sqrt(Float(config.textConfig.hiddenSize)), dtype: emb.dtype)
 
         if let pixels = input.image?.pixels {
             // Process each image through vision tower separately — images may have

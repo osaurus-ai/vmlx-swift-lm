@@ -283,7 +283,7 @@ class MoEGate: Module {
         var k = nGroup - (topkGroup ?? 1)
         var groupIdx = argPartition(topKGroup, kth: k - 1, axis: -2)[.ellipsis, ..<k, 0...]
         groupIdx = broadcast(groupIdx, to: [bsz, seqLen, k, (nRoutedExperts ?? 1) / nGroup])
-        scores = putAlong(groupScores, stopGradient(groupIdx), values: MLXArray(0.0), axis: -2)
+        scores = putAlong(groupScores, stopGradient(groupIdx), values: MLXArray(0.0, dtype: groupScores.dtype), axis: -2)
         scores = flattened(scores, start: -2, end: -1)
 
         k = topK ?? 1

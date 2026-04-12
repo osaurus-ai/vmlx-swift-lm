@@ -99,6 +99,24 @@ iOSInjectionProject/
 .claude/
 .sisyphus/
 TestRunner/
+RunBench/
 *.local.md
 *-AUDIT.md
 *-PLAN.md
+
+# Internal docs and research (keep out of repo)
+docs/
+ASTYPE_OPTIMIZATION_LOG.md
+DECODE-ANALYSIS.md
+FRAMEWORK-FIXES.md
+HANDOFF-*.md
+SWIFT-PERF-FIXES.md
+
+# Dev scripts and test files
+*.bak
+bench_batch.py
+qwen2_moe_python.py
+run_test.py
+run_test.swift
+test_*.swift
+test_*.py

@@ -292,10 +292,10 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         let invScale = pow(Float(headKDim), -0.5)
         qOut =
-            MLXArray(invScale * invScale)
+            MLXArray(invScale * invScale, dtype: qOut.dtype)
             * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
         kOut =
-            MLXArray(invScale)
+            MLXArray(invScale, dtype: kOut.dtype)
             * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newState) = gatedDeltaUpdate(

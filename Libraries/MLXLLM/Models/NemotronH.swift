@@ -387,7 +387,7 @@ private func groupExpertSelect(
         groupIdx = broadcast(groupIdx, to: [bsz, seqLen, k, expertsPerGroup])
 
         // Zero out scores from non-selected groups
-        scores = putAlong(groupScores, groupIdx, values: MLXArray(0.0), axis: -2)
+        scores = putAlong(groupScores, groupIdx, values: MLXArray(0.0, dtype: groupScores.dtype), axis: -2)
 
         // Flatten back
         scores = flattened(scores, start: -2, end: -1)

@@ -687,7 +687,7 @@ public class Gemma4Model: Module {
         // Ensure batch dimension — callers may pass 1D tokens [N] on cache-reuse turns
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         var h = embedTokens(inputs)
-        h = h * MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16).asType(h.dtype)
+        h = h * MLXArray(sqrt(Float(config.hiddenSize)), dtype: h.dtype)
 
         // Per-layer inputs (E2B/E4B)
         var perLayerInputsList: [MLXArray?]

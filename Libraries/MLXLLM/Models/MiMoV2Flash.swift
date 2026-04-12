@@ -79,7 +79,7 @@ private func groupExpertSelect(
         scores = putAlong(
             scores,
             stopGradient(groupIdx),
-            values: MLXArray(0.0),
+            values: MLXArray(0.0, dtype: scores.dtype),
             axis: -2
         )
         scores = flattened(scores, start: -2, end: -1)

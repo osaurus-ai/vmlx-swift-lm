@@ -352,7 +352,7 @@ class Gemma3nMLP: Module {
 
         if self.activationSparsity > 0 {
             self._stdMultiplier =
-                sqrt(MLXArray(2.0)) * erfInverse(2 * MLXArray(self.activationSparsity) - 1)
+                sqrt(MLXArray(2.0, dtype: .float32)) * erfInverse(2 * MLXArray(self.activationSparsity, dtype: .float32) - 1)
         } else {
             self._stdMultiplier = nil
         }
@@ -493,7 +493,7 @@ class Gemma3nAltUp: Module {
     }
 
     func scaleCorrectOutput(_ corrected: MLXArray) -> MLXArray {
-        let scale = config.altupCorrectScale ? correctOutputScale : MLXArray(1.0)
+        let scale = config.altupCorrectScale ? correctOutputScale : MLXArray(1.0, dtype: corrected.dtype)
         return corrected * scale
     }
 

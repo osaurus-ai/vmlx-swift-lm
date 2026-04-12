@@ -21,7 +21,7 @@ private func functionalRMSNorm(_ x: MLXArray, eps: Float) -> MLXArray {
 
 private func applySoftcap(_ logits: MLXArray, cap: Float) -> MLXArray {
     guard cap > 0 else { return logits }
-    let scale = MLXArray(cap)
+    let scale = MLXArray(cap, dtype: logits.dtype)
     return scale * tanh(logits / scale)
 }
 

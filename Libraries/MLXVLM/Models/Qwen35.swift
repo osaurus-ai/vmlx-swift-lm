@@ -725,10 +725,10 @@ enum Qwen35Language {
             var state = cache?[1]
             let invScale = pow(Float(headKDim), -0.5)
             let qNormed =
-                MLXArray(pow(invScale, 2))
+                MLXArray(pow(invScale, 2), dtype: q.dtype)
                 * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
             let kNormed =
-                MLXArray(invScale)
+                MLXArray(invScale, dtype: k.dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
             var out: MLXArray
