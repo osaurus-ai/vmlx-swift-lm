@@ -1032,12 +1032,25 @@ enum Qwen3VLLanguage {
             var positionIds = positionIds
 
             if positionIds == nil {
-                let offset = cache?.offset ?? 0
-                kvSequenceLength += offset + 1
-                var base = MLXArray(stride(from: offset, to: offset + length, by: 1)).asType(.int32)
-                base = tiled(base[.newAxis, 0...], repetitions: [batch, 1])
-                positionIds = base[.newAxis, 0..., 0...]
-                positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
+                // Build position IDs from cache offset. For batched decode with
+                // BatchKVCache, use per-sequence offsets so each sequence gets
+                // correct positional encoding.
+                if let batchCache = cache as? BatchKVCache {
+                    let offsets = batchCache.offsetArray  // [B]
+                    let maxOff = batchCache.offset
+                    kvSequenceLength += maxOff + 1
+                    // For L=1 decode: each sequence's position is its offset
+                    // Shape: [3, B, 1] — 3 for the 3D rope dimensions
+                    let base = offsets.reshaped(1, batch, 1)
+                    positionIds = tiled(base, repetitions: [3, 1, length])
+                } else {
+                    let offset = cache?.offset ?? 0
+                    kvSequenceLength += offset + 1
+                    var base = MLXArray(stride(from: offset, to: offset + length, by: 1)).asType(.int32)
+                    base = tiled(base[.newAxis, 0...], repetitions: [batch, 1])
+                    positionIds = base[.newAxis, 0..., 0...]
+                    positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
+                }
             } else {
                 if let cache {
                     kvSequenceLength += cache.offset + 1

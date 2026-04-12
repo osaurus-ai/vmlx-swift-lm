@@ -151,9 +151,8 @@ private enum Language {
             keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
-            let offset = cache?.offset ?? 0
-            queries = rotaryEmbedding(queries, offset: offset)
-            keys = rotaryEmbedding(keys, offset: offset)
+            queries = applyRotaryPosition(rotaryEmbedding, to: queries, cache: cache)
+            keys = applyRotaryPosition(rotaryEmbedding, to: keys, cache: cache)
 
             let output = attentionWithCacheUpdate(
                 queries: queries,

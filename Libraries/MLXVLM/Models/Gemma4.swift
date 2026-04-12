@@ -527,13 +527,16 @@ private class TextAttn: Module {
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-        sharedKV: (keys: MLXArray, values: MLXArray)? = nil, sharedOffset: Int? = nil
+        sharedKV: (keys: MLXArray, values: MLXArray)? = nil, sharedOffset: Int? = nil,
+        sharedOffsetArray: MLXArray? = nil
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray, offset: Int) {
         let (B, L) = (x.dim(0), x.dim(1))
         var q = qP(x).reshaped(B, L, nH, hD); q = qN(q); q = q.transposed(0, 2, 1, 3)
         let cK: MLXArray; let cV: MLXArray; let off: Int
         if let sharedKV {
-            off = sharedOffset ?? 0; q = rope(q, offset: off)
+            off = sharedOffset ?? 0
+            if let sharedOffsetArray { q = rope(q, offset: sharedOffsetArray) }
+            else { q = rope(q, offset: off) }
             cK = sharedKV.keys; cV = sharedKV.values
         } else {
             off = cache?.offset ?? 0
@@ -644,10 +647,11 @@ private class TextLayer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
         perLayerInput: MLXArray? = nil,
-        sharedKV: (keys: MLXArray, values: MLXArray)? = nil, sharedOffset: Int? = nil
+        sharedKV: (keys: MLXArray, values: MLXArray)? = nil, sharedOffset: Int? = nil,
+        sharedOffsetArray: MLXArray? = nil
     ) -> (h: MLXArray, keys: MLXArray, values: MLXArray, offset: Int) {
         var r = x
-        let (aOut, aK, aV, aOff) = attn(iLN(x), mask: mask, cache: cache, sharedKV: sharedKV, sharedOffset: sharedOffset)
+        let (aOut, aK, aV, aOff) = attn(iLN(x), mask: mask, cache: cache, sharedKV: sharedKV, sharedOffset: sharedOffset, sharedOffsetArray: sharedOffsetArray)
         var h = paLN(aOut); h = r + h; r = h
         if hasMoE, let router, let experts, let pfLN2, let pffLN1, let pffLN2 {
             var h1 = mlp(pfLN(h)); h1 = pffLN1(h1)
@@ -735,16 +739,17 @@ private class TextModel: Module {
         let sc: KVCache? = cache.flatMap { sIdx < $0.count ? $0[sIdx] : nil }
         let gm = createAttentionMask(h: h, cache: gc); let sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow)
 
-        var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int)?] = Array(repeating: nil, count: layers.count)
+        var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int, offsetArray: MLXArray?)?] = Array(repeating: nil, count: layers.count)
         for (i, l) in layers.enumerated() {
             let isGlobal = (i < lt.count ? lt[i] : "sliding_attention") == "full_attention"
             let prevIdx = previousKVs[i]
-            let skv: (keys: MLXArray, values: MLXArray)?; let soff: Int?
-            if prevIdx != i, let prev = intermediates[prevIdx] { skv = (prev.keys, prev.values); soff = prev.offset }
-            else { skv = nil; soff = nil }
+            let skv: (keys: MLXArray, values: MLXArray)?; let soff: Int?; let soffArr: MLXArray?
+            if prevIdx != i, let prev = intermediates[prevIdx] { skv = (prev.keys, prev.values); soff = prev.offset; soffArr = prev.offsetArray }
+            else { skv = nil; soff = nil; soffArr = nil }
             let ce = prevIdx == i ? (i < lc.count ? lc[i] : nil) : nil
-            let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff)
-            h = res.h; intermediates[i] = (res.keys, res.values, res.offset)
+            let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff, sharedOffsetArray: soffArr)
+            let layerOffArr = (ce as? BatchKVCache)?.offsetArray
+            h = res.h; intermediates[i] = (res.keys, res.values, res.offset, layerOffArr)
         }
         return norm(h)
     }

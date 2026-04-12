@@ -232,9 +232,8 @@ private enum Language {
             k = k.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
             v = v.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-            let offset = cache?.offset ?? 0
-            q = ropeEmbed(q, offset: offset)
-            k = ropeEmbed(k, offset: offset)
+            q = applyRotaryPosition(ropeEmbed, to: q, cache: cache)
+            k = applyRotaryPosition(ropeEmbed, to: k, cache: cache)
 
             let output = attentionWithCacheUpdate(
                 queries: q,

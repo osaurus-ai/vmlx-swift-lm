@@ -566,9 +566,8 @@ private enum PixtralLanguage {
                 keys = kNorm(keys)
             }
 
-            let offset = cache?.offset ?? 0
-            queries = rope(queries, offset: offset)
-            keys = rope(keys, offset: offset)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
             let output = attentionWithCacheUpdate(
                 queries: queries, keys: keys, values: values,

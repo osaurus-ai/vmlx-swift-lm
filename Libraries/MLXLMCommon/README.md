@@ -168,6 +168,29 @@ load models, if needed.
 - generate()
     - NaiveStreamingDetokenizer
     - TokenIterator
+- **Batch inference** — see [BatchEngine](BatchEngine/BATCH_ENGINE.md)
+    - `BatchEngine` actor for concurrent request batching
+    - `engine.generate()` returns the same `AsyncStream<Generation>` as single-sequence
+
+### Continuous Batching (Multi-Request)
+
+For serving multiple concurrent requests with higher throughput:
+
+```swift
+let engine = await container.makeBatchEngine(maxBatchSize: 8)
+
+// Submit from multiple async contexts — requests are batched automatically
+let stream = await engine.generate(input: lmInput, parameters: params)
+for await generation in stream {
+    switch generation {
+    case .chunk(let text): print(text, terminator: "")
+    case .info(let info):  print(info.summary())
+    case .toolCall:        break
+    }
+}
+```
+
+See [BatchEngine documentation](BatchEngine/BATCH_ENGINE.md) for full API, model compatibility, and benchmarks.
 
 ## Using a Model
 

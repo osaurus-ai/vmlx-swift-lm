@@ -352,9 +352,8 @@ private enum Language {
             keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-            let offset = cache?.offset ?? 0
-            queries = rope(queries, offset: offset)
-            keys = rope(keys, offset: offset)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
             queries = queries * attentionScale
 

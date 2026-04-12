@@ -254,7 +254,8 @@ class Gemma4Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
         sharedKV: (keys: MLXArray, values: MLXArray)? = nil,
-        sharedOffset: Int? = nil
+        sharedOffset: Int? = nil,
+        sharedOffsetArray: MLXArray? = nil
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray, offset: Int) {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -267,9 +268,15 @@ class Gemma4Attention: Module {
         let usedOffset: Int
 
         if let sharedKV {
-            // Shared KV path: skip K/V projection, use source layer's keys/values
+            // Shared KV path: skip K/V projection, use source layer's keys/values.
+            // Use per-sequence offsets from BatchKVCache when available for correct
+            // batched RoPE — otherwise fall back to scalar offset.
             usedOffset = sharedOffset ?? 0
-            queries = rope(queries, offset: usedOffset)
+            if let sharedOffsetArray {
+                queries = rope(queries, offset: sharedOffsetArray)
+            } else {
+                queries = rope(queries, offset: usedOffset)
+            }
             cachedKeys = sharedKV.keys
             cachedValues = sharedKV.values
         } else {
@@ -526,13 +533,15 @@ class Gemma4DecoderLayer: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: (keys: MLXArray, values: MLXArray)? = nil,
-        sharedOffset: Int? = nil
+        sharedOffset: Int? = nil,
+        sharedOffsetArray: MLXArray? = nil
     ) -> (h: MLXArray, keys: MLXArray, values: MLXArray, offset: Int) {
         // Attention block
         var residual = x
         let (attnOut, keys, values, offset) = selfAttention(
             inputLayernorm(x), mask: mask, cache: cache,
-            sharedKV: sharedKV, sharedOffset: sharedOffset)
+            sharedKV: sharedKV, sharedOffset: sharedOffset,
+            sharedOffsetArray: sharedOffsetArray)
         var h = postAttentionLayernorm(attnOut)
         h = residual + h
 
@@ -716,8 +725,10 @@ public class Gemma4Model: Module {
         let slidingWindowMask = createAttentionMask(
             h: h, cache: slidingCache, windowSize: config.slidingWindow)
 
-        // Track intermediates for KV sharing
-        var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int)?] =
+        // Track intermediates for KV sharing.
+        // offsetArray carries per-sequence [B]-shaped offsets from BatchKVCache for
+        // correct batched RoPE on shared layers.
+        var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int, offsetArray: MLXArray?)?] =
             Array(repeating: nil, count: layers.count)
 
         for (i, layer) in layers.enumerated() {
@@ -729,12 +740,15 @@ public class Gemma4Model: Module {
             let prevIdx = previousKVs[i]
             let sharedKV: (keys: MLXArray, values: MLXArray)?
             let sharedOffset: Int?
+            let sharedOffsetArray: MLXArray?
             if prevIdx != i, let prev = intermediates[prevIdx] {
                 sharedKV = (keys: prev.keys, values: prev.values)
                 sharedOffset = prev.offset
+                sharedOffsetArray = prev.offsetArray
             } else {
                 sharedKV = nil
                 sharedOffset = nil
+                sharedOffsetArray = nil
             }
 
             let layerCacheEntry = prevIdx == i
@@ -743,10 +757,12 @@ public class Gemma4Model: Module {
             let result = layer(
                 h, mask: layerMask, cache: layerCacheEntry,
                 perLayerInput: perLayerInputsList[i],
-                sharedKV: sharedKV, sharedOffset: sharedOffset)
+                sharedKV: sharedKV, sharedOffset: sharedOffset,
+                sharedOffsetArray: sharedOffsetArray)
 
             h = result.h
-            intermediates[i] = (keys: result.keys, values: result.values, offset: result.offset)
+            let layerOffsetArray = (layerCacheEntry as? BatchKVCache)?.offsetArray
+            intermediates[i] = (keys: result.keys, values: result.values, offset: result.offset, offsetArray: layerOffsetArray)
         }
 
         return norm(h)
