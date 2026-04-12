@@ -4,6 +4,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 // MARK: - BatchEngine
 
@@ -91,6 +92,14 @@ public actor BatchEngine {
     /// The loaded model context (model, tokenizer, config, processor).
     private let context: ModelContext
 
+    /// Optional cache coordinator for multi-tier KV caching.
+    /// When present, the engine will attempt to fetch cached state before prefill
+    /// and store cache state after generation completes.
+    private let cacheCoordinator: CacheCoordinator?
+
+    /// Logger for cache-related diagnostics.
+    private static let logger = Logger(subsystem: "vmlx", category: "BatchEngine")
+
     /// Set of token IDs that signal end of generation for this model.
     private let stopTokenIDs: Set<Int>
 
@@ -115,14 +124,19 @@ public actor BatchEngine {
     ///   - maxBatchSize: Maximum concurrent sequences. Defaults to 8.
     ///     Higher values increase throughput but use more memory.
     ///   - memoryPurgeInterval: Steps between GPU memory cache purges. Defaults to 256.
+    ///   - cacheCoordinator: Optional multi-tier cache coordinator. When provided,
+    ///     the engine will attempt cache lookups before prefill and store cache state
+    ///     after generation completes. Defaults to nil.
     public init(
         context: ModelContext,
         maxBatchSize: Int = 8,
-        memoryPurgeInterval: Int = 256
+        memoryPurgeInterval: Int = 256,
+        cacheCoordinator: CacheCoordinator? = nil
     ) {
         self.context = context
         self.maxBatchSize = maxBatchSize
         self.memoryPurgeInterval = memoryPurgeInterval
+        self.cacheCoordinator = cacheCoordinator
 
         // Build stop token set from model config + tokenizer.
         // Matches the logic in Evaluate.swift's buildStopTokenIds plus unknownTokenId.
@@ -373,6 +387,22 @@ public actor BatchEngine {
     private func stepPrefill(slotIndex: Int) {
         var slot = activeSlots[slotIndex]
 
+        // Check multi-tier cache for a prefix match before running full prefill.
+        // For this initial integration, we log hits but still do full prefill —
+        // actual KV state restoration from cache blocks is future work.
+        if let coordinator = cacheCoordinator {
+            let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
+            let result = coordinator.fetch(tokens: tokenIds)
+            if case .hit(let matchedTokens, let remaining, let detail, _, _) = result {
+                Self.logger.info(
+                    "Cache \(detail.rawValue) hit for slot \(slot.id): \(matchedTokens) matched, \(remaining.count) remaining"
+                )
+                // TODO: Restore KV state from cache blocks into slot.cache
+                // This requires mapping CacheBlock data back into the [KVCache] protocol,
+                // which is a separate task. For now, fall through to full prefill.
+            }
+        }
+
         // Use model.prepare() with the full original input (includes image/video for VLMs).
         // This handles both LLM chunked prefill and VLM image embedding in one call.
         let prepareResult: PrepareResult
@@ -528,10 +558,28 @@ public actor BatchEngine {
     // MARK: - Completion
 
     /// Finish a slot by yielding completion info and closing its stream.
+    ///
+    /// When a cache coordinator is present and the slot completed normally
+    /// (not cancelled), stores the prompt tokens for future cache reuse.
     private func finishSlot(_ slot: BatchSlot, reason: GenerateStopReason) {
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
+
+        // Store prompt cache state for completed (non-cancelled) generations.
+        // Actual KV data extraction from [KVCache] is future work — for now we store
+        // the token sequence with empty layer data as a placeholder to exercise the path.
+        if reason != .cancelled, let coordinator = cacheCoordinator {
+            let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
+            coordinator.storeAfterGeneration(
+                promptTokens: promptTokens,
+                layerData: [],    // Placeholder — KV extraction from [KVCache] is future work
+                ssmStates: nil    // Placeholder — SSM state extraction is future work
+            )
+            Self.logger.debug(
+                "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"
+            )
+        }
 
         slot.continuation.yield(.info(GenerateCompletionInfo(
             promptTokenCount: slot.promptTokenCount,

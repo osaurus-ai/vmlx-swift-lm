@@ -35,14 +35,19 @@ extension ModelContainer {
         maxBatchSize: Int = 8,
         memoryPurgeInterval: Int = 256
     ) async -> BatchEngine {
+        // Capture the cache coordinator outside the perform closure.
+        // CacheCoordinator is Sendable so this is safe.
+        let coordinator = self.cacheCoordinator
+
         // Build the engine inside the serial access container so ModelContext
         // (which is non-Sendable) doesn't cross isolation boundaries.
-        await perform { context in
+        return await perform { context in
             nonisolated(unsafe) let ctx = context
             return BatchEngine(
                 context: ctx,
                 maxBatchSize: maxBatchSize,
-                memoryPurgeInterval: memoryPurgeInterval
+                memoryPurgeInterval: memoryPurgeInterval,
+                cacheCoordinator: coordinator
             )
         }
     }
