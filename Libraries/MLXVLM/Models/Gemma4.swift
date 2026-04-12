@@ -565,11 +565,7 @@ private class TextMLP: Module {
         let g = safeGeluApproximate(gP(x))
         let u = uP(x)
         let product: MLXArray
-        if g.dtype == .float16 {
-            product = g.asType(.bfloat16) * u.asType(.bfloat16)
-        } else {
-            product = g * u
-        }
+        product = g * u
         return dP(product)
     }
 }

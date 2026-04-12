@@ -108,7 +108,7 @@ class Qwen3MoEMLP: Module, UnaryLayer {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let g = silu(gate(x))
         let u = up(x)
-        let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+        let product = g * u
         return down(product)
     }
 }

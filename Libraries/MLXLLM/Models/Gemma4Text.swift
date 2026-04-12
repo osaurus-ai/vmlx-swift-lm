@@ -340,11 +340,7 @@ class Gemma4MLP: Module {
         let g = safeGeluApproximate(gateProj(x))
         let u = upProj(x)
         let product: MLXArray
-        if g.dtype == .float16 {
-            product = g.asType(.bfloat16) * u.asType(.bfloat16)
-        } else {
-            product = g * u
-        }
+        product = g * u
         return downProj(product)
     }
 }

@@ -101,8 +101,15 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
 
         guard !keySlices.isEmpty else { continue }
 
-        let restoredKeys = keySlices.count == 1 ? keySlices[0] : concatenated(keySlices, axis: 2)
-        let restoredValues = valueSlices.count == 1 ? valueSlices[0] : concatenated(valueSlices, axis: 2)
+        var restoredKeys = keySlices.count == 1 ? keySlices[0] : concatenated(keySlices, axis: 2)
+        var restoredValues = valueSlices.count == 1 ? valueSlices[0] : concatenated(valueSlices, axis: 2)
+
+        // Ensure restored KV matches bfloat16 (prevents dtype mismatch from stale
+        // disk cache entries created before the universal bfloat16 conversion)
+        if restoredKeys.dtype == .float16 {
+            restoredKeys = restoredKeys.asType(.bfloat16)
+            restoredValues = restoredValues.asType(.bfloat16)
+        }
 
         if let simple = cache[cacheLayerIdx] as? KVCacheSimple {
             simple.state = [restoredKeys, restoredValues]

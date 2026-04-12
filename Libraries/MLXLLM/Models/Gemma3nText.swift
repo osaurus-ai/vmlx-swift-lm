@@ -373,13 +373,7 @@ class Gemma3nMLP: Module {
             activations = safeGeluApproximate(gateProj)
         }
         let upProj = self.upProj(x)
-        // Upcast to bfloat16 before multiply to prevent float16 overflow with mixed-precision JANG models
-        let product: MLXArray
-        if activations.dtype == .float16 {
-            product = activations.asType(.bfloat16) * upProj.asType(.bfloat16)
-        } else {
-            product = activations * upProj
-        }
+        let product = activations * upProj
         let downProj = self.downProj(product)
         return downProj
     }

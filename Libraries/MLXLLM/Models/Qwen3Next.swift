@@ -151,7 +151,7 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let g = silu(gateProj(x))
         let u = upProj(x)
-        let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+        let product = g * u
         return downProj(product)
     }
 }

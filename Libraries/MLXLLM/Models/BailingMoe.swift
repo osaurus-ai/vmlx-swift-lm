@@ -177,7 +177,9 @@ class BailingMoeMLP: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let g = silu(gate(x)); let u = up(x)
-        let product = g.dtype == .float16 ? g.asType(.bfloat16) * u.asType(.bfloat16) : g * u
+        // bfloat16 shares float32's exponent range — no overflow possible.
+        // Load.swift convertToBFloat16 ensures all activations are bfloat16.
+        let product = g * u
         return down(product)
     }
 }
