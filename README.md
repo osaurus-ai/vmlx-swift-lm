@@ -89,6 +89,42 @@ for await generation in stream1 {
 - SSM/Mamba state merging for hybrid models (Qwen3.5, Nemotron-H)
 - 3D RoPE support for Qwen VL models in batch mode
 
+### Multi-Tier KV Cache (Prefix Caching)
+
+Skip redundant prefill computation when the same prompt prefix is seen again. The cache system has three tiers:
+
+- **L1 Paged Cache** -- In-memory, block-based (64 tokens/block), hash-chain prefix matching. Instant KV reuse for shared system prompts.
+- **L2 Disk Cache** -- SQLite-indexed safetensors files. Survives process restarts.
+- **SSM Companion** -- Stores cumulative SSM state for hybrid models (Qwen3.5, Nemotron-H) alongside KV cache. Deep-copied on fetch to prevent in-place corruption.
+
+```swift
+// Enable caching with auto-detection of hybrid models
+let container = try await loadModelContainer(from: modelDir, using: TokenizersLoader())
+await container.enableCachingAsync()  // auto-detects SSM layers, sets model key
+
+// Or with custom config
+let config = CacheCoordinatorConfig(
+    usePagedCache: true,
+    enableDiskCache: true,
+    diskCacheDir: URL(filePath: "/path/to/cache"),
+    pagedBlockSize: 64,
+    maxCacheBlocks: 1000
+)
+container.enableCaching(config: config)
+
+// Generation automatically uses the cache -- no other changes needed.
+// First request: full prefill, stores KV to cache.
+// Second request with same prefix: restores KV, only prefills new tokens.
+```
+
+How it works:
+1. On each request, the coordinator hashes prompt tokens into block-sized chunks with SHA-256 chain hashing
+2. Matching blocks are found in L1 (instant) or L2 (disk load)
+3. KV state from blocks is restored into the model's cache layers
+4. `model.prepare()` only processes the remaining (uncached) tokens
+5. After generation, prompt KV is extracted and stored for future requests
+6. For hybrid SSM models, SSM companion state is stored/restored separately
+
 ### Speculative Decoding
 
 Use a smaller draft model to speed up generation by 29-79% (cherry-picked from upstream [ml-explore#173](https://github.com/ml-explore/mlx-swift-lm/pull/173)):
