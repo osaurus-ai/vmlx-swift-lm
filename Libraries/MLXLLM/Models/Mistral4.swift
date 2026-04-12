@@ -295,7 +295,7 @@ class Mistral4MoEGate: Module {
 
     func callAsFunction(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
         let gates = matmul(x, weight.transposed())
-        let scores = softmax(gates.asType(.float32), axis: -1)
+        let scores = softmax(gates, axis: -1, precise: true)
 
         let inds = argPartition(MLXArray(0) - scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var wts = takeAlong(scores, inds, axis: -1)

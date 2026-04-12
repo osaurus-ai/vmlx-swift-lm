@@ -216,7 +216,7 @@ class BailingMoeGate: Module, UnaryLayer {
         let (bsz, seqLen, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         let logits = gate(x)
-        var scores = sigmoid(logits.asType(.float32))
+        var scores = sigmoid(logits)
         let scoresForChoice = scores + expertBias
         let groupScores = scoresForChoice.reshaped(bsz, seqLen, self.nGroup, -1)
 

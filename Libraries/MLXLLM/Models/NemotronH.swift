@@ -366,7 +366,7 @@ private func groupExpertSelect(
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
 
     // Original scores using sigmoid
-    let origScores = sigmoid(gates.asType(.float32))
+    let origScores = sigmoid(gates)
     var scores = origScores + eSCB
 
     // Group-based selection if n_group > 1

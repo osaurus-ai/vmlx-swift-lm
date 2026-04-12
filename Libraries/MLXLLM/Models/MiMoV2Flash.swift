@@ -67,7 +67,7 @@ private func groupExpertSelect(
     routedScalingFactor: Float,
     normTopkProb: Bool
 ) -> (MLXArray, MLXArray) {
-    var scores = sigmoid(gates.asType(.float32))
+    var scores = sigmoid(gates)
     let originalScores = scores
     scores = scores + eScoreCorrectionBias
 

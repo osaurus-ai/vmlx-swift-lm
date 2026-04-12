@@ -215,7 +215,7 @@ private class M4MoEGate: Module {
         super.init()
     }
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let scores = softmax((matmul(x, weight.transposed())).asType(.float32), axis: -1)
+        let scores = softmax(matmul(x, weight.transposed()), axis: -1, precise: true)
         let inds = argPartition(MLXArray(0) - scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var wts = takeAlong(scores, inds, axis: -1)
         if normTopk { wts = wts / wts.sum(axis: -1, keepDims: true) }

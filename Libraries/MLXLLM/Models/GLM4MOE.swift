@@ -147,9 +147,9 @@ class GLM4MoEGate: Module {
         let hiddenStates = x.matmul(weight.T)
         var scores: MLXArray
         if scoringFunc == "sigmoid" {
-            scores = sigmoid(hiddenStates.asType(.float32))
+            scores = sigmoid(hiddenStates)
         } else {
-            scores = softmax(hiddenStates.asType(.float32), axis: -1)
+            scores = softmax(hiddenStates, axis: -1, precise: true)
         }
 
         let originalScores = scores

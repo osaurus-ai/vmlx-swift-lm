@@ -347,7 +347,7 @@ class GLM4MoELiteGate: Module {
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let hiddenStates = x.matmul(weight.T)
-        let originalScores = sigmoid(hiddenStates.asType(.float32))
+        let originalScores = sigmoid(hiddenStates)
         var selectionScores = originalScores + eScoreCorrectionBias
 
         if nGroup > 1 {

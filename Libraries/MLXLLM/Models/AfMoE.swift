@@ -300,9 +300,9 @@ class AfMoEMoE: Module, UnaryLayer {
 
         var scores: MLXArray
         if scoreFunc == "sigmoid" {
-            scores = sigmoid(gates.asType(.float32))
+            scores = sigmoid(gates)
         } else {
-            scores = softmax(gates.asType(.float32), axis: -1)
+            scores = softmax(gates, axis: -1, precise: true)
         }
 
         // Add expert bias for selection
