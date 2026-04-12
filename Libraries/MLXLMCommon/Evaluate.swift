@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
@@ -569,6 +570,9 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
 ///
 /// Note: this uses `asyncEval()` and there may be an async evaluation running after a call to `next()`.
 public struct TokenIterator: TokenIteratorProtocol {
+
+    private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
+
     let model: any LanguageModel
     var state: LMOutput.State?
 
@@ -587,6 +591,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvMode: KVQuantizationMode
 
     private var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    // Multi-tier cache coordinator (skeleton integration)
+    let cacheCoordinator: CacheCoordinator?
+
+    /// Prompt token IDs captured at init for cache store after generation.
+    let promptTokenIds: [Int]
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -617,6 +627,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
 
+        self.cacheCoordinator = nil
+        self.promptTokenIds = []
+
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
@@ -634,13 +647,16 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - model: the ``LanguageModel``
     ///   - cache: optional ``KVCache``
     ///   - parameters: the generation parameters
+    ///   - cacheCoordinator: optional multi-tier cache coordinator for prefix reuse
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        cacheCoordinator: CacheCoordinator? = nil
     ) throws {
         self.model = model
         self.y = input.text
         self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cacheCoordinator = cacheCoordinator
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -650,6 +666,28 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvMode = parameters.kvMode
+
+        // Capture prompt token IDs for cache store after generation.
+        let tokenCount = input.text.tokens.size
+        if tokenCount > 0 {
+            self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int.self)
+        } else {
+            self.promptTokenIds = []
+        }
+
+        // Multi-tier cache: attempt prefix fetch before prepare.
+        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
+            let result = coordinator.fetch(tokens: promptTokenIds)
+            switch result {
+            case .hit(let matchedTokens, let remainingTokens, let detail, _, _):
+                Self.logger.info(
+                    "Cache \(detail.rawValue) hit: matched \(matchedTokens) tokens, \(remainingTokens.count) remaining — full prepare (KV restore is future work)"
+                )
+            case .miss:
+                let count = self.promptTokenIds.count
+                Self.logger.debug("Cache miss for \(count) prompt tokens")
+            }
+        }
 
         // Compile model forward for greedy decode (no processor, no state).
         // Fuses ~1000 ops into fewer Metal dispatches for ~10% speedup.
@@ -691,6 +729,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
         self.kvMode = .none
+
+        self.cacheCoordinator = nil
+        self.promptTokenIds = []
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -1476,10 +1517,12 @@ public func generate(
 /// ```
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters)
+        input: input, model: context.model, cache: cache, parameters: parameters,
+        cacheCoordinator: cacheCoordinator)
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
@@ -1606,7 +1649,21 @@ public func generateTask(
     iterator: consuming TokenIterator,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
-    generateLoopTask(
+    // Capture cache coordinator state before consuming the iterator.
+    let cacheStoreAction: (@Sendable () -> Void)? = {
+        guard let coordinator = iterator.cacheCoordinator,
+              !iterator.promptTokenIds.isEmpty else { return nil }
+        let promptTokenIds = iterator.promptTokenIds
+        return {
+            coordinator.storeAfterGeneration(
+                promptTokens: promptTokenIds,
+                layerData: [],  // Placeholder — real KV extraction is future work
+                ssmStates: nil
+            )
+        }
+    }()
+
+    return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
         tokenizer: tokenizer,
@@ -1615,7 +1672,8 @@ public func generateTask(
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json
-        )
+        ),
+        cacheStoreAction: cacheStoreAction
     )
 }
 
@@ -1763,14 +1821,29 @@ public func generateTokenTask(
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
-    generateLoopTask(
+    // Capture cache coordinator state before consuming the iterator.
+    let cacheStoreAction: (@Sendable () -> Void)? = {
+        guard let coordinator = iterator.cacheCoordinator,
+              !iterator.promptTokenIds.isEmpty else { return nil }
+        let promptTokenIds = iterator.promptTokenIds
+        return {
+            coordinator.storeAfterGeneration(
+                promptTokens: promptTokenIds,
+                layerData: [],  // Placeholder — real KV extraction is future work
+                ssmStates: nil
+            )
+        }
+    }()
+
+    return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
         tokenizer: tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         includeStopToken: includeStopToken,
-        handler: RawTokenLoopHandler()
+        handler: RawTokenLoopHandler(),
+        cacheStoreAction: cacheStoreAction
     )
 }
 
@@ -1781,7 +1854,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
-    handler: consuming Handler
+    handler: consuming Handler,
+    cacheStoreAction: (@Sendable () -> Void)? = nil
 ) -> (AsyncStream<Handler.Output>, Task<Void, Never>) {
 
     let (stream, continuation) = AsyncStream<Handler.Output>.makeStream()
@@ -1849,6 +1923,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             }
 
             handler.onGenerationEnd(emit: continuation.yield)
+
+            // Multi-tier cache: store prompt state after generation completes.
+            if let cacheStoreAction = cacheStoreAction {
+                cacheStoreAction()
+            }
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start

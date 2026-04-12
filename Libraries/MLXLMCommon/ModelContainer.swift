@@ -220,6 +220,7 @@ public final class ModelContainer: Sendable {
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
+        let coordinator = self.cacheCoordinator
 
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no
@@ -233,7 +234,8 @@ public final class ModelContainer: Sendable {
                 input: input.consume(),
                 parameters: parameters,
                 context: context,
-                wiredMemoryTicket: wiredMemoryTicket
+                wiredMemoryTicket: wiredMemoryTicket,
+                cacheCoordinator: coordinator
             )
         }
     }
