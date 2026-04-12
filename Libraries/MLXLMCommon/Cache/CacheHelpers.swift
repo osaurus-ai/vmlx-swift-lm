@@ -40,8 +40,9 @@ public func extractLayerData(from cache: [any KVCache]) -> [(keys: MLXArray, val
 
 /// Restore per-layer KV tensors from cached blocks into a model's cache array.
 ///
-/// Concatenates KV data from multiple blocks per layer, then sets cache state
-/// via the public ``KVCache/state`` setter.
+/// Blocks only contain KV-bearing layers (SSM/RotatingKVCache layers are filtered
+/// during storage). This function maps block layer indices to the KV-bearing
+/// cache layers, skipping non-KV layers.
 ///
 /// - Parameters:
 ///   - blocks: The cache blocks to restore from, ordered by sequence position.
@@ -50,31 +51,47 @@ public func extractLayerData(from cache: [any KVCache]) -> [(keys: MLXArray, val
 @discardableResult
 public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache]) -> Int {
     guard let firstBlock = blocks.first, let firstData = firstBlock.cacheData else { return 0 }
-    let numLayers = firstData.count
-    guard numLayers == cache.count else { return 0 }
+    let numBlockLayers = firstData.count
 
-    for layerIdx in 0..<numLayers {
-        // Collect KV slices from all blocks for this layer
+    // Build mapping: block layer index → cache layer index
+    // Only KVCacheSimple and CacheList-with-KV layers are KV-bearing
+    var kvCacheIndices: [Int] = []
+    for (i, layer) in cache.enumerated() {
+        if layer is KVCacheSimple {
+            kvCacheIndices.append(i)
+        } else if let cacheList = layer as? CacheList {
+            // Check if any sub-cache is KVCacheSimple
+            for j in 0..<cacheList.count {
+                if cacheList[j] is KVCacheSimple {
+                    kvCacheIndices.append(i)
+                    break
+                }
+            }
+        }
+    }
+
+    // Block layers should match KV-bearing cache layers
+    guard numBlockLayers == kvCacheIndices.count else { return 0 }
+
+    for (blockLayerIdx, cacheLayerIdx) in kvCacheIndices.enumerated() {
         var keySlices: [MLXArray] = []
         var valueSlices: [MLXArray] = []
 
         for block in blocks {
-            guard let data = block.cacheData, layerIdx < data.count,
-                  let kv = data[layerIdx] else { continue }
+            guard let data = block.cacheData, blockLayerIdx < data.count,
+                  let kv = data[blockLayerIdx] else { continue }
             keySlices.append(kv.keys)
             valueSlices.append(kv.values)
         }
 
         guard !keySlices.isEmpty else { continue }
 
-        // Concatenate along sequence dimension (axis 2: [B, H, T, D])
         let restoredKeys = keySlices.count == 1 ? keySlices[0] : concatenated(keySlices, axis: 2)
         let restoredValues = valueSlices.count == 1 ? valueSlices[0] : concatenated(valueSlices, axis: 2)
 
-        // Restore into the cache layer
-        if let simple = cache[layerIdx] as? KVCacheSimple {
+        if let simple = cache[cacheLayerIdx] as? KVCacheSimple {
             simple.state = [restoredKeys, restoredValues]
-        } else if let cacheList = cache[layerIdx] as? CacheList {
+        } else if let cacheList = cache[cacheLayerIdx] as? CacheList {
             for i in 0..<cacheList.count {
                 if let simple = cacheList[i] as? KVCacheSimple {
                     simple.state = [restoredKeys, restoredValues]
