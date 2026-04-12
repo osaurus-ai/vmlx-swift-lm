@@ -45,6 +45,9 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// Total number of blocks in the pool (including the null sentinel at index 0).
     public let maxBlocks: Int
 
+    /// Model key for cache isolation (prevents cross-model hash collisions).
+    public let modelKey: String?
+
     /// Lock for thread safety.
     private let lock = OSAllocatedUnfairLock()
 
@@ -67,9 +70,10 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// - Parameters:
     ///   - blockSize: Number of tokens per block (default 64).
     ///   - maxBlocks: Total pool size including the null sentinel (default 1000).
-    public init(blockSize: Int = 64, maxBlocks: Int = 1000) {
+    public init(blockSize: Int = 64, maxBlocks: Int = 1000, modelKey: String? = nil) {
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks
+        self.modelKey = modelKey
 
         // Pre-allocate all blocks.
         self.blocks = (0..<maxBlocks).map { CacheBlock(blockId: $0, blockSize: blockSize) }
@@ -214,7 +218,7 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         while offset + blockSize <= tokens.count {
             let chunk = Array(tokens[offset..<(offset + blockSize)])
-            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk)
+            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk, modelKey: modelKey)
 
             // Skip if this block already exists in the cache.
             if hashMap.find(hash: hash) != nil {
@@ -259,7 +263,7 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         while offset + blockSize <= tokens.count {
             let chunk = Array(tokens[offset..<(offset + blockSize)])
-            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk)
+            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk, modelKey: modelKey)
 
             if let block = _findCachedBlock(hash: hash) {
                 matchedBlocks.append(block)

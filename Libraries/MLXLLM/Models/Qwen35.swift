@@ -13,10 +13,12 @@ import MLXLMCommon
 import MLXNN
 
 /// Compiled shared expert gate: sigmoid(gate_output) * expert_output → 1 fused op.
-private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
+private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 
 // MARK: - Configuration

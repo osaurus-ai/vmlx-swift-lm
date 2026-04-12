@@ -438,8 +438,8 @@ class Gemma3nAltUp: Module {
         if let altupCoefClip = config.altupCoefClip {
             predictionWeight = clip(
                 predictionWeight,
-                min: MLXArray(-altupCoefClip),
-                max: MLXArray(altupCoefClip)
+                min: MLXArray(-altupCoefClip, dtype: predictionWeight.dtype),
+                max: MLXArray(altupCoefClip, dtype: predictionWeight.dtype)
             )
         }
 
@@ -467,8 +467,8 @@ class Gemma3nAltUp: Module {
         if let altupCoefClip = config.altupCoefClip {
             correctionWeight = clip(
                 correctionWeight,
-                min: MLXArray(-altupCoefClip),
-                max: MLXArray(altupCoefClip)
+                min: MLXArray(-altupCoefClip, dtype: correctionWeight.dtype),
+                max: MLXArray(altupCoefClip, dtype: correctionWeight.dtype)
             )
         }
 

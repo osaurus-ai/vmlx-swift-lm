@@ -4,15 +4,19 @@ import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
-// Safe GELU approximate — avoids MLXNN's compiledGeluApproximate which uses
-// the Power primitive (x ** 3). Power lacks output_shapes in the MLX C++ backend,
-// causing compile(shapeless:true) to crash on some Metal GPUs (returns 0 outputs).
-// Uses x * x * x instead, which decomposes to Multiply ops that have proper
-// output_shapes support.
-public let safeGeluApproximate: @Sendable (MLXArray) -> MLXArray =
-    compile(shapeless: true) { (x: MLXArray) -> MLXArray in
+// GELU approximate without the Power primitive (x ** 3). Uses x * x * x which
+// decomposes to Multiply ops with proper output_shapes support.
+// On M3+: compiled with compile(shapeless: true) for fused Metal dispatch.
+// On M1/M2: runs as plain closure (compile(shapeless: true) crashes on Tahoe — MLX #3329).
+public let safeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
     }
+    if HardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
 /// Drop-in replacement for MLXNN.GELU that avoids the Power primitive crash.
 /// Use this anywhere `GELU(approximation: .precise)` or `.tanh` would be used.
@@ -25,15 +29,28 @@ public class SafeGELU: Module, UnaryLayer {
 
 // Compiled activation kernels — fuses gate activation + element-wise multiply into
 // a single Metal dispatch. Matches Python's @partial(mx.compile, shapeless=True).
-private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
-    (gate: MLXArray, x: MLXArray) -> MLXArray in
-    silu(gate) * x
-}
+// Guarded by HardwareInfo: M1/M2 + macOS Tahoe crashes with compile(shapeless: true).
+private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, x: MLXArray) -> MLXArray in
+        silu(gate) * x
+    }
+    if HardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
-private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(shapeless: true) {
-    (gate: MLXArray, x: MLXArray) -> MLXArray in
-    (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * x
-}
+private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, x: MLXArray) -> MLXArray in
+        (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * x
+    }
+    if HardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)

@@ -14,10 +14,12 @@ import MLXNN
 
 /// Compiled sigmoid gate: fuses sigmoid + multiply into one Metal dispatch.
 /// Used per-layer in Qwen3.5 attention (GatedDeltaNet) — 40 layers per forward.
-private let _compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (x: MLXArray, gate: MLXArray) -> MLXArray in
+private let _compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
     _compiledSigmoidMultiply(x, gate)
@@ -28,12 +30,14 @@ func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
 /// ONE Metal dispatch. Without this, every GatedDeltaNet layer issues 5 separate
 /// Metal kernels (silu + asType + asType + multiply + asType) and at ~0.1ms per
 /// dispatch times ~30 layers, this is the dominant per-step overhead vs Python.
-private let _compiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (h: MLXArray, gate: MLXArray, x: MLXArray) -> MLXArray in
+private let _compiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (h: MLXArray, gate: MLXArray, x: MLXArray) -> MLXArray in
         let gateF32 = silu(gate.asType(.float32))
         let xF32 = x.asType(.float32)
         return (gateF32 * xF32).asType(h.dtype)
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 // MARK: - Model Components
 

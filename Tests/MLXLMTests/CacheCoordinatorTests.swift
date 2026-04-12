@@ -53,7 +53,7 @@ import Testing
     let result = coordinator.fetch(tokens: query)
 
     switch result {
-    case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates):
+    case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates, _):
         #expect(matchedTokens == 8)
         #expect(remainingTokens == [9, 10])
         #expect(detail == .paged)
@@ -96,7 +96,7 @@ import Testing
     let result = coordinator.fetch(tokens: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
     switch result {
-    case .hit(let matchedTokens, _, let detail, _, let fetchedSSM):
+    case .hit(let matchedTokens, _, let detail, _, let fetchedSSM, _):
         #expect(matchedTokens == 8)
         #expect(detail == .paged)
         #expect(fetchedSSM != nil)

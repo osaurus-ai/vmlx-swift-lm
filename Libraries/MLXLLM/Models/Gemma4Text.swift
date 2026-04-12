@@ -14,10 +14,12 @@ import MLXNN
 
 // Compiled logit softcap — fuses divide + tanh + multiply into one Metal dispatch.
 // Matches Python: @partial(mx.compile, shapeless=True) def logit_softcap(softcap, x)
-private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (x: MLXArray, cap: MLXArray) -> MLXArray in
+private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, cap: MLXArray) -> MLXArray in
         tanh(x / cap) * cap
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 // MARK: - Norm Utilities
 

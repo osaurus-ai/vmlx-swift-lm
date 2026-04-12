@@ -93,11 +93,15 @@ private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702,
     return outGlu * (xLinear + 1)
 }
 
-private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { xLinear, xGlu in
-    swiglu(xLinear, xGlu)
-}
+private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { xLinear, xGlu in
+        swiglu(xLinear, xGlu)
+    }
+    if HardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
 class SwiGLUSwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear

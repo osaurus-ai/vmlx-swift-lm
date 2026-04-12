@@ -396,13 +396,36 @@ public actor BatchEngine {
            !hasRotatingCache {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
             let result = coordinator.fetch(tokens: tokenIds)
-            if case .hit(_, let remaining, let detail, let blocks, let ssmStates) = result,
-               !blocks.isEmpty {
-                let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
-                if restoredTokens > 0 {
-                    if let ssm = ssmStates {
-                        restoreSSMStates(ssm, into: slot.cache)
+            if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
+                var restored = false
+                if !blocks.isEmpty {
+                    let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                    if restoredTokens > 0 {
+                        if let ssm = ssmStates {
+                            restoreSSMStates(ssm, into: slot.cache)
+                        }
+                        restored = true
+                        Self.logger.info(
+                            "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
+                        )
                     }
+                }
+
+                // Disk cache restore (blocks are empty, arrays are present)
+                if let diskArrays, !restored {
+                    let diskRestored = restoreFromDiskArrays(diskArrays, into: slot.cache)
+                    if diskRestored > 0 {
+                        if let ssm = ssmStates {
+                            restoreSSMStates(ssm, into: slot.cache)
+                        }
+                        restored = true
+                        Self.logger.info(
+                            "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
+                        )
+                    }
+                }
+
+                if restored {
                     if remaining.isEmpty {
                         // Full cache hit — feed last token to seed decode
                         let lastToken = MLXArray([Int32(tokenIds.last!)])
@@ -415,9 +438,6 @@ public actor BatchEngine {
                             text: LMInput.Text(tokens: remainingArray),
                             image: nil, video: nil)
                     }
-                    Self.logger.info(
-                        "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
-                    )
                 }
             }
         }

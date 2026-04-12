@@ -685,7 +685,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // Text-only cache, no RotatingKVCache (partial restore causes offset mismatch)
             let result = coordinator.fetch(tokens: promptTokenIds)
             switch result {
-            case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates):
+            case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
                 var restored = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
@@ -699,7 +699,20 @@ public struct TokenIterator: TokenIteratorProtocol {
                         )
                     }
                 }
-                // TODO: disk cache hits return blocks=[] — need disk-to-layer restore path
+
+                // Disk cache restore (blocks are empty, arrays are present)
+                if let diskArrays, !restored {
+                    let diskRestored = restoreFromDiskArrays(diskArrays, into: self.cache)
+                    if diskRestored > 0 {
+                        if let ssm = ssmStates {
+                            restoreSSMStates(ssm, into: self.cache)
+                        }
+                        restored = true
+                        Self.logger.info(
+                            "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"
+                        )
+                    }
+                }
 
                 if restored {
                     if remainingTokens.isEmpty {

@@ -14,16 +14,20 @@ import MLXNN
 
 /// Compiled sigmoid multiply: fuses x * sigmoid(gate) into one Metal dispatch.
 /// Used in GatedDeltaNet output projection (per-layer, ~30 layers per forward).
-private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (x: MLXArray, gate: MLXArray) -> MLXArray in
+private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (x: MLXArray, gate: MLXArray) -> MLXArray in
         x * sigmoid(gate)
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 /// Compiled shared expert gate: sigmoid(gate_output) * expert_output → 1 fused op.
-private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
+private let compiledSigmoidGate: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gateOutput: MLXArray, expertOutput: MLXArray) -> MLXArray in
         sigmoid(gateOutput) * expertOutput
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 private enum Qwen35VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
@@ -32,11 +36,13 @@ private enum Qwen35VLError: Error {
 // MARK: - Gated Delta Helpers
 
 /// Compiled compute_g — fuses exp+softplus+mul into 1 Metal dispatch.
-private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay.asType(a.dtype)
     }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
 
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
     -> MLXArray

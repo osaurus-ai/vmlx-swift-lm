@@ -115,7 +115,7 @@ class MiniMaxSparseMoeBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gates = gate(x.asType(.float32))
+        let gates = gate(x)
 
         var scores = sigmoid(gates)
         let originalScores = scores
@@ -125,7 +125,7 @@ class MiniMaxSparseMoeBlock: Module {
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         scores = takeAlong(originalScores, inds, axis: -1)
 
-        scores = scores / (scores.sum(axis: -1, keepDims: true) + 1e-20)
+        scores = scores / (scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype))
         scores = scores.asType(x.dtype)
 
         let y = switchMLP(x, inds)

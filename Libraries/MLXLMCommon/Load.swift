@@ -136,9 +136,15 @@ public func loadWeights(
     // Convert all float16/float32 parameters to bfloat16 to prevent AsType cascades.
     // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
     // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
-    // This applies universally: JANG models, MoE gates, and standard models.
-    let hasFloat16 = weights.values.contains { $0.dtype == .float16 }
-    if hasFloat16 {
+    // Check model.parameters() (not the original weights dict) because the quantize step
+    // above may have created QuantizedLinear modules with float32 scales from MLX.quantized().
+    // JANG models with format:mlx have bfloat16 weights but the quantizer can still produce
+    // float32 scales, causing 1000+ AsType ops if not converted.
+    let allParams = model.parameters().flattened().map { $0.1 }
+    let hasNonBFloat16 = allParams.contains { (arr: MLXArray) in
+        arr.dtype == .float16 || arr.dtype == .float32
+    }
+    if hasNonBFloat16 {
         convertToBFloat16(model: model)
     }
 
@@ -162,6 +168,10 @@ private func convertToBFloat16(model: Module) {
     }
     if !converted.isEmpty {
         let params = ModuleParameters.unflattened(converted)
-        try? model.update(parameters: params, verify: [])
+        do {
+            try model.update(parameters: params, verify: [])
+        } catch {
+            print("[convertToBFloat16] model.update failed: \(error)")
+        }
     }
 }

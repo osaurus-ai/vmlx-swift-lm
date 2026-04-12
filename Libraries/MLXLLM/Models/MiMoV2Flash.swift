@@ -90,7 +90,7 @@ private func groupExpertSelect(
     scores = takeAlong(originalScores, inds, axis: -1)
     if topK > 1, normTopkProb {
         let denominator = scores.sum(axis: -1, keepDims: true)
-        scores = scores / (denominator + 1e-20)
+        scores = scores / (denominator + MLXArray(1e-20, dtype: scores.dtype))
     }
     scores = scores * routedScalingFactor
 

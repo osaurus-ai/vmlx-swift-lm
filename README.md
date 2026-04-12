@@ -37,20 +37,23 @@ let container = try await loadModelContainer(
 
 ### Performance
 
-MoE and hybrid SSM models run **2-4x faster** than both upstream mlx-swift-lm and Python mlx_lm, matching or exceeding Python on every model family tested:
+MoE and hybrid SSM models run **2-4x faster** than both upstream mlx-swift-lm and Python mlx_lm:
 
-| Model | Before | This Fork | Python mlx_lm | Gain |
-|-------|-------:|------:|------:|-----:|
-| Qwen 3.5-35B-A3B (MoE) | 41 tok/s | **103 tok/s** | 94 | **+151%** |
-| Gemma 4 26B (MoE) | 27 tok/s | **87 tok/s** | -- | **+222%** |
-| Mistral Small 4 119B (MLA+MoE) | 16 tok/s | **70 tok/s** | 45-50 | **+338%** |
-| Nemotron Cascade 30B (SSM+MoE) | 45 tok/s | **110 tok/s** | 130 | **+144%** |
-| MiniMax M2.5 (256 experts) | 14 tok/s | **46 tok/s** | 51 | **+229%** |
-| Gemma 4 E2B (dense) | 120 tok/s | **121 tok/s** | 128 | -- |
+| Model | Arch | Upstream Swift | **This Fork** | Python mlx_lm | Gain vs Upstream |
+|-------|------|---------------:|------:|------:|-----:|
+| Qwen 3.5-35B-A3B | SSM+MoE | 41 tok/s | **103 tok/s** | 94 | **+151%** |
+| Gemma 4 26B-A4B | MoE | 27 tok/s | **87 tok/s** | -- | **+222%** |
+| Gemma 4 E2B | Dense | 120 tok/s | **121 tok/s** | 128 | -- |
+| Gemma 4 E4B | Dense | -- | **73 tok/s** | -- | -- |
+| Mistral Small 4 119B | MLA+MoE | 16 tok/s | **70 tok/s** | 45-50 | **+338%** |
+| Nemotron Cascade 30B | SSM+MoE | 45 tok/s | **110 tok/s** | 15.5 | **+144%** |
+| MiniMax M2.5 172B | MoE (256 exp) | 14 tok/s | **46 tok/s** | 51 | **+229%** |
 
-*Measured on M4 Max 128GB. Python baselines from M3 Ultra 256GB (1.5x more bandwidth).*
+*All measurements on M4 Max 128GB. Python baselines from M3 Ultra 256GB (~1.5x more memory bandwidth), so Swift matching Python on M4 Max means Swift is actually faster per-bandwidth.*
 
-Six root-cause fixes that eliminate Metal kernel dispatch overhead:
+**Key takeaway:** Dense models (Gemma 4 E2B) were already near-optimal upstream. The massive gains are on **MoE, MLA, and hybrid SSM** models where dozens of scalar operations per layer compound into thousands of unnecessary GPU dispatches. See [Why These Fixes Were Needed](#why-these-fixes-were-needed) below.
+
+Six root-cause fixes that eliminate Metal kernel dispatch overhead. See [Why These Fixes Were Needed](#why-these-fixes-were-needed) for the full explanation of how Python avoids these issues automatically.
 
 1. **Float32 scalar elimination**: `MLXArray(Float)` without `dtype:` defaults to float32. When multiplied with bfloat16 tensors, MLX inserts AsType cast operations -- each a separate Metal kernel dispatch. Fixed across all 18 model files.
 2. **Precise softmax**: Replace `softmax(x.asType(.float32))` with `softmax(x, precise: true)` -- computes in float32 internally but returns input dtype. Eliminated 988 AsType ops on Mistral4.
@@ -224,6 +227,220 @@ TurboQuant automatically skips non-KV cache layers (MambaCache for SSM, Rotating
 
 ---
 
+## Why These Fixes Were Needed
+
+Both Python (`mlx-lm`) and Swift (`mlx-swift-lm`) use the **exact same C++/Metal backend**. Same library (`libmlx`), same Metal shaders, same GPU. The speed gap is 100% about how many kernel dispatches happen per token -- and that comes from the **computation graph**, not the compute.
+
+### The Problem: Swift's Graph Was 2x Larger
+
+We instrumented the MLX computation graph and found:
+
+| Model | Upstream Swift | This Fork | Reduction |
+|-------|---------------|-----------|-----------|
+| Qwen3.5-35B graph nodes | 5,921 | 4,804 | -19% |
+| Qwen3.5-35B AsType ops | **1,176** | **60** | -95% |
+| Mistral4 119B AsType ops | **988** | **72** | -93% |
+| MiniMax JANG AsType ops | **1,245** | **248** | -80% |
+| Nemotron Cascade AsType ops | **562** | **161** | -71% |
+
+Each `AsType` is a separate Metal kernel dispatch (~20µs). At 1,100+ extra dispatches per decode step: **1100 x 20µs = 22ms of pure overhead per token**.
+
+### Root Cause: Python Has Implicit Dtype Inference, Swift Doesn't
+
+Python's `pybind11` bindings **automatically infer scalar dtypes from context**:
+
+```python
+# Python: mx.array(0.5) sees the other operand is bfloat16 and matches it
+inv_scale = mx.array(1.0 / math.sqrt(head_dim))
+q = inv_scale * rms_norm(q)  # both bfloat16 -- no type cast needed
+
+# Python: softmax has a 'precise' flag
+scores = mx.softmax(gates, axis=-1, precise=True)  # float32 compute, bfloat16 output
+```
+
+Swift has **no implicit dtype inference**. `MLXArray(0.5)` is always `float32`:
+
+```swift
+// Swift: MLXArray(0.5) is ALWAYS float32
+let invScale = MLXArray(1.0 / sqrt(Float(headDim)))  // float32
+let q = invScale * rmsNorm(q, ...)  // bfloat16 * float32 = AsType inserted!
+
+// Swift had no 'precise' option -- devs used explicit .asType(.float32)
+let scores = softmax(gates.asType(.float32), axis: -1)  // everything goes float32
+```
+
+One hidden cast looks harmless. But a model like Qwen3.5-35B with 64 layers, each doing ~18 operations with untyped scalars: **64 x 18 = 1,152 extra Metal dispatches per token.** That's the entire difference between 41 and 103 tok/s.
+
+### Why Upstream Didn't Catch It
+
+1. **No graph-level profiling.** Models produce correct output. Without counting AsType operations, the symptom is just "slower than Python" with no obvious cause.
+2. **Dense models hide the bug.** Llama, Phi, Gemma-E2B have minimal custom math -- few scalar operations, few casts. The bug only becomes catastrophic on MoE routing (dozens of expert-selection ops), GatedDeltaNet (custom normalizations), and hybrid SSM models (per-group RMSNorm).
+3. **Python is the reference.** When Swift runs at 41 tok/s and Python at 94 tok/s, the assumption is "Swift overhead." Nobody traced it to 1,100 unnecessary Metal dispatches.
+4. **JANG models are unique to us.** Apple's repo doesn't test JANG quantizations, which uniquely expose the scales/biases dtype cascade (QuantizedMatmul output dtype follows scales dtype).
+
+### The Universal Rule (For Contributors)
+
+**Every `MLXArray` scalar or constant created at runtime MUST specify `dtype:`**
+
+```swift
+// BAD -- creates float32, triggers AsType cascade
+MLXArray(someFloat) * bfloat16Tensor
+MLXArray(0.0)
+MLXArray.ones([n])  // in a hot path
+softmax(x.asType(.float32), ...)
+
+// GOOD -- zero unnecessary casts
+MLXArray(someFloat, dtype: tensor.dtype) * bfloat16Tensor
+MLXArray(0.0, dtype: tensor.dtype)
+MLXArray.ones([n], dtype: tensor.dtype)
+softmax(x, axis: -1, precise: true)
+```
+
+See `docs/SPEED-FIXES.md` for the complete model-by-model breakdown, and `docs/STRESS-TEST-RESULTS.md` for the 199/199 server integration stress test.
+
+---
+
+## Multi-Tier KV Cache -- Detailed Usage
+
+The cache system eliminates redundant prefill computation. Three tiers work together:
+
+### Architecture
+
+```
+CacheCoordinator
+ ├── L1: PagedCacheManager     (in-memory, block-aligned, instant)
+ ├── L2: DiskCache             (SQLite + safetensors, survives restarts)
+ └── SSM: SSMStateCache        (companion for hybrid models, deep-copy)
+```
+
+### Basic Usage
+
+```swift
+let container = try await loadModelContainer(from: modelDir, using: TokenizersLoader())
+
+// One-line enable with auto-detection
+await container.enableCachingAsync()
+// ^ auto-detects hybrid models (MambaCache/ArraysCache)
+// ^ sets modelKey from model config name
+// ^ creates CacheCoordinator with default config
+
+// Generate as normal -- cache is transparent
+let session = ChatSession(container)
+let reply1 = try await session.respond(to: "Explain quantum computing")
+// First request: full prefill, stores KV to L1+L2 cache
+
+let reply2 = try await session.respond(to: "Now explain it simpler")
+// Second request: prefix match on shared system prompt + prior context
+// Only prefills the new tokens, restores cached KV for the rest
+```
+
+### Custom Configuration
+
+```swift
+let config = CacheCoordinatorConfig(
+    usePagedCache: true,          // Enable L1 in-memory (default: true)
+    enableDiskCache: true,         // Enable L2 disk (default: true)
+    pagedBlockSize: 64,            // Tokens per block (default: 64)
+    maxCacheBlocks: 1000,          // L1 pool size (default: 1000)
+    diskCacheMaxGB: 10.0,          // L2 max disk usage (default: 10 GB)
+    diskCacheDir: URL(filePath: "/path/to/cache"),  // L2 location (default: tmp)
+    ssmMaxEntries: 50,             // SSM companion cache size (default: 50)
+    modelKey: "my-model-v1"        // Isolation key (default: auto from model)
+)
+container.enableCaching(config: config)
+```
+
+### With Continuous Batching
+
+```swift
+// Cache works with BatchEngine too
+let engine = await container.makeBatchEngine(maxBatchSize: 8)
+// Each slot independently checks cache on prefill
+// Each slot stores its KV after generation completes
+```
+
+### With TurboQuant
+
+```swift
+let params = GenerateParameters(
+    kvMode: .turboQuant(keyBits: 3, valueBits: 3))
+
+// Cache + TurboQuant work together:
+// - Paged cache stores float KV (extracted from TQ via .state)
+// - Disk cache stores TQ-native compressed format (26x smaller files)
+// - On restore, TQ caches receive float KV and re-compress during generation
+await container.enableCachingAsync()
+```
+
+### How It Works Under the Hood
+
+1. **Store (after generation):**
+   - `extractLayerData()` reads KV from each cache layer (KVCacheSimple, QuantizedKVCache, TurboQuantKVCache)
+   - L1: Splits into 64-token blocks, computes SHA-256 chain hashes, stores in block pool
+   - L2: Saves as safetensors file keyed by token hash. TQ-compressed layers use TQDiskSerializer (26x smaller)
+   - SSM: For hybrid models, deep-copies MambaCache/ArraysCache states into companion cache
+
+2. **Fetch (before prefill):**
+   - L1 check: Walks token chunks, computes chain hashes, looks up blocks. O(1) per block.
+   - L2 fallback: Tries exact token hash, then one-shorter (for partial matches).
+   - On hit: Restores KV into model cache, restores SSM states, truncates input to remaining tokens.
+   - Full hit: Feeds only the last token to seed decode (skips ALL prefill).
+
+3. **Isolation:**
+   - `modelKey` is included in all hashes -- different models can't read each other's cache
+   - `RotatingKVCache` layers are excluded (partial restore would corrupt rotation state)
+   - VLM requests with images skip cache (image data isn't in the token hash)
+   - Float16 disk entries are auto-cast to bfloat16 on restore
+
+### Cache Performance Impact
+
+| Scenario | Without Cache | With Cache | Savings |
+|----------|-------------|-----------|---------|
+| 2K system prompt, repeated | ~200ms prefill | ~0ms (full hit) | **200ms** |
+| Multi-turn, turn 5 | ~500ms prefill | ~50ms (partial hit) | **450ms** |
+| App restart, same prompt | ~200ms prefill | ~20ms (disk load) | **180ms** |
+
+### Monitoring
+
+```swift
+// Check cache stats
+if let coordinator = container.cacheCoordinator {
+    let pagedStats = coordinator.pagedCache?.stats
+    print("L1 hits: \(pagedStats?.cacheHits ?? 0)")
+    print("L1 misses: \(pagedStats?.cacheMisses ?? 0)")
+
+    let diskHits = coordinator.diskCache?.hits ?? 0
+    let diskMisses = coordinator.diskCache?.misses ?? 0
+    print("L2 hits: \(diskHits), misses: \(diskMisses)")
+
+    let ssmHits = coordinator.ssmStateCache.hits
+    print("SSM hits: \(ssmHits)")
+}
+```
+
+### Tested & Verified
+
+The full cache stack has been stress-tested in the Osaurus server with **199/199 requests passing (100%)** across:
+
+- Multi-turn session reuse (10 turns)
+- Concurrent requests (10 simultaneous)
+- Prefix cache hit verification (consistent `prefix_hash`)
+- Rapid fire (50 sequential at 3.8 req/s)
+- Streaming + non-streaming mixed concurrent
+- Edge cases (empty input, single char, extreme temps, 5K char prompts)
+- Session switching (5 sessions x 3 turns, rapidly alternating)
+- Post-stress health check
+
+Plus 15 unit tests covering cache eviction, SSM deep-copy isolation, batch engine, and concurrent coordinator access. See `docs/STRESS-TEST-RESULTS.md` for full results.
+
+### Disabling Cache
+
+```swift
+container.disableCaching()  // Clears all tiers, releases memory
+```
+
+---
+
 ## Supported Models
 
 ### LLMs (50+ architectures)
@@ -367,7 +584,7 @@ Change your package URL:
 .package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", branch: "main"),
 ```
 
-Everything else stays the same. You gain JANG support, Gemma 4, Mistral Small 4, speculative decoding, `isVLM`, and MoE performance boosts for free.
+Everything else stays the same. You gain JANG support, Gemma 4, Mistral Small 4, speculative decoding, `isVLM`, MoE performance boosts (2-4x), continuous batching, multi-tier KV cache, and TurboQuant compression for free.
 
 If migrating from upstream 2.x, see the [version 3 migration guide](#migrating-to-version-3) below.
 
@@ -450,10 +667,10 @@ let container = try await loadModelContainer(
 
 ## Roadmap
 
-- **Native TurboQuant** -- Quantization-aware weight format for faster loading
-- **Paged KV Cache** -- Memory-efficient caching for long contexts
-- **Prefix Caching** -- Reuse KV cache across prompts with shared prefixes
-- **Async L2 Disk Cache** -- Spill KV cache to disk for very long contexts
+- **Compiled decode** -- Full model `compile(inputs: cache, outputs: cache)` for 10-20% additional decode speedup
+- **VLM cache support** -- Image-hash in cache key for vision model prefix reuse
+- **TQ compressed disk restore** -- Restore TurboQuant compressed representation directly from disk (currently restores as float, model re-compresses)
+- **Native TurboQuant weights** -- Quantization-aware weight format for faster loading
 
 ## Known Limitations
 

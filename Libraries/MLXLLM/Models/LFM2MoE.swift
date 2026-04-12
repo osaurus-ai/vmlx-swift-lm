@@ -286,8 +286,7 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var gates = gate(x).asType(.float32)
-        gates = MLX.softmax(gates, axis: -1)
+        var gates = MLX.softmax(gate(x), axis: -1, precise: true)
 
         if useExpertBias, let expertBias {
             gates = gates + expertBias
@@ -297,7 +296,7 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         let indices = argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         var scores = takeAlong(gates, indices, axis: -1)
         if normTopKProb {
-            let denom = scores.sum(axis: -1, keepDims: true) + 1e-20
+            let denom = scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype)
             scores = scores / denom
         }
         scores = scores.asType(x.dtype)

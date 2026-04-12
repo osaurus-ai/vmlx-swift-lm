@@ -33,7 +33,8 @@ public enum CacheFetchResult: Sendable {
         remainingTokens: [Int],
         detail: CacheDetail,
         blocks: [CacheBlock],
-        ssmStates: [MLXArray]?
+        ssmStates: [MLXArray]?,
+        diskArrays: [String: MLXArray]? = nil
     )
 
     /// No cache tier had a match for the given tokens.
@@ -87,7 +88,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         if config.usePagedCache {
             self.pagedCache = PagedCacheManager(
                 blockSize: config.pagedBlockSize,
-                maxBlocks: config.maxCacheBlocks
+                maxBlocks: config.maxCacheBlocks,
+                modelKey: config.modelKey
             )
         } else {
             self.pagedCache = nil
@@ -97,7 +99,7 @@ public final class CacheCoordinator: @unchecked Sendable {
             let dir = config.diskCacheDir
                 ?? FileManager.default.temporaryDirectory
                     .appendingPathComponent("vmlx_disk_cache")
-            self.diskCache = DiskCache(cacheDir: dir, maxSizeGB: config.diskCacheMaxGB)
+            self.diskCache = DiskCache(cacheDir: dir, maxSizeGB: config.diskCacheMaxGB, modelKey: config.modelKey)
         } else {
             self.diskCache = nil
         }
@@ -152,44 +154,42 @@ public final class CacheCoordinator: @unchecked Sendable {
                 remainingTokens: result.remainingTokens,
                 detail: .paged,
                 blocks: result.blocks,
-                ssmStates: ssmStates
+                ssmStates: ssmStates,
+                diskArrays: nil
             )
         }
 
         // Tier 2: Disk cache (exact match, then one-shorter fallback)
         if let diskCache {
             if let arrays = diskCache.fetch(tokens: tokens) {
-                // If the stored data is TQ-native, deserialize the compressed
-                // representation back to standard KV arrays so callers get a
-                // consistent format. Full TQ cache reconstruction is deferred
-                // to a future change — for now we pass through the decoded
-                // float16 KV pairs from TQDiskSerializer.deserialize().
-                if TQDiskSerializer.isTQNative(arrays) {
-                    _ = TQDiskSerializer.deserialize(arrays)
-                    // TODO: plumb deserialized TQ components back to caller
-                    // for full TurboQuantKVCache reconstruction.
+                var ssmStates: [MLXArray]? = nil
+                if isHybrid {
+                    ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: tokens.count)
                 }
                 return .hit(
                     matchedTokens: tokens.count,
                     remainingTokens: [],
                     detail: .disk,
                     blocks: [],
-                    ssmStates: nil
+                    ssmStates: ssmStates,
+                    diskArrays: arrays
                 )
             }
 
             if tokens.count > 1 {
                 let shorter = Array(tokens.dropLast())
                 if let arrays = diskCache.fetch(tokens: shorter) {
-                    if TQDiskSerializer.isTQNative(arrays) {
-                        _ = TQDiskSerializer.deserialize(arrays)
+                    var ssmStates: [MLXArray]? = nil
+                    if isHybrid {
+                        ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: shorter.count)
                     }
                     return .hit(
                         matchedTokens: shorter.count,
                         remainingTokens: [tokens.last!],
                         detail: .disk,
                         blocks: [],
-                        ssmStates: nil
+                        ssmStates: ssmStates,
+                        diskArrays: arrays
                     )
                 }
             }

@@ -290,7 +290,7 @@ class MoEGate: Module {
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         scores = takeAlong(scores, inds, axis: -1)
         if topK ?? 1 > 1, normTopkProb {
-            let denominator = scores.sum(axis: -1, keepDims: true) + 1e-20
+            let denominator = scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype)
             scores = scores / denominator
             scores = scores * routedScalingFactor
         }

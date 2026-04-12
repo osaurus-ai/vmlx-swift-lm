@@ -22,6 +22,9 @@ public final class DiskCache: @unchecked Sendable {
     /// Maximum total cache size in bytes.
     public let maxSizeBytes: Int
 
+    /// Model key for cache isolation (prevents cross-model hash collisions).
+    public let modelKey: String?
+
     /// SQLite database handle.
     private var db: OpaquePointer?
 
@@ -44,9 +47,10 @@ public final class DiskCache: @unchecked Sendable {
     /// - Parameters:
     ///   - cacheDir: Directory where safetensors files and the SQLite index are stored.
     ///   - maxSizeGB: Maximum cache size in gigabytes. Defaults to 10 GB.
-    public init(cacheDir: URL, maxSizeGB: Float = 10.0) {
+    public init(cacheDir: URL, maxSizeGB: Float = 10.0, modelKey: String? = nil) {
         self.cacheDir = cacheDir
         self.maxSizeBytes = Int(maxSizeGB * 1_073_741_824)
+        self.modelKey = modelKey
 
         // Create cache directory if needed
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
@@ -89,7 +93,7 @@ public final class DiskCache: @unchecked Sendable {
     ///   - tokens: Token IDs used to compute the cache key hash.
     ///   - arrays: Dictionary of named MLX arrays to persist.
     public func store(tokens: [Int], arrays: [String: MLXArray]) {
-        let hash = DiskCache.hashTokens(tokens)
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
 
@@ -122,6 +126,9 @@ public final class DiskCache: @unchecked Sendable {
 
                 // Insert/replace into SQLite
                 self.insertEntry(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
+
+                // Evict oldest entries if total cache exceeds size limit
+                self.evictIfNeeded()
             } catch {
                 // Silently ignore write failures -- cache is best-effort
             }
@@ -133,7 +140,7 @@ public final class DiskCache: @unchecked Sendable {
     /// - Parameter tokens: Token IDs to look up.
     /// - Returns: The cached arrays if found, or `nil` on a miss.
     public func fetch(tokens: [Int]) -> [String: MLXArray]? {
-        let hash = DiskCache.hashTokens(tokens)
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
         let url = safetensorsURL(for: hash)
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -182,12 +189,18 @@ public final class DiskCache: @unchecked Sendable {
     /// Compute a deterministic hash from a token sequence.
     ///
     /// Uses SHA-256 over the raw byte representation of the token array
-    /// and returns the first 32 hex characters.
+    /// and returns the first 32 hex characters. When `modelKey` is provided,
+    /// it is hashed first to prevent cross-model cache collisions.
     ///
-    /// - Parameter tokens: The token IDs to hash.
+    /// - Parameters:
+    ///   - tokens: The token IDs to hash.
+    ///   - modelKey: Optional model identifier for cache isolation.
     /// - Returns: A 32-character lowercase hex string.
-    public static func hashTokens(_ tokens: [Int]) -> String {
+    public static func hashTokens(_ tokens: [Int], modelKey: String? = nil) -> String {
         var hasher = SHA256()
+        if let modelKey {
+            hasher.update(data: Data(modelKey.utf8))
+        }
         tokens.withUnsafeBufferPointer { buffer in
             let rawBuffer = UnsafeRawBufferPointer(buffer)
             hasher.update(bufferPointer: rawBuffer)
@@ -225,11 +238,60 @@ public final class DiskCache: @unchecked Sendable {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
 
-        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        sqlite3_bind_text(stmt, 1, hash, -1, transient)
-        sqlite3_bind_int64(stmt, 2, Int64(tokenCount))
-        sqlite3_bind_int64(stmt, 3, Int64(fileSize))
-        sqlite3_step(stmt)
+        hash.withCString { cStr in
+            sqlite3_bind_text(stmt, 1, cStr, -1, nil)
+            sqlite3_bind_int64(stmt, 2, Int64(tokenCount))
+            sqlite3_bind_int64(stmt, 3, Int64(fileSize))
+            sqlite3_step(stmt)
+        }
         sqlite3_finalize(stmt)
+    }
+
+    /// Evict oldest entries until total cache size is under `maxSizeBytes`.
+    private func evictIfNeeded() {
+        guard let db else { return }
+
+        // Query total size
+        var totalSize: Int64 = 0
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT COALESCE(SUM(file_size), 0) FROM cache_entries", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                totalSize = sqlite3_column_int64(stmt, 0)
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        guard totalSize > Int64(maxSizeBytes) else { return }
+
+        // Fetch oldest entries (by creation time) to evict
+        var toEvict: [(hash: String, fileSize: Int64)] = []
+        var accumulated: Int64 = 0
+        let excess = totalSize - Int64(maxSizeBytes)
+
+        if sqlite3_prepare_v2(db, "SELECT hash, file_size FROM cache_entries ORDER BY created_at ASC", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW, accumulated < excess {
+                if let cStr = sqlite3_column_text(stmt, 0) {
+                    let hash = String(cString: cStr)
+                    let size = sqlite3_column_int64(stmt, 1)
+                    toEvict.append((hash: hash, fileSize: size))
+                    accumulated += size
+                }
+            }
+        }
+        sqlite3_finalize(stmt)
+
+        // Delete evicted entries and their files
+        for entry in toEvict {
+            let url = safetensorsURL(for: entry.hash)
+            try? FileManager.default.removeItem(at: url)
+
+            entry.hash.withCString { cStr in
+                if sqlite3_prepare_v2(db, "DELETE FROM cache_entries WHERE hash = ?", -1, &stmt, nil) == SQLITE_OK {
+                    sqlite3_bind_text(stmt, 1, cStr, -1, nil)
+                    sqlite3_step(stmt)
+                }
+                sqlite3_finalize(stmt)
+            }
+        }
     }
 }

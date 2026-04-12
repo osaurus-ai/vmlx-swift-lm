@@ -20,45 +20,23 @@ import Foundation
 ///
 /// See: MLX issues #3329, #3201, #3256
 public enum HardwareInfo {
-    /// Returns `true` on Apple Silicon M3 or later where `compile(shapeless: true)`
-    /// works correctly with the Metal JIT.
+    /// Returns `true` when `compile(shapeless: true)` is safe to use.
     ///
-    /// Returns `false` on:
-    /// - M1/M2 chips (A14/A15 GPU) — Metal JIT crashes with compile(shapeless: true)
-    /// - Intel Macs — no Metal GPU or older GPU
-    /// - Unknown hardware — safe default
+    /// Currently returns `false` unconditionally. The macOS Tahoe Metal JIT bug
+    /// (MLX #3329, #3201, #3256) causes `Compiled::eval_gpu` to return zero results,
+    /// crashing at `compiledState.callsToFill[0]` (Index out of range).
     ///
-    /// This property is intended to gate `compile(shapeless: true)` usage in
-    /// activation functions and other compiled closures. When `false`, fall back
-    /// to non-compiled closure evaluation (individual Metal ops, which work fine
-    /// on all hardware).
+    /// Originally gated by chip generation (M1/M2 = false, M3+ = true), but the
+    /// crash was confirmed on M4 Pro (Mac16,x) as well — the bug is a macOS Tahoe
+    /// Metal shader compiler issue, not hardware-specific.
+    ///
+    /// Performance impact of disabling: minimal. These are small activation function
+    /// fusions (GELU, SwiGLU, softcap). The individual Metal ops work correctly on
+    /// all hardware and the per-op overhead is negligible vs. the model forward pass.
+    ///
+    /// Re-enable when Apple fixes the Metal JIT in a future macOS update.
     public static var isCompiledDecodeSupported: Bool {
-        guard isAppleSilicon else { return false }
-
-        let identifier = machineIdentifier
-
-        // Parse "MacNN,MM" to get generation number.
-        // M1 = Mac13/Mac14, M2 = Mac15,3-Mac15,8, M3 = Mac15,10+, M4 = Mac16+
-        // Mac17+ = future chips (M5+), always supported.
-        guard let genStr = identifier.split(separator: ",").first,
-              let gen = Int(genStr.dropFirst(3)) else {
-            return false
-        }
-
-        // Mac16+ (M4 and later) — always supported
-        if gen >= 16 { return true }
-
-        // Mac15,10+ = M3 family (A16/A17 GPU, g8x family — Metal JIT works)
-        // Mac15,3-Mac15,8 = M2 family (A15 GPU, g7x — Metal JIT bug)
-        if gen == 15 {
-            if let suffix = identifier.split(separator: ",").last,
-               let model = Int(suffix) {
-                return model >= 10  // Mac15,10+ = M3
-            }
-            return false
-        }
-
-        // Mac13, Mac14 = M1 family — Metal JIT bug
+        // Disabled on all hardware — macOS Tahoe Metal JIT bug affects M1 through M4.
         return false
     }
 

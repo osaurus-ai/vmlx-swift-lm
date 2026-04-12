@@ -398,7 +398,7 @@ private func groupExpertSelect(
 
     // Normalize if needed
     if topK > 1 && normTopkProb {
-        let denominator = finalScores.sum(axis: -1, keepDims: true) + 1e-20
+        let denominator = finalScores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: finalScores.dtype)
         finalScores = finalScores / denominator
     }
 
