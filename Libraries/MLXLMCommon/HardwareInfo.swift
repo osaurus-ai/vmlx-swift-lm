@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc. and JANG Research
+// Copyright © 2026 Osaurus AI
 
 import Foundation
 
@@ -37,47 +37,28 @@ public enum HardwareInfo {
 
         let identifier = machineIdentifier
 
-        // M3+ machine identifiers (A16/A17/A18 GPU — g8x family):
-        // Mac15,10+ = M3 Pro/Max (MacBook Pro)
-        // Mac15,11+ = M3 Air
-        // Mac15,12  = M3 Pro 14"
-        // Mac15,13  = M3 Max 16"
-        // Mac16,3+  = M4 family (MacBook Pro, Mac mini, iMac)
-        // Mac16,8   = M4 Pro Mac mini
-        // Mac16,5   = M3 Max MacBook Pro
-        // Mac16,6   = M3 Pro MacBook Pro
-        // Mac16,7   = M3 Max MacBook Pro
-        // Mac16,8   = M4 Pro Mac mini
-        // Mac16,9   = M4 Max Mac Pro
-        // Mac16,10  = M4 Pro MacBook Pro
-        // Mac16,11  = M4 Max MacBook Pro
-        // Mac16,12  = M4 Air
-        if identifier.hasPrefix("Mac15,10") ||
-           identifier.hasPrefix("Mac15,11") ||
-           identifier.hasPrefix("Mac15,12") ||
-           identifier.hasPrefix("Mac15,13") ||
-           identifier.hasPrefix("Mac16,3") ||
-           identifier.hasPrefix("Mac16,5") ||
-           identifier.hasPrefix("Mac16,6") ||
-           identifier.hasPrefix("Mac16,7") ||
-           identifier.hasPrefix("Mac16,8") ||
-           identifier.hasPrefix("Mac16,9") ||
-           identifier.hasPrefix("Mac16,10") ||
-           identifier.hasPrefix("Mac16,11") ||
-           identifier.hasPrefix("Mac16,12") {
-            return true
-        }
-
-        // M1 (Mac13,*, Mac14,*) and M2 (Mac15,7, Mac15,8) — A14/A15 GPU (g7x family)
-        // These have the Metal JIT bug with compile(shapeless: true)
-        if identifier.hasPrefix("Mac13") ||
-           identifier.hasPrefix("Mac14") ||
-           identifier.hasPrefix("Mac15,7") ||
-           identifier.hasPrefix("Mac15,8") {
+        // Parse "MacNN,MM" to get generation number.
+        // M1 = Mac13/Mac14, M2 = Mac15,3-Mac15,8, M3 = Mac15,10+, M4 = Mac16+
+        // Mac17+ = future chips (M5+), always supported.
+        guard let genStr = identifier.split(separator: ",").first,
+              let gen = Int(genStr.dropFirst(3)) else {
             return false
         }
 
-        // Unknown Apple Silicon — conservative false
+        // Mac16+ (M4 and later) — always supported
+        if gen >= 16 { return true }
+
+        // Mac15,10+ = M3 family (A16/A17 GPU, g8x family — Metal JIT works)
+        // Mac15,3-Mac15,8 = M2 family (A15 GPU, g7x — Metal JIT bug)
+        if gen == 15 {
+            if let suffix = identifier.split(separator: ",").last,
+               let model = Int(suffix) {
+                return model >= 10  // Mac15,10+ = M3
+            }
+            return false
+        }
+
+        // Mac13, Mac14 = M1 family — Metal JIT bug
         return false
     }
 
