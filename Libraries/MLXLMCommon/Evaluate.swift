@@ -685,24 +685,36 @@ public struct TokenIterator: TokenIteratorProtocol {
             // Text-only cache, no RotatingKVCache (partial restore causes offset mismatch)
             let result = coordinator.fetch(tokens: promptTokenIds)
             switch result {
-            case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, let ssmStates):
+            case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates):
+                var restored = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
-                    if let ssm = ssmStates {
-                        restoreSSMStates(ssm, into: self.cache)
+                    if restoredTokens > 0 {
+                        if let ssm = ssmStates {
+                            restoreSSMStates(ssm, into: self.cache)
+                        }
+                        restored = true
+                        Self.logger.info(
+                            "Cache \(detail.rawValue) hit: restored \(restoredTokens) tokens, prefilling \(remainingTokens.count) remaining"
+                        )
                     }
-                    // Truncate input to only the remaining (uncached) tokens.
-                    // The cache already has KV state for the prefix — prepare() only
-                    // needs to process the suffix that wasn't cached.
-                    if !remainingTokens.isEmpty {
+                }
+                // TODO: disk cache hits return blocks=[] — need disk-to-layer restore path
+
+                if restored {
+                    if remainingTokens.isEmpty {
+                        // Full cache hit — feed just the last token to seed decode.
+                        // prepare() needs at least 1 token to produce initial logits.
+                        let lastToken = MLXArray([Int32(promptTokenIds.last!)])
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: lastToken),
+                            image: nil, video: nil)
+                    } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: remainingArray),
                             image: nil, video: nil)
                     }
-                    Self.logger.info(
-                        "Cache \(detail.rawValue) hit: restored \(restoredTokens) tokens, prefilling \(remainingTokens.count) remaining"
-                    )
                 }
             case .miss:
                 let count = promptTokenIds.count

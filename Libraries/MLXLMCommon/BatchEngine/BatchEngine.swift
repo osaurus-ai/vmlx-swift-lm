@@ -399,18 +399,26 @@ public actor BatchEngine {
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates) = result,
                !blocks.isEmpty {
                 let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
-                if let ssm = ssmStates {
-                    restoreSSMStates(ssm, into: slot.cache)
+                if restoredTokens > 0 {
+                    if let ssm = ssmStates {
+                        restoreSSMStates(ssm, into: slot.cache)
+                    }
+                    if remaining.isEmpty {
+                        // Full cache hit — feed last token to seed decode
+                        let lastToken = MLXArray([Int32(tokenIds.last!)])
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: lastToken),
+                            image: nil, video: nil)
+                    } else {
+                        let remainingArray = MLXArray(remaining.map { Int32($0) })
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: remainingArray),
+                            image: nil, video: nil)
+                    }
+                    Self.logger.info(
+                        "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
+                    )
                 }
-                if !remaining.isEmpty {
-                    let remainingArray = MLXArray(remaining.map { Int32($0) })
-                    inputForPrepare = LMInput(
-                        text: LMInput.Text(tokens: remainingArray),
-                        image: nil, video: nil)
-                }
-                Self.logger.info(
-                    "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(restoredTokens) tokens, prefilling \(remaining.count) remaining"
-                )
             }
         }
 
