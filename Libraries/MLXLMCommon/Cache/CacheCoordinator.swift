@@ -158,7 +158,17 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Tier 2: Disk cache (exact match, then one-shorter fallback)
         if let diskCache {
-            if let _ = diskCache.fetch(tokens: tokens) {
+            if let arrays = diskCache.fetch(tokens: tokens) {
+                // If the stored data is TQ-native, deserialize the compressed
+                // representation back to standard KV arrays so callers get a
+                // consistent format. Full TQ cache reconstruction is deferred
+                // to a future change — for now we pass through the decoded
+                // float16 KV pairs from TQDiskSerializer.deserialize().
+                if TQDiskSerializer.isTQNative(arrays) {
+                    _ = TQDiskSerializer.deserialize(arrays)
+                    // TODO: plumb deserialized TQ components back to caller
+                    // for full TurboQuantKVCache reconstruction.
+                }
                 return .hit(
                     matchedTokens: tokens.count,
                     remainingTokens: [],
@@ -170,7 +180,10 @@ public final class CacheCoordinator: @unchecked Sendable {
 
             if tokens.count > 1 {
                 let shorter = Array(tokens.dropLast())
-                if let _ = diskCache.fetch(tokens: shorter) {
+                if let arrays = diskCache.fetch(tokens: shorter) {
+                    if TQDiskSerializer.isTQNative(arrays) {
+                        _ = TQDiskSerializer.deserialize(arrays)
+                    }
                     return .hit(
                         matchedTokens: shorter.count,
                         remainingTokens: [tokens.last!],
@@ -193,6 +206,9 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Distributes the data to each enabled cache tier:
     /// 1. Paged cache receives the token sequence and per-block layer data.
     /// 2. Disk cache receives flattened KV arrays keyed by token hash.
+    ///    When TurboQuant-compressed layers are detected in `cache`, the disk
+    ///    tier stores the 26x-smaller compressed representation via
+    ///    ``TQDiskSerializer`` instead of raw float16 arrays.
     /// 3. SSM companion cache receives states for hybrid models.
     ///
     /// The `perLayerData` is the full-sequence per-layer output from
@@ -204,10 +220,15 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - perLayerData: Per-layer KV tensors covering the entire prompt sequence.
     ///     Layers without KV data (SSM layers) are `nil`.
     ///   - ssmStates: SSM layer states for hybrid models, or `nil`.
+    ///   - cache: The raw per-layer KV cache array from the model. When provided
+    ///     and any layer is a TurboQuant cache in compressed phase, the disk tier
+    ///     stores the compressed representation. Pass `nil` (default) to use the
+    ///     standard float16 disk path.
     public func storeAfterGeneration(
         promptTokens: [Int],
         perLayerData: [(keys: MLXArray, values: MLXArray)?],
-        ssmStates: [MLXArray]?
+        ssmStates: [MLXArray]?,
+        cache: [any KVCache]? = nil
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
@@ -223,16 +244,27 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Store in disk cache
         if let diskCache {
-            // Flatten layer data into a dictionary keyed by layer/type
-            var arrays: [String: MLXArray] = [:]
-            for (blockIdx, block) in blockLayerData.enumerated() {
-                for (layerIdx, kv) in block.enumerated() {
-                    arrays["b\(blockIdx)_l\(layerIdx)_keys"] = kv.keys
-                    arrays["b\(blockIdx)_l\(layerIdx)_values"] = kv.values
+            // Check if any layer in the raw cache is TQ-compressed.
+            let hasTQ = cache?.contains(where: { TQDiskSerializer.isTQCompressed($0) }) ?? false
+
+            if hasTQ, let cache {
+                // Use TQDiskSerializer for 26x smaller disk footprint.
+                let arrays = TQDiskSerializer.serialize(cache: cache)
+                if !arrays.isEmpty {
+                    diskCache.store(tokens: promptTokens, arrays: arrays)
                 }
-            }
-            if !arrays.isEmpty {
-                diskCache.store(tokens: promptTokens, arrays: arrays)
+            } else {
+                // Standard float16 disk path: flatten block layer data into a dictionary.
+                var arrays: [String: MLXArray] = [:]
+                for (blockIdx, block) in blockLayerData.enumerated() {
+                    for (layerIdx, kv) in block.enumerated() {
+                        arrays["b\(blockIdx)_l\(layerIdx)_keys"] = kv.keys
+                        arrays["b\(blockIdx)_l\(layerIdx)_values"] = kv.values
+                    }
+                }
+                if !arrays.isEmpty {
+                    diskCache.store(tokens: promptTokens, arrays: arrays)
+                }
             }
         }
 

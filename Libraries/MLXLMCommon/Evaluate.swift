@@ -1672,17 +1672,20 @@ public func generateTask(
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
-        let perLayerData = extractLayerData(from: iterator.cache)
+        let rawCache = iterator.cache
+        let perLayerData = extractLayerData(from: rawCache)
         let ssmStates: [MLXArray]? = coordinator.isHybrid
-            ? extractSSMStates(from: iterator.cache) : nil
+            ? extractSSMStates(from: rawCache) : nil
         // MLXArray is not Sendable but is safe after eval; suppress the diagnostic.
         nonisolated(unsafe) let layerCapture = perLayerData
         nonisolated(unsafe) let ssmCapture = ssmStates
+        nonisolated(unsafe) let cacheCapture = rawCache
         return {
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
-                ssmStates: ssmCapture
+                ssmStates: ssmCapture,
+                cache: cacheCapture
             )
         }
     }()
@@ -1850,16 +1853,19 @@ public func generateTokenTask(
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
-        let perLayerData = extractLayerData(from: iterator.cache)
+        let rawCache = iterator.cache
+        let perLayerData = extractLayerData(from: rawCache)
         let ssmStates: [MLXArray]? = coordinator.isHybrid
-            ? extractSSMStates(from: iterator.cache) : nil
+            ? extractSSMStates(from: rawCache) : nil
         nonisolated(unsafe) let layerCapture = perLayerData
         nonisolated(unsafe) let ssmCapture = ssmStates
+        nonisolated(unsafe) let cacheCapture = rawCache
         return {
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
-                ssmStates: ssmCapture
+                ssmStates: ssmCapture,
+                cache: cacheCapture
             )
         }
     }()

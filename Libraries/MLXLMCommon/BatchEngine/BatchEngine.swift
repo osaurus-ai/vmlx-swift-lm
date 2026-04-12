@@ -584,7 +584,8 @@ public actor BatchEngine {
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokens,
                 perLayerData: perLayerData,
-                ssmStates: ssmStates
+                ssmStates: ssmStates,
+                cache: slot.cache
             )
             Self.logger.debug(
                 "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"
