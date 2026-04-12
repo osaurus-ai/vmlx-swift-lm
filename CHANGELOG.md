@@ -1,65 +1,64 @@
 # CHANGELOG — vmlx-swift-lm (osaurus-ai/vmlx-swift-lm)
 
-## [2026-04-11] — Float32 AsType Cascade Elimination + JANG bfloat16 Conversion
+## [2026-04-12] — AsType Cascade Elimination (Complete)
 
-### Root Cause
-Two performance bugs causing 2-5x slowdowns:
+### Fix 1: Float32 Scalar Contamination
+`MLXArray(someFloat)` without `dtype:` → float32 scalar × bfloat16 tensor = AsType cascade.
+- **Qwen35.swift** (LLM + VLM): invScale scalars
+- **Qwen3Next.swift**: invScale scalars
+- **Gemma4Text.swift**: sqrt embedding scale double-cast
+- **Gemma4.swift** (VLM): sqrt embedding + vision encoder masks
+- **Gemma3.swift** (VLM): embedding scale + softcap scalar
+- **Gemma3nText.swift**: activationSparsity + altupCorrectScale
+- **GPTOSS.swift**: clip() scalars in swiglu
+- **NanoChat.swift**: applySoftcap scalar
 
-1. **Scalar dtype mismatch:** `MLXArray(someFloat)` without `dtype:` defaults to float32. When multiplied with bfloat16 tensors → AsType cascade. Python infers dtype automatically.
-2. **JANG scales/biases left as float16:** `convertToBFloat16()` skipped quantization scales/biases, but QuantizedMatmul uses scales dtype for output. float16 output × bfloat16 norms → AsType cascade.
+### Fix 2: MoE Gate putAlong Zero-Out
+`MLXArray(0.0)` → `MLXArray(0.0, dtype: groupScores.dtype)`.
+- **7 MoE models**: BailingMoe, DeepseekV3, GLM4MOE, GLM4MOELite, AfMoE, MiMoV2Flash, NemotronH
 
-### Fixes Applied
+### Fix 3: Precise Softmax + Remove Sigmoid Float32 Cast
+`softmax(x.asType(.float32))` → `softmax(x, precise: true)`.
+`sigmoid(x.asType(.float32))` → `sigmoid(x)`.
+- **Mistral4, Mistral4VLM**: softmax precise
+- **GLM4MOE, GLM4MOELite, AfMoE**: softmax precise + sigmoid
+- **BailingMoe, NemotronH, MiMoV2Flash**: sigmoid
 
-**Load.swift — Universal dtype unification:**
-- Removed float16 scales/biases skip in `convertToBFloat16()`
-- Broadened trigger: converts when ANY mixed float16/float32/bfloat16 params exist
-- Before: only MoE models with `switch_mlp`/`switch_glu` keys
-- After: all models with mixed floating-point dtypes
+### Fix 4: Universal Float16 → BFloat16 Conversion
+All float16 params (including scales/biases) → bfloat16.
+- **Load.swift**: no more skipping scales/biases, trigger on any float16
 
-**Qwen35.swift (LLM) — THE critical fix:**
-- `MLXArray(pow(invScale, 2))` → `MLXArray(pow(invScale, 2), dtype: q.dtype)`
-- `MLXArray(invScale)` → `MLXArray(invScale, dtype: k.dtype)`
+### Fix 5: NemotronH Identity Weight Dtype
+`MLXArray.ones([groupSize])` → `MLXArray.ones([groupSize], dtype: unflattened.dtype)`.
+- **NemotronH.swift**: RMSNormGated identity weight in hot path
 
-**Qwen3Next.swift (LLM):** Same invScale fix
+### Fix 6: SSM computeDt Optimization
+`softplus(x)` → `logAddExp(x, 0)`, typed clip scalars.
+- **SSM.swift**
 
-**Qwen35.swift (VLM):** Same invScale fix for VLM variant
+### Results (M4 Max 128GB)
 
-**Gemma4Text.swift:** `MLXArray(sqrt(...), dtype: .bfloat16).asType(h.dtype)` → `dtype: h.dtype`
+| Model | Before | After | Python (M3 Ultra) | Key Fix |
+|-------|--------|-------|-------------------|---------|
+| Qwen3.5-35B MLX Q4 | 41 | **103** | 94 | #1 (invScale) |
+| Gemma4 26B Q4 | 27 | **87** | — | #1 (sqrt double-cast) |
+| Gemma4 E2B Q4 | 120 | **121** | 128 | #1 (sqrt) |
+| Gemma4 E4B Q4 | — | **73** | — | #1 (sqrt) |
+| Mistral4 119B JANG 2L | 16 | **70** | 45-50 | #3 (precise softmax) |
+| MiniMax JANG 2L | 14 | **46** | 51 | #2 + #4 (putAlong + scales) |
+| Nemotron Cascade 30B JANG 2L | 45 | **110** | 130 | #5 (identity weight) |
 
-**Gemma4.swift (VLM):** Lines 382, 466-468, 723, 842 — sqrt double-cast + vision encoder masks
+### VLM Status
+- Gemma4 E2B VLM: **9/9 tests pass** (image, multi-turn, TokenIterator)
+- Qwen3.5 VL: chat template image token issue (pre-existing)
+- Mistral4 VL: multi-turn reshape crash (pre-existing)
 
-**Gemma3.swift (VLM):** Embedding scale double-cast + softcap scalar
-
-**Gemma3nText.swift:** activationSparsity scalars + altupCorrectScale fallback
-
-**GPTOSS.swift:** clip() scalars in swiglu hot path
-
-**NanoChat.swift:** applySoftcap scalar
-
-**MoE gating — 7 models (putAlong zero-out):**
-- BailingMoe, DeepseekV3, GLM4MOE, GLM4MOELite, AfMoE, MiMoV2Flash, NemotronH
-- `MLXArray(0.0)` → `MLXArray(0.0, dtype: groupScores.dtype)`
-
-### Test Results (M4 Max 128GB)
-
-| Model | AsType Before | AsType After | tok/s Before | tok/s After (uncomp) | tok/s After (pipe) |
-|-------|--------------|-------------|-------------|---------------------|-------------------|
-| Qwen3.5-35B MLX 4-bit | 1,176 | 60 | 41 | **103** (+151%) | **138** |
-| Gemma4 E2B 4-bit | 89 | 89 | ~120 | **121** | **147** |
-| Gemma4 E4B 4-bit | ~112 | 112 | ~73 | **73** | **84** |
-| Gemma4 26B 4-bit | ~181 | 181 | **27** | **87** (+222%) | **111** |
-| MiniMax JANG 2L | 1,245 | 248 | **14** | **46** (+229%) | **52** |
-| Nemotron Cascade JANG 2L | 565 | 562 | 44 | **45** | **50** |
-
-*Python baselines: Qwen3.5 ~98 sync / ~123 pipelined. Swift now BEATS Python.*
-
-**Gemma4 26B regression: FIXED** (27 → 87 tok/s, was previously 97-102)
-
-### Merged Branches
-- `perf/astype-elimination-20260411-185828` → main (8 commits)
-- `feature/continuous-batching` → main (1 commit)
+### Batching Status
+- BatchEngine: 0 files changed by speed fixes, fully intact
+- Unit tests: 14 tests (7 unit + 7 integration), documented 2.59x throughput
+- Speed fixes make each batch slot 2-4x faster (AsType elimination)
 
 ### Infrastructure
-- Private repo: osaurus-ai/vmlx-swift-lm (main branch only, clean)
-- .gitignore: internal docs/research/dev scripts excluded
-- Hookify rules: model testing matrix, API compat guard, debug/changelog requirements
+- Private repo: osaurus-ai/vmlx-swift-lm (main only)
+- Complete technical reference: docs/SPEED-FIXES.md (gitignored)
+- Hookify rules: model testing, API compat, speed targets, debug/changelog
