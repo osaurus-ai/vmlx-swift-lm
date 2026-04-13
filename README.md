@@ -107,6 +107,25 @@ vmlx-swift-lm wins every turn on the short-context Gemma 4 test (+14 % over
 Python). The long-context picture will be republished after the next round of
 op fusion lands.
 
+### Llama 3.2 1B Instruct 4bit (pure dense baseline) — long context, 11K tokens
+
+5-turn conversation growing from 47 → 11,022 tokens, greedy decode, 256 tok/turn.
+This is the dense-Llama baseline — no MoE routing, no SSM layers, just plain
+transformer. Full details in [`BENCHMARK-LLAMA-3.2-1B.md`](BENCHMARK-LLAMA-3.2-1B.md).
+
+| Backend | Decode tok/s avg | Overall tok/s avg | Cold-start TTFT |
+|---|---:|---:|---:|
+| Python mlx_lm 0.31.2 | **282.5** | **159.9** | 79 ms |
+| **vmlx-swift-lm** (this fork) | **271.4** *(-4 %)* | **156.2** *(-2 %)* | **21 ms** *(3.8× faster)* |
+| LM Studio 0.4.x (mlx-llm 1.5.0) | n/a (no split) | 155.8 | n/a |
+| omlx 0.3.2 | n/a (no split) | 147.2 | (broken) |
+
+On a pure dense model **all four runtimes land within ~8 % of each other** —
+the FFI-tax gap that hurts Swift on big MoE models barely matters when there's
+no MoE routing or SSM state. vmlx-swift-lm is **within 4 % of Python on decode**
+and **3.8× faster than Python on cold-start TTFT** thanks to wired memory and
+8 K prefill batch.
+
 Six root-cause fixes that eliminate Metal kernel dispatch overhead. See [Why These Fixes Were Needed](#why-these-fixes-were-needed) for the full explanation of how Python avoids these issues automatically.
 
 1. **Float32 scalar elimination**: `MLXArray(Float)` without `dtype:` defaults to float32. When multiplied with bfloat16 tensors, MLX inserts AsType cast operations -- each a separate Metal kernel dispatch. Fixed across all 18 model files.
