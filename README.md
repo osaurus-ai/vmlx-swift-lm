@@ -53,6 +53,60 @@ MoE and hybrid SSM models run **2-4x faster** than both upstream mlx-swift-lm an
 
 **Key takeaway:** Dense models (Gemma 4 E2B) were already near-optimal upstream. The massive gains are on **MoE, MLA, and hybrid SSM** models where dozens of scalar operations per layer compound into thousands of unnecessary GPU dispatches. See [Why These Fixes Were Needed](#why-these-fixes-were-needed) below.
 
+## 📊 Multi-Turn Benchmarks vs Other Apple-Silicon Runtimes
+
+Single-turn micro-benchmarks miss the real workload. Below are full
+multi-turn conversation benchmarks for the two architectures most representative
+of modern open-weight models — a hybrid SSM+MoE (Qwen 3.5-35B-A3B) and a dense
+MoE (Gemma 4 26B-A4B) — across **every Apple-Silicon LLM runtime that exists
+today** for these models.
+
+| Aspect | What it measures |
+|---|---|
+| **Decode tok/s** | Sustained generation speed once prefill is done |
+| **Prefill tok/s** | How fast the runtime processes new prompt tokens |
+| **TTFT** | Time to first token after submitting the prompt |
+| **Overall tok/s** | End-to-end per-turn (256 generated / total wall time) — what the user actually feels |
+
+### Qwen 3.5-35B-A3B (hybrid SSM + MoE) — long context, 10.9K tokens
+
+5-turn conversation growing from 21 → 10,932 tokens, greedy decode, 256 tok/turn,
+M4 Max 128 GB. **All other inference processes killed before each backend run.**
+Full details in [`BENCHMARK-QWEN3.5-35B.md`](BENCHMARK-QWEN3.5-35B.md).
+
+| Backend | Backend type | Decode T1 | Decode T5 | Prefill avg | TTFT T1 | Overall avg (T2-5) |
+|---|---|---:|---:|---:|---:|---:|
+| Python mlx_lm 0.31.2 | Python + mlx C++ (latest) | 122.1 | 106.1 | **1520** tok/s | 281 ms | **62.4** tok/s |
+| **vmlx-swift-lm** (this fork) | Swift + mlx-swift osaurus-0.31.3 | 106.4 | 91.3 | 1415 tok/s | **53 ms** | 56.5 tok/s |
+| omlx 0.3.2 | Python + mlx C++, paged auto-cache | ~83 | ~57 | (broken)¹ | (broken)¹ | 47.0 tok/s |
+| LM Studio 0.4.x | Swift + mlx-llm 1.5.0 | 107.5 | 25.5² | n/a | (broken)¹ | 42.4 tok/s |
+
+¹ Streaming TTFT broken — backends buffer chunks until generation completes.
+² LM Studio has no prefix cache; it re-prefills the full conversation every turn.
+
+**Headline:**
+- **vmlx-swift-lm has the fastest cold-start TTFT (53 ms — 5× faster than Python)** thanks to wired memory + 8 K prefill batch.
+- **vmlx-swift-lm is the fastest *Swift-binding* runtime — beats LM Studio by +33 % overall** and beats omlx by +20 % overall.
+- Python mlx_lm currently leads on long-context decode by ~12 % — a known compile-fusion gap we're closing.
+
+### Gemma 4 26B-A4B (dense MoE) — short context, 5.5K tokens
+
+5-turn conversation growing from 25 → 5,499 tokens, greedy decode, 256 tok/turn.
+**This is the short-context test only**; a long-context version is pending more
+op fusion work (router rms_norm, geglu) before publishing. Full details in
+[`BENCHMARK-GEMMA-4-26B.md`](BENCHMARK-GEMMA-4-26B.md).
+
+| Backend | Decode T1 | Decode T5 | Avg decode (T2-5) |
+|---|---:|---:|---:|
+| **vmlx-swift-lm** (this fork) | **98.2** | **86.5** | **88.4** |
+| Python mlx_lm 0.31.2 | 71.6 | 78.1 | 77.4 |
+| omlx 0.3.2 | 77.7 | 68.6 | 71.0 |
+| LM Studio | — | — | — (Gemma 4 not yet supported by mlx-llm 1.5.0) |
+
+vmlx-swift-lm wins every turn on the short-context Gemma 4 test (+14 % over
+Python). The long-context picture will be republished after the next round of
+op fusion lands.
+
 Six root-cause fixes that eliminate Metal kernel dispatch overhead. See [Why These Fixes Were Needed](#why-these-fixes-were-needed) for the full explanation of how Python avoids these issues automatically.
 
 1. **Float32 scalar elimination**: `MLXArray(Float)` without `dtype:` defaults to float32. When multiplied with bfloat16 tensors, MLX inserts AsType cast operations -- each a separate Metal kernel dispatch. Fixed across all 18 model files.
