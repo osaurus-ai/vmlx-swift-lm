@@ -5,7 +5,7 @@ import CompilerPluginSupport
 import PackageDescription
 
 let package = Package(
-    name: "mlx-swift-lm",
+    name: "vmlx-swift-lm",
     platforms: [
         .macOS(.v14),
         .iOS(.v17),
