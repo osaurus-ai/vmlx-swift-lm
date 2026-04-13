@@ -44,6 +44,30 @@ private let _vlmCompiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> ML
     return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
+/// Compiled swiglu: silu(gate) * x → 1 fused Metal dispatch instead of 2.
+/// Matches Python mlx_lm/models/activations.py @partial(mx.compile, shapeless=True) swiglu.
+/// Called 40×/step in Qwen3.5 MoE (shared_expert MLP).
+private let _vlmCompiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, x: MLXArray) -> MLXArray in
+        silu(gate) * x
+    }
+    return compile(shapeless: true, body)
+}()
+
+/// Compiled precise swiglu: casts to float32, does silu+mul, casts back.
+/// Matches Python mlx_lm/models/qwen3_next.py @partial(mx.compile, shapeless=True) _precise_swiglu.
+/// Called 30×/step in Qwen3.5 (linear_attention RMSNormGated output path).
+private let _vlmCompiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
+        (h: MLXArray, gate: MLXArray, x: MLXArray) -> MLXArray in
+        let gateF32 = silu(gate.asType(.float32))
+        let xF32 = x.asType(.float32)
+        return (gateF32 * xF32).asType(h.dtype)
+    }
+    return compile(shapeless: true, body)
+}()
+
 private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray)
     -> MLXArray
 {
@@ -626,11 +650,12 @@ enum Qwen35Language {
         }
 
         func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-            var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+            let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
             if let gate {
-                x = x * silu(gate)
+                // Fused precise swiglu matching Python's _precise_swiglu (1 dispatch vs 2+casts).
+                return _vlmCompiledPreciseSwiGLU(hiddenStates, gate, x)
             }
-            return x
+            return x.asType(hiddenStates.dtype)
         }
     }
 
@@ -760,10 +785,8 @@ enum Qwen35Language {
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
-            let g = silu(gateProj(x))
-            let u = upProj(x)
-            let product = g * u
-            return downProj(product)
+            // Fused silu(gate) * up via compiled swiglu (1 Metal dispatch vs 2).
+            downProj(_vlmCompiledSwiGLU(gateProj(x), upProj(x)))
         }
     }
 

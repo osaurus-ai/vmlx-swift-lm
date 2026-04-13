@@ -38,6 +38,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", branch: "osaurus-0.31.3"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.21"),
     ],
     targets: [
         .target(
@@ -113,6 +114,16 @@ let package = Package(
             ],
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
+        ),
+        .executableTarget(
+            name: "RunBench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "RunBench"
         ),
         .testTarget(
             name: "MLXLMTests",

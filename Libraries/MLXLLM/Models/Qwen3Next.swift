@@ -41,6 +41,14 @@ private let _compiledPreciseSwiGLU: @Sendable (MLXArray, MLXArray, MLXArray) -> 
 
 // MARK: - Model Components
 
+// Compiled swiglu for MLP: fuses silu(gate) * up into 1 Metal dispatch.
+private let _compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { (gate: MLXArray, x: MLXArray) -> MLXArray in
+        silu(gate) * x
+    }
+    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 final class Qwen3NextRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
@@ -153,10 +161,9 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let g = silu(gateProj(x))
-        let u = upProj(x)
-        let product = g * u
-        return downProj(product)
+        // Fuses silu(gate) * up into 1 Metal dispatch instead of 2.
+        let activated = _compiledSwiGLU(gateProj(x), upProj(x))
+        return downProj(activated)
     }
 }
 
