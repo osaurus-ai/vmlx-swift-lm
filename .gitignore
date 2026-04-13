@@ -117,6 +117,10 @@ SWIFT-PERF-FIXES.md
 bench_batch.py
 qwen2_moe_python.py
 run_test.py
+
+# Metal library copied from Xcode DerivedData for terminal swift-run bench
+# runs (see ../vmlx-swift/VMLX_README.md for the workaround). Do not commit.
+default.metallib
 run_test.swift
 test_*.swift
 test_*.py
