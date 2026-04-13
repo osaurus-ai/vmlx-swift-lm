@@ -77,17 +77,28 @@ Full details in [`BENCHMARK-QWEN3.5-35B.md`](BENCHMARK-QWEN3.5-35B.md).
 | Backend | Backend type | Decode T1 | Decode T5 | Prefill avg | TTFT T1 | Overall avg (T2-5) |
 |---|---|---:|---:|---:|---:|---:|
 | Python mlx_lm 0.31.2 | Python + mlx C++ (latest) | 122.1 | 106.1 | **1520** tok/s | 281 ms | **62.4** tok/s |
-| **vmlx-swift-lm** (this fork) | Swift + mlx-swift osaurus-0.31.3 | 106.4 | 91.3 | 1415 tok/s | **53 ms** | 56.5 tok/s |
+| **vmlx-swift-lm** (this fork) | Swift + mlx-swift osaurus-0.31.3 | 106 (peak 111)³ | **96.2** | 1335 tok/s | **53 ms** | ~58 tok/s |
 | omlx 0.3.2 | Python + mlx C++, paged auto-cache | ~83 | ~57 | (broken)¹ | (broken)¹ | 47.0 tok/s |
 | LM Studio 0.4.x | Swift + mlx-llm 1.5.0 | 107.5 | 25.5² | n/a | (broken)¹ | 42.4 tok/s |
 
 ¹ Streaming TTFT broken — backends buffer chunks until generation completes.
 ² LM Studio has no prefix cache; it re-prefills the full conversation every turn.
+³ Swift median of 3 runs; peak of best run in parens. Run-to-run variance ±4 tok/s on T1.
+
+**Updated 2026-04-13** — the compile micro-fusion work in commits
+`cf55f6d` and `21176a4` lifts long-context (T5) decode from 91.3 → **96.2 tok/s
+(+5.4%)** on Qwen 3.5-35B-A3B-4bit. T1 decode is essentially unchanged at the
+median (104.7 vs prior 106.4) but peaks higher (111 vs prior 106) and
+variance has collapsed — run-to-run spread on T5 went from ~10 tok/s to ~4.
 
 **Headline:**
 - **vmlx-swift-lm has the fastest cold-start TTFT (53 ms — 5× faster than Python)** thanks to wired memory + 8 K prefill batch.
-- **vmlx-swift-lm is the fastest *Swift-binding* runtime — beats LM Studio by +33 % overall** and beats omlx by +20 % overall.
-- Python mlx_lm currently leads on long-context decode by ~12 % — a known compile-fusion gap we're closing.
+- **vmlx-swift-lm is the fastest *Swift-binding* runtime — beats LM Studio by +37 % overall** and beats omlx by +23 % overall.
+- Python mlx_lm currently leads on long-context decode by ~10 %. Investigation
+  in [`docs/research/2026-04-13-decode-speed-to-120.md`](docs/research/2026-04-13-decode-speed-to-120.md)
+  isolates the remaining gap to mlx-swift per-op eager overhead and compile-site
+  coverage; further compile work is bounded to ~2 tok/s and closing the gap
+  fully requires either mlx-swift bridge changes or custom Metal kernels.
 
 ### Gemma 4 26B-A4B (dense MoE) — short context, 5.5K tokens
 
