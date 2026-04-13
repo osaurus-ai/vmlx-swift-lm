@@ -439,6 +439,61 @@ struct ToolTests {
         #expect(toolCall.function.arguments["expression"] == .string("2+2"))
     }
 
+    // MARK: - Gemma 4 Format Tests
+
+    @Test("Test Gemma 4 Function Parser - simple args")
+    func testGemma4ParserSimple() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
+        let content = "<|tool_call>call:add{a:5,b:3}<tool_call|>"
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "add")
+    }
+
+    @Test("Test Gemma 4 Function Parser - escaped strings")
+    func testGemma4ParserEscapedStrings() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
+        let content =
+            "<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|>"
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Gemma 4 Function Parser - comma inside escaped value")
+    func testGemma4ParserCommaInString() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
+        let content =
+            "<|tool_call>call:search{query:<|\"|>hello, world<|\"|>}<tool_call|>"
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("hello, world"))
+    }
+
+    @Test("Test Gemma 4 Format via ToolCallProcessor (auto-infer)")
+    func testGemma4FormatProcessor() throws {
+        // Verify the factory gemma4 case wires the correct tags and escape marker.
+        let processor = ToolCallProcessor(format: .gemma4)
+        _ = processor.processChunk(
+            "<|tool_call>call:calculator{expression:<|\"|>2+2<|\"|>}<tool_call|>")
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "calculator")
+        #expect(toolCall.function.arguments["expression"] == .string("2+2"))
+    }
+
+    @Test("Test ToolCallFormat.infer maps gemma4 model_type correctly")
+    func testGemma4FormatInference() throws {
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "gemma3") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma3_text") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma3n") == .gemma)
+    }
+
     // MARK: - Kimi K2 Format Tests
 
     @Test("Test Kimi K2 Tool Call Parser")
