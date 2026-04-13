@@ -14,14 +14,19 @@ import MLXNN
 
 /// Compiled compute_g — fuses exp+exp+softplus+mul+neg into 1 Metal dispatch.
 /// Matches Python's @mx.compile(shapeless=True) def compute_g().
-/// Called per GatedDeltaNet layer per token (~30 layers per forward).
-private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = {
-    let body: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
+/// Called per GatedDeltaNet layer per token (~12 SSM layers in Qwen 3.5).
+///
+/// Always compiled, regardless of `HardwareInfo.isCompiledDecodeSupported`. The broad
+/// disable of compile() targeted shape-variable prefill graphs that caused trace-cache
+/// misses; compute_g operates on tiny [numVHeads] tensors with stable shapes across
+/// every decode step, so the trace cache hits 100% of the time and there is no prefill
+/// stall to worry about. Python's mlx_lm reference compiles this exact function and
+/// gets ~17 tok/s more on Qwen 3.5-35B vs Swift's eager path.
+private let _compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { (aLog: MLXArray, a: MLXArray, dtBias: MLXArray) -> MLXArray in
         let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
         return decay.asType(a.dtype)
     }
-    return HardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
-}()
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     _compiledComputeG(aLog, a, dtBias)
