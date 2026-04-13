@@ -874,8 +874,14 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.compiledForward = nil
         }
 
+        // Models expect [B, L] input. If the caller passed 1D tokens [L], add a batch
+        // axis. If they passed 2D [B, L] already (some VLM bench/test paths), use as-is —
+        // adding another newAxis would produce 3D and break QuantizedLinear matmul on
+        // pure-LLM model paths (Llama, Mistral, Phi, etc).
+        let stepInput: LMInput.Text =
+            previous.tokens.ndim == 1 ? previous[text: .newAxis] : previous
         let result = model(
-            previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            stepInput, cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
         if needsCacheQuantization {
