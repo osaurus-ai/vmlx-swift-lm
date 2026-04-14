@@ -97,41 +97,49 @@ public final class DiskCache: @unchecked Sendable {
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
 
-        // Pre-evaluate arrays on calling thread so GPU work completes
-        // before handing off to the background writer.
+        // Pre-realize arrays on calling thread so GPU work completes
+        // before the writer hits the C++ save path.
         MLX.eval(Array(arrays.values))
 
         lock.withLock {
             stores += 1
         }
 
-        // Background write to avoid blocking the caller.
-        // Use DispatchQueue to avoid Swift 6 Sendable constraints on Task.detached,
-        // since MLXArray is not Sendable but is safe to use cross-thread after eval.
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
+        // SYNCHRONOUS write — previously dispatched to a background
+        // `DispatchQueue.global(qos: .utility)`, but that dispatch raced
+        // with process termination on short-lived sessions: the caller
+        // returned, the process (bench harness, a curl-then-SIGTERM
+        // serve loop, or any short Osaurus session) exited, the
+        // safetensors writer hadn't started yet, and the file was left
+        // at 0 bytes. Every "T1 then restart then T2" workflow then saw
+        // a cache miss on T2 because the on-disk file existed but was
+        // empty. The save is a single safetensors call on already-
+        // realized MLXArrays — costs ~milliseconds, well under the
+        // request latency budget, and removes the whole class of
+        // "disk cache silently did nothing" bugs.
+        do {
+            try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
 
-            do {
-                try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
-
-                // Record file size
-                let fileSize: Int
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-                   let size = attrs[.size] as? Int
-                {
-                    fileSize = size
-                } else {
-                    fileSize = 0
-                }
-
-                // Insert/replace into SQLite
-                self.insertEntry(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
-
-                // Evict oldest entries if total cache exceeds size limit
-                self.evictIfNeeded()
-            } catch {
-                // Silently ignore write failures -- cache is best-effort
+            let fileSize: Int
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                let size = attrs[.size] as? Int
+            {
+                fileSize = size
+            } else {
+                fileSize = 0
             }
+
+            insertEntry(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
+            evictIfNeeded()
+        } catch {
+            // Best-effort: swallow so a write failure doesn't fail the
+            // caller's request — the model output is already produced.
+            // But LOG to stderr so operational failures surface instead
+            // of hiding silently. Matches the fetch-side corrupt-entry
+            // log below.
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk] store failed for hash \(hash): \(error)\n"
+                .utf8))
         }
     }
 
@@ -154,6 +162,18 @@ public final class DiskCache: @unchecked Sendable {
             return arrays
         } catch {
             lock.withLock { misses += 1 }
+            // A failed deserialize is almost always a corrupt safetensors
+            // file — a 0-byte leftover from the pre-synchronous-store
+            // bug, a partial write from an earlier crash, disk full
+            // during flush, or a format-version mismatch after upgrade.
+            // Log the specific error so operators can see the reason
+            // instead of silently counting a cache miss, and delete the
+            // corrupt file so the next turn doesn't retry and log the
+            // same error on every fetch.
+            FileHandle.standardError.write(Data(
+                "[vmlx][cache/disk] fetch corrupt entry at \(url.lastPathComponent): \(error) — removing\n"
+                .utf8))
+            try? FileManager.default.removeItem(at: url)
             return nil
         }
     }
