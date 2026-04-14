@@ -576,8 +576,8 @@ public final class LLMModelFactory: ModelFactory {
         // falls through to the standard non-TQ model path.
         let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
         if let jangData = try? Data(contentsOf: jangConfigURL),
-            var configDict = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
-            let jangDict = try? JSONSerialization.jsonObject(with: jangData) as? [String: Any]
+            var configDict = (try? JSONSerialization.jsonObject(with: configData)) as? [String: Any],
+            let jangDict = (try? JSONSerialization.jsonObject(with: jangData)) as? [String: Any]
         {
             for key in ["weight_format", "mxtq_seed"] {
                 if configDict[key] == nil, let v = jangDict[key] {
