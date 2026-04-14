@@ -377,18 +377,26 @@ public enum JANGTQKernels {
         return rot
     }
 
-    /// Fused gate+up+SwiGLU for K experts in one kernel dispatch.
-    /// Returns fp32 of shape `(K, out_features)` (broadcast mode for one token).
+    /// Fused gate+up+SwiGLU.
+    /// - `K` : experts per token (e.g. 8) — becomes `meta[0]` inside the kernel
+    ///         so the kernel can compute `token_idx = dispatch_idx / K`.
+    /// - `batchTokens` : number of input rows in `xRot` (tokens in the batch).
+    ///         Total dispatches in `y` grid = `batchTokens * K`.
+    /// - `xRot` shape: `(batchTokens, inFeatures)`
+    /// - `rhsIndices` shape: `(batchTokens * K,)` uint32
+    /// Returns fp32 of shape `(batchTokens * K, out_features)`.
     public static func fusedGateUpSwiGLU(
         xRot: MLXArray,
         packedGate: MLXArray, normsGate: MLXArray,
         packedUp: MLXArray,   normsUp: MLXArray,
         codebook: MLXArray,
         rhsIndices: MLXArray,
-        K: Int, inFeatures: Int, outFeatures: Int, bits: Int = 2
+        batchTokens: Int, K: Int,
+        inFeatures: Int, outFeatures: Int, bits: Int = 2
     ) -> MLXArray {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
+        let nDispatches = batchTokens * K
         let meta = MLXArray([
             UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
@@ -401,24 +409,27 @@ public enum JANGTQKernels {
             [xRot, packedGate, normsGate, packedUp, normsUp,
              codebook, rhsIndices, meta],
             template: nil,
-            grid: (gridX, K, 1),
+            grid: (gridX, nDispatches, 1),
             threadGroup: (tgX, 1, 1),
-            outputShapes: [[K, outFeatures]],
+            outputShapes: [[nDispatches, outFeatures]],
             outputDTypes: [.float32]
         )
         return arr[0]
     }
 
-    /// Gather TQ matmul (per-row mode for down_proj).
-    /// Returns fp32 of shape `(K, out_features)`.
+    /// Gather TQ matmul in per-row mode (down_proj path).
+    /// - `xRot` shape: `(nRows, inFeatures)` — one row per (token, expert) pair.
+    /// - `rhsIndices` shape: `(nRows,)` uint32 — expert id for each row.
+    /// Returns fp32 of shape `(nRows, outFeatures)`.
     public static func gatherTQ(
         xRot: MLXArray,
         packed: MLXArray, norms: MLXArray,
         codebook: MLXArray, rhsIndices: MLXArray,
-        K: Int, inFeatures: Int, outFeatures: Int, bits: Int = 2
+        nRows: Int, inFeatures: Int, outFeatures: Int, bits: Int = 2
     ) -> MLXArray {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
+        // Per-row: K_meta = 1, so token_idx = dispatch_idx, k_idx = 0.
         let meta = MLXArray([
             UInt32(1), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
@@ -430,9 +441,9 @@ public enum JANGTQKernels {
         let arr = JANGTQKernelLibrary.gatherTQ(
             [xRot, packed, norms, codebook, rhsIndices, meta],
             template: nil,
-            grid: (gridX, K, 1),
+            grid: (gridX, nRows, 1),
             threadGroup: (tgX, 1, 1),
-            outputShapes: [[K, outFeatures]],
+            outputShapes: [[nRows, outFeatures]],
             outputDTypes: [.float32]
         )
         return arr[0]

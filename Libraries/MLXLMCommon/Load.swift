@@ -33,14 +33,7 @@ public func loadWeights(
     let jangtqSidecarURL = modelDirectory.appendingPathComponent("jangtq_runtime.safetensors")
     let isJANGTQNative = FileManager.default.fileExists(atPath: jangtqSidecarURL.path)
 
-    // .jangspec bundle: per-expert blobs + hot-core safetensors + flat index.
-    // Read everything via JangSpecBundleLoader, which produces a {key: MLXArray}
-    // dict identical in shape to the standard safetensors enumeration so the
-    // rest of this function (sanitize, MXTQ dequant, per-layer quant inference,
-    // model.update) runs unchanged.
-    if JangSpecBundleLoader.isBundle(at: modelDirectory) {
-        weights = try JangSpecBundleLoader.loadWeights(from: modelDirectory)
-    } else if let jangConfig, !jangConfig.isV2, JangLoader.hasV1Weights(at: modelDirectory) {
+    if let jangConfig, !jangConfig.isV2, JangLoader.hasV1Weights(at: modelDirectory) {
         // JANG v1 models use .jang.safetensors files that need uint8->uint32 repacking
         weights = try JangLoader.loadV1Weights(at: modelDirectory)
     } else {
@@ -61,21 +54,6 @@ public func loadWeights(
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
-
-    // JANG MXTQ (TurboQuant-packed) dequantization.
-    // Detects `.tq_packed` keys and rewrites them into affine
-    // (.weight/.scales/.biases) triplets BEFORE per-model sanitize so that
-    // downstream key-remap / expert-rename logic sees the final parameter
-    // layout. No-op for non-MXTQ JANG models. Skipped when JANGTQ-native
-    // (runtime sidecar present) because those tensors are consumed raw.
-    if let jangConfig, !isJANGTQNative {
-        do {
-            _ = try dequantizeJangMXTQ(weights: &weights, jangConfig: jangConfig)
-        } catch {
-            print("[loadWeights] MXTQ dequant failed: \(error)")
-            throw error
-        }
-    }
 
     // JANGTQ native: load the signs/codebook sidecar into the runtime cache
     // before model.update() so TurboQuantSwitchGLU has everything it needs

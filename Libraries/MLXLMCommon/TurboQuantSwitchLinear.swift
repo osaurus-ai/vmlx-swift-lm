@@ -89,7 +89,7 @@ public class TurboQuantSwitchLinear: Module {
         let y = JANGTQKernels.gatherTQ(
             xRot: xFlat, packed: packed, norms: norms,
             codebook: codebook, rhsIndices: idxFlat,
-            K: K, inFeatures: inFeatures, outFeatures: outFeatures, bits: bits
+            nRows: batch * K, inFeatures: inFeatures, outFeatures: outFeatures, bits: bits
         )
         // Reshape output to match gather_qmm's `(..., K, 1, out_features)` shape
         // expected by callers (broadcast K).
@@ -162,27 +162,31 @@ public class TurboQuantSwitchGLU: Module {
         // 1. Rotate input
         let xRot = JANGTQKernels.hadamardRotate(xFlat, signs: signsIn, dim: inputDims)
 
-        // 2. Fused gate+up+SwiGLU
+        // 2. Fused gate+up+SwiGLU — broadcast mode: K_meta = K so the kernel
+        //    can compute token_idx = dispatch_idx / K and k_idx = dispatch_idx % K.
+        //    Total dispatches = batchTokens * K.
         let xAct = JANGTQKernels.fusedGateUpSwiGLU(
             xRot: xRot,
             packedGate: gateProj.packed, normsGate: gateProj.norms,
             packedUp: upProj.packed, normsUp: upProj.norms,
             codebook: cbGate, rhsIndices: idxFlat,
-            K: K * batchTokens, inFeatures: inputDims, outFeatures: hiddenDims, bits: bits
+            batchTokens: batchTokens, K: K,
+            inFeatures: inputDims, outFeatures: hiddenDims, bits: bits
         )
-        // x_act shape: (K * batchTokens, hidden_dims)
+        // xAct shape: (batchTokens * K, hidden_dims)
 
-        // 3. Hadamard rotate x_act
+        // 3. Hadamard rotate x_act — one row per (token, expert) pair.
         let xActRot = JANGTQKernels.hadamardRotate(xAct, signs: signsDn, dim: hiddenDims)
 
-        // 4. Gather TQ matmul (down_proj)
+        // 4. Gather TQ matmul (down_proj) — per-row mode, one row per pair.
         let y = JANGTQKernels.gatherTQ(
             xRot: xActRot,
             packed: downProj.packed, norms: downProj.norms,
             codebook: cbDown, rhsIndices: idxFlat,
-            K: K * batchTokens, inFeatures: hiddenDims, outFeatures: inputDims, bits: bits
+            nRows: batchTokens * K,
+            inFeatures: hiddenDims, outFeatures: inputDims, bits: bits
         )
-        // y shape: (K * batchTokens, inputDims)
+        // y shape: (batchTokens * K, inputDims)
 
         // Reshape to match SwitchGLU's output: (batch, seq, K, inputDims)
         var outShape = indices.shape

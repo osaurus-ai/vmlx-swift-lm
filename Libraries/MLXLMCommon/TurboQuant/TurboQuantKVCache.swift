@@ -121,6 +121,56 @@ public final class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         super.init()
     }
 
+    // MARK: - Restore from disk
+
+    /// Reload the compressed phase of this cache from already-encoded
+    /// `EncodedKeys`/`EncodedValues` payloads (e.g. coming back from a
+    /// disk fetch). The encoder state is fully deterministic from
+    /// (dim, keyBits, valueBits, seed) so nothing extra needs storing.
+    /// After this call the cache is in `.compressed` phase with the
+    /// supplied offset.
+    public func restoreCompressed(
+        encodedKeys: EncodedKeys,
+        encodedValues: EncodedValues,
+        sourceOffset: Int
+    ) {
+        let dim = encodedKeys.shape.last ?? 0
+        guard dim > 0 else { return }
+        let kBits = encodedKeys.indexBits + 1
+        let vBits = encodedValues.indexBits
+        let seed = encodedKeys.seed
+
+        let state = TQEncoder.EncoderState(
+            dim: dim, keyBits: kBits, valueBits: vBits, seed: seed)
+        self.encoderState = state
+
+        let dKeys = TQEncoder.decodeKeys(encodedKeys, state: state)
+        let dValues = TQEncoder.decodeValues(encodedValues, state: state)
+
+        // Force lazy materialization so MLX doesn't graph 30+ layers at once.
+        MLX.eval(dKeys, dValues)
+
+        self.compressedKeys = encodedKeys
+        self.compressedValues = encodedValues
+        self.decodedKeyBuffer = dKeys
+        self.decodedValueBuffer = dValues
+        self.prefixTokenCount = dKeys.dim(2)
+
+        let B = dKeys.dim(0), H = dKeys.dim(1)
+        let kD = dKeys.dim(3), vD = dValues.dim(3)
+        let windowK = MLXArray.zeros([B, H, windowStep, kD], dtype: dKeys.dtype)
+        let windowV = MLXArray.zeros([B, H, windowStep, vD], dtype: dValues.dtype)
+        self.unifiedKeys = concatenated([dKeys, windowK], axis: 2)
+        self.unifiedValues = concatenated([dValues, windowV], axis: 2)
+        self.windowOffset = 0
+
+        self.phase = .compressed
+        self.offset = sourceOffset
+
+        self.floatKeys = nil
+        self.floatValues = nil
+    }
+
     // MARK: - Create from KVCacheSimple
 
     /// Convert a KVCacheSimple to TurboQuantKVCache by compressing its contents.
