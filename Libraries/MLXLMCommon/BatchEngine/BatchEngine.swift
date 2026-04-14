@@ -389,13 +389,17 @@ public actor BatchEngine {
 
         // Check multi-tier cache for a prefix match before running full prefill.
         // On cache hit, restore KV state and only prefill remaining tokens.
+        //
+        // VLM inputs (image/video) are now supported via `slot.mediaSalt`,
+        // which mixes a pixel fingerprint into the cache-coordinator key so
+        // "same text + same image" hits while "same text + different image"
+        // misses. RotatingKVCache is still skipped because its sliding-window
+        // semantics are incompatible with partial restore.
         var inputForPrepare = slot.originalInput
         let hasRotatingCache = slot.cache.contains { $0 is RotatingKVCache }
-        if let coordinator = cacheCoordinator,
-           slot.originalInput.image == nil, slot.originalInput.video == nil,
-           !hasRotatingCache {
+        if let coordinator = cacheCoordinator, !hasRotatingCache {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
-            let result = coordinator.fetch(tokens: tokenIds)
+            let result = coordinator.fetch(tokens: tokenIds, mediaSalt: slot.mediaSalt)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
                 var restored = false
                 if !blocks.isEmpty {
@@ -605,8 +609,22 @@ public actor BatchEngine {
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
 
         // Store prompt cache state for completed (non-cancelled) generations.
-        // Extract real KV data and SSM states from the slot's cache.
-        if reason != .cancelled, let coordinator = cacheCoordinator {
+        //
+        // Must mirror the fetch-side guard in `stepPrefill` — if the fetch
+        // would have skipped this slot (RotatingKVCache), the store MUST
+        // also skip, otherwise we waste a full KV extraction + disk write
+        // for an entry that can never be matched on the next request.
+        //
+        // Asymmetric store was the root cause of the hybrid-model decode
+        // "cratering" and long-context degradation observed in batch
+        // scenarios: every completed RotatingKVCache request would pay
+        // the full extraction cost for dead data, and memory pool pressure
+        // from the extracted tensors would carry over into the next slot.
+        //
+        // The `mediaSalt` is passed through so the stored key matches the
+        // key the next fetch will look for (VL multi-turn cache hits).
+        let hasRotatingCache = slot.cache.contains { $0 is RotatingKVCache }
+        if reason != .cancelled, let coordinator = cacheCoordinator, !hasRotatingCache {
             let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
             let perLayerData = extractLayerData(from: slot.cache)
             let ssmStates: [MLXArray]? = coordinator.isHybrid
@@ -615,7 +633,8 @@ public actor BatchEngine {
                 promptTokens: promptTokens,
                 perLayerData: perLayerData,
                 ssmStates: ssmStates,
-                cache: slot.cache
+                cache: slot.cache,
+                mediaSalt: slot.mediaSalt
             )
             Self.logger.debug(
                 "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"
@@ -630,5 +649,24 @@ public actor BatchEngine {
             stopReason: reason
         )))
         slot.continuation.finish()
+
+        // Long-context pressure relief: the global memoryPurgeInterval (256
+        // decode steps) is too coarse for long requests where a single slot
+        // can allocate several GB of activations before releasing the pool
+        // back to the allocator. Without this, long-context traffic
+        // degraded subsequent requests by holding onto the pool — manifesting
+        // as decode-speed cratering on the next request submitted.
+        //
+        // Trigger a targeted purge when the just-finished slot had a
+        // non-trivially-long prompt. 4096 tokens is the threshold: short
+        // chat requests skip the extra C call (~100us) while long-context
+        // or document-QA requests reclaim the pool at request boundaries.
+        let longContextPurgeThreshold = 4096
+        if slot.promptTokenCount >= longContextPurgeThreshold {
+            Memory.clearCache()
+            // Reset the global counter too so we don't double-purge on the
+            // next scheduling tick.
+            stepsSinceMemoryPurge = 0
+        }
     }
 }

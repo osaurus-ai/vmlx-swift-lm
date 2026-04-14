@@ -77,6 +77,14 @@ struct BatchSlot {
     /// Prefill step size for this request.
     let prefillStepSize: Int
 
+    /// Stable fingerprint of any VLM image/video content in the input.
+    /// `nil` for text-only requests. Computed once at slot construction and
+    /// passed to the cache coordinator on both fetch (prefill) and store
+    /// (finishSlot) so VLM multi-turn traffic can cache-hit on identical
+    /// media without colliding with text-only entries. See
+    /// ``computeMediaSalt(for:)``.
+    let mediaSalt: String?
+
     // MARK: - Sampling
 
     /// Sample a token from logits, applying processor and sampler.
@@ -118,5 +126,6 @@ extension BatchSlot {
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize
+        self.mediaSalt = computeMediaSalt(for: request.input)
     }
 }
