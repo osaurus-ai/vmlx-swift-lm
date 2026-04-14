@@ -41,6 +41,11 @@ public func loadWeights(
             at: modelDirectory, includingPropertiesForKeys: nil)!
         for case let url as URL in enumerator {
             if url.pathExtension == "safetensors" {
+                // Skip the JANGTQ sidecar — it contains runtime signs/codebook
+                // arrays that go into JANGTQRuntimeCache, not module params.
+                if url.lastPathComponent == "jangtq_runtime.safetensors" {
+                    continue
+                }
                 let (w, m) = try loadArraysAndMetadata(url: url)
                 for (key, value) in w {
                     weights[key] = value
@@ -70,7 +75,9 @@ public func loadWeights(
     // JANG: dequantize MoE gate weights from quantized uint32 → float.
     // Gates are stored at 8-bit (CRITICAL tier) but may have different group_size
     // than the body. Dequantizing resolves ambiguous bit/group_size inference.
-    if let jangConfig, !isJANGTQNative {
+    // Safe for JANGTQ-native too: the dequant only touches `.*.gate.*` keys,
+    // not the `tq_packed`/`tq_norms` expert projections.
+    if let jangConfig {
         JangLoader.dequantizeMoEGates(
             weights: &weights, groupSize: jangConfig.quantization.blockSize,
             bitWidthsUsed: jangConfig.quantization.bitWidthsUsed)
@@ -78,6 +85,9 @@ public func loadWeights(
 
     // Determine quantization: JANG models infer per-layer bit widths from tensor shapes.
     // Standard MLX models use the quantization from config.json as before.
+    // Safe for JANGTQ-native: infer only walks `.scales` keys, so it picks
+    // up the affine 8-bit attention / embed / lm_head and ignores the
+    // tq_packed expert projections.
     let effectivePerLayerQuantization: BaseConfiguration.PerLayerQuantization?
     if let jangConfig {
         effectivePerLayerQuantization = JangLoader.inferPerLayerQuantization(
@@ -155,16 +165,20 @@ public func loadWeights(
     // Convert all float16/float32 parameters to bfloat16 to prevent AsType cascades.
     // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
     // bfloat16 shares float32's exponent range, so promotion is cheaper/eliminated.
-    // Check model.parameters() (not the original weights dict) because the quantize step
-    // above may have created QuantizedLinear modules with float32 scales from MLX.quantized().
-    // JANG models with format:mlx have bfloat16 weights but the quantizer can still produce
-    // float32 scales, causing 1000+ AsType ops if not converted.
-    let allParams = model.parameters().flattened().map { $0.1 }
-    let hasNonBFloat16 = allParams.contains { (arr: MLXArray) in
-        arr.dtype == .float16 || arr.dtype == .float32
-    }
-    if hasNonBFloat16 {
-        convertToBFloat16(model: model)
+    //
+    // JANGTQ bypass: Python baseline runs with fp16 TurboQuant norms, and the
+    // JANGTQ Metal kernels infer their signature from the norm dtype. Casting
+    // those norms to bf16 breaks the gate/up/down projections (verified on
+    // MiniMax M2.7 JANGTQ_2L). JANGTQ dispatches are already fp32 internally,
+    // so there's no fp16↔fp32 ping-pong to collapse. Skip the cast entirely.
+    if !isJANGTQNative {
+        let allParams = model.parameters().flattened().map { $0.1 }
+        let hasNonBFloat16 = allParams.contains { (arr: MLXArray) in
+            arr.dtype == .float16 || arr.dtype == .float32
+        }
+        if hasNonBFloat16 {
+            convertToBFloat16(model: model)
+        }
     }
 
     eval(model)
