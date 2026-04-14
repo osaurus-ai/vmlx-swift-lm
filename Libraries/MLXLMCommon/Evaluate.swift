@@ -733,15 +733,25 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
 
                 if restored {
+                    // Rebuild inputForPrepare with tokens shaped as `[1, T]`
+                    // (2D batch-first). Some model forward paths — notably
+                    // the Qwen3.5 VLM `Qwen35Language.LanguageModel` which
+                    // reads `inputs.dim(1)` to compute position-ids — crash
+                    // with MLX's `SmallVector out of range` (array.cpp:335)
+                    // when fed a 1D tensor. Emitting 2D works uniformly
+                    // because all `callAsFunction` paths either broadcast
+                    // 2D already or tolerate the extra leading axis.
                     if remainingTokens.isEmpty {
                         // Full cache hit — feed just the last token to seed decode.
                         // prepare() needs at least 1 token to produce initial logits.
                         let lastToken = MLXArray([Int32(promptTokenIds.last!)])
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: lastToken),
                             image: nil, video: nil)
                     } else {
                         let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: remainingArray),
                             image: nil, video: nil)

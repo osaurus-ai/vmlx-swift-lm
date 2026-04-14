@@ -3,6 +3,18 @@ import MLX
 @testable import MLXLMCommon
 import Testing
 
+/// SSMStateCache tests are wrapped in a `.serialized` suite because MLX's
+/// Metal command buffer state is process-global. When swift-testing runs
+/// multiple `@Test` bodies concurrently and each allocates its own MLXArray
+/// / runs `.eval()`, the default shared command encoder can get two
+/// concurrent "start encoding" calls and trip the AGX driver's
+/// `tryCoalescingPreviousComputeCommandEncoderWithConfig:nextEncoderClass:`
+/// assertion ("A command encoder is already encoding to this command
+/// buffer"). That's an MLX-level parallelism issue, not a bug in these
+/// tests — each test passes cleanly in isolation. Serializing within the
+/// suite makes `swift test` reliable without needing `--no-parallel`.
+@Suite(.serialized)
+struct SSMStateCacheTests {
 @Test func ssmStateCacheStoreAndFetch() {
     let cache = SSMStateCache(maxEntries: 10)
     let tokens = [1, 2, 3, 4, 5]
@@ -115,4 +127,5 @@ import Testing
     // Different tokens (same boundary) should produce a different key
     let differentTokens = SSMStateCache.makeKey(tokens: [100, 200, 999], boundary: 3)
     #expect(differentTokens != first)
+}
 }
