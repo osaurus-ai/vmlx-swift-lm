@@ -33,7 +33,6 @@ extension LLMModel {
         // shape unchanged, and `y[step...]` would produce an empty `[0, T]`
         // tensor which then crashed the next forward pass with
         // `[reshape] Cannot infer the shape of an empty array`.
-        let originalShape = input.text.tokens.shape
         var flatTokens = input.text.tokens.reshaped([-1])
         var flatMask: MLXArray? = nil
         if let m = input.text.mask {
@@ -55,15 +54,15 @@ extension LLMModel {
             Memory.clearCache()
         }
 
-        // Return the remaining tokens in the original shape (1D or 2D),
-        // so downstream code that inspects `.ndim` sees what it expects.
-        let remaining: MLXArray
-        if originalShape.count >= 2 {
-            remaining = flatTokens[.newAxis, 0...]
-        } else {
-            remaining = flatTokens
-        }
-        return .tokens(LMInput.Text(tokens: remaining, mask: flatMask))
+        // Return the remainder as a 1D `[T]` tensor regardless of the
+        // caller's original rank. Downstream consumers —
+        // `TokenIterator.step(previous:)` and
+        // `BatchEngine.stepPrefill`'s post-prepare forward — both expect
+        // the returned `.tokens` payload to be 1D and add a leading batch
+        // axis themselves before invoking the model. Returning 2D here
+        // would cause them to produce a 3D `[1, 1, T]` input and crash
+        // the forward pass.
+        return .tokens(LMInput.Text(tokens: flatTokens, mask: flatMask))
     }
 
     public func messageGenerator(tokenizer: Tokenizer) -> MessageGenerator {
