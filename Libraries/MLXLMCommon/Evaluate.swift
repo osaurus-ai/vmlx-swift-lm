@@ -1720,9 +1720,17 @@ public func generateTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
+    //
+    // Must mirror the fetch-side guard in `TokenIterator.init` — if the
+    // fetch would have skipped this iterator (RotatingKVCache), the store
+    // MUST also skip, otherwise we waste a full KV extraction + disk
+    // write for an entry that can never be matched on the next request.
+    // See BatchEngine.finishSlot for the same fix in the batch path.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
+        let hasRotatingCache = iterator.cache.contains { $0 is RotatingKVCache }
+        if hasRotatingCache { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache
@@ -1909,9 +1917,13 @@ public func generateTokenTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
+    // Symmetric with TokenIterator fetch guard — skip store for RotatingKVCache
+    // since the ring-buffer state doesn't correspond to the prompt prefix.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
+        let hasRotatingCache = iterator.cache.contains { $0 is RotatingKVCache }
+        if hasRotatingCache { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache

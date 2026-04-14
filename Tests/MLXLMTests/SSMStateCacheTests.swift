@@ -53,7 +53,7 @@ import Testing
     let tokens = [1, 2, 3]
     let boundary = 3
 
-    let original = MLXArray([1.0, 2.0, 3.0, 4.0])
+    let original = MLXArray([1.0, 2.0, 3.0, 4.0] as [Float])
     cache.store(ssmStates: [original], tokens: tokens, boundary: boundary)
 
     // Fetch and modify the returned copy
