@@ -145,6 +145,16 @@ public struct JangLoader: Sendable {
                 return configURL
             }
         }
+        // .jangspec bundles built before the Plan 6 builder update only place
+        // jang_config.json under target/. Fall back to the bundle layout so
+        // those still load without rebuilding the bundle.
+        for name in jangConfigFileNames {
+            let configURL = modelPath.appendingPathComponent("target")
+                .appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: configURL.path) {
+                return configURL
+            }
+        }
         return nil
     }
 

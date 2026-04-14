@@ -59,7 +59,25 @@ public enum LLMTypeRegistry {
             "mimo": create(MiMoConfiguration.self, MiMoModel.init),
             "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
             "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
-            "minimax_m2": create(MiniMaxConfiguration.self, MiniMaxModel.init),
+            "minimax_m2": { data in
+                // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
+                // which swaps the MoE SwitchGLU for TurboQuantSwitchGLU so the
+                // codebook Metal kernels run instead of gather_qmm. Attention
+                // path is unchanged.
+                struct FormatCheck: Codable {
+                    let weightFormat: String?
+                    enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+                }
+                if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+                    check.weightFormat == "mxtq"
+                {
+                    let config = try JSONDecoder.json5().decode(
+                        MiniMaxJANGTQConfiguration.self, from: data)
+                    return MiniMaxJANGTQModel(config)
+                }
+                let config = try JSONDecoder.json5().decode(MiniMaxConfiguration.self, from: data)
+                return MiniMaxModel(config)
+            },
             "glm4": create(GLM4Configuration.self, GLM4Model.init),
             "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
             "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),

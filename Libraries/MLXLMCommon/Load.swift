@@ -26,8 +26,22 @@ public func loadWeights(
     // Resolve symlinks (mlxstudio uses symlinked model directories)
     let modelDirectory = modelDirectory.resolvingSymlinksInPath()
 
-    // JANG v1 models use .jang.safetensors files that need uint8->uint32 repacking
-    if let jangConfig, !jangConfig.isV2, JangLoader.hasV1Weights(at: modelDirectory) {
+    // JANGTQ-native detection: presence of the runtime sidecar means the
+    // bundle ships tq_packed/tq_norms tensors that should be consumed RAW
+    // by TurboQuantSwitchGLU — we must NOT run the MXTQ→affine expander,
+    // the per-layer quant inference, or the MoE-gate dequant.
+    let jangtqSidecarURL = modelDirectory.appendingPathComponent("jangtq_runtime.safetensors")
+    let isJANGTQNative = FileManager.default.fileExists(atPath: jangtqSidecarURL.path)
+
+    // .jangspec bundle: per-expert blobs + hot-core safetensors + flat index.
+    // Read everything via JangSpecBundleLoader, which produces a {key: MLXArray}
+    // dict identical in shape to the standard safetensors enumeration so the
+    // rest of this function (sanitize, MXTQ dequant, per-layer quant inference,
+    // model.update) runs unchanged.
+    if JangSpecBundleLoader.isBundle(at: modelDirectory) {
+        weights = try JangSpecBundleLoader.loadWeights(from: modelDirectory)
+    } else if let jangConfig, !jangConfig.isV2, JangLoader.hasV1Weights(at: modelDirectory) {
+        // JANG v1 models use .jang.safetensors files that need uint8->uint32 repacking
         weights = try JangLoader.loadV1Weights(at: modelDirectory)
     } else {
         let enumerator = FileManager.default.enumerator(
@@ -48,10 +62,37 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // JANG MXTQ (TurboQuant-packed) dequantization.
+    // Detects `.tq_packed` keys and rewrites them into affine
+    // (.weight/.scales/.biases) triplets BEFORE per-model sanitize so that
+    // downstream key-remap / expert-rename logic sees the final parameter
+    // layout. No-op for non-MXTQ JANG models. Skipped when JANGTQ-native
+    // (runtime sidecar present) because those tensors are consumed raw.
+    if let jangConfig, !isJANGTQNative {
+        do {
+            _ = try dequantizeJangMXTQ(weights: &weights, jangConfig: jangConfig)
+        } catch {
+            print("[loadWeights] MXTQ dequant failed: \(error)")
+            throw error
+        }
+    }
+
+    // JANGTQ native: load the signs/codebook sidecar into the runtime cache
+    // before model.update() so TurboQuantSwitchGLU has everything it needs
+    // on first forward.
+    if isJANGTQNative {
+        do {
+            try JANGTQRuntimeCache.shared.loadSidecar(from: jangtqSidecarURL)
+        } catch {
+            print("[loadWeights] JANGTQ sidecar load failed: \(error)")
+            throw error
+        }
+    }
+
     // JANG: dequantize MoE gate weights from quantized uint32 → float.
     // Gates are stored at 8-bit (CRITICAL tier) but may have different group_size
     // than the body. Dequantizing resolves ambiguous bit/group_size inference.
-    if let jangConfig {
+    if let jangConfig, !isJANGTQNative {
         JangLoader.dequantizeMoEGates(
             weights: &weights, groupSize: jangConfig.quantization.blockSize,
             bitWidthsUsed: jangConfig.quantization.bitWidthsUsed)
