@@ -33,6 +33,20 @@ extension LLMModel {
         // shape unchanged, and `y[step...]` would produce an empty `[0, T]`
         // tensor which then crashed the next forward pass with
         // `[reshape] Cannot infer the shape of an empty array`.
+        // This extension is single-sequence only: generation in vmlx-swift-lm
+        // always uses batch=1, and the forward-pass shapes downstream (attention
+        // masking, KV cache append, etc.) assume it. If a caller ever feeds a
+        // truly batched input (dim 0 > 1), the flatten below would interleave
+        // sequences into one; fail fast instead of producing silent garbage.
+        let tokensShape = input.text.tokens.shape
+        if tokensShape.count >= 2 && tokensShape[0] != 1 {
+            fatalError(
+                "LLMModel.prepare expects single-sequence input (batch=1), "
+                + "got shape \(tokensShape). BatchEngine handles multi-sequence "
+                + "batching outside this extension."
+            )
+        }
+
         var flatTokens = input.text.tokens.reshaped([-1])
         var flatMask: MLXArray? = nil
         if let m = input.text.mask {
