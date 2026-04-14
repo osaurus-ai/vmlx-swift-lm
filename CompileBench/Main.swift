@@ -5,9 +5,10 @@ import MLXNN
 @main
 struct CompileBench {
     static func main() {
-        // Override via BENCH_N / BENCH_DIM env vars to sweep.
+        // Override via BENCH_N / BENCH_DIM / BENCH_MODE env vars to sweep.
         let N = Int(ProcessInfo.processInfo.environment["BENCH_N"] ?? "10000") ?? 10000
         let DIM = Int(ProcessInfo.processInfo.environment["BENCH_DIM"] ?? "16") ?? 16
+        let mode = ProcessInfo.processInfo.environment["BENCH_MODE"] ?? "compute_g"
 
         let aLog = MLXRandom.uniform(low: Float(0), high: Float(1), [DIM]).asType(.float32)
         let aArr = MLXRandom.uniform(low: Float(0), high: Float(1), [DIM])
@@ -15,8 +16,25 @@ struct CompileBench {
         eval(aLog, aArr, dtBias)
 
         @Sendable func eager(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-            let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-            return decay.asType(a.dtype)
+            // Isolation modes — each does a minimal chain that tests one
+            // suspect primitive. Compare against Python for per-op attribution.
+            switch mode {
+            case "astype_f32":     return aLog.asType(.float32)
+            case "astype_bf16":    return aLog.asType(.bfloat16)
+            case "astype_back":    return aLog.asType(.float32).asType(.bfloat16)
+            case "softplus":       return softplus(a)
+            case "unary_neg":      return -a
+            case "mul":            return a * dtBias
+            case "exp4":           return exp(exp(exp(exp(a))))
+            case "neg_mul":        return -a * dtBias
+            case "compute_g_no_cast":
+                // compute_g minus the two type casts, to isolate whether the
+                // cast path is the slow one.
+                return exp(-exp(aLog) * softplus(a + dtBias))
+            default:
+                let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+                return decay.asType(a.dtype)
+            }
         }
 
         let compiled: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
