@@ -135,11 +135,21 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///
     /// For hybrid models, SSM companion states are fetched alongside paged cache hits.
     ///
-    /// - Parameter tokens: The full token sequence to look up.
+    /// The `mediaSalt` argument is a stable fingerprint of any VLM image or
+    /// video content associated with the prompt (see ``computeMediaSalt(for:)``).
+    /// When non-`nil` it is mixed into every tier's hash so VLM inputs with
+    /// the same text prefix but different media don't alias. Pass `nil` for
+    /// text-only inputs to preserve the exact pre-existing hash.
+    ///
+    /// - Parameters:
+    ///   - tokens: The full token sequence to look up.
+    ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
-    public func fetch(tokens: [Int]) -> CacheFetchResult {
+    public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
         // Tier 1: Paged cache (in-memory)
-        if let pagedCache, let result = pagedCache.fetchPrefix(tokens: tokens) {
+        if let pagedCache,
+           let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
+        {
             var ssmStates: [MLXArray]? = nil
 
             if isHybrid {
@@ -161,7 +171,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Tier 2: Disk cache (exact match, then one-shorter fallback)
         if let diskCache {
-            if let arrays = diskCache.fetch(tokens: tokens) {
+            if let arrays = diskCache.fetch(tokens: tokens, mediaSalt: mediaSalt) {
                 var ssmStates: [MLXArray]? = nil
                 if isHybrid {
                     ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: tokens.count)
@@ -178,7 +188,7 @@ public final class CacheCoordinator: @unchecked Sendable {
 
             if tokens.count > 1 {
                 let shorter = Array(tokens.dropLast())
-                if let arrays = diskCache.fetch(tokens: shorter) {
+                if let arrays = diskCache.fetch(tokens: shorter, mediaSalt: mediaSalt) {
                     var ssmStates: [MLXArray]? = nil
                     if isHybrid {
                         ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: shorter.count)
@@ -228,7 +238,8 @@ public final class CacheCoordinator: @unchecked Sendable {
         promptTokens: [Int],
         perLayerData: [(keys: MLXArray, values: MLXArray)?],
         ssmStates: [MLXArray]?,
-        cache: [any KVCache]? = nil
+        cache: [any KVCache]? = nil,
+        mediaSalt: String? = nil
     ) {
         let totalTokens = promptTokens.count
         let blockSize = config.pagedBlockSize
@@ -239,7 +250,8 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Store in paged cache
         if let pagedCache {
-            pagedCache.storeTokenSequence(tokens: promptTokens, layerData: blockLayerData)
+            pagedCache.storeTokenSequence(
+                tokens: promptTokens, layerData: blockLayerData, mediaSalt: mediaSalt)
         }
 
         // Store in disk cache
@@ -251,7 +263,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                 // Use TQDiskSerializer for 26x smaller disk footprint.
                 let arrays = TQDiskSerializer.serialize(cache: cache)
                 if !arrays.isEmpty {
-                    diskCache.store(tokens: promptTokens, arrays: arrays)
+                    diskCache.store(
+                        tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
                 }
             } else {
                 // Standard float16 disk path: flatten block layer data into a dictionary.
@@ -263,7 +276,8 @@ public final class CacheCoordinator: @unchecked Sendable {
                     }
                 }
                 if !arrays.isEmpty {
-                    diskCache.store(tokens: promptTokens, arrays: arrays)
+                    diskCache.store(
+                        tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
                 }
             }
         }

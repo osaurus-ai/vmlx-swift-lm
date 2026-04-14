@@ -92,8 +92,8 @@ public final class DiskCache: @unchecked Sendable {
     /// - Parameters:
     ///   - tokens: Token IDs used to compute the cache key hash.
     ///   - arrays: Dictionary of named MLX arrays to persist.
-    public func store(tokens: [Int], arrays: [String: MLXArray]) {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+    public func store(tokens: [Int], arrays: [String: MLXArray], mediaSalt: String? = nil) {
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
 
@@ -139,8 +139,8 @@ public final class DiskCache: @unchecked Sendable {
     ///
     /// - Parameter tokens: Token IDs to look up.
     /// - Returns: The cached arrays if found, or `nil` on a miss.
-    public func fetch(tokens: [Int]) -> [String: MLXArray]? {
-        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey)
+    public func fetch(tokens: [Int], mediaSalt: String? = nil) -> [String: MLXArray]? {
+        let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
 
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -196,10 +196,21 @@ public final class DiskCache: @unchecked Sendable {
     ///   - tokens: The token IDs to hash.
     ///   - modelKey: Optional model identifier for cache isolation.
     /// - Returns: A 32-character lowercase hex string.
-    public static func hashTokens(_ tokens: [Int], modelKey: String? = nil) -> String {
+    public static func hashTokens(
+        _ tokens: [Int],
+        modelKey: String? = nil,
+        mediaSalt: String? = nil
+    ) -> String {
         var hasher = SHA256()
         if let modelKey {
             hasher.update(data: Data(modelKey.utf8))
+        }
+        // Mix the VLM media salt after modelKey so VLM inputs with the same
+        // text prefix but different images/videos land at different hashes.
+        // Passing `nil` preserves the exact pre-existing text-only hash.
+        if let mediaSalt {
+            hasher.update(data: Data("|media:".utf8))
+            hasher.update(data: Data(mediaSalt.utf8))
         }
         tokens.withUnsafeBufferPointer { buffer in
             let rawBuffer = UnsafeRawBufferPointer(buffer)

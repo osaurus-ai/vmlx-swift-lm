@@ -27,6 +27,108 @@ import Testing
     #expect(hashA.count == 64)
 }
 
+@Test func blockHashMediaSaltIsolation() {
+    // VLM cache keying: mediaSalt must distinguish otherwise-identical
+    // token sequences so "same text + different image" doesn't collide.
+    let tokens = [1, 2, 3, 4, 5]
+
+    // Backward-compat: omitting mediaSalt matches explicit-nil exactly.
+    let hashNoSalt = CacheBlock.computeBlockHash(parentHash: nil, tokenIds: tokens)
+    let hashExplicitNil = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens, modelKey: nil, mediaSalt: nil)
+    #expect(hashNoSalt == hashExplicitNil)
+
+    // Text-only (nil salt) is distinct from any salted variant — prevents
+    // a text-only entry from ever satisfying a VLM lookup or vice versa.
+    let hashSaltA = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens, mediaSalt: "imageA-sha256")
+    #expect(hashNoSalt != hashSaltA)
+
+    // Different salts diverge.
+    let hashSaltB = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens, mediaSalt: "imageB-sha256")
+    #expect(hashSaltA != hashSaltB)
+
+    // Same salt is deterministic.
+    let hashSaltAAgain = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens, mediaSalt: "imageA-sha256")
+    #expect(hashSaltA == hashSaltAAgain)
+
+    // mediaSalt and modelKey are independent salt sources.
+    let hashSaltAModelX = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens,
+        modelKey: "model-x", mediaSalt: "imageA-sha256")
+    let hashSaltAModelY = CacheBlock.computeBlockHash(
+        parentHash: nil, tokenIds: tokens,
+        modelKey: "model-y", mediaSalt: "imageA-sha256")
+    #expect(hashSaltAModelX != hashSaltAModelY)
+    #expect(hashSaltAModelX != hashSaltA)
+}
+
+@Test func computeMediaSaltDeterminism() {
+    // Build a fake "image" from a constant seed so the test is reproducible.
+    // 3x8x8 uint8 mimics a tiny patch tensor.
+    let pixelsA = MLXArray(
+        Array(0..<(3 * 8 * 8)).map { UInt8($0 % 256) },
+        [3, 8, 8])
+    let pixelsA2 = MLXArray(
+        Array(0..<(3 * 8 * 8)).map { UInt8($0 % 256) },
+        [3, 8, 8])
+    let pixelsB = MLXArray(
+        Array(0..<(3 * 8 * 8)).map { UInt8((255 - $0) % 256) },
+        [3, 8, 8])
+
+    let imageA = LMInput.ProcessedImage(pixels: pixelsA)
+    let imageA2 = LMInput.ProcessedImage(pixels: pixelsA2)
+    let imageB = LMInput.ProcessedImage(pixels: pixelsB)
+
+    let tokens = MLXArray([Int32(1), 2, 3])
+    let text = LMInput.Text(tokens: tokens)
+
+    let inputTextOnly = LMInput(text: text)
+    let inputWithA = LMInput(text: text, image: imageA)
+    let inputWithA2 = LMInput(text: text, image: imageA2)
+    let inputWithB = LMInput(text: text, image: imageB)
+
+    let saltNone = computeMediaSalt(for: inputTextOnly)
+    let saltA = computeMediaSalt(for: inputWithA)
+    let saltA2 = computeMediaSalt(for: inputWithA2)
+    let saltB = computeMediaSalt(for: inputWithB)
+
+    // Text-only inputs get nil so we preserve the exact text-only hashing.
+    #expect(saltNone == nil)
+
+    // Identical pixel contents produce identical salts regardless of which
+    // MLXArray instance holds them.
+    #expect(saltA != nil)
+    #expect(saltA == saltA2)
+
+    // Different pixel contents produce different salts.
+    #expect(saltA != saltB)
+
+    // Salts are 64-hex SHA256 digests.
+    #expect(saltA?.count == 64)
+}
+
+@Test func diskCacheHashMediaSaltIsolation() {
+    let tokens = [10, 20, 30, 40]
+
+    // Backward-compat: nil salt matches omitted salt.
+    let noSalt = DiskCache.hashTokens(tokens)
+    let explicitNil = DiskCache.hashTokens(tokens, modelKey: nil, mediaSalt: nil)
+    #expect(noSalt == explicitNil)
+
+    // Salted variant differs from unsalted.
+    let salted = DiskCache.hashTokens(tokens, mediaSalt: "abc123")
+    #expect(noSalt != salted)
+
+    // Determinism and pairwise distinctness across salts.
+    let saltedAgain = DiskCache.hashTokens(tokens, mediaSalt: "abc123")
+    #expect(salted == saltedAgain)
+    let otherSalt = DiskCache.hashTokens(tokens, mediaSalt: "def456")
+    #expect(salted != otherSalt)
+}
+
 @Test func cacheBlockRefCounting() {
     let block = CacheBlock(blockId: 0, blockSize: 32)
     #expect(block.refCount == 0)

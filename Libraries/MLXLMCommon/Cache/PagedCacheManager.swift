@@ -207,7 +207,8 @@ public final class PagedCacheManager: @unchecked Sendable {
     ///     contains one `(keys, values)` tuple per transformer layer.
     public func storeTokenSequence(
         tokens: [Int],
-        layerData: [[(keys: MLXArray, values: MLXArray)]]
+        layerData: [[(keys: MLXArray, values: MLXArray)]],
+        mediaSalt: String? = nil
     ) {
         lock.lock()
         defer { lock.unlock() }
@@ -218,7 +219,9 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         while offset + blockSize <= tokens.count {
             let chunk = Array(tokens[offset..<(offset + blockSize)])
-            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk, modelKey: modelKey)
+            let hash = CacheBlock.computeBlockHash(
+                parentHash: parentHash, tokenIds: chunk,
+                modelKey: modelKey, mediaSalt: mediaSalt)
 
             // Skip if this block already exists in the cache.
             if hashMap.find(hash: hash) != nil {
@@ -253,7 +256,7 @@ public final class PagedCacheManager: @unchecked Sendable {
     /// - Parameter tokens: The full token sequence to match.
     /// - Returns: A ``PrefixFetchResult`` describing how many tokens matched
     ///   and which blocks hold the cached data, or `nil` if no prefix matches.
-    public func fetchPrefix(tokens: [Int]) -> PrefixFetchResult? {
+    public func fetchPrefix(tokens: [Int], mediaSalt: String? = nil) -> PrefixFetchResult? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -263,7 +266,9 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         while offset + blockSize <= tokens.count {
             let chunk = Array(tokens[offset..<(offset + blockSize)])
-            let hash = CacheBlock.computeBlockHash(parentHash: parentHash, tokenIds: chunk, modelKey: modelKey)
+            let hash = CacheBlock.computeBlockHash(
+                parentHash: parentHash, tokenIds: chunk,
+                modelKey: modelKey, mediaSalt: mediaSalt)
 
             if let block = _findCachedBlock(hash: hash) {
                 matchedBlocks.append(block)

@@ -598,6 +598,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt token IDs captured at init for cache store after generation.
     let promptTokenIds: [Int]
 
+    /// Stable fingerprint of any VLM image/video content in the input.
+    /// `nil` for text-only inputs. Mixed into cache-coordinator keys so
+    /// VLM multi-turn conversations can cache-hit on identical media,
+    /// and won't collide with text-only entries. See `computeMediaSalt`.
+    let mediaSalt: String?
+
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
@@ -629,6 +635,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -675,15 +682,26 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.promptTokenIds = []
         }
 
+        // Compute a stable fingerprint of any image/video content once at
+        // init, so both the pre-prepare fetch below and the post-generation
+        // store see the same salt. Text-only inputs get nil here, which
+        // preserves the exact pre-existing text-only cache hashing.
+        self.mediaSalt = computeMediaSalt(for: input)
+
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.
+        //
+        // VLM inputs (image/video) are now supported: the mediaSalt computed
+        // above is mixed into the cache keys by the coordinator, so "same
+        // text prefix + same image" hits while "same text + different image"
+        // misses. Previously any image/video bypassed the cache entirely,
+        // wasting a full vision-tower encode and prefill on every turn.
         var inputForPrepare = input
         let hasRotatingCache = self.cache.contains { $0 is RotatingKVCache }
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty,
-           input.image == nil, input.video == nil,
            !hasRotatingCache {
-            // Text-only cache, no RotatingKVCache (partial restore causes offset mismatch)
-            let result = coordinator.fetch(tokens: promptTokenIds)
+            let result = coordinator.fetch(
+                tokens: promptTokenIds, mediaSalt: mediaSalt)
             switch result {
             case .hit(_, let remainingTokens, let detail, let blocks, let ssmStates, let diskArrays):
                 var restored = false
@@ -777,6 +795,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -1705,6 +1724,7 @@ public func generateTask(
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
+        let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache
         let perLayerData = extractLayerData(from: rawCache)
         let ssmStates: [MLXArray]? = coordinator.isHybrid
@@ -1718,7 +1738,8 @@ public func generateTask(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
                 ssmStates: ssmCapture,
-                cache: cacheCapture
+                cache: cacheCapture,
+                mediaSalt: capturedMediaSalt
             )
         }
     }()
@@ -1892,6 +1913,7 @@ public func generateTokenTask(
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
+        let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache
         let perLayerData = extractLayerData(from: rawCache)
         let ssmStates: [MLXArray]? = coordinator.isHybrid
@@ -1904,7 +1926,8 @@ public func generateTokenTask(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
                 ssmStates: ssmCapture,
-                cache: cacheCapture
+                cache: cacheCapture,
+                mediaSalt: capturedMediaSalt
             )
         }
     }()
