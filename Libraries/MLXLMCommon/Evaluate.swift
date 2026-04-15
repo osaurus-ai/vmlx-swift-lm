@@ -697,9 +697,14 @@ public struct TokenIterator: TokenIteratorProtocol {
         // misses. Previously any image/video bypassed the cache entirely,
         // wasting a full vision-tower encode and prefill on every turn.
         var inputForPrepare = input
-        let hasRotatingCache = self.cache.contains { $0 is RotatingKVCache }
-        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty,
-           !hasRotatingCache {
+        // SLIDING-1 (2026-04-15): the legacy guard `!hasRotatingCache` was
+        // removed once `TQDiskSerializer` v2 + `restoreRotatingLayer` /
+        // `restoreFromV2Arrays` learned to round-trip the ring buffer +
+        // 5-tuple `metaState` cleanly. Sliding-window models (Gemma3,
+        // Gemma3n, Gemma4 SWA layers, Mistral4 with maxKVSize, MiMoV2Flash,
+        // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
+        // persistence + paged restore on cache hit.
+        if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
             let result = coordinator.fetch(
                 tokens: promptTokenIds, mediaSalt: mediaSalt)
             switch result {
@@ -1731,16 +1736,13 @@ public func generateTask(
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
     //
-    // Must mirror the fetch-side guard in `TokenIterator.init` — if the
-    // fetch would have skipped this iterator (RotatingKVCache), the store
-    // MUST also skip, otherwise we waste a full KV extraction + disk
-    // write for an entry that can never be matched on the next request.
-    // See BatchEngine.finishSlot for the same fix in the batch path.
+    // SLIDING-1 (2026-04-15): the legacy `!hasRotatingCache` early-out
+    // is gone now that `TQDiskSerializer` v2 handles ring-buffer state
+    // round-trip via the `.rotating` `LayerKind`. Sliding-window models
+    // get full L2 disk persistence on the same code path as standard KV.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
-        let hasRotatingCache = iterator.cache.contains { $0 is RotatingKVCache }
-        if hasRotatingCache { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache
@@ -1927,13 +1929,10 @@ public func generateTokenTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
-    // Symmetric with TokenIterator fetch guard — skip store for RotatingKVCache
-    // since the ring-buffer state doesn't correspond to the prompt prefix.
+    // SLIDING-1: rotating cache now persists to disk via the v2 schema.
     let cacheStoreAction: (@Sendable () -> Void)? = {
         guard let coordinator = iterator.cacheCoordinator,
               !iterator.promptTokenIds.isEmpty else { return nil }
-        let hasRotatingCache = iterator.cache.contains { $0 is RotatingKVCache }
-        if hasRotatingCache { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
         let rawCache = iterator.cache

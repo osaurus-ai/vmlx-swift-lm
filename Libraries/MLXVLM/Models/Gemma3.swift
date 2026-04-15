@@ -1002,12 +1002,22 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         // Use causal masking for text generation
         let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
 
-        let result = languageModel(
-            nil,  // Pass nil for tokens when using embeddings
-            cache: convertedCache,
+        // Chunked prefill — vmlx #50/#51. `.causal` mask mode is applied
+        // per-chunk inside the LM, so slicing the embedding along axis 1
+        // is safe. Without chunking, multi-image / long-image prompts
+        // exceed the Metal single-buffer cap on large MoE models.
+        let result = chunkedPrefillEmbedding(
             inputEmbedding: inputEmbeddings,
-            mask: maskMode
-        )
+            cache: convertedCache,
+            prefillStepSize: windowSize ?? 512
+        ) { chunk in
+            languageModel(
+                nil,  // Pass nil for tokens when using embeddings
+                cache: convertedCache,
+                inputEmbedding: chunk,
+                mask: maskMode
+            )
+        }
 
         return .logits(result)
     }

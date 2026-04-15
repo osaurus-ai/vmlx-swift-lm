@@ -254,20 +254,32 @@ public final class CacheCoordinator: @unchecked Sendable {
                 tokens: promptTokens, layerData: blockLayerData, mediaSalt: mediaSalt)
         }
 
-        // Store in disk cache
+        // Store in disk cache.
+        //
+        // SLIDING-1: when the raw cache is available, use the v2
+        // `TQDiskSerializer.serialize(cache:)` path unconditionally. The
+        // v2 schema tags every layer with its `LayerKind` (kvSimple,
+        // tqCompressed, qkv, mamba, rotating, kv) so RotatingKVCache,
+        // MambaCache and QuantizedKVCache layers all round-trip to disk
+        // — previously only the standard KV layers reached disk because
+        // the legacy path filtered everything else via
+        // `splitLayerDataIntoBlocks`. This is what enables full L2
+        // disk persistence for sliding-window models (Gemma3/Gemma4
+        // SWA layers, Mistral4 with maxKVSize, MiMoV2Flash, BaichuanM1,
+        // Qwen3.5-VL inherited sliding layers).
         if let diskCache {
-            // Check if any layer in the raw cache is TQ-compressed.
-            let hasTQ = cache?.contains(where: { TQDiskSerializer.isTQCompressed($0) }) ?? false
-
-            if hasTQ, let cache {
-                // Use TQDiskSerializer for 26x smaller disk footprint.
+            if let cache {
                 let arrays = TQDiskSerializer.serialize(cache: cache)
                 if !arrays.isEmpty {
                     diskCache.store(
                         tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
                 }
             } else {
-                // Standard float16 disk path: flatten block layer data into a dictionary.
+                // Legacy fallback when the caller didn't pass the raw cache:
+                // use the per-block flatten path so existing call sites
+                // don't regress. Only standard KV layers reach disk on
+                // this path; sliding/mamba/qkv layers are silently
+                // dropped, same as before SLIDING-1.
                 var arrays: [String: MLXArray] = [:]
                 for (blockIdx, block) in blockLayerData.enumerated() {
                     for (layerIdx, kv) in block.enumerated() {

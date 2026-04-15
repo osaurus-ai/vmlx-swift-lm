@@ -396,8 +396,12 @@ public actor BatchEngine {
         // misses. RotatingKVCache is still skipped because its sliding-window
         // semantics are incompatible with partial restore.
         var inputForPrepare = slot.originalInput
-        let hasRotatingCache = slot.cache.contains { $0 is RotatingKVCache }
-        if let coordinator = cacheCoordinator, !hasRotatingCache {
+        // SLIDING-1: legacy `!hasRotatingCache` guard removed — v2 schema
+        // round-trips ring buffer + 5-tuple metaState via `.rotating`
+        // LayerKind. Sliding-window models (Gemma3/Gemma4 SWA, Mistral4
+        // with maxKVSize, MiMoV2Flash, BaichuanM1, Qwen3.5-VL inherited)
+        // now hit paged + L2 disk on the same path as standard KV.
+        if let coordinator = cacheCoordinator {
             let tokenIds = slot.originalInput.text.tokens.asArray(Int.self)
             let result = coordinator.fetch(tokens: tokenIds, mediaSalt: slot.mediaSalt)
             if case .hit(_, let remaining, let detail, let blocks, let ssmStates, let diskArrays) = result {
@@ -610,21 +614,12 @@ public actor BatchEngine {
 
         // Store prompt cache state for completed (non-cancelled) generations.
         //
-        // Must mirror the fetch-side guard in `stepPrefill` — if the fetch
-        // would have skipped this slot (RotatingKVCache), the store MUST
-        // also skip, otherwise we waste a full KV extraction + disk write
-        // for an entry that can never be matched on the next request.
-        //
-        // Asymmetric store was the root cause of the hybrid-model decode
-        // "cratering" and long-context degradation observed in batch
-        // scenarios: every completed RotatingKVCache request would pay
-        // the full extraction cost for dead data, and memory pool pressure
-        // from the extracted tensors would carry over into the next slot.
-        //
-        // The `mediaSalt` is passed through so the stored key matches the
-        // key the next fetch will look for (VL multi-turn cache hits).
-        let hasRotatingCache = slot.cache.contains { $0 is RotatingKVCache }
-        if reason != .cancelled, let coordinator = cacheCoordinator, !hasRotatingCache {
+        // SLIDING-1 (2026-04-15): the legacy `!hasRotatingCache` guard
+        // was removed once the v2 `TQDiskSerializer` learned to round-trip
+        // ring buffer + 5-tuple metaState via `.rotating` LayerKind. The
+        // `mediaSalt` is passed through so the stored key matches the key
+        // the next fetch will look for (VL multi-turn cache hits).
+        if reason != .cancelled, let coordinator = cacheCoordinator {
             let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
             let perLayerData = extractLayerData(from: slot.cache)
             let ssmStates: [MLXArray]? = coordinator.isHybrid

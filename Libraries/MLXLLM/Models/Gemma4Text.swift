@@ -310,15 +310,27 @@ class Gemma4Attention: Module {
             }
         }
 
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: cachedKeys,
-            values: cachedValues,
-            scale: scale,
-            mask: mask
+        // vmlx #52: Gemma 4 attention scores can exceed fp16 max
+        // (±65504) on long contexts, especially in combination with
+        // the final-logit softcap amplifying tails. Promote Q/K/V to
+        // fp32 for the SDPA, then cast the result back to the
+        // original dtype. Mirrors the Python v1.3.29 patch and the
+        // VLM-side fix in Libraries/MLXVLM/Models/Gemma4.swift.
+        // Critical for the sliding-window layers in particular —
+        // sliding window concentrates attention on a smaller key set
+        // so individual scores climb faster as context grows.
+        let origDType = queries.dtype
+        var qF = queries, kF = cachedKeys, vF = cachedValues
+        if origDType == .float16 {
+            qF = qF.asType(.float32)
+            kF = kF.asType(.float32)
+            vF = vF.asType(.float32)
+        }
+        var sdpa = MLXFast.scaledDotProductAttention(
+            queries: qF, keys: kF, values: vF, scale: scale, mask: mask
         )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        if origDType == .float16 { sdpa = sdpa.asType(.float16) }
+        let output = sdpa.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         return (outputProj(output), cachedKeys, cachedValues, usedOffset)
     }

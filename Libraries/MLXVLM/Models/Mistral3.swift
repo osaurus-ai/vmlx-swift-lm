@@ -745,7 +745,19 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes: imageSizes
         )
 
-        let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
+        // Chunked prefill — vmlx #50/#51. Inner model does
+        // `if let inputsEmbeds { h = inputsEmbeds } else { h = embedTokens(inputs) }`,
+        // so `inputs` is ignored when embeds is non-nil. `h.dim(1)` drives
+        // attention-scale length, which reflects the per-chunk embedding.
+        // Without chunking, large-image prompts (100k+ token embeddings)
+        // blow past the Metal single-buffer cap on the bigger MoE models.
+        let logits = chunkedPrefillEmbedding(
+            inputEmbedding: embeddings,
+            cache: cache,
+            prefillStepSize: windowSize ?? 512
+        ) { chunk in
+            languageModel(inputIds, cache: cache, inputsEmbeds: chunk)
+        }
         return .logits(.init(logits: logits))
     }
 

@@ -311,9 +311,23 @@ private class VisionAttn: Module {
         q = applyMultidimensionalRope(q, positions: positions, base: ropeBase)
         k = applyMultidimensionalRope(k, positions: positions, base: ropeBase)
         q = q.transposed(0, 2, 1, 3); k = k.transposed(0, 2, 1, 3); v = v.transposed(0, 2, 1, 3)
-        let out = MLXFast.scaledDotProductAttention(
+        // vmlx #52: Gemma 4 vision tower weights are float16 and attention
+        // scores can exceed ±65504, producing -inf → NaN propagation through
+        // embed_vision → model emits only <pad> tokens. Promote Q/K/V to
+        // float32 for the SDPA, then cast back. Mirrors the Python
+        // v1.3.29 patch.
+        let origDType = q.dtype
+        if origDType == .float16 {
+            q = q.asType(.float32)
+            k = k.asType(.float32)
+            v = v.asType(.float32)
+        }
+        var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: 1.0,
             mask: mask != nil ? .array(mask!) : .none)
+        if origDType == .float16 {
+            out = out.asType(.float16)
+        }
         return oProj(out.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 }
@@ -551,8 +565,22 @@ private class TextAttn: Module {
             q = applyRotaryPosition(rope, to: q, cache: cache)
             if let cache { (cK, cV) = cache.update(keys: kT, values: vT) } else { (cK, cV) = (kT, vT) }
         }
-        let out = MLXFast.scaledDotProductAttention(queries: q, keys: cK, values: cV, scale: scale, mask: mask)
-            .transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        // vmlx #52 text-path: Gemma 4 text attention scores can exceed
+        // fp16 max (±65504) on long contexts, especially in combination
+        // with the final-logit softcap amplifying tails. Mirror the
+        // vision-tower fp32 upcast when the activation dtype is fp16.
+        // Critical for sliding-window layers since the windowed key set
+        // concentrates softmax mass on fewer entries.
+        let origDType = q.dtype
+        var qF = q, kF = cK, vF = cV
+        if origDType == .float16 {
+            qF = qF.asType(.float32)
+            kF = kF.asType(.float32)
+            vF = vF.asType(.float32)
+        }
+        var sdpa = MLXFast.scaledDotProductAttention(queries: qF, keys: kF, values: vF, scale: scale, mask: mask)
+        if origDType == .float16 { sdpa = sdpa.asType(.float16) }
+        let out = sdpa.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         return (oP(out), cK, cV, off)
     }
 }
