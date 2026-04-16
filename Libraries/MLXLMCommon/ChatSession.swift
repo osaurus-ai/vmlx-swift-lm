@@ -400,6 +400,21 @@ public final class ChatSession {
                     // prepare the input
                     messages.append(message.consume())
 
+                    // Preserve the active user turn across continuations.
+                    // Chat templates like Qwen3/3.5 scan `messages[::-1]`
+                    // for the last user query and raise when none is
+                    // found; if we only forward .tool(result) on turn 2
+                    // they throw "No user query found in messages."
+                    // Keep a pointer to the most recent user message and
+                    // re-prepend it on every restart so the template
+                    // always has a user anchor, even when the KV cache
+                    // already contains that turn's prefill.
+                    var anchorUserMessage: Chat.Message?
+                    for m in messages.reversed() where m.role == .user {
+                        anchorUserMessage = m
+                        break
+                    }
+
                     // loop can restart on tool calls
                     restart: while !messages.isEmpty {
                         let userInput = UserInput(
@@ -445,6 +460,15 @@ public final class ChatSession {
                         if let toolDispatch, !pendingToolCalls.isEmpty,
                             !Task.isCancelled
                         {
+                            // Re-prepend the anchor user message so the
+                            // chat template sees a user turn ahead of
+                            // the .tool result(s) on the next iteration.
+                            // The KV cache already covers the anchor's
+                            // tokens so this is essentially free at
+                            // inference time.
+                            if let anchor = anchorUserMessage {
+                                messages.append(anchor)
+                            }
                             for toolCall in pendingToolCalls {
                                 let toolResult = try await toolDispatch(toolCall)
                                 messages.append(.tool(toolResult))
