@@ -39,7 +39,25 @@ public enum LLMTypeRegistry {
             "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
             "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
             "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
-            "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
+            "qwen3_5_moe": { data in
+                // Peek at weight_format — "mxtq" routes to the JANGTQ variant,
+                // which swaps the routed-expert SwitchGLU for TurboQuantSwitchGLU
+                // so the codebook Metal kernels run instead of gather_qmm.
+                // Same model_type is reused by Qwen 3.6.
+                struct FormatCheck: Codable {
+                    let weightFormat: String?
+                    enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+                }
+                if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+                    check.weightFormat == "mxtq"
+                {
+                    let config = try JSONDecoder.json5().decode(
+                        Qwen35JANGTQConfiguration.self, from: data)
+                    return Qwen35JANGTQModel(config)
+                }
+                let config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: data)
+                return Qwen35MoEModel(config)
+            },
             "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         ]
     }
