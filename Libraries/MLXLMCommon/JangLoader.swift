@@ -100,6 +100,161 @@ public struct JangRuntime: Sendable, Equatable {
     }
 }
 
+/// Capability hints stamped into `jang_config.json` by the JANG converter.
+///
+/// Allows downstream consumers (osaurus, llm-tool, etc.) to pick the right
+/// reasoning / tool-call parser without hard-coding per-model branching.
+/// All fields are optional — missing values mean "unknown, fall back to
+/// model-type heuristics."
+///
+/// Field naming is intentionally lenient: aliases produced by the JANG
+/// converter (e.g. `tool_parser: "qwen"` instead of vmlx's canonical
+/// `"xml_function"`) are normalized at consumption time by
+/// `ToolCallFormat.fromCapabilityName(_:)` and
+/// `ReasoningParser.fromCapabilityName(_:)`.
+public struct JangCapabilities: Sendable {
+    /// Reasoning-tag style. Known values: `qwen3`, `deepseek_r1`,
+    /// `think_xml` (all → `<think>...</think>`); `mistral`, `gemma4`, `none`
+    /// (no reasoning tags emitted). `nil` means unknown.
+    public let reasoningParser: String?
+
+    /// Tool-call format. Known values: `qwen`, `qwen3_coder` → `xml_function`;
+    /// `minimax` → `minimax_m2`; `glm47`, `deepseek` → `glm4`; `nemotron` →
+    /// `xml_function`; plus any canonical `ToolCallFormat` rawValue. `nil`
+    /// means unknown.
+    public let toolParser: String?
+
+    /// Whether the model's chat template natively gates `<think>` blocks
+    /// behind an `enable_thinking` flag. Consumers may flip this flag to
+    /// suppress / require reasoning per request.
+    public let thinkInTemplate: Bool?
+
+    /// Whether the model is trained to emit tool calls.
+    public let supportsTools: Bool?
+
+    /// Whether the model is trained to emit reasoning blocks.
+    public let supportsThinking: Bool?
+
+    /// Family bucket for UI/registry grouping (e.g. `qwen3_5`, `gemma4`).
+    public let family: String?
+
+    /// `text` or `vision`. Hint for UI affordances; vmlx detects vision
+    /// support from the model class itself.
+    public let modality: String?
+
+    /// `kv`, `hybrid`, or `mla`. Hint for cache/memory budgeting. vmlx
+    /// engine selects the actual cache type from the model class — `mla`
+    /// is currently a forward-looking hint (vmlx falls back to standard
+    /// KV for MLA models).
+    public let cacheType: String?
+
+    public init(
+        reasoningParser: String? = nil,
+        toolParser: String? = nil,
+        thinkInTemplate: Bool? = nil,
+        supportsTools: Bool? = nil,
+        supportsThinking: Bool? = nil,
+        family: String? = nil,
+        modality: String? = nil,
+        cacheType: String? = nil
+    ) {
+        self.reasoningParser = reasoningParser
+        self.toolParser = toolParser
+        self.thinkInTemplate = thinkInTemplate
+        self.supportsTools = supportsTools
+        self.supportsThinking = supportsThinking
+        self.family = family
+        self.modality = modality
+        self.cacheType = cacheType
+    }
+
+    /// Source of a parser resolution — used for telemetry and so callers
+    /// can log `detection_source=jang_stamped` when the JANG capabilities
+    /// stamp wins, vs `detection_source=model_type_heuristic` when the
+    /// loader had to fall back.
+    public enum ResolutionSource: String, Sendable {
+        /// Resolved from `jang_config.json["capabilities"]`.
+        case jangStamped = "jang_stamped"
+        /// Resolved from `config.json["model_type"]` heuristic (no stamp,
+        /// or stamp value was unrecognised).
+        case modelTypeHeuristic = "model_type_heuristic"
+        /// Neither stamp nor heuristic resolved a parser.
+        case none = "none"
+    }
+}
+
+/// Convenience facade for resolving parsers with explicit precedence.
+///
+/// Precedence (per vmlx-swift-lm production contract — matches the
+/// Tier-1/Tier-2 split osaurus's engine uses):
+/// 1. **JANG stamp wins** when present and value resolves.
+/// 2. Otherwise fall back to `model_type` heuristic
+///    (`ToolCallFormat.infer(from:)`).
+/// 3. Otherwise `nil` (caller can render raw).
+///
+/// Designed so consumers can call this once and log a single
+/// `detection_source=` value for diagnostics.
+public enum ParserResolution {
+
+    /// Resolve a `ReasoningParser` for a model.
+    ///
+    /// - Parameters:
+    ///   - capabilities: the `JangCapabilities` block from `jang_config.json`
+    ///     (pass `nil` for non-JANG models).
+    ///   - modelType: the `model_type` field from `config.json` — used as
+    ///     a heuristic fallback when no stamp is present.
+    /// - Returns: a parser instance and the source it came from. The
+    ///   parser is `nil` for models that don't emit reasoning (Mistral 4,
+    ///   Gemma 4) — callers should skip parsing and stream raw.
+    public static func reasoning(
+        capabilities: JangCapabilities?,
+        modelType: String?
+    ) -> (parser: ReasoningParser?, source: JangCapabilities.ResolutionSource) {
+        if let cap = capabilities, cap.reasoningParser != nil {
+            // Stamped — honour exactly. `nil` is a valid stamp meaning
+            // "this model emits no reasoning".
+            return (
+                ReasoningParser.fromCapabilityName(cap.reasoningParser),
+                .jangStamped
+            )
+        }
+        // Heuristic by model_type. We treat any model_type that hasn't
+        // been listed as `mistral`/`gemma`/`gemma4` as potentially
+        // reasoning-capable and return a default `<think>...</think>`
+        // parser. This matches Qwen 3.5 / 3.6 / DeepSeek / GLM / Nemotron
+        // behaviour. False positives are harmless — the parser only
+        // splits when it sees actual `<think>` markers in the stream.
+        guard let modelType, !modelType.isEmpty else {
+            return (nil, .none)
+        }
+        let t = modelType.lowercased()
+        if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+            return (nil, .modelTypeHeuristic)
+        }
+        return (ReasoningParser(), .modelTypeHeuristic)
+    }
+
+    /// Resolve a `ToolCallFormat` for a model.
+    ///
+    /// - Parameters:
+    ///   - capabilities: stamped capabilities, or `nil`.
+    ///   - modelType: `model_type` from `config.json` for heuristic fallback.
+    public static func toolCall(
+        capabilities: JangCapabilities?,
+        modelType: String?
+    ) -> (format: ToolCallFormat?, source: JangCapabilities.ResolutionSource) {
+        if let cap = capabilities,
+            let stamped = ToolCallFormat.fromCapabilityName(cap.toolParser)
+        {
+            return (stamped, .jangStamped)
+        }
+        if let modelType, let inferred = ToolCallFormat.infer(from: modelType) {
+            return (inferred, .modelTypeHeuristic)
+        }
+        return (nil, .none)
+    }
+}
+
 /// Parsed JANG model configuration from jang_config.json.
 public struct JangConfig: Sendable {
     public let format: String
@@ -110,13 +265,19 @@ public struct JangConfig: Sendable {
     public let architecture: JangArchitecture
     public let runtime: JangRuntime
 
+    /// Optional capability stamp from the JANG converter. `nil` for
+    /// pre-stamp models — consumers should fall back to model-type
+    /// heuristics.
+    public let capabilities: JangCapabilities?
+
     public init(
         format: String = "jang",
         formatVersion: String = "2.0",
         quantization: JangQuantization = JangQuantization(),
         sourceModel: JangSourceModel = JangSourceModel(),
         architecture: JangArchitecture = JangArchitecture(),
-        runtime: JangRuntime = JangRuntime()
+        runtime: JangRuntime = JangRuntime(),
+        capabilities: JangCapabilities? = nil
     ) {
         self.format = format
         self.formatVersion = formatVersion
@@ -124,6 +285,7 @@ public struct JangConfig: Sendable {
         self.sourceModel = sourceModel
         self.architecture = architecture
         self.runtime = runtime
+        self.capabilities = capabilities
     }
 }
 
@@ -235,13 +397,30 @@ public struct JangLoader: Sendable {
             runtime = JangRuntime()
         }
 
+        let capabilities: JangCapabilities?
+        if let cDict = json["capabilities"] as? [String: Any] {
+            capabilities = JangCapabilities(
+                reasoningParser: cDict["reasoning_parser"] as? String,
+                toolParser: cDict["tool_parser"] as? String,
+                thinkInTemplate: cDict["think_in_template"] as? Bool,
+                supportsTools: cDict["supports_tools"] as? Bool,
+                supportsThinking: cDict["supports_thinking"] as? Bool,
+                family: cDict["family"] as? String,
+                modality: cDict["modality"] as? String,
+                cacheType: cDict["cache_type"] as? String
+            )
+        } else {
+            capabilities = nil
+        }
+
         return JangConfig(
             format: format,
             formatVersion: formatVersion,
             quantization: quantization,
             sourceModel: sourceModel,
             architecture: architecture,
-            runtime: runtime
+            runtime: runtime,
+            capabilities: capabilities
         )
     }
 

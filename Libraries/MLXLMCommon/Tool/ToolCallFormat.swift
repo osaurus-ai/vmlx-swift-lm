@@ -177,4 +177,68 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         return nil
     }
+
+    /// Resolve a `JangCapabilities.toolParser` value into a canonical
+    /// `ToolCallFormat`.
+    ///
+    /// The JANG converter stamps short, family-style names (`qwen`,
+    /// `minimax`, `glm47`, `deepseek`, `nemotron`, `gemma4`, `mistral`)
+    /// rather than vmlx's enum raw values (`xml_function`, `minimax_m2`,
+    /// `glm4`, ...). This factory accepts both spellings plus the
+    /// vLLM-ecosystem standard `qwen3_coder`.
+    ///
+    /// Returns `nil` when the name is unknown or empty — callers should
+    /// fall back to `infer(from: model_type)`.
+    public static func fromCapabilityName(_ name: String?) -> ToolCallFormat? {
+        guard let name, !name.isEmpty else { return nil }
+        let n = name.lowercased()
+
+        // Direct rawValue match first (e.g. "xml_function", "minimax_m2").
+        if let direct = ToolCallFormat(rawValue: n) {
+            return direct
+        }
+
+        switch n {
+        // Qwen 3.5 / 3.6 family — XML-style <tool_call>…</tool_call>
+        // (vLLM ecosystem name `qwen3_coder` aliased here).
+        case "qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
+            "qwen3_coder":
+            return .xmlFunction
+        // MiniMax — JANG converter stamps `minimax`; older artifacts use
+        // the canonical `minimax_m2`. Future M2.5 variants use
+        // `minimax_m2_5` per the converter.
+        case "minimax", "minimax_m2_5":
+            return .minimaxM2
+        // GLM 4.x / 5 / DeepSeek tool format (arg_key / arg_value tags).
+        case "glm47", "glm5", "glm4_moe", "deepseek":
+            return .glm4
+        // Nemotron-H / Cascade — same XML-style envelope as Qwen3 Coder.
+        // Our `XMLFunctionParser` handles `<tool_call><function=name>…`
+        // which Nemotron's variant matches; if a future Nemotron release
+        // uses Hermes-style `<TOOLCALL>` tags, a dedicated enum case
+        // should be added here.
+        case "nemotron", "nemotron_h":
+            return .xmlFunction
+        // Gemma — JANG stamps `gemma4`; the `gemma` short form maps to
+        // legacy Gemma 3 format and is included for forward compatibility
+        // with older stamps. Both produce `<|tool_call>…<tool_call|>`
+        // style envelopes via `GemmaFunctionParser`.
+        case "gemma":
+            return .gemma
+        case "gemma4":
+            return .gemma4
+        // Mistral 4 — `[TOOL_CALLS] … [ARGS] …` JSON delimiters.
+        case "mistral", "mistral4":
+            return .mistral
+        // LFM2 — pythonic `[func(arg='v')]` between
+        // `<|tool_call_start|>` / `<|tool_call_end|>`.
+        case "lfm2", "lfm2_5":
+            return .lfm2
+        // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
+        case "kimi", "kimik2", "kimi_k2":
+            return .kimiK2
+        default:
+            return nil
+        }
+    }
 }
