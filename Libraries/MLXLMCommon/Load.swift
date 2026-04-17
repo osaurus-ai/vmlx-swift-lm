@@ -72,6 +72,33 @@ public func loadWeights(
         }
     }
 
+    // Fail-fast guard: if jang_config.json declares `weight_format: "mxtq"`
+    // (which routes the factory to the JANGTQ model class with
+    // `TurboQuantSwitchGLU`), the bundle MUST also ship
+    // `jangtq_runtime.safetensors`. Without it the runtime cache stays
+    // empty and `TurboQuantSwitchLinear` `fatalError`s on the first
+    // forward pass — a SIGABRT that's hard to trace from a server log.
+    // Surface the missing file at load time with a clear message instead.
+    if let jangConfigURL = JangLoader.findConfigPath(at: modelDirectory),
+        let configData = try? Data(contentsOf: jangConfigURL),
+        let configJSON = try? JSONSerialization.jsonObject(with: configData)
+            as? [String: Any],
+        (configJSON["weight_format"] as? String) == "mxtq",
+        !isJANGTQNative
+    {
+        throw NSError(
+            domain: "MLXLMCommon.JANGTQ", code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "JANGTQ bundle is incomplete: jang_config.json at "
+                    + "\(jangConfigURL.path) declares weight_format=\"mxtq\" "
+                    + "but jangtq_runtime.safetensors is missing from "
+                    + "\(modelDirectory.path). Re-download the bundle "
+                    + "including the sidecar (signs.{N}.{seed} + "
+                    + "codebook.{N}.{bits} arrays)."
+            ])
+    }
+
     // JANG: dequantize MoE gate weights from quantized uint32 → float.
     // Gates are stored at 8-bit (CRITICAL tier) but may have different group_size
     // than the body. Dequantizing resolves ambiguous bit/group_size inference.
