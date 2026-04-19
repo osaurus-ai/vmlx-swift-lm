@@ -31,6 +31,13 @@ struct BatchSlot {
     /// Continuation for streaming tokens back to the caller.
     let continuation: AsyncStream<BatchGeneration>.Continuation
 
+    /// The request's full ``GenerateParameters``, preserved so per-slot
+    /// lifecycle hooks (quantization, compile path, etc.) can consult the
+    /// original configuration. Added by Stage 0 of the batch-engine blockers
+    /// work — ``BatchQuantize`` reads `kvMode`/`kvBits`/`quantizedKVStart`
+    /// from here.
+    let parameters: GenerateParameters
+
     /// Per-request sampler (temperature, topP, etc. from the request's `GenerateParameters`).
     let sampler: LogitSampler
 
@@ -44,7 +51,12 @@ struct BatchSlot {
     let maxTokens: Int?
 
     /// Per-layer KV caches for this sequence (B=1 each).
-    let cache: [KVCache]
+    ///
+    /// `var` (not `let`) so `BatchQuantize.maybeCompress` can swap `KVCacheSimple`
+    /// layers for `TurboQuantKVCache` after the compression threshold is reached.
+    /// The KVCache protocol is a reference type — a swap replaces the layer handle,
+    /// per-slot state before the swap is migrated by `TurboQuantKVCache.fromSimpleCache`.
+    var cache: [KVCache]
 
     /// The original full input, preserved for VLM `prepare()` which needs image data.
     /// Also used for seeding the logit processor with the full prompt tokens.
@@ -85,6 +97,23 @@ struct BatchSlot {
     /// ``computeMediaSalt(for:)``.
     let mediaSalt: String?
 
+    /// Compiled forward closure captured when this slot's cache is promoted
+    /// to `CompilableKVCache` layers. Stage 1B.3 sets this for the solo
+    /// slot in a `maxBatchSize == 1` engine when
+    /// `parameters.enableCompiledBatchDecode` is on AND the cache family
+    /// is `.simple`. Nil means "route this slot's decode through the
+    /// uncompiled `BatchKVCache` path".
+    ///
+    /// When non-nil, `stepBatchDecode` feeds this slot's next token through
+    /// the closure directly instead of wrapping it in a `BatchKVCache`.
+    /// The closure mutates `slot.cache` (now `CompilableKVCache` layers) in
+    /// place via the `_updateInternal` discipline; no wrapper is constructed
+    /// per step.
+    ///
+    /// Stage 1B.4 will generalise to `maxBatchSize > 1` via a per-bucket
+    /// `BucketHandle` holding shared `[B, H, maxLen, D]` buffers.
+    var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
     // MARK: - Sampling
 
     /// Sample a token from logits, applying processor and sampler.
@@ -115,6 +144,7 @@ extension BatchSlot {
     init(from request: BatchPendingRequest, cache: [KVCache], stopTokenIDs: Set<Int>) {
         self.id = request.id
         self.continuation = request.continuation
+        self.parameters = request.parameters
         self.sampler = request.parameters.sampler()
         self.processor = request.parameters.processor()
         self.stopTokenIDs = stopTokenIDs
@@ -127,5 +157,6 @@ extension BatchSlot {
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize
         self.mediaSalt = computeMediaSalt(for: request.input)
+        self.compiledForward = nil
     }
 }

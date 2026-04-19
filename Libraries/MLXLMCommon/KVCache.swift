@@ -442,13 +442,19 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 }
 
 /// Rotating KV cache for sliding window attention
+///
+/// - Note: Internal state members are `internal` (module-private) so
+///   `CompilableRotatingKVCache` — a same-module subclass that rewrites
+///   the ring-buffer writes to be compile-traceable — can read / mutate
+///   them. External callers still cannot touch these; the class remains
+///   public with public API members only.
 public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
-    private var keep: Int
-    private var keys: MLXArray?
-    private var values: MLXArray?
-    private var maxCacheSize: Int
-    private var step: Int
-    private var idx: Int = 0
+    internal var keep: Int
+    internal var keys: MLXArray?
+    internal var values: MLXArray?
+    internal var maxCacheSize: Int
+    internal var step: Int
+    internal var idx: Int = 0
 
     public override var maxSize: Int? { maxCacheSize }
 
@@ -1175,8 +1181,13 @@ public class MambaCache: ArraysCache {
 }
 
 /// Composite cache that manages multiple sub-caches
+///
+/// - Note: `caches` is `internal` (module-private) so
+///   `CompilableCacheList` — a same-module subclass that returns
+///   compile-traceable innerState from compile-compatible sub-caches —
+///   can access it. External callers still can't touch it.
 public class CacheList: BaseKVCache {
-    private var caches: [KVCache]
+    internal var caches: [KVCache]
 
     /// The number of sub-caches in this composite cache.
     public var count: Int { caches.count }

@@ -115,6 +115,41 @@ public struct GenerateParameters: Sendable {
     public var enableCompiledDecode: Bool = false
     public var compiledMaxCacheLength: Int? = nil
 
+    /// Enable `compile()` tracing for BATCHED decode. Opt-in; default false.
+    ///
+    /// When true, the `BatchEngine` routes decode steps through `BatchCompile`
+    /// which caches one compiled forward per batch-size bucket. Requests that
+    /// carry an incompatible cache type (RotatingKVCache, MambaCache,
+    /// CacheList, or — until Stage 2 ships — TurboQuantKVCache) transparently
+    /// fall back to the existing uncompiled batched path.
+    ///
+    /// This is independent from ``enableCompiledDecode`` which gates compile
+    /// on the single-sequence `TokenIterator` path. You can enable either,
+    /// both, or neither.
+    ///
+    /// See the "Batch Engine Blockers" spec at
+    /// `docs/superpowers/specs/2026-04-18-batch-engine-blockers-design.md`.
+    public var enableCompiledBatchDecode: Bool = false
+
+    /// Batch-size buckets for compiled batch decode. Each bucket owns one
+    /// compiled trace and one set of `[B, L, maxLen, H_kv, D]` KV buffers.
+    /// At decode time, requests pad up to the next bucket >= active-slot
+    /// count; dead rows are suppressed via a liveness mask.
+    ///
+    /// Memory cost: the KV buffers for all active buckets are resident
+    /// simultaneously. Per bucket of size `B` on a typical 32-layer /
+    /// H_kv=8 / D=128 / maxLen=4096 model: ~536 MB × B. For the default
+    /// `[1, 2, 4]` buckets that's ~3.75 GB of compile-side KV buffers.
+    ///
+    /// Raise to `[1, 2, 4, 8]` only after verifying memory headroom on the
+    /// target hardware. Every extra bucket adds compile time on first-hit
+    /// and keeps its buffer allocated until `BatchCompile.invalidate()`
+    /// (e.g., on `container.unload()`).
+    ///
+    /// Only consulted when ``enableCompiledBatchDecode`` is `true`. Must be
+    /// sorted ascending and non-empty; `BatchCompile` validates at use.
+    public var compiledBatchBuckets: [Int] = [1, 2, 4]
+
     /// Sampling temperature
     public var temperature: Float
 
@@ -154,6 +189,8 @@ public struct GenerateParameters: Sendable {
         kvMode: KVQuantizationMode = .none,
         enableCompiledDecode: Bool = false,
         compiledMaxCacheLength: Int? = nil,
+        enableCompiledBatchDecode: Bool = false,
+        compiledBatchBuckets: [Int] = [1, 2, 4],
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -174,6 +211,8 @@ public struct GenerateParameters: Sendable {
         self.kvMode = kvMode
         self.enableCompiledDecode = enableCompiledDecode
         self.compiledMaxCacheLength = compiledMaxCacheLength
+        self.enableCompiledBatchDecode = enableCompiledBatchDecode
+        self.compiledBatchBuckets = compiledBatchBuckets
         self.temperature = temperature
         self.topP = topP
         self.topK = topK

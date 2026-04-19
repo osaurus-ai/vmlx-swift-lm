@@ -336,6 +336,347 @@ private func streamAndCollect(
     return result
 }
 
+// MARK: - BatchEngine Tests
+
+/// Integration coverage for `BatchEngine` on real downloaded models.
+/// Complements unit tests that use tiny synthetic models — these exercise
+/// the actual Qwen/GLM/LFM weight tensors the engine is shipped to serve.
+///
+/// Downstream test packages call these with a preloaded `LMModelContainer`
+/// from `IntegrationTestModels`.
+public enum BatchEngineIntegrationTests {
+
+    /// Submit a single request through `BatchEngine` at `maxBatchSize == 1`
+    /// and verify the response is coherent. Smoke-test for Stage 0/1A/1B.3
+    /// on real model weights (not just the synthetic test model used by
+    /// unit tests).
+    public static func oneShot(container: LMModelContainer) async throws {
+        let params = GenerateParameters(maxTokens: 64, temperature: 0)
+        try await runBatchPrompt(
+            container: container,
+            prompt: "What is 2+2? Reply with just the number.",
+            parameters: params,
+            label: "BatchEngine one-shot",
+            validate: { result in
+                let lower = result.lowercased()
+                try check(
+                    result.contains("4") || lower.contains("four"),
+                    "Expected '4' or 'four' in BatchEngine response, got: \(result)"
+                )
+            }
+        )
+    }
+
+    /// Submit a TurboQuant-compressed request through `BatchEngine`. At
+    /// prompt length > 8, the per-prefill compression hook fires and
+    /// slot caches become `TurboQuantKVCache`. The decode path wraps them
+    /// in a `BatchKVCache` via the shared shape contract (no subclass at
+    /// Stage 0). Stage 2 compile+TQ still disabled at the engine level
+    /// per iter 9 rollback.
+    public static func turboQuantSingle(container: LMModelContainer) async throws {
+        let params = GenerateParameters(
+            maxTokens: 48,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+            temperature: 0
+        )
+        try await runBatchPrompt(
+            container: container,
+            prompt: "Count from 1 to 5, separated by commas.",
+            parameters: params,
+            label: "BatchEngine TQ",
+            validate: { result in
+                try check(
+                    result.contains("1") && result.contains("5"),
+                    "Expected count output (1..5) in TQ response, got: \(result)"
+                )
+            }
+        )
+    }
+
+    /// Submit a request with `enableCompiledBatchDecode: true` at
+    /// `maxBatchSize == 1`. Verifies the Stage 1B.3 compile wiring works
+    /// end-to-end on real model weights — not just the synthetic test
+    /// Llama used by unit tests.
+    public static func compiledSingle(container: LMModelContainer) async throws {
+        let params = GenerateParameters(
+            maxTokens: 48,
+            enableCompiledBatchDecode: true,
+            temperature: 0
+        )
+        try await runBatchPrompt(
+            container: container,
+            prompt: "Name three primary colors.",
+            parameters: params,
+            label: "BatchEngine compile",
+            validate: { result in
+                let lower = result.lowercased()
+                // Primary colors (depending on model): red/blue/yellow or red/green/blue
+                let hasRed = lower.contains("red")
+                let hasBlue = lower.contains("blue")
+                try check(
+                    hasRed || hasBlue,
+                    "Expected a primary color (red/blue) in compile-path response, got: \(result)"
+                )
+            }
+        )
+    }
+
+    /// VLM path through `BatchEngine`. Feeds a solid red image and asks
+    /// the model to name the color. Uses the same "red square + what
+    /// color" probe shape as `ChatSessionTests.visionModel` so results
+    /// are directly comparable. Container must be a preloaded VLM
+    /// (e.g. `IntegrationTestModels.vlmContainer()`).
+    public static func visionModel(container: LMModelContainer) async throws {
+        let redImage = CIImage(color: .red).cropped(
+            to: CGRect(x: 0, y: 0, width: 100, height: 100))
+        let params = GenerateParameters(maxTokens: 32, temperature: 0)
+        let engine = await container.makeBatchEngine(maxBatchSize: 1)
+
+        let stream = try await container.perform { context in
+            nonisolated(unsafe) let ctx = context
+            let input = try await ctx.processor.prepare(input: UserInput(
+                prompt: "What color is this image? Reply with just the color name.",
+                images: [.ciImage(redImage)]
+            ))
+            nonisolated(unsafe) let sendableInput = input
+            return await engine.generate(input: sendableInput, parameters: params)
+        }
+        let result = try await collectGeneration(stream, label: "BatchEngine VLM")
+        try check(
+            result.lowercased().contains("red"),
+            "Expected 'red' in VLM response, got: \(result)"
+        )
+    }
+
+    /// Multi-turn through `BatchEngine` with cache coordinator enabled.
+    /// Tests the full cache-hit path: turn 1 populates the coordinator,
+    /// turn 2 retrieves the prefix. Both turns submit the same prompt
+    /// and should produce identical greedy output.
+    ///
+    /// **Caveat:** `container.enableCaching()` must be called before
+    /// `makeBatchEngine` so the engine captures the coordinator. The
+    /// helper handles this internally.
+    public static func multiTurn(container: LMModelContainer) async throws {
+        // Attach a cache coordinator before building the engine.
+        container.enableCaching()
+        defer { container.disableCaching() }
+
+        let params = GenerateParameters(maxTokens: 32, temperature: 0)
+        let engine = await container.makeBatchEngine(maxBatchSize: 1)
+
+        // Turn 1 — populates cache.
+        let result1 = try await runOneBatch(
+            engine: engine, container: container,
+            prompt: "What is the capital of Italy? One word.",
+            parameters: params, label: "Multi-turn 1")
+
+        // Turn 2 — same prompt, should cache-hit.
+        let result2 = try await runOneBatch(
+            engine: engine, container: container,
+            prompt: "What is the capital of Italy? One word.",
+            parameters: params, label: "Multi-turn 2")
+
+        try check(
+            result1.lowercased().contains("rome"),
+            "Expected 'Rome' in turn 1 response, got: \(result1)"
+        )
+        try check(
+            result2.lowercased().contains("rome"),
+            "Expected 'Rome' in turn 2 response (cache hit), got: \(result2)"
+        )
+    }
+
+    /// Stage 3 verification: verify compile+sliding-window works on real
+    /// models. Caller must supply a container whose model uses
+    /// `RotatingKVCache` (Gemma3/Gemma4 SWA layers, Mistral4 with
+    /// maxKVSize, MiMoV2Flash, BaichuanM1, Qwen3.5-VL inherited).
+    /// Runs a decode long enough to exercise the ring (and potentially
+    /// the wrap point, depending on model's sliding-window size).
+    public static func compiledSlidingWindow(container: LMModelContainer) async throws {
+        let params = GenerateParameters(
+            maxTokens: 64,
+            enableCompiledBatchDecode: true,
+            temperature: 0
+        )
+        try await runBatchPrompt(
+            container: container,
+            prompt: "Summarise recursion in one short paragraph.",
+            parameters: params,
+            label: "BatchEngine compile+sliding",
+            validate: { result in
+                try check(
+                    !result.isEmpty,
+                    "Expected non-empty response from compile+sliding-window path"
+                )
+                // Coherent-response check: for a recursion prompt, the
+                // model should mention something like function / call /
+                // self / recursive / base. Loose check — don't require
+                // a specific word; just one of them.
+                let lower = result.lowercased()
+                let keywords = ["function", "call", "self", "recursiv", "base"]
+                try check(
+                    keywords.contains(where: { lower.contains($0) }),
+                    "Expected coherent recursion-related response, got: \(result)"
+                )
+            }
+        )
+    }
+
+    /// Decode-speed smoke: verify compiled BatchEngine path delivers at
+    /// LEAST the uncompiled path's throughput on real weights. This is
+    /// the primary win Stage 1B.3 was designed for — "all model-level
+    /// compile optimisations are exhausted. Next gains must come from
+    /// framework-level changes: static chunk KV cache (Overflow Bin) to
+    /// enable full decode compile()" (per `perf_decode_gap_analysis`).
+    ///
+    /// Measures tok/s on both paths for the same prompt. Asserts the
+    /// compiled path is not MATERIALLY slower (within 5%) — a regression
+    /// catcher. Actual speedup is measured in real benchmarks; this
+    /// just ensures we never ship a compile path that REGRESSES decode
+    /// speed.
+    public static func compiledDecodeSpeedFloor(container: LMModelContainer) async throws {
+        let maxTokens = 32
+        let prompt = "Describe a sunset in one short paragraph."
+
+        // Uncompiled baseline.
+        let uncompiledParams = GenerateParameters(
+            maxTokens: maxTokens, enableCompiledBatchDecode: false, temperature: 0)
+        let uStart = Date()
+        _ = try await runOneBatchSimple(
+            container: container, prompt: prompt, parameters: uncompiledParams,
+            label: "Speed uncompiled")
+        let uTime = Date().timeIntervalSince(uStart)
+        let uTps = Double(maxTokens) / uTime
+
+        // Compiled path.
+        let compiledParams = GenerateParameters(
+            maxTokens: maxTokens, enableCompiledBatchDecode: true, temperature: 0)
+        let cStart = Date()
+        _ = try await runOneBatchSimple(
+            container: container, prompt: prompt, parameters: compiledParams,
+            label: "Speed compiled")
+        let cTime = Date().timeIntervalSince(cStart)
+        let cTps = Double(maxTokens) / cTime
+
+        let ratio = cTps / uTps
+        print("Speed: uncompiled \(String(format: "%.1f", uTps)) tok/s, compiled \(String(format: "%.1f", cTps)) tok/s, ratio \(String(format: "%.2f", ratio))x")
+
+        // Floor: compiled must be no slower than 95% of uncompiled. This
+        // is intentionally loose — first-hit compile cost is amortised
+        // over many runs; the SECOND call is when speedup should appear.
+        // A proper benchmark would warm up the trace first. Here we just
+        // guard against catastrophic regressions.
+        try check(
+            ratio > 0.95,
+            "Compiled path is materially slower than uncompiled: \(ratio)x"
+        )
+    }
+
+    /// Minimal single-prompt run, no validation hook — used by perf
+    /// helpers where we only care about timing, not content.
+    private static func runOneBatchSimple(
+        container: LMModelContainer,
+        prompt: String,
+        parameters: GenerateParameters,
+        label: String
+    ) async throws -> String {
+        let maxB = parameters.enableCompiledBatchDecode ? 1 : 2
+        let engine = await container.makeBatchEngine(maxBatchSize: maxB)
+        return try await runOneBatch(
+            engine: engine, container: container,
+            prompt: prompt, parameters: parameters, label: label)
+    }
+
+    /// Submit two concurrent requests through `BatchEngine` at
+    /// `maxBatchSize == 2`. Verifies batched decode runs across slots
+    /// without compile (since compile requires maxBatchSize=1 at Stage
+    /// 1B.3).
+    public static func twoConcurrent(container: LMModelContainer) async throws {
+        let params = GenerateParameters(maxTokens: 32, temperature: 0)
+        let engine = await container.makeBatchEngine(maxBatchSize: 2)
+
+        async let streamA = runOneBatch(
+            engine: engine, container: container,
+            prompt: "What is the capital of France? One word.",
+            parameters: params, label: "Concurrent A")
+        async let streamB = runOneBatch(
+            engine: engine, container: container,
+            prompt: "What is the capital of Japan? One word.",
+            parameters: params, label: "Concurrent B")
+
+        let (resultA, resultB) = try await (streamA, streamB)
+
+        try check(
+            resultA.lowercased().contains("paris"),
+            "Expected 'Paris' in A's response, got: \(resultA)"
+        )
+        try check(
+            resultB.lowercased().contains("tokyo"),
+            "Expected 'Tokyo' in B's response, got: \(resultB)"
+        )
+    }
+
+    /// Helper: prepare one input inside the container (staying on the
+    /// container's actor for non-Sendable LMInput) then kick off decode on
+    /// the engine. Returns the collected text.
+    private static func runOneBatch(
+        engine: BatchEngine,
+        container: LMModelContainer,
+        prompt: String,
+        parameters: GenerateParameters,
+        label: String
+    ) async throws -> String {
+        let stream = try await container.perform { context in
+            nonisolated(unsafe) let ctx = context
+            let input = try await ctx.processor.prepare(input: UserInput(
+                chat: [.user(prompt)]
+            ))
+            nonisolated(unsafe) let sendableInput = input
+            return await engine.generate(input: sendableInput, parameters: parameters)
+        }
+        return try await collectGeneration(stream, label: label)
+    }
+
+    /// Helper: run a single prompt through BatchEngine and pipe it
+    /// through a validator.
+    private static func runBatchPrompt(
+        container: LMModelContainer,
+        prompt: String,
+        parameters: GenerateParameters,
+        label: String,
+        validate: @Sendable (String) throws -> Void
+    ) async throws {
+        let maxB = parameters.enableCompiledBatchDecode ? 1 : 2
+        let engine = await container.makeBatchEngine(maxBatchSize: maxB)
+        let result = try await runOneBatch(
+            engine: engine, container: container,
+            prompt: prompt, parameters: parameters, label: label)
+        try validate(result)
+    }
+
+    /// Collect an `AsyncStream<Generation>` into a single text string,
+    /// mirroring the `ChatSessionTests` helper but for BatchEngine's
+    /// stream type.
+    private static func collectGeneration(
+        _ stream: AsyncStream<Generation>,
+        label: String
+    ) async throws -> String {
+        var result = ""
+        print("\(label): ", terminator: "")
+        for await generation in stream {
+            switch generation {
+            case .chunk(let text):
+                print(text, terminator: "")
+                result += text
+            case .info, .toolCall:
+                break
+            }
+        }
+        print()
+        return result
+    }
+}
+
 // MARK: - Embedder Tests
 
 public enum EmbedderTests {

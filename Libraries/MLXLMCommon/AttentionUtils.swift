@@ -66,12 +66,38 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+
+        // Stage 2 (iter 9): when the caller passes `.none`, give the cache
+        // a chance to contribute a mask. Most caches (KVCacheSimple,
+        // RotatingKVCache, TurboQuantKVCache) return `.none` for n=1 decode
+        // and rely on the K/V shape itself to bound attention. But the
+        // compile-path variants (CompilableKVCache,
+        // CompilableTurboQuantKVCache) return the FULL fixed-size buffer
+        // from update() and need a real `.array` mask to exclude
+        // uninitialised tail positions. Without this hook, tail zeros
+        // would dilute softmax weights — negligible when scores are large
+        // (KVCacheSimple-valued prefill) but material when scores are
+        // small (TQ-decoded prefill, which is why Stage 2 rolled back
+        // originally before the real fix landed).
+        //
+        // Caches whose makeMask returns `.none` for n=1 (the base class
+        // default) get `effectiveMask == .none` here, preserving today's
+        // behaviour exactly.
+        var effectiveMask = mask
+        if case .none = mask {
+            let cacheMask = cache.makeMask(
+                n: queries.dim(2), windowSize: nil, returnArray: true)
+            if case .array = cacheMask {
+                effectiveMask = cacheMask
+            }
+        }
+
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,
             values: cachedValues,
             scale: scale,
-            mask: mask
+            mask: effectiveMask
         )
     }
 }

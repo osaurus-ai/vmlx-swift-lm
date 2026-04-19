@@ -65,38 +65,44 @@ public enum TQPhase: Sendable {
 /// - Full reset: If trim below prefix boundary, decode → truncate → re-encode.
 ///   This only happens if speculative decoding rejects ALL generated tokens
 ///   AND the prefix, which is extremely rare.
-public final class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
+public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
 
     public private(set) var phase: TQPhase = .fill
 
     // Fill phase storage
-    private var floatKeys: MLXArray?
-    private var floatValues: MLXArray?
+    internal var floatKeys: MLXArray?
+    internal var floatValues: MLXArray?
 
     // Compressed phase storage
     public private(set) var compressedKeys: EncodedKeys?
     public private(set) var compressedValues: EncodedValues?
 
     // Decoded prefix (persistent float buffer for attention reads)
-    private var decodedKeyBuffer: MLXArray?
-    private var decodedValueBuffer: MLXArray?
+    internal var decodedKeyBuffer: MLXArray?
+    internal var decodedValueBuffer: MLXArray?
 
     // Unified buffer: [decoded_prefix | window_slots]
-    private var unifiedKeys: MLXArray?
-    private var unifiedValues: MLXArray?
+    //
+    // NOTE: Access levels raised from `private` to `internal` (2026-04-18) so
+    // `CompilableTurboQuantKVCache` — a same-module subclass that rewrites
+    // the compressed-phase append path to be compile-traceable — can read /
+    // assign these buffers. External callers still cannot touch them (the
+    // type stays `public` but these members remain module-private).
+    internal var unifiedKeys: MLXArray?
+    internal var unifiedValues: MLXArray?
 
     /// Number of tokens in the decoded prefix.
-    private var prefixTokenCount: Int = 0
+    internal var prefixTokenCount: Int = 0
 
     /// Pre-allocated window step size. Window grows in chunks to avoid per-token allocation.
-    private let windowStep = 256
+    internal let windowStep = 256
 
     /// Number of tokens written into the window region of the unified buffer.
-    private var windowOffset = 0
+    internal var windowOffset = 0
 
     /// Encoder state (codebooks, rotation signs, QJL matrix).
     /// Created during compression, reused for any subsequent decode operations.
-    private var encoderState: TQEncoder.EncoderState?
+    internal var encoderState: TQEncoder.EncoderState?
 
     // Configuration
     public let keyBits: Int

@@ -31,6 +31,17 @@ public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: 
     if let compilable = cache as? CompilableKVCache {
         return rope(x, offset: compilable.offsetArray)
     }
+    // Iter 21 fix: CompilableTurboQuantKVCache and CompilableRotatingKVCache
+    // also expose MLXArray offset counters. Without routing through those,
+    // the Int `cache.offset` gets captured at compile trace-build and every
+    // compiled decode step uses the same RoPE position — the Stage 2 v2
+    // drift root cause.
+    if let compilableTQ = cache as? CompilableTurboQuantKVCache {
+        return rope(x, offset: compilableTQ.offsetArray)
+    }
+    if let compilableRot = cache as? CompilableRotatingKVCache {
+        return rope(x, offset: compilableRot.offsetArray)
+    }
     // Batched decode: use per-sequence [B]-shaped offsets for correct positional encoding.
     if let batchCache = cache as? BatchKVCache {
         return rope(x, offset: batchCache.offsetArray)
