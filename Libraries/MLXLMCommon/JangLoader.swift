@@ -266,19 +266,32 @@ public enum ParserResolution {
                 .jangStamped
             )
         }
-        // Heuristic by model_type. We treat any model_type that hasn't
-        // been listed as `mistral`/`gemma`/`gemma4` as potentially
-        // reasoning-capable and return a default `<think>...</think>`
-        // parser. This matches Qwen 3.5 / 3.6 / DeepSeek / GLM / Nemotron
-        // behaviour. False positives are harmless — the parser only
-        // splits when it sees actual `<think>` markers in the stream.
+        // Heuristic by model_type. We treat most model types as
+        // `<think>`-family and return a parser tuned for that. Gemma 4
+        // uses a different wire format (harmony channel envelope) and
+        // gets a dedicated parser. Gemma 3 / 3n and Mistral have no
+        // reasoning envelope.
         guard let modelType, !modelType.isEmpty else {
             return (nil, .none)
         }
         let t = modelType.lowercased()
+        if t.hasPrefix("gemma4") {
+            return (
+                ReasoningParser.fromCapabilityName("harmony"),
+                .modelTypeHeuristic
+            )
+        }
         if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
             return (nil, .modelTypeHeuristic)
         }
+        // The `<think>…</think>` family — Qwen 3.5 / 3.6, DeepSeek-R1,
+        // GLM 4.x, Nemotron. The default parser returned here starts in
+        // content mode to preserve byte-for-byte compatibility with the
+        // previous behaviour; Evaluate / BatchEngine resolve the
+        // `think_xml` capability stamp themselves via
+        // `ReasoningParser.fromCapabilityName` (which now returns a
+        // parser with `startInReasoning=true` to handle the Qwen 3.6
+        // enable_thinking=true prefill case).
         return (ReasoningParser(), .modelTypeHeuristic)
     }
 

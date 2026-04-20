@@ -383,7 +383,9 @@ public final class VLMModelFactory: ModelFactory {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
                 let t = baseConfig.modelType.lowercased()
-                if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                if t.hasPrefix("gemma4") {
+                    mutableConfiguration.reasoningParserName = "harmony"
+                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
                     mutableConfiguration.reasoningParserName = "none"
                 } else {
                     mutableConfiguration.reasoningParserName = "think_xml"

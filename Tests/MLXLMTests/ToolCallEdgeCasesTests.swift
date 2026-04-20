@@ -432,7 +432,11 @@ struct ToolCallEdgeCasesTests {
             ("nemotron", true),
             ("none", false),
             ("mistral", false),
-            ("gemma4", false),
+            // gemma4 used to return nil — now routes to the harmony
+            // parser as of 2026-04-20 (see TPAE-2026-04-20-TRIAGE.md
+            // "2:59 PM" addendum).
+            ("gemma4", true),
+            ("harmony", true),
         ]
         let tmpDir = URL(fileURLWithPath: "/tmp/vmlx-test-placeholder")
         for (stamp, shouldResolve) in stamps {

@@ -729,12 +729,19 @@ public final class LLMModelFactory: ModelFactory {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
-                // Heuristic: families that emit `<think>...</think>` natively.
+                // Heuristic: families that emit `<think>...</think>` natively,
+                // vs. Gemma-4's harmony-channel envelope
+                // (`<|channel>thought\n…<channel|>`), vs. plain models with
+                // no reasoning tags.
+                //
                 // Matches the ParserResolution facade but flattened to a
                 // canonical stamp string so we keep a single code path
                 // through the handler.
                 let t = baseConfig.modelType.lowercased()
-                if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                if t.hasPrefix("gemma4") {
+                    mutableConfiguration.reasoningParserName = "harmony"
+                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                    // Gemma 3 / 3n / Mistral: no reasoning envelope.
                     mutableConfiguration.reasoningParserName = "none"
                 } else {
                     mutableConfiguration.reasoningParserName = "think_xml"

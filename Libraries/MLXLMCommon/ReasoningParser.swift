@@ -77,9 +77,25 @@ public struct ReasoningParser: Sendable {
 
     // MARK: Init
 
-    public init(startTag: String = "<think>", endTag: String = "</think>") {
+    /// - Parameters:
+    ///   - startTag: The tag that opens a reasoning block.
+    ///   - endTag: The tag that closes a reasoning block.
+    ///   - startInReasoning: Start the parser already inside a reasoning
+    ///     block. Use this when the chat template prefills the opening
+    ///     tag at the prompt tail (e.g. Qwen 3.6 emits `<think>\n` at
+    ///     the end of the assistant prompt when `enable_thinking=true`,
+    ///     which is the template default) — the model's first output
+    ///     byte is already reasoning, so starting in `.content` mode
+    ///     would leak the entire CoT into the visible answer until the
+    ///     first `</think>` flips state.
+    public init(
+        startTag: String = "<think>",
+        endTag: String = "</think>",
+        startInReasoning: Bool = false
+    ) {
         self.startTag = startTag
         self.endTag = endTag
+        self.insideReasoning = startInReasoning
     }
 
     // MARK: Streaming API
@@ -163,22 +179,51 @@ extension ReasoningParser {
     /// Build a parser from a `JangCapabilities.reasoningParser` string.
     ///
     /// Accepts every name the JANG converter currently produces plus the
-    /// canonical `think_xml`/`none` values. Unknown names → `nil` (caller
-    /// should fall back to model-type heuristics or skip parsing).
+    /// canonical `think_xml` / `harmony` / `none` values. Unknown names
+    /// → `nil` (caller should fall back to model-type heuristics or skip
+    /// parsing).
     ///
-    /// All `<think>...</think>`-style aliases collapse to a single
-    /// `ReasoningParser` instance because the syntax is identical across
-    /// Qwen 3.5/3.6, DeepSeek-R1, GLM 4.x, and Nemotron Cascade. Models
-    /// that have no native reasoning tags (`mistral`, `gemma4`, `none`)
-    /// return `nil` so callers know to skip parsing entirely.
+    /// Returns parsers pre-configured for each family's wire format:
+    ///
+    /// - **`<think>` family** (Qwen 3.5 / 3.6, DeepSeek-R1, GLM 4.x,
+    ///   Nemotron, MiniMax) — `<think>…</think>`. The Qwen 3.6 chat
+    ///   template prefills `<think>\n` at the end of the assistant
+    ///   prompt by default (`enable_thinking=true` branch), so the
+    ///   model's first output byte is ALREADY inside a think block.
+    ///   To route those pre-`</think>` bytes to `.reasoning` instead of
+    ///   leaking them into `.chunk`, we return parsers with
+    ///   `startInReasoning=true`. Callers that explicitly disabled
+    ///   `enable_thinking` should construct a parser directly with
+    ///   `ReasoningParser()` (default `startInReasoning=false`).
+    ///
+    /// - **`harmony` family** (Gemma-4) — `<|channel>thought\n…<channel|>`.
+    ///   Gemma-4's chat template emits this envelope unconditionally
+    ///   for the thinking channel (an empty block when
+    ///   `enable_thinking=false`, a populated block otherwise). The
+    ///   model emits the opening tag explicitly, so `startInReasoning`
+    ///   stays false.
+    ///
+    /// - **`none`** (Mistral, LFM2, plain models) — returns `nil` so the
+    ///   pipeline skips reasoning parsing entirely.
     public static func fromCapabilityName(_ name: String?) -> ReasoningParser? {
         guard let name, !name.isEmpty else { return nil }
         switch name.lowercased() {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2":
-            return ReasoningParser()
-        case "none", "off", "disabled", "mistral", "gemma", "gemma4":
+            // Start inside the reasoning block — matches the Qwen 3.x
+            // family's chat-template default (`enable_thinking=true`
+            // prefills `<think>\n` at prompt tail).
+            return ReasoningParser(startInReasoning: true)
+        case "harmony", "harmony_channel", "gemma4_channel", "gemma4":
+            // Gemma-4 harmony-channel envelope. Derived from the model's
+            // chat_template.jinja:
+            //   {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
+            return ReasoningParser(
+                startTag: "<|channel>thought\n",
+                endTag: "<channel|>",
+                startInReasoning: false)
+        case "none", "off", "disabled", "mistral", "gemma":
             return nil
         default:
             return nil
