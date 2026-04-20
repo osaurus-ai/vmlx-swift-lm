@@ -334,7 +334,13 @@ struct ReasoningParserTests {
                 Issue.record("\(name) must resolve to a non-nil parser")
                 continue
             }
-            #expect(parser.startTag == "<|channel>thought\n")
+            // Start tag is bare `<|channel>` so the parser latches on
+            // any channel name (thought / analysis / final / action /
+            // …) — not just `thought`. This fixes the 2026-04-20
+            // 3:54 PM report where Gemma-4 emitted a JSON
+            // `<|channel> {"action": …}<channel|>` block that leaked
+            // into `.chunk` when the start tag required `thought\n`.
+            #expect(parser.startTag == "<|channel>")
             #expect(parser.endTag == "<channel|>")
         }
     }
@@ -503,14 +509,19 @@ struct ToolCallFormatCapabilityTests {
 
 @Suite("Harmony (Gemma-4) parser — streaming")
 struct HarmonyParserStreamingTests {
+    // Bare `<|channel>` start tag matches ANY channel name — not just
+    // `thought`. Gemma-4 at inference emits channels like
+    // `<|channel>thought\n…<channel|>` for CoT but also
+    // `<|channel> {...json...}<channel|>` for ReAct-style tool hints.
+    // See 2026-04-20 3:54 PM tpae screenshot / TRIAGE 3:54 PM addendum.
     private var harmonyParser: ReasoningParser {
         ReasoningParser(
-            startTag: "<|channel>thought\n",
+            startTag: "<|channel>",
             endTag: "<channel|>",
             startInReasoning: false)
     }
 
-    @Test("full harmony block in a single feed splits correctly")
+    @Test("full harmony block (thought channel) in a single feed")
     func testSingleFeedHarmonyBlock() {
         var p = harmonyParser
         var segs = p.feed(
@@ -518,7 +529,9 @@ struct HarmonyParserStreamingTests {
         segs.append(contentsOf: p.flush())
         let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
         let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
-        #expect(reasoning == "inner reasoning")
+        // With bare `<|channel>` start, the channel name is part of
+        // the reasoning delta.
+        #expect(reasoning == "thought\ninner reasoning")
         #expect(content == "prefixafter")
     }
 
@@ -542,7 +555,7 @@ struct HarmonyParserStreamingTests {
             case .content(let c): content += c
             }
         }
-        #expect(reasoning == "thinking")
+        #expect(reasoning == "thought\nthinking")
         #expect(content == "preanswer")
     }
 
@@ -554,8 +567,56 @@ struct HarmonyParserStreamingTests {
         segs.append(contentsOf: p.flush())
         let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
         let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
-        #expect(reasoning == "ab")
+        // Both channel-name prefixes + inner reasoning join together.
+        #expect(reasoning == "thought\nathought\nb")
         #expect(content == "midend")
+    }
+
+    @Test("2026-04-20 3:54 PM regression — JSON action channel with no `thought` name")
+    func testJsonActionChannelRoutesToReasoning() {
+        // Exact byte sequence from tpae's 3:54 PM screenshot:
+        //   <|channel> {\n "action": "google_search",\n ...\n}\n<channel|>I don't...
+        // The old parser (start = "<|channel>thought\n") didn't match
+        // because byte 11 is ' ', not 't', so the whole envelope leaked
+        // into `.chunk`. With bare `<|channel>` start, it latches.
+        var p = harmonyParser
+        let input =
+            "<|channel> {\n" +
+            " \"action\": \"google_search\",\n" +
+            " \"action_input\": \"weather in Irvine\"\n" +
+            "}\n" +
+            "<channel|>I don't have real-time weather data."
+        var segs = p.feed(input)
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning.contains("google_search"),
+            "JSON action block must be routed to reasoning, not content")
+        #expect(content == "I don't have real-time weather data.")
+        // Absolutely no harmony markers anywhere in content.
+        #expect(!content.contains("<|channel>"))
+        #expect(!content.contains("<channel|>"))
+    }
+
+    @Test("analysis / final / custom channel names all route to reasoning")
+    func testCustomChannelNames() {
+        for (name, innerText) in [
+            ("analysis", "weighing options"),
+            ("final", "pre-answer thoughts"),
+            ("tool", "{\"name\":\"f\"}"),
+            ("", "no-name channel"),
+        ] {
+            var p = harmonyParser
+            let input = "a<|channel>\(name)\n\(innerText)<channel|>b"
+            var segs = p.feed(input)
+            segs.append(contentsOf: p.flush())
+            let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+            let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+            #expect(reasoning == "\(name)\n\(innerText)",
+                "channel name `\(name)`: full envelope should route to reasoning")
+            #expect(content == "ab",
+                "channel name `\(name)`: only pre/post envelope should remain as content")
+        }
     }
 
     @Test("unclosed harmony block flushes as reasoning on EOS")
@@ -565,7 +626,9 @@ struct HarmonyParserStreamingTests {
         segs.append(contentsOf: p.flush())
         let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
         let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
-        #expect(reasoning == "truncated mid-thought")
+        // With bare `<|channel>` start, the channel-name bytes
+        // (`thought\n`) are part of the reasoning delta.
+        #expect(reasoning == "thought\ntruncated mid-thought")
         #expect(content == "visible")
     }
 

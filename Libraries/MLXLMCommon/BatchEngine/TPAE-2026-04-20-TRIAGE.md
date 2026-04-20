@@ -316,7 +316,50 @@ inline in `.chunk`, preceded by 50+ chars of reasoning text.
   + 2?"): **244 `.reasoning` deltas, 1 `.chunk` ("\n\n2 + "), zero
   `<think>` / `</think>` markers in `.chunk`.**
 
-### Test coverage added by `daad538`
+### 3:54 PM — "gemma4 still weird" — non-`thought` harmony channel
+
+tpae screenshot shows Gemma-4-26B-A4B-mxfp4 on "what's the weather in
+irvine?" emitting a JSON action block inside a harmony channel that's
+NOT named `thought`:
+
+```
+<|channel> {
+ "action": "google_search",
+ "action_input": "weather in Irvine"
+}
+<channel|>I don'm able to provide real-time weather information…
+```
+
+All those bytes leaked into `.chunk`.
+
+- **Status:** CLOSED.
+- **Commit:** `fix/gemma4-harmony-any-channel` branch.
+- **Root cause:** The 2:59 PM fix hardcoded the harmony start tag as
+  `<|channel>thought\n` (18 bytes). At inference Gemma-4 also emits
+  OTHER channel names — `<|channel> {...}<channel|>` for ReAct-style
+  action hints, `<|channel>analysis<channel|>` for analysis, etc.
+  When the opener isn't `thought\n` (e.g., space + brace for the
+  JSON case), the parser doesn't latch and the whole envelope leaks.
+- **Fix:** drop the `thought\n` requirement — make the start tag a
+  bare `<|channel>`. Any channel name now routes to `.reasoning`.
+  The channel name itself (e.g. `thought\n`, ` {`, `analysis\n`)
+  becomes part of the reasoning delta — osaurus can show it raw or
+  split on the first newline for channel routing.
+- **Real-model verification** (Gemma-4-26B-A4B-mxfp4, tpae's exact
+  "what's the weather in irvine?" prompt): **43 `.chunk` events
+  with clean answer "I do not have access to real-time weather
+  data…", 5 `.reasoning` deltas (model emitted 3 empty `thought`
+  channels during reasoning), zero `<|channel>` / `<channel|>`
+  markers in `.chunk`.** Same result on the 4bit quant.
+- **Pinned regression test:**
+  `HarmonyParserStreamingTests.testJsonActionChannelRoutesToReasoning`
+  replays the EXACT byte sequence from tpae's screenshot and asserts
+  reasoning contains `google_search` AND content is strictly the
+  post-`<channel|>` text. Also added
+  `testCustomChannelNames` covering `thought` / `analysis` / `final`
+  / `tool` / empty channel names all routing correctly.
+
+### Test coverage added by `daad538` + `fix/gemma4-harmony-any-channel`
 
 - New `@Suite "Harmony (Gemma-4) parser — streaming"` — 5 tests
   (single-feed, char-by-char, multi-block, unclosed-EOS flush,

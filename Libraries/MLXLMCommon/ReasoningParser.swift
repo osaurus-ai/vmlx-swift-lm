@@ -216,11 +216,20 @@ extension ReasoningParser {
             // prefills `<think>\n` at prompt tail).
             return ReasoningParser(startInReasoning: true)
         case "harmony", "harmony_channel", "gemma4_channel", "gemma4":
-            // Gemma-4 harmony-channel envelope. Derived from the model's
-            // chat_template.jinja:
-            //   {{- '<|channel>thought\n' + thinking_text + '\n<channel|>' -}}
+            // Gemma-4 harmony-channel envelope. The training template
+            // emits `<|channel>thought\n…\n<channel|>` for CoT (see
+            // chat_template.jinja line 238), but at inference the
+            // model also emits other channel names — `<|channel>`
+            // followed by a JSON action block then `<channel|>` for
+            // ReAct-style tool hints, `<|channel>analysis…<channel|>`
+            // etc. We latch on the bare `<|channel>` opener so ANY
+            // channel routes to `.reasoning` and nothing in the
+            // envelope leaks into `.chunk`. The channel-name bytes
+            // after `<|channel>` are emitted as part of the reasoning
+            // delta — osaurus-side UIs can show them raw or split on
+            // the first newline if they want channel routing.
             return ReasoningParser(
-                startTag: "<|channel>thought\n",
+                startTag: "<|channel>",
                 endTag: "<channel|>",
                 startInReasoning: false)
         case "none", "off", "disabled", "mistral", "gemma":
