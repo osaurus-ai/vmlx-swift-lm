@@ -139,6 +139,45 @@ If you want reasoning blocks surfaced (for a think-pane UI), the library does no
 - Use `ReasoningParser.split(_:)` on the accumulated assistant text after the stream finishes (non-streaming reveal).
 - Call `Evaluate.generateTokens(...)` (raw token stream) and run your own `ReasoningParser` instance alongside — trades parsing back to app layer in exchange for streaming visibility of reasoning.
 
+### API parity with upstream ml-explore/mlx-swift-lm
+
+`Libraries/MLXLMCommon/Tool/ToolCallProcessor.swift` is **byte-identical** to [ml-explore/mlx-swift-lm `main`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Tool/ToolCallProcessor.swift) as of 2026-04-19 — the same stream-state machine, the same `jsonBracesBalanced`-gated inline-format buffering, the same `separateToken` / `partialMatch` helpers. Osaurus's `StreamAccumulator.swift` consumes this public API today:
+
+```swift
+// osaurus/Packages/OsaurusCore/Services/ModelRuntime/StreamAccumulator.swift
+let processor = ToolCallProcessor(format: toolCallFormat, tools: toolsSpec)
+let displayText = processor.processChunk(token)       // user-visible text
+processor.processEOS()                                // flush at end of stream
+for toolCall in processor.toolCalls { … }             // authoritative tool calls
+```
+
+Every method, every state transition, every return-value nullability matches upstream. Osaurus can pin to either repo without drift.
+
+### What's additive vs upstream (and why)
+
+| vmlx-swift-lm only | Why |
+|---|---|
+| `ToolCallFormat.gemma4` + `GemmaFunctionParser(startTag:"<|tool_call>", endTag:"<tool_call|>", escapeMarker:"<|\"|>")` | Gemma-4 ships a *different* envelope from Gemma-3; upstream only has `.gemma`. Fixes tpae's "gemma4 is outputting harmony format" issue. |
+| `ToolCallFormat.fromCapabilityName(_:)` | Accepts the short stamps the JANG converter writes (`qwen`, `qwen3_6`, `minimax`, `glm47`, `deepseek`, `nemotron`, `gemma4`, `mistral`, `lfm2`, `kimi_k2`). Osaurus's `JANGReasoningResolver` calls this via `ParserResolution`. |
+| `ReasoningParser` (+ `fromCapabilityName` + `split(_:)`) | Upstream has no streaming `<think>` parser. Osaurus's `StreamingDeltaProcessor` holds a `ReasoningParser?` instance and feeds chunks through `feed(_:) -> [ReasoningSegment]` + `flush()`. |
+| `JangCapabilities` + `JangLoader.loadConfig` + `ParserResolution` | JANG / JANGTQ bundle metadata — osaurus reads `capabilities.reasoning_parser` and `capabilities.tool_parser` stamps for auto-pickup. |
+| `ModelConfiguration.reasoningParserName` | Capability stamp carried through `ResolvedModelConfiguration` so Evaluate + BatchEngine can resolve a `ReasoningParser` without re-reading disk. |
+
+All additions are purely additive — `ToolCallFormat` still has every upstream case (including `.llama3` + `Llama3ToolCallParser`) and `infer(from: modelType, configData: Data? = nil)` keeps the upstream secondary-signal path for Llama 3 `rope_scaling.rope_type == "llama3"` / `vocab_size >= 128000` detection.
+
+### Osaurus PR #893 consumer map (2026-04-19)
+
+tpae's WIP PR [osaurus-ai/osaurus#893](https://github.com/osaurus-ai/osaurus/pull/893) "Deprecate Work Mode (migrate into single Chat/Agent system)" touches four sites that consume vmlx APIs. All four are covered by this branch:
+
+| Site | API it uses | Provided by |
+|---|---|---|
+| `StreamAccumulator.swift` | `ToolCallProcessor(format:tools:)`, `processChunk(_:)`, `processEOS()`, `toolCalls` | `Libraries/MLXLMCommon/Tool/ToolCallProcessor.swift` — byte-identical with upstream |
+| `BatchEngineAdapter.swift` | `ModelConfiguration.toolCallFormat` + new `toolCallFormatOverride: ToolCallFormat?` | `ModelConfiguration.toolCallFormat` field stamped by LLM/VLM factories with JANG stamp priority |
+| `JANGReasoningResolver.swift` | `JangLoader.loadConfig`, `JangCapabilities`, `ParserResolution.reasoning/.toolCall`, `ReasoningParser`, `ToolCallFormat` | all public on `MLXLMCommon` |
+| `StreamingDeltaProcessor.swift` | `ReasoningParser` value, `parser.feed(_:) -> [ReasoningSegment]`, `.content`/`.reasoning` cases, `parser.flush()`, `ReasoningParser()` init | `Libraries/MLXLMCommon/ReasoningParser.swift` |
+
+No osaurus change depends on an API we don't ship. If tpae flips `mlxBatchEngine=YES` default + merges #893, the MLX path is fully covered.
+
 ---
 
 ## Production bugs fixed this session (iters 28-64)
