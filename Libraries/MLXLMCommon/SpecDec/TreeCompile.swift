@@ -66,8 +66,7 @@ public struct CompiledTree: @unchecked Sendable {
 
 /// Compile a ``DDTree`` into MLX tensors for ``TreeVerify``.
 ///
-/// Phase 0 stub — Phase 2 ports the real `compile_tree` from humanrouter's
-/// `compile.py`.
+/// Port of humanrouter/ddtree-mlx `compile.py` (iter 7).
 public enum TreeCompile {
 
     /// Produce a ``CompiledTree`` from the Python/Swift-side tree structure.
@@ -83,8 +82,64 @@ public enum TreeCompile {
         rootTokenID: Int32,
         prefixLen: Int
     ) throws -> CompiledTree {
-        throw SpecDecError.notImplemented(
-            "TreeCompile.compile — Phase 2 will port humanrouter/ddtree-mlx compile.py"
+        let treeSize = 1 + tree.nodeCount
+
+        // 1. Input IDs: [root_token, node_0_token, ..., node_{N-1}_token]
+        var tokenIdsBuf: [Int32] = Array(repeating: 0, count: treeSize)
+        tokenIdsBuf[0] = rootTokenID
+        if tree.nodeCount > 0 {
+            let nodeTokens = tree.nodeTokenIds.asArray(Int32.self)
+            for (i, t) in nodeTokens.enumerated() {
+                tokenIdsBuf[1 + i] = t
+            }
+        }
+        // Python wraps in uint32 via `mx.array(..., dtype=mx.uint32)[None]`.
+        let inputIdsInt32 = MLXArray(tokenIdsBuf).reshaped(1, treeSize)
+        let inputIds = inputIdsInt32.asType(.uint32)
+
+        // 2. Position IDs: root at prefix_len; each node at prefix_len + depth.
+        var positionsBuf: [Int32] = Array(repeating: 0, count: treeSize)
+        positionsBuf[0] = Int32(prefixLen)
+        var depthsBuf: [Int32] = [0]
+        depthsBuf.reserveCapacity(treeSize)
+        if tree.nodeCount > 0 {
+            let depths = tree.nodeDepths.asArray(Int32.self)
+            for (i, d) in depths.enumerated() {
+                positionsBuf[1 + i] = Int32(prefixLen) + d
+                depthsBuf.append(d)
+            }
+        }
+        let positionIds = MLXArray(positionsBuf)
+
+        // 3. Attention mask: tree-to-tree visibility only — 0.0 where
+        //    the child can attend to the ancestor, -inf elsewhere.
+        //    Shape: (1, 1, tree_size, tree_size), float32.
+        //    Python: `np.where(tree.visibility, 0.0, -np.inf)` then
+        //    `[None, None, :, :]`.
+        let visibilityBool = tree.visibility.asArray(Bool.self)
+        var maskBuf: [Float] = Array(
+            repeating: -Float.infinity, count: treeSize * treeSize)
+        for i in 0..<(treeSize * treeSize) where visibilityBool[i] {
+            maskBuf[i] = 0.0
+        }
+        let attentionMask = MLXArray(maskBuf)
+            .reshaped(treeSize, treeSize)
+            .expandedDimensions(axes: [0, 1])  // (1, 1, T, T)
+
+        // 4. DFS ordering for linear / recurrent layers.
+        let (dfs, invDfs) = try TreeBuilder.computeDfsOrder(tree: tree)
+        let dfsOrder = MLXArray(dfs)
+        let invDfsOrder = MLXArray(invDfs)
+
+        return CompiledTree(
+            inputIds: inputIds,
+            positionIds: positionIds,
+            attentionMask: attentionMask,
+            dfsOrder: dfsOrder,
+            invDfsOrder: invDfsOrder,
+            parents: tree.parents,
+            depths: depthsBuf,
+            treeSize: treeSize
         )
     }
 
