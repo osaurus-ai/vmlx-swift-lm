@@ -26,12 +26,29 @@ final class ChatTemplateOverrideIntegrationTests: XCTestCase {
 
     private func tokenizerDirectory() -> URL? {
         // Well-known cached snapshot from the rest of the bench suite.
-        let snap = "/Users/eric/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-8bit/snapshots/11de96878523501bcaa86104e3c186de07ff9068"
-        let dir = URL(fileURLWithPath: snap)
-        guard FileManager.default.fileExists(atPath: dir.path),
-              FileManager.default.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path)
-        else { return nil }
-        return dir
+        // Resolved relative to the user's HF cache so it works for any
+        // developer who has pulled Qwen3-0.6B; falls through to XCTSkip
+        // on machines that haven't cached it. Override with
+        // `VMLX_TEST_TOKENIZER_DIR` to point at a different tokenizer.
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["VMLX_TEST_TOKENIZER_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        let hfCache = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub")
+        let repoDir = hfCache.appendingPathComponent(
+            "models--mlx-community--Qwen3-0.6B-8bit/snapshots")
+        // Walk snapshot subdirs — the hash is content-addressed so we
+        // can't hardcode it.
+        guard let snapshots = try? FileManager.default.contentsOfDirectory(
+            at: repoDir, includingPropertiesForKeys: nil) else { return nil }
+        for snap in snapshots {
+            let tokJSON = snap.appendingPathComponent("tokenizer.json")
+            if FileManager.default.fileExists(atPath: tokJSON.path) {
+                return snap
+            }
+        }
+        return nil
     }
 
     /// Write a minimal template to a temp file that produces a

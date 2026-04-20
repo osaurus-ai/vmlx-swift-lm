@@ -1,0 +1,80 @@
+{{- bos_token -}}
+{%- macro render_content(content) -%}
+    {%- if content is string -%}
+        {{- content | trim -}}
+    {%- elif content is sequence -%}
+        {%- for item in content -%}
+            {%- if item['type'] == 'text' -%}
+                {{- item['text'] | trim -}}
+            {%- elif item['type'] == 'image' -%}
+                {{- '\n\n<|image|>\n\n' -}}
+            {%- elif item['type'] == 'video' -%}
+                {{- '\n\n<|video|>\n\n' -}}
+            {%- elif item['type'] == 'audio' -%}
+                {{- '\n\n<|audio|>\n\n' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- macro render_tool_args(arguments) -%}
+    {%- if arguments is mapping -%}
+        {%- set first = true -%}
+        {%- for key, value in arguments | dictsort -%}
+            {%- if not first %},{% endif -%}
+            {%- set first = false -%}
+            {{- key -}}:{%- if value is string -%}<|"|>{{ value }}<|"|>
+                {%- elif value is boolean -%}{{ 'true' if value else 'false' }}
+                {%- else -%}{{ value }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- elif arguments is string -%}
+        {{- arguments -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if (tools or (messages[0]['role'] in ['system', 'developer'])) -%}
+    {{- '<|turn>system\n' -}}
+    {%- if messages[0]['role'] in ['system', 'developer'] -%}
+        {{- render_content(messages[0]['content']) -}}
+        {%- set loop_messages = messages[1:] -%}
+    {%- else -%}
+        {%- set loop_messages = messages -%}
+    {%- endif -%}
+    {%- if tools -%}
+        {%- for tool in tools -%}
+            {{- '<|tool>declaration:' + tool['function']['name'] -}}
+            {%- if tool['function']['description'] -%}
+                {{- '{description:<|"|>' + tool['function']['description'] + '<|"|>}' -}}
+            {%- endif -%}
+            {{- '<tool|>' -}}
+        {%- endfor -%}
+    {%- endif -%}
+    {{- '<turn|>\n' -}}
+{%- else -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+    {%- if message['role'] == 'tool' -%}
+        {#- Tool-response message: emit wrapped in <|tool_response>...</tool_response|> -#}
+        {{- '<|tool_response>response:' + (message.get('name') or 'unknown') + '{' -}}
+        {{- render_content(message['content']) -}}
+        {{- '}<tool_response|>\n' -}}
+    {%- else -%}
+        {{- '<|turn>' + role + '\n' -}}
+        {%- if message['content'] -%}
+            {{- render_content(message['content']) -}}
+        {%- endif -%}
+        {%- if message['tool_calls'] -%}
+            {%- for tool_call in message['tool_calls'] -%}
+                {%- set fn = tool_call['function'] -%}
+                {{- '<|tool_call>call:' + fn['name'] + '{' -}}
+                {{- render_tool_args(fn['arguments']) -}}
+                {{- '}<tool_call|>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- '<turn|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n' -}}
+{%- endif -%}

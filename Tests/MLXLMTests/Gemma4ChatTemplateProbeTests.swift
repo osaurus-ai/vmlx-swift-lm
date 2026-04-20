@@ -24,14 +24,34 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
     /// Loading from disk to keep the test file small. Skipped when the model
     /// isn't on this machine (so CI/other dev boxes don't fail).
     private func loadGemma4Template() throws -> String? {
-        let candidates = [
-            "/Users/eric/.mlxstudio/models/MLXModels/mlx-community/gemma-4-e2b-it-4bit/chat_template.jinja",
-            "/Users/eric/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit/snapshots/11111111111111111111111111111111/chat_template.jinja",
-        ]
-        for path in candidates {
-            if FileManager.default.fileExists(atPath: path) {
-                return try String(contentsOfFile: path, encoding: .utf8)
+        // Try the HF cache snapshots dir first (content-addressed),
+        // then the well-known mlxstudio location. Env override
+        // `VMLX_GEMMA4_TEMPLATE_PATH` lets a dev point this elsewhere
+        // without editing sources.
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["VMLX_GEMMA4_TEMPLATE_PATH"], !override.isEmpty,
+           FileManager.default.fileExists(atPath: override) {
+            return try String(contentsOfFile: override, encoding: .utf8)
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        // 1. HF hub cache — walk snapshots.
+        let hfRepo = home.appendingPathComponent(
+            ".cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-4bit/snapshots")
+        if let snapshots = try? FileManager.default.contentsOfDirectory(
+            at: hfRepo, includingPropertiesForKeys: nil)
+        {
+            for snap in snapshots {
+                let tpl = snap.appendingPathComponent("chat_template.jinja")
+                if FileManager.default.fileExists(atPath: tpl.path) {
+                    return try String(contentsOfFile: tpl.path, encoding: .utf8)
+                }
             }
+        }
+        // 2. mlxstudio well-known layout.
+        let ms = home.appendingPathComponent(
+            ".mlxstudio/models/MLXModels/mlx-community/gemma-4-e2b-it-4bit/chat_template.jinja")
+        if FileManager.default.fileExists(atPath: ms.path) {
+            return try String(contentsOfFile: ms.path, encoding: .utf8)
         }
         return nil
     }
@@ -217,6 +237,75 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "Video placeholder must survive. Got: \(rendered)")
         XCTAssertTrue(rendered.contains("look at this"))
         XCTAssertTrue(rendered.contains("and this video"))
+    }
+
+    /// Iter 60: the Gemma4WithTools.jinja template adds tool-call + tool-response +
+    /// thinking rendering on top of Gemma4Minimal. Pin that all four turn types
+    /// render into Gemma-4's native `<|tool>` / `<|tool_call>` / `<|tool_response>`
+    /// markers.
+    func testGemma4WithToolsTemplateRenders() throws {
+        var searchPath = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var found: URL? = nil
+        for _ in 0..<6 {
+            let candidate = searchPath
+                .appendingPathComponent("Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                found = candidate; break
+            }
+            searchPath = searchPath.deletingLastPathComponent()
+        }
+        guard let templateURL = found else {
+            throw XCTSkip("Gemma4WithTools.jinja not found.")
+        }
+        let src = try String(contentsOf: templateURL, encoding: .utf8)
+        let template = try Template(src)
+
+        let tools: [[String: Any]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "description": "fetch current weather",
+                ] as [String: Any]
+            ] as [String: Any]
+        ]
+        let messages: [[String: Any]] = [
+            ["role": "system", "content": "You are a helpful assistant." ] as [String: Any],
+            ["role": "user",   "content": "What's the weather in Paris?" ] as [String: Any],
+            [
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    [
+                        "function": [
+                            "name": "get_weather",
+                            "arguments": ["location": "Paris"] as [String: Any]
+                        ] as [String: Any]
+                    ] as [String: Any]
+                ] as [Any]
+            ] as [String: Any],
+            [
+                "role": "tool",
+                "name": "get_weather",
+                "content": "22°C, sunny"
+            ] as [String: Any],
+        ]
+
+        let out = try template.render([
+            "bos_token": "<bos>",
+            "messages": messages,
+            "tools": tools,
+            "add_generation_prompt": true,
+        ])
+
+        XCTAssertTrue(out.contains("<|tool>declaration:get_weather"),
+            "Tool declaration must emit Gemma-4's <|tool> wrapper. Got: \(out)")
+        XCTAssertTrue(out.contains("<|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>}<tool_call|>"),
+            "Assistant tool_call must render inline with Gemma's invoke syntax. Got: \(out)")
+        XCTAssertTrue(out.contains("<|tool_response>response:get_weather{22°C, sunny}<tool_response|>"),
+            "Tool response must render with Gemma's <|tool_response> wrapper. Got: \(out)")
+        XCTAssertTrue(out.hasSuffix("<|turn>model\n"),
+            "Generation prompt must end with open model turn.")
     }
 
     /// Iter 52: the system-message branch must handle multi-part content
