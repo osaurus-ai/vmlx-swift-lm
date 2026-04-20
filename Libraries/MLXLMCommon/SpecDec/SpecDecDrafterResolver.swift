@@ -77,12 +77,12 @@ public actor SpecDecDrafterResolver {
     }
 
     /// Convert HF's 1-based `target_layer_ids` (which count the
-    /// embedding output as "layer 0") into vmlx's 0-based post-block
-    /// convention. Matches `extract_context_feature`'s `offset = 1`.
+    /// HF `target_layer_ids` ARE 0-based indices into
+    /// `target.model.layers` per z-lab/dflash `_patch_model`. Use as-is.
     private func zeroBasedTargetLayerIDs(
         _ config: DFlashDrafterConfiguration
     ) -> [Int] {
-        config.dflashConfig.targetLayerIds.map { $0 - 1 }
+        config.dflashConfig.targetLayerIds
     }
 }
 

@@ -225,14 +225,17 @@ public enum SpecDecRuntimeLinear {
             thisRoundTokens.append(bonus)
             onCommitted?(thisRoundTokens)
 
-            // Update target_hidden: the captured hidden states for the
-            // accepted+bonus positions. Slice the last `acceptance+1`
-            // positions of the verify feature.
+            // Update target_hidden: slice to the FULL committed prefix
+            // (original tokens before this round + accepted + new bonus).
+            // z-lab/dflash accumulates via a drafter KV cache; without
+            // that cache our drafter sees no context from prior rounds,
+            // so we feed the entire committed sequence each round.
             let verifyFeature = extractContextFeature(
                 captured: verifyHidden, targetLayerIDs: args.targetBlockIDs)
-            let keep = acceptanceLength + 1
-            let start = verifyInput.count - keep
-            targetHidden = verifyFeature[0..., start..., 0...]
+            // Committed positions = verifyInput[0..(verifyInput.count - blockSize) + acceptanceLength + 1]
+            // I.e., everything before the block + accepted drafts + new bonus.
+            let committedEnd = verifyInput.count - blockSize + acceptanceLength + 1
+            targetHidden = verifyFeature[0..., 0..<committedEnd, 0...]
             materialize(targetHidden)
         }
 
@@ -473,19 +476,15 @@ public enum SpecDecRuntimeDDTree {
             thisRoundTokens.append(bonus)
             onCommitted?(thisRoundTokens)
 
-            // Update target_hidden. v1: re-prefill on the growing
-            // sequence to produce fresh hiddens at the latest positions.
-            // Slice the last `accepted + 1` positions to match Python
-            // reference shape. Iter 10+ optimisation will reuse the
-            // verify pass's captured states.
+            // Update target_hidden: re-prefill on the committed sequence
+            // and pass ALL committed positions (drafter has no KV cache
+            // of its own, so it must see full history each round).
             let reprefill = MLXArray(tokens).reshaped(1, tokens.count)
             let (_, reprefillHidden) = args.target(
                 reprefill, cache: nil, captureLayerIDs: targetLayerSet)
             let feature = extractContextFeature(
                 captured: reprefillHidden, targetLayerIDs: args.targetBlockIDs)
-            let keep = acceptanceLength + 1
-            let start = tokens.count - keep
-            targetHidden = feature[0..., start..., 0...]
+            targetHidden = feature
             materialize(targetHidden)
         }
 

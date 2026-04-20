@@ -115,33 +115,6 @@ struct DDTreeDesignTests {
         #expect(TreeCompile.isDfsPrefix(acceptedIndices: accepted, dfsOrder: dfs) == false)
     }
 
-    // MARK: - Stub functions must throw .notImplemented (Phase 0 → Phase 1 contract)
-
-    @Test("TreeBuilder.build throws notImplemented in Phase 0")
-    func testTreeBuilderNotImplemented() {
-        do {
-            _ = try TreeBuilder.build(draftLogits: .init(), budget: 1)
-            Issue.record("Expected notImplemented error")
-        } catch let SpecDecError.notImplemented(msg) {
-            #expect(msg.contains("TreeBuilder.build"))
-        } catch {
-            Issue.record("Wrong error type: \(error)")
-        }
-    }
-
-    @Test("TreeCompile.compile throws notImplemented in Phase 0")
-    func testTreeCompileNotImplemented() {
-        do {
-            _ = try TreeCompile.compile(
-                tree: .empty(), rootTokenID: 0, prefixLen: 0)
-            Issue.record("Expected notImplemented error")
-        } catch is SpecDecError {
-            // expected
-        } catch {
-            Issue.record("Wrong error type: \(error)")
-        }
-    }
-
     @Test("SpecDecError has all expected cases")
     func testSpecDecErrorCases() {
         let cases: [SpecDecError] = [
