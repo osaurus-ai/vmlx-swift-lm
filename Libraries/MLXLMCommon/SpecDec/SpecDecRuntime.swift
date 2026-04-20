@@ -141,11 +141,15 @@ public enum SpecDecRuntimeLinear {
 
         // 2. Decode loop.
         while tokens.count < maxLen {
-            // Stop-token check on the generated suffix.
+            // Stop-token check on the generated suffix. Truncate at the
+            // first stop token so we don't leak tokens committed after
+            // the stop in the same round.
             if !args.stopTokenIDs.isEmpty {
-                for t in tokens[promptLen...] where args.stopTokenIDs.contains(t) {
+                for i in promptLen..<tokens.count
+                where args.stopTokenIDs.contains(tokens[i]) {
+                    let truncated = Array(tokens.prefix(i + 1))
                     return DFlashLinearResult(
-                        tokenIds: tokens, acceptanceLengths: acceptanceLengths)
+                        tokenIds: truncated, acceptanceLengths: acceptanceLengths)
                 }
             }
 
@@ -241,9 +245,14 @@ public enum SpecDecRuntimeLinear {
 
         // Trim any mask tokens that leaked in — matches Python's
         // `output_ids = output_ids[:, output_ids[0] != mask_token_id]`.
+        // Also trim the generated suffix to exactly maxNewTokens — each
+        // round commits a whole bonus+accepted block which may overshoot.
         let filtered = tokens.filter { $0 != args.maskTokenID }
+        let capped = filtered.count > maxLen
+            ? Array(filtered.prefix(maxLen))
+            : filtered
         return DFlashLinearResult(
-            tokenIds: filtered, acceptanceLengths: acceptanceLengths)
+            tokenIds: capped, acceptanceLengths: acceptanceLengths)
     }
 
     /// Sample greedy argmax from logits. Only temperature == 0 supported
@@ -387,11 +396,14 @@ public enum SpecDecRuntimeDDTree {
         onCommitted?([bonus])
 
         while tokens.count < maxLen {
-            // Stop-token check on generated suffix.
+            // Stop-token check on generated suffix. Truncate at first
+            // stop token so round-commits after the stop don't leak out.
             if !args.stopTokenIDs.isEmpty {
-                for t in tokens[promptLen...] where args.stopTokenIDs.contains(t) {
+                for i in promptLen..<tokens.count
+                where args.stopTokenIDs.contains(tokens[i]) {
+                    let truncated = Array(tokens.prefix(i + 1))
                     return DDTreeResult(
-                        tokenIds: tokens, acceptanceLengths: acceptanceLengths)
+                        tokenIds: truncated, acceptanceLengths: acceptanceLengths)
                 }
             }
 
@@ -489,8 +501,11 @@ public enum SpecDecRuntimeDDTree {
         }
 
         let filtered = tokens.filter { $0 != args.maskTokenID }
+        let capped = filtered.count > maxLen
+            ? Array(filtered.prefix(maxLen))
+            : filtered
         return DDTreeResult(
-            tokenIds: filtered, acceptanceLengths: acceptanceLengths)
+            tokenIds: capped, acceptanceLengths: acceptanceLengths)
     }
 
     /// Duplicate of ``SpecDecRuntimeLinear/sampleArgmax(_:temperature:)``
