@@ -18,7 +18,7 @@ import MLX
 ///
 /// The runtime runs on a background `Task`; each committed batch of
 /// tokens is detokenized via `NaiveStreamingDetokenizer` and yielded as
-/// `.chunk(String)`. A final `.info(GenerateCompletionInfo)` fires on
+/// `.chunk(String)` and `.reasoning(String)`. A final `.info(GenerateCompletionInfo)` fires on
 /// completion.
 ///
 /// Tool-call and reasoning parsing are applied to the detokenized
@@ -293,14 +293,19 @@ public enum SpecDecStream {
             guard let chunk = detokenizer.next() else { continue }
 
             // 1. Reasoning pass (if configured) — peels off <think>…
-            //    segments; reasoning content is silently dropped to
-            //    match upstream ml-explore/mlx-swift-lm `Generation`
-            //    which has no `.reasoning(String)` case.
+            //    segments. `.reasoning(String)` events are emitted on
+            //    the stream so callers can render a think-pane UI;
+            //    content continues into the tool-call processor.
             let contentPieces: [String]
             if var parser = reasoningParser {
                 var pieces: [String] = []
                 for segment in parser.feed(chunk) {
-                    if case .content(let c) = segment { pieces.append(c) }
+                    switch segment {
+                    case .content(let c):
+                        pieces.append(c)
+                    case .reasoning(let r):
+                        continuation.yield(.reasoning(r))
+                    }
                 }
                 reasoningParser = parser
                 contentPieces = pieces
@@ -330,13 +335,16 @@ public enum SpecDecStream {
     ) {
         if var parser = reasoningParser {
             for segment in parser.flush() {
-                if case .content(let c) = segment,
-                    let visibleText = toolCallProcessor.processChunk(c)
-                {
-                    continuation.yield(.chunk(visibleText))
-                }
-                if let call = toolCallProcessor.toolCalls.popLast() {
-                    continuation.yield(.toolCall(call))
+                switch segment {
+                case .content(let c):
+                    if let visibleText = toolCallProcessor.processChunk(c) {
+                        continuation.yield(.chunk(visibleText))
+                    }
+                    if let call = toolCallProcessor.toolCalls.popLast() {
+                        continuation.yield(.toolCall(call))
+                    }
+                case .reasoning(let r):
+                    continuation.yield(.reasoning(r))
                 }
             }
             reasoningParser = parser

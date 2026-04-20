@@ -101,7 +101,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `public protocol UserInputProcessor: Sendable { func prepare(input: UserInput) async throws -> LMInput }` | Called as `context.processor.prepare(input: userInput)`. |
 | `public struct LMInput: Sendable` | Carries `text: LMInput.Text` + optional vision tensors. |
 | `public struct GenerateParameters: Sendable` | Temperature, topP, topK, minP, maxTokens, prefillStepSize, kvBits, kvGroupSize, quantizedKVStart, kvMode, repetition/presence/frequency penalty contexts. Osaurus builds via `ModelRuntime.makeGenerateParameters`. |
-| `public enum Generation: Sendable { case chunk(String), case info(GenerateCompletionInfo), case toolCall(ToolCall) }` | Returned by `BatchEngine.generate` + `Evaluate.generate`. |
+| `public enum Generation: Sendable { case chunk(String), case reasoning(String), case info(GenerateCompletionInfo), case toolCall(ToolCall) }` | Returned by `BatchEngine.generate` + `Evaluate.generate` + `SpecDecStream.streamDflashLinear` / `streamDDTree`. `.reasoning` is a streaming delta — concat consecutive ones for the full think-block. See `REASONING-STREAM-EVENT.md`. |
 | `public enum TokenGeneration: Sendable { case token(Int), case info(GenerateCompletionInfo) }` | Returned by `BatchEngine.submit` + `generateTokenTask`. Raw token IDs. |
 | `public enum BatchGeneration: Sendable { case token(Int), case info(GenerateCompletionInfo) }` | Same shape as `TokenGeneration`, emitted by `BatchEngine.submit`. |
 | `public struct GenerateCompletionInfo: Sendable` | `promptTokenCount`, `generationTokenCount`, `promptTime`, `generationTime`, `stopReason: StopReason`, plus `tokensPerSecond` computed var. |
@@ -196,6 +196,8 @@ for await event in stream {
     switch event {
     case .chunk(let text):     // pure user text, reasoning-stripped, tool-stripped
         accumulator.appendAssistantText(text)
+    case .reasoning(let thought): // streaming <think>…</think> delta
+        accumulator.appendReasoning(thought)
     case .toolCall(let call):  // authoritative — no re-parse needed
         accumulator.emitToolCall(name: call.function.name,
                                  arguments: call.function.arguments)

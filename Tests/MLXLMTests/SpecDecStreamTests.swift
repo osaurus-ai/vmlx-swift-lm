@@ -147,7 +147,8 @@ struct SpecDecStreamTests {
             switch ev {
             case .chunk(let c): chunks.append(c)
             case .info: infoCount += 1
-            case .toolCall: break
+            case .reasoning, .toolCall: break
+            @unknown default: break
             }
         }
 
@@ -198,7 +199,8 @@ struct SpecDecStreamTests {
             switch ev {
             case .chunk(let c): chunks.append(c)
             case .info: infoCount += 1
-            case .toolCall: break
+            case .reasoning, .toolCall: break
+            @unknown default: break
             }
         }
         #expect(infoCount == 1)

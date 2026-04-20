@@ -4,6 +4,161 @@ import Foundation
 import MLXLMCommon
 import Testing
 
+/// Mini driver that mirrors the post-detokenizer pipeline shared by
+/// Evaluate.swift / BatchEngine.swift / SpecDecStream.swift (ReasoningParser →
+/// ToolCallProcessor → emit). Used only by the `Generation.reasoning` event
+/// regression tests below — keeps them free of model-loading machinery.
+private func driveGenerationPipeline(
+    chunks: [String],
+    reasoningParserStartTag: String = "<think>",
+    reasoningParserEndTag: String = "</think>",
+    toolCallFormat: ToolCallFormat = .json
+) -> [Generation] {
+    var reasoningParser: ReasoningParser? = ReasoningParser(
+        startTag: reasoningParserStartTag, endTag: reasoningParserEndTag)
+    let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
+    var events: [Generation] = []
+
+    func pump(_ raw: String) {
+        let pieces: [String]
+        if var parser = reasoningParser {
+            var kept: [String] = []
+            for segment in parser.feed(raw) {
+                switch segment {
+                case .content(let c):
+                    kept.append(c)
+                case .reasoning(let r):
+                    events.append(.reasoning(r))
+                }
+            }
+            reasoningParser = parser
+            pieces = kept
+        } else {
+            pieces = [raw]
+        }
+        for piece in pieces {
+            if let textToYield = toolCallProcessor.processChunk(piece) {
+                events.append(.chunk(textToYield))
+            }
+            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                events.append(.toolCall(toolCall))
+            }
+        }
+    }
+
+    func flush() {
+        if var parser = reasoningParser {
+            for segment in parser.flush() {
+                switch segment {
+                case .content(let c):
+                    if let textToYield = toolCallProcessor.processChunk(c) {
+                        events.append(.chunk(textToYield))
+                    }
+                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                        events.append(.toolCall(toolCall))
+                    }
+                case .reasoning(let r):
+                    events.append(.reasoning(r))
+                }
+            }
+            reasoningParser = parser
+        }
+        toolCallProcessor.processEOS()
+        for toolCall in toolCallProcessor.toolCalls {
+            events.append(.toolCall(toolCall))
+        }
+    }
+
+    for chunk in chunks { pump(chunk) }
+    flush()
+    return events
+}
+
+@Suite("Generation.reasoning event")
+struct GenerationReasoningEventTests {
+
+    @Test("reasoning block surfaces as .reasoning events, answer as .chunk")
+    func testReasoningAndContentSeparated() {
+        let events = driveGenerationPipeline(chunks: [
+            "<think>weighing options</think>final answer"
+        ])
+
+        let reasoningPieces = events.compactMap { $0.reasoning }
+        let contentPieces = events.compactMap { $0.chunk }
+        #expect(reasoningPieces.joined() == "weighing options")
+        #expect(contentPieces.joined() == "final answer")
+    }
+
+    @Test("reasoning streams char-by-char across chunk boundaries")
+    func testReasoningStreamsAcrossChunks() {
+        // Simulate the token-by-token delivery osaurus sees from the
+        // detokenizer. The parser must still emit a coherent .reasoning
+        // stream even when the start/end tags straddle chunks.
+        let prompt = "pre<think>A B C</think>post"
+        let chunks = prompt.map { String($0) }
+        let events = driveGenerationPipeline(chunks: chunks)
+
+        let reasoning = events.compactMap { $0.reasoning }.joined()
+        let content = events.compactMap { $0.chunk }.joined()
+        #expect(reasoning == "A B C")
+        #expect(content == "prepost")
+    }
+
+    @Test("unclosed <think> flushes trailing reasoning at end-of-stream")
+    func testUnclosedReasoningFlushesOnEOS() {
+        let events = driveGenerationPipeline(chunks: [
+            "answer<think>truncated mid-thought"
+        ])
+        let reasoning = events.compactMap { $0.reasoning }.joined()
+        let content = events.compactMap { $0.chunk }.joined()
+        // Matches ReasoningParser.split semantics: post-start bytes are
+        // reasoning, even if no closing tag arrived.
+        #expect(reasoning == "truncated mid-thought")
+        #expect(content == "answer")
+    }
+
+    @Test("no reasoning tag → zero .reasoning events")
+    func testNoReasoningEmitsNoReasoningEvents() {
+        let events = driveGenerationPipeline(chunks: ["just an answer"])
+        let reasoningCount = events.filter { $0.reasoning != nil }.count
+        #expect(reasoningCount == 0)
+        #expect(events.compactMap { $0.chunk }.joined() == "just an answer")
+    }
+
+    @Test("reasoning + tool-call coexist — both surfaced, .chunk is clean")
+    func testReasoningAndToolCallCoexist() {
+        // ToolCallProcessor(format: .json) extracts inline JSON tool calls.
+        let events = driveGenerationPipeline(chunks: [
+            "<think>need to call weather</think>",
+            "Here you go: ",
+            #"{"name": "get_weather", "arguments": {"city": "SF"}}"#,
+        ])
+        let reasoning = events.compactMap { $0.reasoning }.joined()
+        let content = events.compactMap { $0.chunk }.joined()
+        let toolCalls = events.compactMap { $0.toolCall }
+
+        #expect(reasoning == "need to call weather")
+        #expect(content == "Here you go: ")
+        #expect(toolCalls.count == 1)
+        #expect(toolCalls.first?.function.name == "get_weather")
+    }
+
+    @Test("Generation enum has .reasoning case + reasoning computed property")
+    func testGenerationEnumSurface() {
+        // Pure enum smoke test — pin the public API surface osaurus
+        // depends on.
+        let r: Generation = .reasoning("thinking out loud")
+        #expect(r.reasoning == "thinking out loud")
+        #expect(r.chunk == nil)
+        #expect(r.toolCall == nil)
+        #expect(r.info == nil)
+
+        let c: Generation = .chunk("answer")
+        #expect(c.reasoning == nil)
+        #expect(c.chunk == "answer")
+    }
+}
+
 @Suite("ReasoningParser")
 struct ReasoningParserTests {
 

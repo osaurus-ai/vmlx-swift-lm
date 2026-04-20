@@ -71,11 +71,12 @@ public enum Blocker: String, CaseIterable {
 
 ### Contract
 
-`BatchEngine.generate(input:parameters:)` and `Evaluate.generate(...)` emit these three event cases. Every tool call the model emits is surfaced as `.toolCall(ToolCall)` — **osaurus should not parse tool calls at its level**.
+`BatchEngine.generate(input:parameters:)` and `Evaluate.generate(...)` emit four event cases. Every tool call the model emits is surfaced as `.toolCall(ToolCall)` and every `<think>…</think>` block as `.reasoning(String)` — **osaurus should not parse tool calls or reasoning at its level**.
 
 ```swift
 public enum Generation: Sendable {
     case chunk(String)            // pure user-visible text; no <think>, no <tool_call>
+    case reasoning(String)        // streaming chain-of-thought delta (think-pane)
     case toolCall(ToolCall)       // fully-parsed tool call, authoritative
     case info(GenerateCompletionInfo)
 }
@@ -92,9 +93,9 @@ After iter 66, the library does all parsing. Both paths (single-stream `Evaluate
 
 ```
 detokenized chunk
-    → ReasoningParser.feed(_:)                    (strips <think>…</think>)
+    → ReasoningParser.feed(_:)                    (emits .reasoning + forwards content)
     → ToolCallProcessor.processChunk(_:)          (extracts .toolCall + pure text)
-    → emit .chunk / .toolCall
+    → emit .chunk / .reasoning / .toolCall
 ```
 
 ### Auto-pickup for JANG / MLX / VL models
@@ -134,12 +135,12 @@ Both `LLMModelFactory` and `VLMModelFactory` stamp the two capability fields on 
 
 - **Remove or bypass** the app-layer tool-call parser for the MLX runtime path.
 - Consume `.toolCall(ToolCall)` events directly from the stream and forward to the OpenAI `tool_calls` response field.
+- Consume `.reasoning(String)` events on a separate UI channel (think-pane, collapsed thought bubble, whatever renders chain-of-thought for this product). Each `.reasoning(String)` is a streaming delta — concatenate them to rebuild the full reasoning transcript; the library does NOT buffer until end-of-think.
 - Continue rendering `.chunk(String)` as assistant text — it is already reasoning-stripped and tool-call-stripped.
 
-If you want reasoning blocks surfaced (for a think-pane UI), the library does not currently emit a `.reasoning` event — the upstream `Generation` enum doesn't have one. Options:
+See `GEMMA4-SLIDING-WINDOW-CRASH.md` and `REASONING-STREAM-EVENT.md` for the per-crash fix log and the reasoning-event contract.
 
-- Use `ReasoningParser.split(_:)` on the accumulated assistant text after the stream finishes (non-streaming reveal).
-- Call `Evaluate.generateTokens(...)` (raw token stream) and run your own `ReasoningParser` instance alongside — trades parsing back to app layer in exchange for streaming visibility of reasoning.
+Callers that only need the final answer can still exhaustively match `.chunk` / `.toolCall` / `.info` and ignore `.reasoning` — but because the `Generation` enum is not `@frozen`, add `case .reasoning: break` (or a default) to keep the switch exhaustive. No model-level flag disables reasoning emission; if `reasoningParserName` is `"none"` (Gemma-3/4, Mistral) the library never emits `.reasoning` events in the first place.
 
 ### API parity with upstream ml-explore/mlx-swift-lm
 

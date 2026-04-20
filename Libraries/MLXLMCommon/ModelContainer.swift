@@ -229,6 +229,7 @@ public final class ModelContainer: Sendable {
     /// for await generation in stream {
     ///     switch generation {
     ///     case .chunk(let text): print(text)
+    ///     case .reasoning: break  // optional: route to think-pane
     ///     case .info(let info): print(info.tokensPerSecond)
     ///     case .toolCall(let call): handleToolCall(call)
     ///     }

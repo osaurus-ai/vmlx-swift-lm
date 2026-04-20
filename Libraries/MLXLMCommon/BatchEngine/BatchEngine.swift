@@ -197,6 +197,7 @@ public actor BatchEngine {
     /// for await generation in stream {
     ///     switch generation {
     ///     case .chunk(let text): print(text, terminator: "")
+    ///     case .reasoning: break    // route to a think-pane if you render CoT
     ///     case .info(let info): print("\n\(info.summary())")
     ///     case .toolCall: break
     ///     }
@@ -261,7 +262,12 @@ public actor BatchEngine {
                 if var parser = reasoningParser {
                     var kept: [String] = []
                     for segment in parser.feed(raw) {
-                        if case .content(let c) = segment { kept.append(c) }
+                        switch segment {
+                        case .content(let c):
+                            kept.append(c)
+                        case .reasoning(let r):
+                            continuation.yield(.reasoning(r))
+                        }
                     }
                     reasoningParser = parser
                     pieces = kept
@@ -281,13 +287,16 @@ public actor BatchEngine {
             func flush() {
                 if var parser = reasoningParser {
                     for segment in parser.flush() {
-                        if case .content(let c) = segment,
-                            let textToYield = toolCallProcessor.processChunk(c)
-                        {
-                            continuation.yield(.chunk(textToYield))
-                        }
-                        if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                            continuation.yield(.toolCall(toolCall))
+                        switch segment {
+                        case .content(let c):
+                            if let textToYield = toolCallProcessor.processChunk(c) {
+                                continuation.yield(.chunk(textToYield))
+                            }
+                            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                                continuation.yield(.toolCall(toolCall))
+                            }
+                        case .reasoning(let r):
+                            continuation.yield(.reasoning(r))
                         }
                     }
                     reasoningParser = parser

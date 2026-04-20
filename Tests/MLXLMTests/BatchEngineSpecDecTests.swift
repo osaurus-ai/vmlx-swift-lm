@@ -78,8 +78,10 @@ struct BatchEngineSpecDecTests {
         for await ev in stream {
             switch ev {
             case .chunk: chunks += 1
+            case .reasoning: break
             case .toolCall: toolCalls += 1
             case .info: infoCount += 1
+            @unknown default: break
             }
         }
         return (chunks, toolCalls, infoCount)

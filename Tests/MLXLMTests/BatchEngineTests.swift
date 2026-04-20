@@ -406,7 +406,9 @@ class BatchEngineIntegrationTests: XCTestCase {
                 XCTAssertEqual(info.promptTokenCount, 5)
                 XCTAssertGreaterThan(info.generationTokenCount, 0)
                 XCTAssertEqual(info.stopReason, .length)
-            case .toolCall:
+            case .reasoning, .toolCall:
+                break
+            @unknown default:
                 break
             }
         }

@@ -183,9 +183,10 @@ let engine = await container.makeBatchEngine(maxBatchSize: 8)
 let stream = await engine.generate(input: lmInput, parameters: params)
 for await generation in stream {
     switch generation {
-    case .chunk(let text): print(text, terminator: "")
-    case .info(let info):  print(info.summary())
-    case .toolCall:        break
+    case .chunk(let text):   print(text, terminator: "")
+    case .reasoning:         break  // route to a think-pane if you render CoT
+    case .info(let info):    print(info.summary())
+    case .toolCall:          break
     }
 }
 ```

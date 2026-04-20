@@ -21,6 +21,7 @@ let stream = await engine.generate(input: input, parameters: params)
 for await event in stream {
     switch event {
     case .chunk(let text):     // pure user text, reasoning-stripped, tool-stripped
+    case .reasoning(let r):    // streaming <think>…</think> delta
     case .toolCall(let call):  // fully parsed tool call
     case .info(let info):      // prompt_tokens + generation_tokens + wall time
     }
@@ -114,7 +115,8 @@ Same contract as tool-call parsing: everything happens inside vmlx-swift-lm. Osa
 
 `AsyncStream<Generation>` yields the same events as the non-speculative path:
 
-- `.chunk(String)` — user-visible text. Reasoning (`<think>...</think>`) stripped and dropped silently. Tool-call envelopes extracted by `ToolCallProcessor`.
+- `.chunk(String)` — user-visible text. Reasoning (`<think>...</think>`) peeled off into `.reasoning` events; tool-call envelopes extracted into `.toolCall` events.
+- `.reasoning(String)` — streaming chain-of-thought delta, one per parser segment. Concatenate consecutive `.reasoning` events for the full think block.
 - `.toolCall(ToolCall)` — authoritative tool call extracted by the library.
 - `.info(GenerateCompletionInfo)` — one at end. Reports prompt token count + generation token count + wall time.
 
