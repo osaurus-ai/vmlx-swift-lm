@@ -29,12 +29,29 @@ mlx-swift-lm supports function calling / tool use with multiple model-specific f
 | Format | Models | Example Output |
 |--------|--------|----------------|
 | `.json` | Llama, Qwen, most models | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
-| `.lfm2` | LFM2 | `<\|tool_call_start\|>{"name":"f",...}<\|tool_call_end\|>` |
-| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3.5 | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
-| `.glm4` | GLM4 | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
-| `.gemma` | Gemma | `call:name{key:value}` |
+| `.lfm2` | LFM2 / LFM2.5 | `<\|tool_call_start\|>[f(arg='v')]<\|tool_call_end\|>` (pythonic) |
+| `.xmlFunction` | Nemotron-H, Qwen3 Coder, Qwen3.5, **Qwen 3.6** | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
+| `.glm4` | GLM4 / GLM5 / DeepSeek | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
+| `.gemma` | Gemma 3 | `<start_function_call>call:name{key:<escape>v<escape>}<end_function_call>` |
+| `.gemma4` | **Gemma 4** (different envelope than Gemma 3) | `<\|tool_call>call:name{key:<\|"\|>v<\|"\|>}<tool_call\|>` |
 | `.kimiK2` | Kimi K2 | `functions.name:0<\|tool_call_argument_begin\|>{...}` |
-| `.minimaxM2` | MiniMax M2 | `<invoke name="f"><parameter name="k">v</parameter></invoke>` |
+| `.minimaxM2` | **MiniMax M2 / M2.5** | `<minimax:tool_call><invoke name="f"><parameter name="k">v</parameter></invoke></minimax:tool_call>` |
+| `.mistral` | Mistral V11+ / Mistral Small 4 | `[TOOL_CALLS]f[ARGS]{"k":"v"}` |
+| `.llama3` | Llama 3.x (inline JSON) | `<\|python_tag\|>{"name":"f","parameters":{...}}` |
+
+### Interleaved reasoning (Qwen 3.6, MiniMax M2)
+
+Both emit `<think>...</think>` blocks **between** tool calls, not just before. Example from Qwen 3.6:
+
+```
+<think>need weather</think>
+<tool_call><function=get_weather><parameter=location>Paris</parameter></function></tool_call>
+<think>now check time</think>
+<tool_call><function=get_time><parameter=zone>UTC</parameter></function></tool_call>
+Final answer.
+```
+
+`BatchEngine.generate` / `Evaluate.generate` pipeline `ReasoningParser` → `ToolCallProcessor` so both tool calls surface as authoritative `.toolCall(ToolCall)` events and the reasoning never leaks to `.chunk`. See `reasoning-parser.md` for the streaming contract.
 
 ## Defining Tools
 
@@ -186,14 +203,30 @@ let processor = ToolCallProcessor(
 
 ## Format Auto-Detection
 
-Formats are auto-detected from model type:
+Both `LLMModelFactory._load` and `VLMModelFactory._load` stamp `ModelConfiguration.toolCallFormat` at load time with this priority:
+
+1. Caller-supplied override on `configuration.toolCallFormat`.
+2. **JANG `capabilities.tool_parser` stamp** via `ToolCallFormat.fromCapabilityName(_:)` — authoritative when `jang_config.json` is present.
+3. `ToolCallFormat.infer(from: modelType, configData:)` model-type heuristic.
 
 ```swift
-// Auto-detected based on model_type in config.json
-ToolCallFormat.infer(from: "lfm2")     // -> .lfm2
-ToolCallFormat.infer(from: "glm4")     // -> .glm4
-ToolCallFormat.infer(from: "gemma")    // -> .gemma
-ToolCallFormat.infer(from: "llama")    // -> nil (use default .json)
+// Model-type heuristic (secondary signal allows Llama 3 detection)
+ToolCallFormat.infer(from: "lfm2")      // -> .lfm2
+ToolCallFormat.infer(from: "glm4_moe")  // -> .glm4
+ToolCallFormat.infer(from: "gemma3")    // -> .gemma
+ToolCallFormat.infer(from: "gemma4")    // -> .gemma4
+ToolCallFormat.infer(from: "llama",
+    configData: configJSON)              // -> .llama3 if vocab_size≥128000
+
+// JANG capability stamps — short family names from the JANG converter
+ToolCallFormat.fromCapabilityName("qwen")        // -> .xmlFunction
+ToolCallFormat.fromCapabilityName("qwen3_6")     // -> .xmlFunction
+ToolCallFormat.fromCapabilityName("minimax")     // -> .minimaxM2
+ToolCallFormat.fromCapabilityName("gemma4")      // -> .gemma4
+ToolCallFormat.fromCapabilityName("glm47")       // -> .glm4
+ToolCallFormat.fromCapabilityName("nemotron")    // -> .xmlFunction
+ToolCallFormat.fromCapabilityName("kimi_k2")     // -> .kimiK2
+ToolCallFormat.fromCapabilityName("mistral4")    // -> .mistral
 ```
 
 ### Explicit Format in Configuration
@@ -201,7 +234,8 @@ ToolCallFormat.infer(from: "llama")    // -> nil (use default .json)
 ```swift
 let config = ModelConfiguration(
     id: "mlx-community/GLM-4-9B-0414-4bit",
-    toolCallFormat: .glm4
+    toolCallFormat: .glm4,
+    reasoningParserName: "glm4"   // JANG stamp for ReasoningParser
 )
 ```
 
@@ -276,8 +310,27 @@ public protocol ToolCallParser: Sendable {
     var startTag: String? { get }  // nil for inline formats
     var endTag: String? { get }
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
+    // Default impl splits on startTag + calls parse; override when a single
+    // buffer can contain multiple calls (Pythonic / LFM2).
+    func parseEOS(_ toolCallBuffer: String,
+                  tools: [[String: any Sendable]]?) -> [ToolCall]
 }
 ```
+
+### ToolCallProcessor contract
+
+`ToolCallProcessor.swift` is byte-identical with ml-explore/mlx-swift-lm `main`. The streaming state machine is: `normal → potentialToolCall → collectingToolCall`. For inline formats (no wrapper tags), chunks are buffered until either (a) the parser returns a `ToolCall` or (b) JSON braces balance with no match, at which point the buffer flushes as user text. This is the invariant osaurus's `StreamAccumulator` depends on.
+
+## Osaurus integration
+
+Osaurus consumes this module at four sites (see `Libraries/MLXLMCommon/BatchEngine/OSAURUS-API-SURFACE.md` for the full per-symbol map):
+
+- `StreamAccumulator.swift` — holds `ToolCallProcessor(format:, tools:)`, calls `processChunk` per token + `processEOS` on stream end.
+- `BatchEngineAdapter.swift` — reads `context.configuration.toolCallFormat` + accepts a `toolCallFormatOverride`.
+- `JANGReasoningResolver.swift` — uses `ParserResolution.toolCall(capabilities:modelType:)` + caches per model.
+- `StreamingDeltaProcessor.swift` — holds a `ReasoningParser` instance for `<think>` stripping.
+
+For the authoritative migration path (drop app-layer tool-call parsing, consume `.toolCall(ToolCall)` events from `BatchEngine.generate` directly), see `Libraries/MLXLMCommon/BatchEngine/OSAURUS-INTEGRATION.md` §4.
 
 ## Error Handling
 

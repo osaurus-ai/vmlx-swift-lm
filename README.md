@@ -6,6 +6,20 @@ A Swift package for building applications with large language models (LLMs) and 
 
 This fork adds native [JANG](https://jangq.ai) mixed-precision quantization, **TurboQuant KV cache compression** (4.7-5.0x memory savings), **Gemma 4**, **Mistral Small 4**, speculative decoding, VLM detection, and MoE performance optimizations on top of the full upstream library. Existing apps don't need to change anything -- all upstream APIs are preserved.
 
+## For osaurus integrators (read first)
+
+If you're integrating this fork from [osaurus-ai/osaurus](https://github.com/osaurus-ai/osaurus), three docs in this repo are the authoritative reference:
+
+| Doc | Use it for |
+|---|---|
+| [`Libraries/MLXLMCommon/BatchEngine/OSAURUS-API-SURFACE.md`](Libraries/MLXLMCommon/BatchEngine/OSAURUS-API-SURFACE.md) | Per-symbol reference — every `MLXLMCommon` / `MLXLLM` / `MLXVLM` symbol osaurus consumes, with the exact osaurus file + line that calls it. |
+| [`Libraries/MLXLMCommon/BatchEngine/OSAURUS-INTEGRATION.md`](Libraries/MLXLMCommon/BatchEngine/OSAURUS-INTEGRATION.md) | Quick integration notes — addresses `osaurus/docs/INFERENCE_RUNTIME.md` concerns, migration path to drop app-layer tool-call parsing, PR #893 consumer map. |
+| [`Libraries/MLXLMCommon/BatchEngine/BATCH_ENGINE.md`](Libraries/MLXLMCommon/BatchEngine/BATCH_ENGINE.md) | Full continuous-batching architecture, every iter-log addendum, real-model verification matrix. |
+
+Dedicated per-topic skill references live under [`skills/mlx-swift-lm/references/`](skills/mlx-swift-lm/references/) — in particular [`tool-calling.md`](skills/mlx-swift-lm/references/tool-calling.md) and [`reasoning-parser.md`](skills/mlx-swift-lm/references/reasoning-parser.md) document the streaming contract osaurus's `StreamAccumulator` + `StreamingDeltaProcessor` rely on.
+
+**`Libraries/MLXLMCommon/Tool/ToolCallProcessor.swift` is byte-identical with [ml-explore/mlx-swift-lm `main`](https://github.com/ml-explore/mlx-swift-lm)** — osaurus can pin to either repo without drift.
+
 ## What's New in This Fork
 
 ### New Model Architectures
