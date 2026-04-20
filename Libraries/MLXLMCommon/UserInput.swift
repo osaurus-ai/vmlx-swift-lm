@@ -204,6 +204,14 @@ public struct UserInput {
         ])
         self.tools = tools
         self.additionalContext = additionalContext
+        // Swift init semantics: `didSet` on `prompt` does not fire during
+        // initialisation, so the top-level `images` / `videos` properties
+        // would otherwise stay empty even though the chat messages carry
+        // them. VL processors (Qwen3VL, etc.) key off `input.images.isEmpty`
+        // to decide whether to run the vision pipeline — silent image-drop
+        // without these assignments. Matches what the `didSet` clause does.
+        self.images = images
+        self.videos = videos
     }
 
     /// Initialize the `UserInput` with model specific mesage structures.

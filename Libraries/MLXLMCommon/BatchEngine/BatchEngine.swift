@@ -214,25 +214,29 @@ public actor BatchEngine {
         let tokenizer = context.tokenizer
         let (_, tokenStream) = submit(input: input, parameters: parameters)
 
-        return AsyncStream<Generation> { continuation in
-            Task {
-                var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-                for await event in tokenStream {
-                    switch event {
-                    case .token(let id):
-                        detokenizer.append(token: id)
-                        while let text = detokenizer.next() {
-                            continuation.yield(.chunk(text))
-                        }
-                    case .info(let info):
-                        // Flush remaining text from detokenizer
-                        detokenizer.startNewSegment()
-                        continuation.yield(.info(info))
+        // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
+        // `AsyncStream.makeStream()` with an unstructured `Task {}` that
+        // owns the continuation. `if let` (not `while let`) — calling
+        // `NaiveStreamingDetokenizer.next()` in a loop produces empty
+        // strings forever and melts throughput under a real HF tokenizer.
+        let (outStream, continuation) = AsyncStream<Generation>.makeStream()
+        Task {
+            var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+            for await event in tokenStream {
+                switch event {
+                case .token(let id):
+                    detokenizer.append(token: id)
+                    if let text = detokenizer.next() {
+                        continuation.yield(.chunk(text))
                     }
+                case .info(let info):
+                    detokenizer.startNewSegment()
+                    continuation.yield(.info(info))
                 }
-                continuation.finish()
             }
+            continuation.finish()
         }
+        return outStream
     }
 
     /// Cancel a specific request by ID.
@@ -350,7 +354,47 @@ public actor BatchEngine {
     private func admitPendingRequests() {
         while activeSlots.count < maxBatchSize && !waitQueue.isEmpty {
             let request = waitQueue.removeFirst()
+
+            // Stage 0: warn if the request asks for a KV-quant mode not yet
+            // supported under batched decode (affine / legacy kvBits).
+            // TurboQuant is supported and takes effect in `stepPrefill`'s
+            // post-prefill compression hook. See BatchQuantize.swift.
+            BatchQuantize.wrapNewCacheIfNeeded(
+                slotID: request.id,
+                parameters: request.parameters
+            )
+
             let cache = context.model.newCache(parameters: request.parameters)
+
+            // Iter 57: auto-detect hybrid models at admission so SSM
+            // companion states round-trip through the coordinator.
+            // Without this the caller has to remember to
+            // `coordinator.setHybrid(true)` for Qwen3.6-MoE / Nemotron
+            // Cascade / other Mamba-attn hybrids — every forgotten call
+            // silently skips SSM-state store on finish, which breaks
+            // cross-turn cache reuse for hybrid chat. The check is
+            // idempotent; non-hybrid models never flip the flag because
+            // `CacheFamily.classify` only returns `.heterogeneous` or
+            // `.mamba` when a Mamba/SSM layer is present.
+            if let coordinator = cacheCoordinator, !coordinator.isHybrid {
+                let family = CacheFamily.classify(cache)
+                if family == .heterogeneous || family == .mamba {
+                    // Second-line check: at least one layer actually is
+                    // a SSM-style cache before flipping the flag. Keeps
+                    // `.heterogeneous` models that mix attention +
+                    // rotating (Gemma-4) from being misflagged.
+                    let hasSSM = cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache
+                    }
+                    if hasSSM {
+                        coordinator.setHybrid(true)
+                        Self.logger.info(
+                            "Coordinator flipped to isHybrid=true on first hybrid slot admission"
+                        )
+                    }
+                }
+            }
+
             let slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
             activeSlots.append(slot)
         }
@@ -434,7 +478,43 @@ public actor BatchEngine {
                 }
 
                 if restored {
-                    if remaining.isEmpty {
+                    // Two classes of partial-restore that must roll back to
+                    // full prefill rather than feed "remaining" tokens into
+                    // model.prepare — correctness over speed in both cases:
+                    //
+                    // 1. VL content: `mergeInputIdsWithImageFeatures` aligns
+                    //    vision tokens by count against `imageFeatures[]`.
+                    //    Splitting the vision-token region across a cache
+                    //    boundary makes MLX trap `SmallVector out of range`.
+                    //    Detect via `slot.originalInput.image/video` presence.
+                    //
+                    // 2. Hybrid SSM: the Mamba/SSM branch's recurrence is
+                    //    path-dependent. Restoring SSM state that was
+                    //    computed over the FULL prefix and then only feeding
+                    //    "remaining" tokens double-counts some positions
+                    //    and the resulting state diverges from what a clean
+                    //    prefill would produce — model output degrades.
+                    //    Detect by checking cache for MambaCache/ArraysCache
+                    //    layers.
+                    let hasVisualContent =
+                        slot.originalInput.image != nil ||
+                        slot.originalInput.video != nil
+                    let hasSSMLayer = slot.cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache
+                    }
+                    let unsafePartial = !remaining.isEmpty &&
+                        (hasVisualContent || hasSSMLayer)
+                    if unsafePartial {
+                        let why: String
+                        if hasVisualContent { why = "VL vision-token region can't be split" }
+                        else                { why = "hybrid SSM recurrence path-dependent on full prefix" }
+                        let slotIDStr = slot.id.description
+                        Self.logger.info(
+                            "Slot \(slotIDStr, privacy: .public): partial cache hit — rolling back to full prefill (\(why))"
+                        )
+                        slot.cache = context.model.newCache(parameters: slot.parameters)
+                        inputForPrepare = slot.originalInput
+                    } else if remaining.isEmpty {
                         // Full cache hit — feed last token to seed decode
                         let lastToken = MLXArray([Int32(tokenIds.last!)])
                         inputForPrepare = LMInput(
@@ -491,6 +571,22 @@ public actor BatchEngine {
         slot.decodeStartTime = Date()
         slot.pendingTokens = MLXArray([Int32]()) // clear
 
+        // Stage 0: KV-quant compression hook. For requests with
+        // `kvMode: .turboQuant(...)`, this swaps `KVCacheSimple` layers for
+        // `TurboQuantKVCache` once the first KV layer's offset exceeds the
+        // TQ minimum threshold (quantizedKVStart + 8). Prefill has just
+        // populated the cache, so typical prompts >8 tokens compress here.
+        // Shorter prompts will continue running float until the per-step
+        // hook in `stepBatchDecode` crosses the threshold. Affine / kvBits
+        // modes are currently no-ops (warning logged at admission).
+        BatchQuantize.maybeCompress(
+            cache: &slot.cache,
+            parameters: slot.parameters
+        )
+
+        // Stage 1B.3: compile-decode promotion hook.
+        self.maybePromoteToCompiledDecode(slot: &slot)
+
         // Check EOS on first generated token before yielding
         if stopTokenIDs.contains(tokenID) {
             finishSlot(slot, reason: .stop)
@@ -509,6 +605,241 @@ public actor BatchEngine {
         activeSlots[slotIndex] = slot
     }
 
+    // MARK: - Compiled Decode Step (Stage 1B.3)
+
+    /// Run a single decode step through a compiled forward closure for the
+    /// `maxBatchSize == 1` path.
+    ///
+    /// The closure was captured in ``maybePromoteToCompiledDecode`` after
+    /// prefill. It expects `[tokens]` as input and returns `[logits]` —
+    /// both single-element arrays. `tokens` shape is `[1]` (one token for
+    /// one sequence), `logits` shape is `[1, 1, V]`.
+    ///
+    /// Everything after the forward call (sampling, EOS checking, yield,
+    /// per-step quantization hook) matches `stepBatchDecode`'s sampling
+    /// loop. Duplicating rather than refactoring for now — the compiled
+    /// path will grow its own concerns in Stage 1B.4 (liveness masks,
+    /// multi-row routing) and merging logic prematurely would tangle
+    /// both.
+    private func stepCompiledDecode(
+        slotIndex: Int,
+        forward: @Sendable ([MLXArray]) -> [MLXArray]
+    ) {
+        var slot = activeSlots[slotIndex]
+        guard let nextToken = slot.nextToken else {
+            Self.logger.error(
+                "Slot \(slot.id.description, privacy: .public): stepCompiledDecode called without nextToken"
+            )
+            return
+        }
+
+        // Run the compiled forward pass. Closure captures the slot's
+        // CompilableKVCache layers as its state; mutating them via
+        // `_updateInternal` is how the trace advances.
+        let result = forward([nextToken])
+        guard result.count == 1 else {
+            Self.logger.error(
+                "Slot \(slot.id.description, privacy: .public): compiled forward returned \(result.count) outputs, expected 1"
+            )
+            return
+        }
+
+        // result[0] shape: [1, 1, V]. Force materialisation so we can
+        // read the sampled token ID below.
+        MLX.eval(result[0])
+
+        // Extract as [1, V] for the processor/sampler contract.
+        let logits = result[0][0 ..< 1, 0, 0...]
+        let token = slot.sampleToken(from: logits)
+        let tokenID = token.item(Int.self)
+
+        // Stage 0: per-step KV-quant hook. For compile+TQ this is a no-op
+        // because compile requires `.simple` family (TQ compression would
+        // have already run during prefill promotion or be blocked). Kept
+        // for symmetry with `stepBatchDecode` so any future compile+quant
+        // mode finds the hook wired in.
+        BatchQuantize.maybeCompress(
+            cache: &slot.cache,
+            parameters: slot.parameters
+        )
+
+        // Stop conditions (same rules as uncompiled path).
+        if stopTokenIDs.contains(tokenID) {
+            finishSlot(slot, reason: .stop)
+            slot.isFinished = true
+        } else {
+            slot.continuation.yield(.token(tokenID))
+            slot.generatedTokenCount += 1
+            slot.nextToken = token
+
+            if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
+                finishSlot(slot, reason: .length)
+                slot.isFinished = true
+            }
+        }
+
+        activeSlots[slotIndex] = slot
+    }
+
+    // MARK: - Compile-Decode Promotion (Stage 1B.3)
+
+    /// Promote a slot's cache to `CompilableKVCache` layers and build a
+    /// compiled forward closure when all preconditions hold.
+    ///
+    /// Called from `stepPrefill` after `BatchQuantize.maybeCompress` runs
+    /// (so TurboQuant-compressed slots are correctly excluded — their
+    /// family is `.turboQuant`, not `.simple`).
+    ///
+    /// Preconditions (all must hold for promotion):
+    ///  - `slot.parameters.enableCompiledBatchDecode == true`
+    ///  - `self.maxBatchSize == 1` — Stage 1B.3 scope. Stage 1B.4 lifts
+    ///    this via a per-bucket `BucketHandle` with shared multi-row
+    ///    `[B, H, maxLen, D]` buffers.
+    ///  - `HardwareInfo.isCompiledDecodeSupported` — dodges MLX#3329 on
+    ///    affected macOS Tahoe Metal driver builds.
+    ///  - `CacheFamily.classify(slot.cache) == .simple` — compile is only
+    ///    wired for KVCacheSimple layers today.
+    ///  - Every layer is an actual `KVCacheSimple` (not already
+    ///    `CompilableKVCache`) so the `CompilableKVCache(from:)` conversion
+    ///    has valid state to copy.
+    ///
+    /// When all hold, every layer is swapped for
+    /// `CompilableKVCache(from: originalLayer, maxLength: compiledMaxCacheLength)`
+    /// and the compiled forward closure is built via
+    /// ``BatchCompile/compileForward(model:cacheRef:)``. `stepBatchDecode`
+    /// then routes this slot's decode tokens through the closure.
+    private func maybePromoteToCompiledDecode(slot: inout BatchSlot) {
+        guard slot.parameters.enableCompiledBatchDecode else { return }
+        guard self.maxBatchSize == 1 else { return }
+        guard HardwareInfo.isCompiledDecodeSupported else { return }
+
+        let family = CacheFamily.classify(slot.cache)
+        let slotIDString = slot.id.description
+
+        switch family {
+        case .simple:
+            // Stage 1B.3 path. Promote KVCacheSimple layers to
+            // CompilableKVCache(from:) then build the compiled forward.
+            // Skip if layers are already CompilableKVCache (e.g., restored
+            // via cache coordinator — not yet implemented but harmless
+            // guard).
+            guard slot.cache.allSatisfy({ $0 is KVCacheSimple }) else { return }
+
+            let maxLen = slot.parameters.compiledMaxCacheLength ?? 4096
+            let promoted: [KVCache] = slot.cache.map { layer in
+                CompilableKVCache(from: layer, maxLength: maxLen) as KVCache
+            }
+            MLX.eval(promoted)
+            slot.cache = promoted
+            slot.compiledForward = BatchCompile.compileForward(
+                model: context.model, cacheRef: promoted)
+
+            Self.logger.debug(
+                "Slot \(slotIDString, privacy: .public): promoted to compiled decode via .simple family (maxLen=\(maxLen))"
+            )
+
+        case .turboQuant:
+            // Stage 2 SHIPPED (iter 21). Root cause of the long-
+            // investigated drift was `applyRotaryPosition` falling
+            // through to the Int `cache.offset` for TurboQuant layers
+            // instead of the MLXArray offset counter. Fixed in
+            // `RoPEApplication.swift`. Multi-step compiled-vs-uncompiled
+            // drift dropped from 6-13% to FP precision (~5e-7).
+            //
+            // All slots must be in compressed phase for compile to
+            // engage — short-prompt slots still in fill phase run the
+            // uncompiled path (next per-step maybeCompress hook will
+            // compress them when threshold crosses).
+            let allCompressed = slot.cache.allSatisfy { layer in
+                (layer as? TurboQuantKVCache)?.phase == .compressed
+            }
+            guard allCompressed else { return }
+
+            let promoted: [KVCache] = slot.cache.map { layer in
+                CompilableTurboQuantKVCache(from: layer as! TurboQuantKVCache) as KVCache
+            }
+            MLX.eval(promoted)
+            slot.cache = promoted
+            slot.compiledForward = BatchCompile.compileForward(
+                model: context.model, cacheRef: promoted)
+
+            Self.logger.debug(
+                "Slot \(slotIDString, privacy: .public): promoted to compiled decode via .turboQuant family"
+            )
+
+        case .rotating:
+            // Stage 3 (iter 12 built, iter 13 wired). Sliding-window
+            // models — Gemma3 / Gemma4 SWA layers / Mistral4 with
+            // maxKVSize / MiMoV2Flash / BaichuanM1 / Qwen3.5-VL inherited —
+            // promote each RotatingKVCache layer to
+            // CompilableRotatingKVCache and build the compiled forward.
+            //
+            // Stage 3 verified drift:
+            //   - Linear single-step: bit-identical (4.6e-7)
+            //   - Growth-boundary 10 steps: ~8% (from 30% pre-fix)
+            //   - Wrap-around 20 steps: ~3% (below 5% bar — from 68% pre-fix)
+            guard slot.cache.allSatisfy({ $0 is RotatingKVCache && !($0 is CompilableRotatingKVCache) }) else {
+                return
+            }
+
+            let promoted: [KVCache] = slot.cache.map { layer in
+                CompilableRotatingKVCache(from: layer as! RotatingKVCache) as KVCache
+            }
+            MLX.eval(promoted)
+            slot.cache = promoted
+            slot.compiledForward = BatchCompile.compileForward(
+                model: context.model, cacheRef: promoted)
+
+            Self.logger.debug(
+                "Slot \(slotIDString, privacy: .public): promoted to compiled decode via .rotating family"
+            )
+
+        case .cacheList:
+            // Stage 5 (iter 22 wiring). Composite cache for FalconH1 /
+            // BaichuanM1. Promote each CacheList layer to
+            // CompilableCacheList; the composite's sub-caches get
+            // promoted individually (KVCacheSimple → CompilableKVCache,
+            // RotatingKVCache → CompilableRotatingKVCache, etc).
+            //
+            // Fall back to uncompiled if any sub-cache can't be promoted
+            // (CompilableCacheList.allSubCachesCompileReady == false).
+            let promoted: [KVCache] = slot.cache.map { layer in
+                if let list = layer as? CacheList, !(layer is CompilableCacheList) {
+                    return CompilableCacheList(from: list) as KVCache
+                }
+                return layer
+            }
+            let allReady = promoted.allSatisfy {
+                ($0 as? CompilableCacheList)?.allSubCachesCompileReady ?? false
+            }
+            guard allReady else {
+                Self.logger.debug(
+                    "Slot \(slotIDString, privacy: .public): .cacheList compile skipped — not all sub-caches compile-ready"
+                )
+                return
+            }
+            MLX.eval(promoted)
+            slot.cache = promoted
+            slot.compiledForward = BatchCompile.compileForward(
+                model: context.model, cacheRef: promoted)
+            Self.logger.debug(
+                "Slot \(slotIDString, privacy: .public): promoted to compiled decode via .cacheList family"
+            )
+
+        case .mamba, .heterogeneous:
+            // Stage 4 pending (hybrid trace grouping is its own spec).
+            //
+            // Gemma3/Gemma4 hit this branch via `.heterogeneous` because
+            // their cache mixes KVCacheSimple (full_attention) +
+            // RotatingKVCache (sliding_attention). Decode runs through
+            // the existing uncompiled BatchKVCache path.
+            Self.logger.debug(
+                "Slot \(slotIDString, privacy: .public): compile skipped — family=\(family.description) (stage pending or heterogeneous)"
+            )
+            return
+        }
+    }
+
     // MARK: - Batched Decode
 
     /// Run one batched decode step across all decode-phase slots.
@@ -517,6 +848,18 @@ public actor BatchEngine {
     /// ``BatchKVCache`` wrappers, runs one model forward pass, then samples
     /// independently per sequence.
     private func stepBatchDecode(slotIndices: [Int]) {
+        // Stage 1B.3: single-slot compiled decode path. When this slot was
+        // promoted to a compiled-forward during `stepPrefill`, route through
+        // the compiled closure instead of constructing per-step BatchKVCache
+        // wrappers. This path only engages at `maxBatchSize == 1` (the
+        // promotion gate), so `slotIndices.count` is strictly 1 here.
+        if slotIndices.count == 1,
+            let forward = activeSlots[slotIndices[0]].compiledForward
+        {
+            stepCompiledDecode(slotIndex: slotIndices[0], forward: forward)
+            return
+        }
+
         let B = slotIndices.count
 
         // Build batched input: [B, 1]
@@ -580,6 +923,17 @@ public actor BatchEngine {
             let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
             let token = slot.sampleToken(from: logits)
             let tokenID = token.item(Int.self)
+
+            // Stage 0: per-step KV-quant compression hook. For slots with
+            // short prompts that were below the TQ minimum threshold at
+            // prefill end, this catches the threshold crossing during decode.
+            // Slots already in TurboQuant phase short-circuit via the internal
+            // `cache.contains(where: { $0 is TurboQuantKVCache })` guard, so
+            // this is a cheap no-op once compressed.
+            BatchQuantize.maybeCompress(
+                cache: &slot.cache,
+                parameters: slot.parameters
+            )
 
             // Check stop conditions BEFORE yielding — don't emit EOS tokens to callers.
             // This matches TokenIterator behavior where the stop token is never surfaced.
