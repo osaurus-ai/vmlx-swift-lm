@@ -100,10 +100,16 @@ public struct ModelConfiguration: Sendable {
     ///
     /// Accepted values match `ReasoningParser.fromCapabilityName(_:)`:
     /// - `"think_xml"`, `"qwen3"`, `"qwen3_5"`, `"qwen3_6"`, `"deepseek_r1"`,
-    ///   `"glm4"`, `"nemotron"`, `"minimax"` → strip `<think>...</think>`
-    /// - `"none"`, `"mistral"`, `"gemma4"` → no stripping (these families emit
-    ///   no `<think>` tags at inference time)
-    /// - `nil` → no stripping (byte-compatible with upstream default)
+    ///   `"glm4"`, `"nemotron"`, `"minimax"` → strip `<think>...</think>`.
+    ///   These stamps use `startInReasoning=true` because the Qwen 3.x
+    ///   chat templates prefill `<think>\n` at prompt tail when
+    ///   `enable_thinking=true` (the template default).
+    /// - `"harmony"` / `"harmony_channel"` / `"gemma4_channel"` /
+    ///   `"gemma4"` → strip `<|channel>thought\n...<channel|>` (Gemma-4
+    ///   harmony-channel envelope).
+    /// - `"none"`, `"mistral"`, `"gemma"` → no stripping (these families
+    ///   emit no reasoning envelope at inference time).
+    /// - `nil` → no stripping (byte-compatible with upstream default).
     public var reasoningParserName: String?
 
     public init(
