@@ -29,15 +29,29 @@ for arg in "$@"; do
   esac
 done
 
-# Default model paths — override by exporting before invocation.
-: "${Q06B:=/Users/eric/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-8bit/snapshots/11de96878523501bcaa86104e3c186de07ff9068}"
-: "${Q36:=/Users/eric/.mlxstudio/models/MLXModels/OsaurusAI/Qwen3.6-35B-A3B-JANGTQ2}"
-: "${VL4B:=/Users/eric/.mlxstudio/models/MLXModels/dealignai/Qwen3.5-VL-4B-JANG_4S-CRACK}"
-: "${G4E2B:=/Users/eric/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit}"
-: "${BENCH_MAX_TOKENS:=30}"
-: "${G4_TEMPLATE:=/Users/eric/vmlx-swift-lm/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja}"
+# Resolve script-relative repo root so the template path works regardless
+# of where the script is invoked from.
+SCRIPT_DIR="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-cd "$(/usr/bin/dirname "$0")/.."
+# Default model paths — override by exporting before invocation.
+# Q06B is content-addressed in the HF hub cache; auto-resolve via snapshot
+# walk if the default isn't set.
+if [ -z "${Q06B:-}" ]; then
+  _hub="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3-0.6B-8bit/snapshots"
+  if [ -d "$_hub" ]; then
+    Q06B="$(/usr/bin/find "$_hub" -maxdepth 1 -mindepth 1 -type d | /usr/bin/head -1)"
+  else
+    Q06B=""
+  fi
+fi
+: "${Q36:=$HOME/.mlxstudio/models/MLXModels/OsaurusAI/Qwen3.6-35B-A3B-JANGTQ2}"
+: "${VL4B:=$HOME/.mlxstudio/models/MLXModels/dealignai/Qwen3.5-VL-4B-JANG_4S-CRACK}"
+: "${G4E2B:=$HOME/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit}"
+: "${BENCH_MAX_TOKENS:=30}"
+: "${G4_TEMPLATE:=$REPO_ROOT/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja}"
+
+cd "$REPO_ROOT"
 
 PASS=0
 FAIL=0
@@ -142,13 +156,30 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+VL9B="${VL9B:-$HOME/.mlxstudio/models/MLXModels/mlx-community/Qwen3.5-VL-9B-8bit}"
+echo "=== Qwen3.5-VL-9B mlx-community (validates TokenizersBackend substitution, iter 59) ==="
+if check_model "$VL9B"; then
+  run_scenario "VL-9B BENCH_VL_BATCH_CHAT" env BENCH_MODEL="$VL9B" BENCH_VL_BATCH_CHAT=1 BENCH_MAX_TOKENS=20 .build/debug/RunBench
+else
+  skip "Qwen3.5-VL-9B mlx-community not cached at $VL9B"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
+G4_TOOLS_TEMPLATE="${G4_TOOLS_TEMPLATE:-$REPO_ROOT/Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja}"
 echo "=== Gemma-4-E2B-4bit (sliding-window, template override) ==="
 if check_model "$G4E2B"; then
   if [ -e "$G4_TEMPLATE" ]; then
-    run_scenario "Gemma-4-E2B BENCH_BATCH_CHAT" \
+    run_scenario "Gemma-4-E2B BENCH_BATCH_CHAT (Gemma4Minimal)" \
       env BENCH_MODEL="$G4E2B" VMLX_CHAT_TEMPLATE_OVERRIDE="$G4_TEMPLATE" BENCH_BATCH_CHAT=1 BENCH_MAX_TOKENS=$BENCH_MAX_TOKENS .build/debug/RunBench
   else
     skip "Gemma4Minimal.jinja missing at $G4_TEMPLATE"
+  fi
+  if [ -e "$G4_TOOLS_TEMPLATE" ]; then
+    run_scenario "Gemma-4-E2B BENCH_BATCH_CHAT (Gemma4WithTools, iter 60)" \
+      env BENCH_MODEL="$G4E2B" VMLX_CHAT_TEMPLATE_OVERRIDE="$G4_TOOLS_TEMPLATE" BENCH_BATCH_CHAT=1 BENCH_MAX_TOKENS=$BENCH_MAX_TOKENS .build/debug/RunBench
+  else
+    skip "Gemma4WithTools.jinja missing at $G4_TOOLS_TEMPLATE"
   fi
 else
   skip "Gemma-4-E2B-4bit not cached at $G4E2B"
