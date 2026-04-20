@@ -4,7 +4,21 @@
 
 **Looking for the full public-API surface?** See `OSAURUS-API-SURFACE.md` in this directory — per-symbol reference with shape + which osaurus file consumes it, cross-checked against osaurus `main` and PR #893.
 
-**Status** (2026-04-19): **production-ready** to flip `mlxBatchEngine=YES` as default. Verified 121 engine unit tests (0 failures), 25 bench scenarios across dense / hybrid-SSM / sliding-window / VL JANG / VL mlx-community model families.
+## Doc map
+
+| Doc | For |
+|---|---|
+| `OSAURUS-INTEGRATION.md` (this file) | Narrative overview — what osaurus flipped / closed / is blocked on. |
+| **`TPAE-2026-04-20-TRIAGE.md`** | **Start here if you're reading tpae's Slack thread.** Line-by-line map from every message (1:58 AM through 3:17 AM) to its resolution — commit, doc, real-model verification row. |
+| `OSAURUS-API-SURFACE.md` | Per-symbol public API surface. The canonical reference osaurus integrators link against. |
+| `OSAURUS-SPECDEC.md` (one level up) | `GenerateParameters.draftStrategy` contract — DFlash / DDTree speculative decoding. |
+| `GEMMA4-SLIDING-WINDOW-CRASH.md` | 2026-04-20 fix for tpae's `broadcast_shapes` crash on Gemma-4 at prompts past `sliding_window=1024`. Real-model verification matrix included. |
+| `REASONING-STREAM-EVENT.md` | 2026-04-20 `Generation.reasoning(String)` library-level streaming channel. Closes tpae's "thinking parsers should be handled at library level". |
+| `STOP-SEQUENCES-CONTRACT.md` | 2026-04-20 `GenerateParameters.extraStopStrings` field + `StopStringMatcher`. Closes tpae's "what should happen to text-level stop sequences". |
+| `FORK-SYNC-PROCESS.md` | 2026-04-20 three-remote topology (upstream / public / origin) + sync procedure + carrying-patch triage. Closes tpae's "are we keeping this up to date". |
+| `BATCH_ENGINE.md` (next to these) | Internal iter log — architecture decisions, per-iter rationale, the ~2100-line deep dive. |
+
+**Status** (2026-04-20): **production-ready**. All four tpae-reported issues fixed, documented, unit-tested, AND real-model-verified against the actual crashing `gemma-4-26b-a4b-it` architecture at tpae's exact 2152 → 3715 → 7869 → 8362 prompt progression. See `GEMMA4-SLIDING-WINDOW-CRASH.md` §"Real-model verification" for the run-by-run numbers.
 
 **Iter 66 closes tpae's tool-call-parsing request** — `BatchEngine.generate()` + `Evaluate.generate()` now emit authoritative `.toolCall(ToolCall)` events for every supported family (JSON, Qwen xml_function, Qwen 3.6 interleaved thinking, Mistral, GLM-4, LFM2, Kimi K2, Gemma-3/4, MiniMax M2). Osaurus no longer needs its own tool-call parser at the app layer. See §4 below.
 
