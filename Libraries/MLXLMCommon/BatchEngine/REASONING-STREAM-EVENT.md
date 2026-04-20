@@ -168,6 +168,23 @@ K2 / Nemotron scenarios in `scripts/verify-engine.sh` — once the
 harness is run against any think-emitting family, `.reasoning` deltas
 now show up in the event stream.
 
+### 2026-04-20 PM multi-turn real-model matrix
+
+After the harmony fix (`daad538`), added a 3-turn leak-check scenario
+`BENCH_QWEN_MULTITURN_TOOL=1` in `RunBench/Bench.swift` that asserts
+ZERO reasoning-envelope markers in `.chunk` across every turn for
+both families. Results on M4 Max:
+
+| Model | Scenario | Turn 1 | Turn 2 | Turn 3 | Markers leaked in `.chunk` |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B-MXFP4 | enable_thinking=true, 3 turns | 179 reasoning / 0 chunk | 179 reasoning / 0 chunk | 179 reasoning / 0 chunk (180 tok cap) | **0** |
+| Qwen3.6-35B-A3B-MXFP4 | same, 600 tok cap | 599 reasoning / 0 chunk | 594 reasoning / 0 chunk | 578 reasoning / 18 chunk (clean answer) | **0** |
+| Gemma-4-26B-A4B-it-4bit | harmony, 3 turns, 120 tok cap | 112 reasoning / 0 chunk | 1 reasoning / 108 chunk | 1 reasoning / 36 chunk | **0** |
+
+Test scenario checks for ALL envelope variants on every turn:
+`<think>`, `</think>`, `<|channel>`, `<channel|>`. Any single
+appearance in `.chunk` fails the scenario.
+
 ## Migration for osaurus
 
 Replace the app-layer `StreamingDeltaProcessor` fan-out logic with a

@@ -377,6 +377,18 @@ daad538 fix(reasoning): Gemma-4 harmony parser + Qwen3.6 prefilled-think support
     session).
   - Gemma-4-e2b with `extraStopStrings` halt-and-truncate verified.
   - Qwen3.6-35B multi-turn to 8385 tokens verified.
+  - **Qwen3.6-35B 3-turn scenario** mirroring tpae's 3:02-3:15 PM
+    screenshots (README request, followup with pre-loaded context,
+    weather topic change) — turn 1 / 2 / 3: zero `<think>` leaks;
+    turn 3 full lifecycle: 578 `.reasoning` deltas + 18 `.chunk`
+    events with clean visible answer. Harness is
+    `BENCH_QWEN_MULTITURN_TOOL=1` in `RunBench/Bench.swift`
+    (`runQwenMultiturnToolCheck`). Asserts every turn has zero
+    `<think>` / `</think>` AND zero `<|channel>` / `<channel|>`
+    markers in `.chunk`.
+  - **Gemma-4-26B 3-turn same harness** — same zero-leak assertion
+    with harmony markers. Turn 2: 108 chunks + 1 reasoning delta,
+    turn 3: 36 chunks + 1 reasoning delta, all turns pass.
 
 Everything tpae reported on 2026-04-20 (AM and PM threads) is either
 fixed with a dedicated doc, or out of scope with a documented
