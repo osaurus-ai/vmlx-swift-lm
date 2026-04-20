@@ -193,7 +193,7 @@ public class Qwen3ModelInner: Module {
     }
 }
 
-public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStateCaptureModel {
+public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStateCaptureModel, TokenEmbedderModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -251,6 +251,24 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider, HiddenState
         }
 
         return weights
+    }
+
+    // MARK: - TokenEmbedderModel
+
+    /// Embed token IDs via the target's shared embedding table. Matches
+    /// what `Qwen3ModelInner.callAsFunction` does at its first line.
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        model.embedTokens(tokenIds)
+    }
+
+    /// Project hidden states through the target's LM head. For tied
+    /// word embeddings the head is the transposed embedding. Mirrors
+    /// the projection path in `callAsFunction(_:cache:)` exactly.
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 }
 
