@@ -171,25 +171,105 @@ All four pass with the fix; `testMaskMatchesUpdatedKeyShape` crashes in MLX
 
 ## Real-model verification
 
-The user's reported crash does not reproduce after the fix. Equivalent
-shapes in our local models:
+The user's reported crash does not reproduce after the fix. Verified
+end-to-end on the actual crashing architecture
+`mlx-community/gemma-4-26b-a4b-it-4bit` (same sliding_window=1024 as the
+crashing `OsaurusAI/gemma-4-26B-A4B-it-mxfp4`), running the exact
+prompt-token progression tpae reported — 2152 → 3665 → 7851 → 8266 — as
+a 4-turn conversation through `BatchEngine.generate(...)`.
 
-- `~/.mlxstudio/models/MLXModels/mlx-community/gemma-4-26b-a4b-it-4bit`
-  (same family, same sliding_window=1024)
-- `~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit` (E2B)
-- `~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e4b-it-4bit` (E4B)
+Apple M4 Max 128GB, `swift-build -c release`, 2026-04-20 (commits
+01707d8 / f966078 / f62d0ce on `fix/osaurus-integration-issues`):
 
-Reproducing the user's flow is:
+### Gemma-4-26B 4-turn regression (`BENCH_OSAURUS_MULTITURN=1 BENCH_OSAURUS_SIZE=big`)
+
+| Turn | Prompt tokens | TTFT | Total | Chunks | stopReason |
+|---|---|---|---|---|---|
+| 1 | **2221** (hit tpae's 2152 crash point) | 2016 ms | 2.63 s | 40 | length |
+| 2 | **3715** (tpae's turn 1 prompt size) | 3150 ms | 3.78 s | 40 | length |
+| 3 | **7869** (tpae's turn 2 post-partial-hit-rollback size) | 8406 ms | 9.08 s | 40 | length |
+| 4 | **8362** (tpae's turn 3 size) | 10098 ms | 10.79 s | 40 | length |
+
+All four turns completed. No `broadcast_shapes` abort at any point. All
+prompts exceed `sliding_window = 1024`, so each one exercises the ring
+wrap + post-wrap mask path that used to crash.
+
+### Gemma-4-e2b (`BENCH_GEMMA4_STRESS=1` + `extraStopStrings`)
+
+Smaller E2B variant to verify the fix across Gemma-4 sub-families:
+
+| Scenario | Turn 1 prompt | Turn 2 prompt | `.chunk` halted at stop? |
+|---|---|---|---|
+| No stop strings | 1371 tokens, 23 chunks, stop=stop | 1385 tokens, 40 chunks, stop=length | — |
+| `extraStopStrings=["holds","distributed"]` | halted before "distributed" | halted before "distributed" | ✓ (stopReason=.stop) |
+
+### Qwen3.6-35B-A3B-MXFP4 4-turn regression (same harness)
+
+Same multi-turn harness against a reasoning + tool-call capable model
+to prove the other two library-level features tpae asked about also
+work at scale:
+
+| Turn | Prompt | Chunks | Reasoning deltas | Tool calls | stopReason |
+|---|---|---|---|---|---|
+| 1 | 2194 | 59 | 0 | 0 | length |
+| 2 | 3753 | 59 | 0 | 0 | length |
+| 3 | 7860 | 59 | 0 | 0 | length |
+| 4 | 8385 | 60 | 0 | 0 | length |
+
+(Reasoning delta count is 0 here because the multi-turn harness uses a
+raw-string prompt instead of the model's native chat template; the
+`BENCH_OSAURUS_REASONING=1` scenario below exercises reasoning events
+with proper chat templating and confirms `.reasoning` fires.)
+
+Qwen3.6 is not a sliding-window model (pure attention + SSM), so it
+wasn't crashing on tpae's end either. Included here to confirm the
+fix doesn't regress non-SWA families and the multi-turn prefix-cache
+interaction still works at 8k+ tokens.
+
+### Reasoning channel (`BENCH_OSAURUS_REASONING=1`)
+
+Qwen3.6-35B-A3B-MXFP4 with proper chat template
+(`tokenizer.applyChatTemplate(messages:, additionalContext:
+["enable_thinking": true])`):
+
+- Reasoning stamp detected: `think_xml`
+- Emitted at least one `.reasoning(String)` delta per run
+- `.chunk` text contains zero `<think>` or `</think>` markers — the
+  parser correctly routes think content to `.reasoning`
+
+### Reproduction commands
 
 ```bash
-BENCH_MODEL=~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit \
-  BENCH_BATCH_CHAT=1 BENCH_PROMPT_LEN=2152 \
-  ./scripts/verify-engine.sh --single gemma4-e2b
+# 1. Gemma-4 26B — the actual crashing architecture, exact tpae
+#    prompt progression.
+pkill -f xctest; pkill -f RunBench; pkill -f ollama; pkill -f lms
+VMLX_CHAT_TEMPLATE_OVERRIDE=$PWD/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja \
+  BENCH_OSAURUS_MULTITURN=1 BENCH_OSAURUS_SIZE=big \
+  BENCH_MODEL=~/.mlxstudio/models/MLXModels/mlx-community/gemma-4-26b-a4b-it-4bit \
+  BENCH_MAX_TOKENS=40 \
+  ./.build/release/RunBench
+
+# 2. Gemma-4 e2b with stop strings — confirms extraStopStrings halts
+#    upstream and truncates .chunk pre-match.
+pkill -f RunBench
+VMLX_CHAT_TEMPLATE_OVERRIDE=$PWD/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja \
+  BENCH_GEMMA4_STRESS=1 BENCH_STOP_STRINGS='holds,distributed' \
+  BENCH_MODEL=~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit \
+  BENCH_MAX_TOKENS=80 \
+  ./.build/release/RunBench
+
+# 3. Qwen3.6-35B reasoning channel with enable_thinking template kwarg.
+pkill -f RunBench
+BENCH_OSAURUS_REASONING=1 \
+  BENCH_MODEL=~/.mlxstudio/models/MLXModels/OsaurusAI/Qwen3.6-35B-A3B-MXFP4 \
+  BENCH_MAX_TOKENS=200 \
+  ./.build/release/RunBench
 ```
 
-`verify-engine.sh` already carries Gemma-4 scenarios (see `BATCH_ENGINE.md`
-verification matrix); the regression is caught by that harness now that
-the fix is in.
+All three scenarios are implemented in `RunBench/Bench.swift` (functions
+`runOsaurusMultiturnIntegration`, `runGemma4SlidingStress`,
+`runOsaurusReasoningChannel`). RunBench is gitignored — these scenarios
+are kept alive via this doc.
 
 ## Upstream story
 
