@@ -97,26 +97,35 @@ public final class DiskCache: @unchecked Sendable {
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
 
-        // Pre-realize arrays on calling thread so GPU work completes
-        // before the writer hits the C++ save path.
+        // Iter 61: the full write path (realize + save + SQLite insert)
+        // must be serialized. MLX.eval AND the safetensors save both
+        // submit Metal command-buffer work, and two threads overlapping
+        // those calls crash with
+        //   "failed assertion _status < MTLCommandBufferStatusCommitted"
+        // even when each individual `save()` is held by a lock. So the
+        // lock has to cover the realize step too.
+        //
+        // BatchEngine's actor serializes per-engine, but the coordinator
+        // is reachable from non-actor callers (TokenIterator path,
+        // external cache warmers), so thread-safety has to live here,
+        // not rely on the caller.
+        //
+        // SYNCHRONOUS write (not dispatched to background) because prior
+        // Darwin dispatch-to-background races with process termination on
+        // short sessions would leave 0-byte safetensors files on disk.
+        //
+        // Use manual lock/unlock rather than `withLock` because MLXArray
+        // is not `Sendable` and `OSAllocatedUnfairLock.withLock` needs
+        // `@Sendable` closures under Swift 6 strict concurrency. The
+        // unfair-lock primitive doesn't require Sendable — we just need
+        // `defer { unlock() }` to cover every exit path.
+        lock.lock()
+        defer { lock.unlock() }
+        stores += 1
+        // Pre-realize arrays under the lock so Metal work completes
+        // before the writer hits the C++ save path AND no other thread
+        // can interleave MLX ops on the same device during this window.
         MLX.eval(Array(arrays.values))
-
-        lock.withLock {
-            stores += 1
-        }
-
-        // SYNCHRONOUS write — previously dispatched to a background
-        // `DispatchQueue.global(qos: .utility)`, but that dispatch raced
-        // with process termination on short-lived sessions: the caller
-        // returned, the process (bench harness, a curl-then-SIGTERM
-        // serve loop, or any short Osaurus session) exited, the
-        // safetensors writer hadn't started yet, and the file was left
-        // at 0 bytes. Every "T1 then restart then T2" workflow then saw
-        // a cache miss on T2 because the on-disk file existed but was
-        // empty. The save is a single safetensors call on already-
-        // realized MLXArrays — costs ~milliseconds, well under the
-        // request latency budget, and removes the whole class of
-        // "disk cache silently did nothing" bugs.
         do {
             try save(arrays: arrays, metadata: ["format": "mlx"], url: url)
 
@@ -129,14 +138,13 @@ public final class DiskCache: @unchecked Sendable {
                 fileSize = 0
             }
 
-            insertEntry(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
-            evictIfNeeded()
+            _insertEntryLocked(hash: hash, tokenCount: tokenCount, fileSize: fileSize)
+            _evictIfNeededLocked()
         } catch {
-            // Best-effort: swallow so a write failure doesn't fail the
-            // caller's request — the model output is already produced.
-            // But LOG to stderr so operational failures surface instead
-            // of hiding silently. Matches the fetch-side corrupt-entry
-            // log below.
+            // Best-effort: swallow so a write failure doesn't fail
+            // the caller's request — the model output is already
+            // produced. But LOG to stderr so operational failures
+            // surface instead of hiding silently.
             FileHandle.standardError.write(Data(
                 "[vmlx][cache/disk] store failed for hash \(hash): \(error)\n"
                 .utf8))
@@ -259,7 +267,9 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// Insert or replace a cache entry in the SQLite index.
-    private func insertEntry(hash: String, tokenCount: Int, fileSize: Int) {
+    /// Caller MUST hold `lock` — the `_Locked` suffix is the convention
+    /// for helpers that assume serialized access.
+    private func _insertEntryLocked(hash: String, tokenCount: Int, fileSize: Int) {
         guard let db else { return }
 
         let sql = """
@@ -279,7 +289,8 @@ public final class DiskCache: @unchecked Sendable {
     }
 
     /// Evict oldest entries until total cache size is under `maxSizeBytes`.
-    private func evictIfNeeded() {
+    /// Caller MUST hold `lock`.
+    private func _evictIfNeededLocked() {
         guard let db else { return }
 
         // Query total size
