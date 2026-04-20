@@ -137,7 +137,13 @@ public enum SpecDecRuntimeLinear {
         //    re-running. For those targets we fall back to re-prefill
         //    each round (correct, O(tokens_so_far²) total, works fine).
         let targetCache: [KVCache] = args.target.newCache(parameters: nil)
-        let useRollbackFastPath = canTrimPromptCache(targetCache)
+        // Gate the target-cache+rollback fast path. Disabled via env var
+        // `DFLASH_DISABLE_FAST_PATH=1` when we're validating byte-parity
+        // against the fallback; always disabled when any layer cache is
+        // non-trimmable (hybrid SSM).
+        let envDisable = ProcessInfo.processInfo.environment[
+            "DFLASH_DISABLE_FAST_PATH"] == "1"
+        let useRollbackFastPath = !envDisable && canTrimPromptCache(targetCache)
 
         let (prefillLogits, prefillHidden) = args.target(
             args.inputIds,
