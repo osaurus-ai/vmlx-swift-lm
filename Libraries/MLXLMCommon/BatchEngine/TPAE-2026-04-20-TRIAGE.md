@@ -132,28 +132,31 @@ doc in this directory or notes the explicit out-of-scope rationale.
 
 ### 2:42 AM — "are we keeping this up to date"
 
-- **Status:** CLOSED.
-- **Commit:** `b003ba8 — docs(fork-sync): document osaurus-ai/mlx-swift-lm ↔ ml-explore sync process`
+- **Status:** CLOSED — `osaurus-ai/mlx-swift-lm` is **deprecated**.
+  We don't maintain it; everything osaurus consumes lives on
+  `osaurus-ai/vmlx-swift-lm`.
 - **Doc:** [`FORK-SYNC-PROCESS.md`](FORK-SYNC-PROCESS.md)
-- **Summary of state as of 2026-04-20:**
-  - `upstream` = ml-explore/mlx-swift-lm (canonical Apple MLX).
-  - `public` = osaurus-ai/mlx-swift-lm — Eric's STABLE public fork:
-    upstream + ONLY the carrying fixes osaurus production needs
-    (Gemma-4 VLM, JANG overflow, Qwen3.5 norm shift, MXFP loader).
-    Currently **75 commits ahead** of upstream, **18 behind**.
-  - `origin` = osaurus-ai/vmlx-swift-lm — Eric's DEV superset
-    (BatchEngine + SpecDec + CacheCoordinator + TurboQuant on top
-    of the `public` base). **120 commits ahead** of public.
-- **Sync procedure:** documented step-by-step for both
-  `upstream → public` (merge with conflict hotspot list) and
-  `public → origin` (fast-forward-able — origin is strictly ahead).
-- **Upstream PR candidates identified:** four clean batches from
-  the 75 carrying patches — JANG MLP float16 overflow bundle,
-  Gemma4 VLM image pipeline bundle, Gemma4 multi-turn 1D-token
-  crash, SwitchGLU compiledGeluApproximate workaround.
-- **Acceptance gate for a public push:** full build + regression
-  suites + real-model smoke (`BENCH_GEMMA4_STRESS` on a local
-  Gemma-4 model). Exact commands in the doc.
+- **Why deprecated:** maintaining two forks (a "clean" one that
+  tracks upstream + carrying fixes, AND a superset with
+  BatchEngine / SpecDec / CacheCoordinator / TurboQuant) had no
+  consumer — osaurus always wants the superset because that's
+  where the APIs it depends on live (`.reasoning(String)`,
+  `extraStopStrings`, `draftStrategy`, `CacheCoordinator`,
+  etc.). Drift between the two was pure operational tax.
+- **Action for osaurus integrators:** change the Package.swift
+  dependency to:
+  ```swift
+  .package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", branch: "main")
+  ```
+  and drop any reference to `osaurus-ai/mlx-swift-lm`.
+- **Remaining sync work:** `upstream` (`ml-explore/mlx-swift-lm`)
+  → `origin` (`vmlx-swift-lm`) only. Procedure + hotspot conflict
+  list + acceptance gate documented in `FORK-SYNC-PROCESS.md`.
+- **Upstream PR candidates identified:** four clean bundles we
+  could push back to `ml-explore/mlx-swift-lm` to shrink our
+  carrying diff — JANG MLP float16 overflow, Gemma4 VLM image
+  pipeline, Gemma4 multi-turn 1D-token crash, SwitchGLU
+  compiledGeluApproximate workaround.
 
 ### 2:48 AM — the Gemma-4-26B crash
 

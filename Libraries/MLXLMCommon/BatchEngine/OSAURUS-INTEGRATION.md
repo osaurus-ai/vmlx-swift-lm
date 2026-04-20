@@ -15,7 +15,7 @@
 | `GEMMA4-SLIDING-WINDOW-CRASH.md` | 2026-04-20 fix for tpae's `broadcast_shapes` crash on Gemma-4 at prompts past `sliding_window=1024`. Real-model verification matrix included. |
 | `REASONING-STREAM-EVENT.md` | 2026-04-20 `Generation.reasoning(String)` library-level streaming channel. Closes tpae's "thinking parsers should be handled at library level". |
 | `STOP-SEQUENCES-CONTRACT.md` | 2026-04-20 `GenerateParameters.extraStopStrings` field + `StopStringMatcher`. Closes tpae's "what should happen to text-level stop sequences". |
-| `FORK-SYNC-PROCESS.md` | 2026-04-20 three-remote topology (upstream / public / origin) + sync procedure + carrying-patch triage. Closes tpae's "are we keeping this up to date". |
+| `FORK-SYNC-PROCESS.md` | 2026-04-20 upstream-sync procedure (`ml-explore/mlx-swift-lm` → `osaurus-ai/vmlx-swift-lm`). **Note:** `osaurus-ai/mlx-swift-lm` is deprecated — osaurus consumes vmlx directly. Closes tpae's "are we keeping this up to date". |
 | `BATCH_ENGINE.md` (next to these) | Internal iter log — architecture decisions, per-iter rationale, the ~2100-line deep dive. |
 
 **Status** (2026-04-20): **production-ready**. All four tpae-reported issues fixed, documented, unit-tested, AND real-model-verified against the actual crashing `gemma-4-26b-a4b-it` architecture at tpae's exact 2152 → 3715 → 7869 → 8362 prompt progression. See `GEMMA4-SLIDING-WINDOW-CRASH.md` §"Real-model verification" for the run-by-run numbers.

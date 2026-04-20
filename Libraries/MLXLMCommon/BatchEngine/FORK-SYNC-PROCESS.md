@@ -1,261 +1,171 @@
-# Fork-sync process — osaurus-ai/mlx-swift-lm ↔ ml-explore/mlx-swift-lm
+# Upstream sync process — ml-explore/mlx-swift-lm ↔ osaurus-ai/vmlx-swift-lm
 
-**Status:** Landed on branch `fix/osaurus-integration-issues` (2026-04-20).
+**Status:** 2026-04-20. `osaurus-ai/mlx-swift-lm` (the "clean" public
+fork) is **deprecated** — everything lives on
+`osaurus-ai/vmlx-swift-lm` now. This doc describes how to keep vmlx
+in sync with the single upstream that matters:
+`ml-explore/mlx-swift-lm`.
+
 **Closes:** tpae's (2026-04-20) "are we keeping this up to date:
-https://github.com/osaurus-ai/mlx-swift-lm"
+https://github.com/osaurus-ai/mlx-swift-lm" — short answer: no, and
+we don't need to. Point consumers at `osaurus-ai/vmlx-swift-lm`
+instead.
 
-## Three-remote topology
+## Two-remote topology
 
 ```
-     ml-explore/mlx-swift-lm (upstream)          canonical Apple MLX tree
-                 │
-                 │  Apple merges new model families, v3 API tweaks,
-                 │  tool-call format additions, bug fixes to original code.
+     ml-explore/mlx-swift-lm (upstream)          canonical Apple MLX tree.
+                 │                                new model families, v3
+                 │                                API tweaks, bug fixes.
                  ▼
-     osaurus-ai/mlx-swift-lm (public)            Eric's STABLE public fork:
-                 │                                upstream + ONLY carrying fixes
-                 │                                needed for osaurus production.
-                 │                                No BatchEngine / SpecDec /
-                 │                                CacheCoordinator / TurboQuant.
-                 ▼
-     osaurus-ai/vmlx-swift-lm (origin, THIS REPO) Eric's DEV superset:
-                                                  public + BatchEngine (batched
-                                                  decode, compile, TurboQuant),
-                                                  SpecDec (DFlash/DDTree),
-                                                  Cache system (paged + disk),
-                                                  JANG loader, etc.
+     osaurus-ai/vmlx-swift-lm (origin, THIS REPO) single source of truth.
+                                                  = upstream + Eric's
+                                                  carrying patches +
+                                                  BatchEngine + SpecDec +
+                                                  CacheCoordinator +
+                                                  TurboQuant + JANG loader.
 ```
 
-Git remotes configured locally (verify with `git remote -v`):
+Local git remotes (verify with `git remote -v`):
 
 ```
 origin    https://github.com/osaurus-ai/vmlx-swift-lm.git (fetch + push)
-public    https://github.com/osaurus-ai/mlx-swift-lm.git (fetch + push)
 upstream  https://github.com/ml-explore/mlx-swift-lm.git (fetch + push)
 ```
 
+If `osaurus-ai/mlx-swift-lm` is still configured as a `public` remote
+from an earlier session, drop it — we don't use it:
+
+```bash
+git remote remove public    # one-time cleanup
+```
+
+## Deprecation note for osaurus-ai/mlx-swift-lm
+
+That repo was a curated "upstream + just the carrying bug fixes"
+fork. Maintaining two forks (the clean public one AND the superset
+vmlx) has no value for anyone — osaurus integrators always want the
+superset because that's where `BatchEngine`, `CacheCoordinator`,
+`GenerateParameters.draftStrategy`, `extraStopStrings`, and
+`.reasoning(String)` live. Any drift between the two was a pure
+operational tax with no consumer.
+
+**Action for osaurus integrators:** change your Package.swift
+dependency to:
+
+```swift
+.package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", branch: "main")
+```
+
+and remove any reference to `osaurus-ai/mlx-swift-lm`.
+
 ## Current state (2026-04-20)
 
-| Measure | Count | What it means |
-|---|---|---|
-| `public/main` ahead of `upstream/main` | **75 commits** | Carrying fixes (Gemma4 VLM, Qwen3.5 norm shift, JANG loader, MXFP4, MLP overflow, Gemma4 multi-image/multi-turn, etc.). |
-| `upstream/main` ahead of `public/main` | **18 commits** | Unmerged upstream changes. Need review-and-merge. |
-| `origin/main` ahead of `public/main` | **120 commits** | BatchEngine + SpecDec + CacheCoordinator + TurboQuant + all additions layered on top of `public`. |
-| `public/main` ahead of `origin/main` | **0 commits** | `origin` is a strict superset of `public`. |
+- `origin/main` is ahead of `upstream/main` by 195 commits (120 vmlx
+  superset on top of the 75 carrying fixes that used to live on the
+  public fork — all merged into origin here).
+- `upstream/main` has some commits that haven't been brought into
+  origin yet — those need review on each sync pass.
 
-## What the public fork carries
+Peek the upstream-only changes any time:
 
-All 75 carrying patches in `public/main..upstream/main` fall into three
-groups:
+```bash
+git fetch upstream
+git log --oneline origin/main..upstream/main
+```
 
-### Group A — Upstream-compatible bug fixes (candidate for upstream PR)
-
-Small, focused, self-contained fixes that address real bugs in upstream
-code. Each would likely be accepted as a standalone PR against
-`ml-explore/mlx-swift-lm`:
-
-- `800e68c` — JANG mixed-precision MLP float16 overflow (silu(gate) × up >
-  65504) — extended to Qwen3.5/Gemma3/MiniMax in `57fe2e5`.
-- `8486b4c` — JANG MoE gate dequantization shape ambiguity.
-- `10d547e` — JANG per-layer bit inference strict round-trip.
-- `0db30fb` + `b59586f` — SwitchGLU / compiledGeluApproximate crash on
-  MLXNN Power primitive.
-- `acf2b58` — MXFP4/MXFP8 nil-bias handling during model load.
-- `1ddabd7` — Gemma4 VLM sRGB tone curve conversion (images silently
-  dropped).
-- `bd01662` + `c4d698c` — Gemma4 multi-image processing and padding.
-- `285a736` + `7917108` — Gemma4 / Gemma3n multi-turn crash on 1D tokens
-  without batch dim.
-- `2671c4c` — Gemma4 VLM vision tower / processor / maskedScatter.
-- `534e427` — Gemma4 VLM processor wrong image token scan.
-- `e47259c` + `833bbf2` — Gemma4 sanitize: skip clipped linear params +
-  audio tower weights.
-- `847a8c7` — remove auto-wired memory limit (crashes on smaller GPUs).
-- `1584724` — resolve symlinks in loadWeights.
-- `c627326` — log factory errors instead of silently swallowing.
-
-**Action:** file these as upstream PRs in batches by theme (Gemma4 VLM
-bundle, JANG overflow bundle, MXFP loader bundle). `upstream` remote is
-configured for `git push` — do NOT force-push; instead prepare a branch
-and open a PR via `gh pr create --repo ml-explore/mlx-swift-lm`.
-
-### Group B — Additions that aren't bug fixes (probably fork-only)
-
-- `7324494` + `e92a722` — Gemma 4 E2B / E4B support (PLE, KV sharing,
-  double-wide MLP). **Upstream got their own at #185; our version has
-  more JANG integration points.** On next sync review whether upstream's
-  version supersedes ours or if we should upstream the JANG pieces.
-- `b78dc79` + `0e6c19b` — Qwen3.5 norm shift (VLM JANG norm detection).
-- Miscellaneous diagnostic logging (`f298889`, `d80e723`).
-
-### Group C — Perf tunes (fork-only)
-
-`5a44ba1` / `b186468` / `6bf2cf1` / `6dfeef9` / `2278e91` / `5de7d15`
-/ `f5d48bf` / `2f5e4f8` / `9a3c13f` — compile GatedDelta, compile
-sigmoid ops, asyncEval tuning, stream-split experiment (reverted),
-asType elimination in Qwen3.5/Qwen3Next. Measured-fragile territory;
-keep in fork until upstream has comparable benchmarks.
-
-## Sync procedure — upstream → public
+## Sync procedure — upstream → origin
 
 For each upstream release / quarterly refresh:
 
 ```bash
-# 1. Fetch fresh from both remotes.
+# 1. Fetch upstream and see the delta.
 git fetch upstream
-git fetch public
+git log --oneline origin/main..upstream/main
 
-# 2. Check how far upstream has moved.
-git log --oneline public/main..upstream/main | head -30
+# 2. Start a local sync branch off main.
+git fetch origin
+git checkout -B sync/upstream-YYYYMMDD origin/main
 
-# 3. Decide merge strategy:
-#    - If upstream added ≤ ~10 changes and they don't conflict with
-#      carrying patches: fast-forward merge (preserve linear history).
-#    - If upstream added new model families / refactored files that
-#      also have carrying patches: rebase public onto upstream/main.
-#      Rebase is usually correct because carrying patches are all
-#      bug fixes on top of upstream code — they shouldn't be
-#      "replayed as merges."
-
-# 4. Start a sync branch off public/main locally.
-git checkout -B sync/upstream-YYYYMMDD public/main
-
-# 5. Merge upstream (preserves public's carrying patches as "new"
-#    commits on top of upstream; keeps upstream's linear history
-#    reachable):
+# 3. Merge upstream (preserves origin's linear history, writes one
+#    merge commit). Rebase is an option but with 195 carrying commits
+#    the merge route is saner.
 git merge upstream/main
-# OR rebase:
-git rebase upstream/main
+# (or rebase, if the delta is small and you're willing to resolve
+# conflicts per-commit instead of per-file.)
 
-# 6. Resolve conflicts. Common hot-spots (based on the 75 carry patches):
-#    - Libraries/MLXLLM/Models/Gemma4Text.swift (both sides modify)
+# 4. Resolve conflicts. Hotspot files (based on current carrying
+#    patches):
+#    - Libraries/MLXLLM/Models/Gemma4Text.swift
 #    - Libraries/MLXVLM/Models/Gemma4.swift
-#    - Libraries/MLXLMCommon/ModelConfiguration.swift
 #    - Libraries/MLXLLM/Models/Qwen35.swift / Qwen3Next.swift
+#    - Libraries/MLXLMCommon/ModelConfiguration.swift
 #    - Libraries/MLXLMCommon/Tool/ToolCallFormat.swift
+#    - Libraries/MLXLMCommon/Evaluate.swift
+#    - Libraries/MLXLMCommon/BatchEngine/*  (vmlx-only; conflicts
+#      only if upstream introduces a same-named thing)
 
-# 7. Verify: full build + the package unit tests pass + the
-#    RunBench smoke scenarios work on the real models in ~/.mlxstudio.
+# 5. Verify.
 swift build
-swift test --skip-build --filter BatchKVCache
-swift test --skip-build --filter GenerationReasoning
-swift test --skip-build --filter StopStringMatcher
-# Real-model smoke:
+swift test --skip-build --filter 'BatchKVCacheRotatingSlot'
+swift test --skip-build --filter 'StopStringMatcher'
+swift test --skip-build --filter 'ReasoningParser'
+swift test --skip-build --filter 'Tool-Call Edge Cases'
+# Real-model smoke — against a Gemma-4 model with prompt > 1024
+# tokens to hit the SWA crash regression gate:
+pkill -f xctest; pkill -f RunBench; pkill -f ollama; pkill -f lms
 VMLX_CHAT_TEMPLATE_OVERRIDE=$PWD/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja \
-  BENCH_GEMMA4_STRESS=1 \
+  BENCH_OSAURUS_MULTITURN=1 BENCH_OSAURUS_SIZE=medium \
   BENCH_MODEL=~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit \
-  BENCH_MAX_TOKENS=40 swift run -c release RunBench
+  BENCH_MAX_TOKENS=40 \
+  ./.build/release/RunBench
 
-# 8. Push to public.
-git push public sync/upstream-YYYYMMDD:main
+# 6. Push to origin.
+git push origin sync/upstream-YYYYMMDD:main
 ```
 
-## Sync procedure — public → origin (vmlx)
+## Upstream PR candidates
 
-`origin` is already strictly ahead of `public`; the sync is just a
-fast-forward-able merge:
-
-```bash
-git fetch public
-git checkout main   # on vmlx-swift-lm
-git merge public/main
-# No conflicts expected: public's 75 patches are already included in
-# origin's 120-commit superset as the fork's base layer.
-git push origin main
-```
-
-If conflicts DO appear (e.g., because a carry patch was subsequently
-refactored in vmlx's superset layer), resolve in favour of the vmlx
-version — vmlx's refactored layer has downstream dependencies
-(BatchEngine / SpecDec) that public doesn't.
-
-## Upstream PRs — candidate batch
-
-After the 2026-04-20 review, the following should be submitted as PRs
-to `ml-explore/mlx-swift-lm`:
+The current vmlx tree contains a handful of fixes that are clean
+bug-fixes against upstream code, not vmlx-only additions. These
+could land upstream as discrete PRs, shrinking our carrying diff:
 
 1. **"Fix float16 overflow in JANG MLP / Qwen3.5 / Gemma3 / MiniMax"**
-   — squash `800e68c`, `57fe2e5`. Keep the before/after numerical
-   examples in the PR body.
+   — `800e68c`, `57fe2e5`. silu(gate) × up exceeds 65504.
 2. **"Fix Gemma4 VLM image pipeline — sRGB / multi-image / sanitize"**
-   — squash `1ddabd7` + `bd01662` + `c4d698c` + `2671c4c` + `534e427` +
-   `e47259c` + `833bbf2`. This is a single coherent story once cleaned
-   up; upstream's Gemma4 VLM work (#180) likely overlaps.
-3. **"Fix Gemma4 / Gemma3n multi-turn 1D-token crash"** — `285a736` +
+   — `1ddabd7`, `bd01662`, `c4d698c`, `2671c4c`, `534e427`, `e47259c`,
+   `833bbf2`. May overlap with upstream's own Gemma4 VLM PR (#180).
+3. **"Fix Gemma4 / Gemma3n multi-turn 1D-token crash"** — `285a736`,
    `7917108`. Small, clean, obvious bug.
-4. **"Skip SwitchGLU compiledGeluApproximate path that crashes on
-   MLXNN Power primitive"** — `0db30fb` + `b59586f`. Workaround-
-   flavoured but until MLXNN is fixed this IS the fix.
+4. **"Skip SwitchGLU compiledGeluApproximate crash on MLXNN Power"** —
+   `0db30fb`, `b59586f`.
 
-Leave Group B + Group C in the fork until upstream has equivalent
-benchmarking / tooling to evaluate them.
+Submit via:
 
-## CI and acceptance gate
+```bash
+gh pr create --repo ml-explore/mlx-swift-lm \
+  --title "Fix X" --body-file pr-body.md
+```
 
-Before pushing any public/main update:
+vmlx-only additions (`BatchEngine`, `SpecDec`, `CacheCoordinator`,
+`TurboQuant`, `JANG loader`, `.reasoning` event, `extraStopStrings`)
+are deliberately scoped to vmlx and not candidates for upstream.
 
-- Package builds on macOS 14 + Xcode 16 (our target surface).
-- Unit suites green: `BatchKVCacheRotatingSlotTests`,
-  `GenerationReasoningEventTests`, `StopStringMatcherTests`,
-  `ReasoningParserTests`, `BatchEngineTests`, `BatchCausalMaskTests`,
-  `ToolCallEdgeCasesTests`, `ToolTests`, `CacheCoordinatorTests`.
-- Real-model smoke against at least one of:
+## Acceptance gate before pushing main
+
+- `swift build` green.
+- Regression suites green: `BatchKVCacheRotatingSlot` (4),
+  `StopStringMatcher` (14), `ReasoningParser` (37), `Tool-Call Edge
+  Cases` (24), existing `SpecDec` suites (90), `BatchKVCache` + `BatchCausalMask`.
+- Real-model smoke — at least one of:
   - `~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit`
-    (Gemma-4 SWA, prompt > 1024 tokens — regression for the 2026-04-20
-    broadcast_shapes crash).
+    (Gemma-4 SWA, prompt > 1024 tokens — regression gate for the
+    2026-04-20 broadcast_shapes crash).
   - `~/.mlxstudio/models/MLXModels/OsaurusAI/Qwen3.6-35B-A3B-MXFP4`
     (reasoning emission + tool-call format wiring).
 
-Canonical bench invocation:
-
-```bash
-pkill -f xctest; pkill -f RunBench; pkill -f ollama; pkill -f lms
-VMLX_CHAT_TEMPLATE_OVERRIDE=$PWD/Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja \
-  BENCH_GEMMA4_STRESS=1 \
-  BENCH_STOP_STRINGS="END,STOP" \
-  BENCH_MODEL=~/.mlxstudio/models/MLXModels/OsaurusAI/gemma-4-e2b-it-4bit \
-  BENCH_MAX_TOKENS=80 \
-  swift run -c release RunBench
-```
-
-Expected output:
-
-```
-=== BENCH_GEMMA4_STRESS: Gemma-4 SWA crash regression ===
-  …
-[Turn 1 (> 1024 tokens)]
-  prompt tokens = 1371
-  chunks=N reasoningDeltas=M toolCalls=0 stopReason=(stop|length)
-  .chunk preview: "…"
-=== BENCH_GEMMA4_STRESS: passed (no broadcast_shapes crash) ===
-```
-
-A FAIL at any stage blocks the sync until resolved.
-
-## When NOT to sync
-
-- Upstream is mid-refactor (e.g., v4 API is being drafted). Wait until
-  upstream tags a release or at least stabilizes `main`.
-- Our fork has an in-flight PR to upstream. Let that land first so the
-  next sync includes a smaller delta.
-- We are inside a merge freeze for a downstream osaurus release. The
-  fork-sync happens AFTER the release ship.
-
 ## Ownership
 
-Fork sync is Eric's responsibility — no CI job does it automatically.
-The upstream repo's maintainers are Apple's MLX team; changes in their
-main branch can land at any time. Target a quarterly sync cadence with
-ad-hoc syncs when upstream lands a critical fix.
-
-## Related
-
-- `OSAURUS-INTEGRATION.md` — what osaurus consumes from this repo.
-- `OSAURUS-API-SURFACE.md` — per-symbol public-API surface.
-- `GEMMA4-SLIDING-WINDOW-CRASH.md` — the SWA regression this fork-sync
-  doc was written alongside.
-- `REASONING-STREAM-EVENT.md` — the `.reasoning(String)` event the
-  2026-04-20 sync lands on the origin fork; public doesn't carry it
-  yet (only origin does — BatchEngine-dependent).
-- `STOP-SEQUENCES-CONTRACT.md` — the `extraStopStrings` field added
-  in the same session.
+Eric owns the sync. Target a quarterly cadence with ad-hoc syncs
+when upstream lands a critical fix (crash class, new model family
+osaurus wants).
