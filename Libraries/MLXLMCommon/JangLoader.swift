@@ -165,6 +165,29 @@ public struct JangCapabilities: Sendable {
     /// KV for MLA models).
     public let cacheType: String?
 
+    /// Speculative-decoding strategy the JANG bundle ships alongside
+    /// this target. Known values: `dflash`, `ddtree`, `autoregressive`,
+    /// `none`. `nil` means the bundle does not ship a compatible
+    /// drafter. Maps to ``DraftStrategy`` via
+    /// ``ParserResolution/draftStrategy(capabilities:modelDirectory:)``.
+    public let draftStrategy: String?
+
+    /// Path to the drafter checkpoint, RELATIVE to `jang_config.json`.
+    /// Typical value: `"drafter/"` (i.e. a subdirectory next to the
+    /// target weights). `nil` when `draftStrategy` is absent or `none`.
+    public let drafterPath: String?
+
+    /// Branching budget for ``DraftStrategy/ddtree(drafterPath:branchingBudget:blockSize:)``.
+    /// Paper recommends 32-64 for greedy, 16-24 for sampling. `nil`
+    /// when `draftStrategy != "ddtree"`.
+    public let branchingBudget: Int?
+
+    /// Block size the drafter was trained with — must match
+    /// `config.json["block_size"]` inside the drafter snapshot. When
+    /// present, callers use this to satisfy
+    /// ``DraftStrategy/dflash(drafterPath:blockSize:)`` etc.
+    public let blockSize: Int?
+
     public init(
         reasoningParser: String? = nil,
         toolParser: String? = nil,
@@ -173,7 +196,11 @@ public struct JangCapabilities: Sendable {
         supportsThinking: Bool? = nil,
         family: String? = nil,
         modality: String? = nil,
-        cacheType: String? = nil
+        cacheType: String? = nil,
+        draftStrategy: String? = nil,
+        drafterPath: String? = nil,
+        branchingBudget: Int? = nil,
+        blockSize: Int? = nil
     ) {
         self.reasoningParser = reasoningParser
         self.toolParser = toolParser
@@ -183,6 +210,10 @@ public struct JangCapabilities: Sendable {
         self.family = family
         self.modality = modality
         self.cacheType = cacheType
+        self.draftStrategy = draftStrategy
+        self.drafterPath = drafterPath
+        self.branchingBudget = branchingBudget
+        self.blockSize = blockSize
     }
 
     /// Source of a parser resolution — used for telemetry and so callers
@@ -269,6 +300,61 @@ public enum ParserResolution {
             return (inferred, .modelTypeHeuristic)
         }
         return (nil, .none)
+    }
+
+    /// Resolve a ``DraftStrategy`` from JANG capability stamp.
+    ///
+    /// Maps `capabilities.draft_strategy` + `capabilities.drafter_path`
+    /// + `capabilities.branching_budget` + `capabilities.block_size` into
+    /// a concrete `DraftStrategy` enum. The drafter path is resolved
+    /// relative to `modelDirectory` (the snapshot root containing
+    /// `jang_config.json`) — JANG bundles ship drafters co-located.
+    ///
+    /// Returns `nil` when:
+    /// - `capabilities` is nil.
+    /// - `draftStrategy` is nil, `"none"`, or unrecognised.
+    /// - `drafterPath` is nil (strategy requires one but bundle
+    ///   doesn't ship it).
+    /// - `blockSize` is nil (required for both `.dflash` + `.ddtree`).
+    ///
+    /// - Parameters:
+    ///   - capabilities: the `JangCapabilities` block from
+    ///     `jang_config.json`.
+    ///   - modelDirectory: the snapshot root. `capabilities.drafter_path`
+    ///     is appended to this.
+    public static func draftStrategy(
+        capabilities: JangCapabilities?,
+        modelDirectory: URL
+    ) -> (strategy: DraftStrategy?, source: JangCapabilities.ResolutionSource) {
+        guard let cap = capabilities,
+            let name = cap.draftStrategy?.lowercased(),
+            name != "none",
+            let relativePath = cap.drafterPath,
+            let blockSize = cap.blockSize
+        else {
+            return (nil, .none)
+        }
+        let drafterURL = modelDirectory
+            .appendingPathComponent(relativePath, isDirectory: true)
+            .resolvingSymlinksInPath()
+        switch name {
+        case "dflash":
+            return (
+                .dflash(drafterPath: drafterURL, blockSize: blockSize),
+                .jangStamped
+            )
+        case "ddtree":
+            let budget = cap.branchingBudget ?? 32
+            return (
+                .ddtree(
+                    drafterPath: drafterURL,
+                    branchingBudget: budget,
+                    blockSize: blockSize),
+                .jangStamped
+            )
+        default:
+            return (nil, .none)
+        }
     }
 }
 
@@ -649,7 +735,11 @@ public struct JangLoader: Sendable {
                 supportsThinking: cDict["supports_thinking"] as? Bool,
                 family: cDict["family"] as? String,
                 modality: cDict["modality"] as? String,
-                cacheType: cDict["cache_type"] as? String
+                cacheType: cDict["cache_type"] as? String,
+                draftStrategy: cDict["draft_strategy"] as? String,
+                drafterPath: cDict["drafter_path"] as? String,
+                branchingBudget: cDict["branching_budget"] as? Int,
+                blockSize: cDict["block_size"] as? Int
             )
         } else {
             capabilities = nil

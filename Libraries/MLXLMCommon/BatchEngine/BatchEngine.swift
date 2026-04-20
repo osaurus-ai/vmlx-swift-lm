@@ -211,6 +211,25 @@ public actor BatchEngine {
         input: consuming sending LMInput,
         parameters: GenerateParameters
     ) -> AsyncStream<Generation> {
+        // Block-diffusion speculative decoding dispatch. When
+        // parameters.draftStrategy is .dflash or .ddtree AND the
+        // target model conforms to HiddenStateCaptureModel +
+        // TokenEmbedderModel, route through SpecDecStream. Zero API
+        // churn for callers using .none / nil / .autoregressive — they
+        // fall through to the batched-decode path below.
+        if let strategy = parameters.draftStrategy,
+            strategy.usesBlockDiffusion,
+            let stream = SpecDecStream.streamViaStrategy(
+                strategy: strategy,
+                inputIds: input.text.tokens,
+                context: context,
+                maxNewTokens: parameters.maxTokens ?? 256,
+                stopTokenIDs: [],
+                temperature: parameters.temperature)
+        {
+            return stream
+        }
+
         let tokenizer = context.tokenizer
         // Snapshot format + reasoning stamp from the configuration so the
         // background task doesn't need to reach back into the actor.

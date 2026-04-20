@@ -207,7 +207,43 @@ for await event in stream {
 
 `BatchEngine.generate` internally runs `ReasoningParser.fromCapabilityName(modelConfiguration.reasoningParserName)` (set by the factory via JANG stamp + model-type heuristic) and `ToolCallProcessor(format: toolCallFormat)`. Result: `.chunk` is pure text and `.toolCall` is authoritative on every supported family.
 
-## 13. Integration smoke: what the library verifies pre-ship
+## 13. Speculative decoding (DFlash + DDTree) — opt-in
+
+Block-diffusion speculative decoding landed on branch `feature/ddtree-spec-dec`. Zero API churn for callers using `.none` / `nil`.
+
+```swift
+public enum DraftStrategy: Sendable {
+    case none
+    case autoregressive(draftModel: any LanguageModel, numDraftTokens: Int)
+    case dflash(drafterPath: URL, blockSize: Int)
+    case ddtree(drafterPath: URL, branchingBudget: Int, blockSize: Int)
+}
+
+public var GenerateParameters.draftStrategy: DraftStrategy?
+```
+
+Set `draftStrategy` on `GenerateParameters` and the same `Evaluate.generate` / `BatchEngine.generate` entry points dispatch through `SpecDecStream.streamViaStrategy`. The returned `AsyncStream<Generation>` emits the same `.chunk(String)` + `.toolCall(ToolCall)` + `.info(GenerateCompletionInfo)` events the non-speculative path does.
+
+Invariant: **at temperature 0, output is byte-identical to greedy autoregressive decode**. The drafter affects speed (mean acceptance length), not output.
+
+Per-symbol reference:
+
+| Symbol | Purpose |
+|---|---|
+| `DraftStrategy` | enum on `GenerateParameters.draftStrategy` |
+| `SpecDecStream.streamDflashLinear / streamDDTree / streamViaStrategy` | wraps runtime → `AsyncStream<Generation>` |
+| `SpecDecDrafterResolver` | actor cache for loaded drafters; `shared` singleton |
+| `DFlashDraftModel` | block-diffusion drafter ported from z-lab/dflash `dflash.py` |
+| `DFlashDrafterLoader.load(from:)` | local HF snapshot → `DFlashDraftModel` |
+| `HiddenStateCaptureModel` | protocol that target models implement to expose per-layer hidden states (Qwen3 conforms) |
+| `TokenEmbedderModel` | protocol that target models implement to expose `embed(_:)` + `projectToLogits(_:)` (Qwen3 conforms) |
+| `TreeBuilder` / `TreeCompile` / `TreeVerify` | DDTree algorithm ports of `tree.py` / `compile.py` / `verify.py` |
+| `SpecDecRuntimeLinear.run` / `SpecDecRuntimeDDTree.run` | stateless runtime entry points |
+| `SpecDecRuntime` actor | long-lived wrapper for BatchEngine integration |
+
+Full guide: `Libraries/MLXLMCommon/SpecDec/OSAURUS-SPECDEC.md`.
+
+## 14. Integration smoke: what the library verifies pre-ship
 
 - `./scripts/verify-engine.sh --tests-only` → 121 unit tests, 0 failures.
 - `./scripts/verify-engine.sh --quick` → 20 scenarios green.

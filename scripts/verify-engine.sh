@@ -88,11 +88,11 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-echo "=== Unit tests (121 expected) ==="
+echo "=== Unit tests (121 XCTest + Swift Testing suites) ==="
 /usr/bin/pkill -9 xctest 2>/dev/null || true
 /bin/sleep 1
 if swift test \
-  --filter "BatchCompile|CompilableCacheList|CompilableMambaCache|CompilableRotatingKVCache|CompilableTurboQuantKVCache|RotatingKVCacheCompile|MambaCacheCompile|TurboQuantCompile|SSMStateCache|JangTokenizerFallback|Gemma4ChatTemplateProbe|CacheCoordinatorRotating|CacheCoordinatorMediaSalt|CacheCoordinatorConcurrency|UserInputInitSemantics|BucketHandle|BatchEngineCompileWiring|ChatTemplateOverrideIntegration|TokenizerClassSubstitution|JANGTQKernelsTests" \
+  --filter "BatchCompile|CompilableCacheList|CompilableMambaCache|CompilableRotatingKVCache|CompilableTurboQuantKVCache|RotatingKVCacheCompile|MambaCacheCompile|TurboQuantCompile|SSMStateCache|JangTokenizerFallback|Gemma4ChatTemplateProbe|CacheCoordinatorRotating|CacheCoordinatorMediaSalt|CacheCoordinatorConcurrency|UserInputInitSemantics|BucketHandle|BatchEngineCompileWiring|ChatTemplateOverrideIntegration|TokenizerClassSubstitution|JANGTQKernelsTests|DDTreeDesignTests" \
   2>&1 | /usr/bin/grep -E "Executed [0-9]+ tests.*in " | /usr/bin/tail -1; then
   pass "unit tests"
 else
@@ -185,6 +185,22 @@ else
   skip "Gemma-4-E2B-4bit not cached at $G4E2B"
 fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# SpecDec (DFlash + DDTree) — iter 16. Runs only when both a compatible
+# target AND a drafter are on disk. Qwen3.5-27B pair lives at the
+# standard /tmp/ddtree-downloads mirror from the Phase 0 download task.
+: "${SPECDEC_TARGET:=/tmp/ddtree-downloads/Qwen3.5-27B-target}"
+: "${SPECDEC_DRAFTER:=/tmp/ddtree-downloads/Qwen3.5-27B-DFlash}"
+if [ -e "$SPECDEC_TARGET" ] && [ -e "$SPECDEC_DRAFTER/config.json" ]; then
+  echo "=== SpecDec (Qwen3.5-27B target + z-lab drafter) ==="
+  run_scenario "Qwen3.5-27B BENCH_BATCH_SPECDEC" \
+    env BENCH_MODEL="$SPECDEC_TARGET" BENCH_SPECDEC_DRAFTER="$SPECDEC_DRAFTER" \
+    BENCH_BATCH_SPECDEC=1 BENCH_MAX_TOKENS=6 .build/debug/RunBench
+  echo ""
+else
+  skip "SpecDec (target or drafter missing: target=$SPECDEC_TARGET, drafter=$SPECDEC_DRAFTER)"
+fi
 
 # ---------------------------------------------------------------------------
 printf '=== Summary: %d passed, %d failed, %d skipped ===\n' "$PASS" "$FAIL" "$SKIP"

@@ -532,6 +532,19 @@ public class Qwen35TextModelInner: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+        let (h, _) = callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: [])
+        return h
+    }
+
+    /// Forward with optional per-block hidden-state capture. Mirrors
+    /// `Qwen3ModelInner.callAsFunctionCapturing`. Empty `captureLayerIDs`
+    /// produces output byte-identical to the plain forward.
+    func callAsFunctionCapturing(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -542,6 +555,9 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        var captured: [Int: MLXArray] = [:]
+        captured.reserveCapacity(captureLayerIDs.count)
+
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -549,13 +565,16 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            if captureLayerIDs.contains(i) {
+                captured[i] = hiddenStates
+            }
         }
 
-        return norm(hiddenStates)
+        return (norm(hiddenStates), captured)
     }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, HiddenStateCaptureModel, TokenEmbedderModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -583,6 +602,38 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    /// `HiddenStateCaptureModel` conformance — forwards to the inner
+    /// capturing variant. Empty `captureLayerIDs` yields byte-identical
+    /// logits to the plain forward. See Qwen35TextModelInner.callAsFunctionCapturing.
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        let (finalHidden, captured) = model.callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(finalHidden)
+        } else {
+            logits = model.embedTokens.asLinear(finalHidden)
+        }
+        return (logits, captured)
+    }
+
+    // MARK: - TokenEmbedderModel
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        model.embedTokens(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -643,7 +694,7 @@ extension Qwen35TextModel: LoRAModel {
 
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStateCaptureModel, TokenEmbedderModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -658,6 +709,26 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    /// `HiddenStateCaptureModel` conformance — delegates through the
+    /// inner language model. Hybrid SSM decoder layers capture alongside
+    /// attention layers; drafters that target Qwen 3.5 can read states
+    /// from any of the `num_hidden_layers` blocks.
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        languageModel(inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+    }
+
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        languageModel.embed(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        languageModel.projectToLogits(hidden)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

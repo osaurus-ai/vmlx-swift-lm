@@ -15,8 +15,10 @@ If you're integrating this fork from [osaurus-ai/osaurus](https://github.com/osa
 | [`Libraries/MLXLMCommon/BatchEngine/OSAURUS-API-SURFACE.md`](Libraries/MLXLMCommon/BatchEngine/OSAURUS-API-SURFACE.md) | Per-symbol reference — every `MLXLMCommon` / `MLXLLM` / `MLXVLM` symbol osaurus consumes, with the exact osaurus file + line that calls it. |
 | [`Libraries/MLXLMCommon/BatchEngine/OSAURUS-INTEGRATION.md`](Libraries/MLXLMCommon/BatchEngine/OSAURUS-INTEGRATION.md) | Quick integration notes — addresses `osaurus/docs/INFERENCE_RUNTIME.md` concerns, migration path to drop app-layer tool-call parsing, PR #893 consumer map. |
 | [`Libraries/MLXLMCommon/BatchEngine/BATCH_ENGINE.md`](Libraries/MLXLMCommon/BatchEngine/BATCH_ENGINE.md) | Full continuous-batching architecture, every iter-log addendum, real-model verification matrix. |
+| [`Libraries/MLXLMCommon/SpecDec/OSAURUS-SPECDEC.md`](Libraries/MLXLMCommon/SpecDec/OSAURUS-SPECDEC.md) | DFlash + DDTree speculative decoding guide — DraftStrategy enum, drafter checkpoint map, byte-parity invariant, integration snippets. |
+| [`Libraries/MLXLMCommon/SpecDec/DDTREE-DESIGN.md`](Libraries/MLXLMCommon/SpecDec/DDTREE-DESIGN.md) | SpecDec design + iter log with commit SHAs. |
 
-Dedicated per-topic skill references live under [`skills/mlx-swift-lm/references/`](skills/mlx-swift-lm/references/) — in particular [`tool-calling.md`](skills/mlx-swift-lm/references/tool-calling.md) and [`reasoning-parser.md`](skills/mlx-swift-lm/references/reasoning-parser.md) document the streaming contract osaurus's `StreamAccumulator` + `StreamingDeltaProcessor` rely on.
+Dedicated per-topic skill references live under [`skills/mlx-swift-lm/references/`](skills/mlx-swift-lm/references/) — in particular [`tool-calling.md`](skills/mlx-swift-lm/references/tool-calling.md), [`reasoning-parser.md`](skills/mlx-swift-lm/references/reasoning-parser.md), and [`speculative-decoding.md`](skills/mlx-swift-lm/references/speculative-decoding.md).
 
 **`Libraries/MLXLMCommon/Tool/ToolCallProcessor.swift` is byte-identical with [ml-explore/mlx-swift-lm `main`](https://github.com/ml-explore/mlx-swift-lm)** — osaurus can pin to either repo without drift.
 
@@ -228,7 +230,9 @@ How it works:
 
 ### Speculative Decoding
 
-Use a smaller draft model to speed up generation by 29-79% (cherry-picked from upstream [ml-explore#173](https://github.com/ml-explore/mlx-swift-lm/pull/173)):
+Three strategies, one field on `GenerateParameters.draftStrategy`:
+
+**1. Classic autoregressive draft (cherry-picked from upstream [ml-explore#173](https://github.com/ml-explore/mlx-swift-lm/pull/173))** — smaller draft model, 29-79% speedup:
 
 ```swift
 let mainModel = try await loadModelContainer(
@@ -241,6 +245,33 @@ let draftModel = try await loadModelContainer(
 let result = try await mainModel.generate(
     input: input, parameters: params, draft: draftModel)
 ```
+
+**2. DFlash block-diffusion drafter** ([arXiv 2602.06036](https://arxiv.org/abs/2602.06036)) — one drafter forward produces a whole block of proposed tokens via block diffusion + target-hidden KV injection. Paper reports ~6× over AR, ~2.5× over EAGLE-3:
+
+```swift
+var params = GenerateParameters(maxTokens: 256, temperature: 0)
+params.draftStrategy = .dflash(
+    drafterPath: URL(fileURLWithPath: "…/z-lab/Qwen3.5-27B-DFlash"),
+    blockSize: 16)
+let stream = try generate(input: input, parameters: params, context: ctx)
+```
+
+**3. DDTree — strict superset of DFlash** ([arXiv 2604.12989](https://arxiv.org/abs/2604.12989)) — best-first heap tree + ancestor-only attention mask verify. Paper reports ~7.5× on Qwen3-8B MATH-500 at T=0, 1.5× on top of DFlash:
+
+```swift
+params.draftStrategy = .ddtree(
+    drafterPath: URL(fileURLWithPath: "…/z-lab/Qwen3.5-27B-DFlash"),
+    branchingBudget: 32,
+    blockSize: 16)
+let stream = try generate(input: input, parameters: params, context: ctx)
+```
+
+Contract: at `temperature: 0`, output is **byte-identical to plain greedy AR**. Drafter quality affects speed, not tokens.
+
+Drafters load from HuggingFace `z-lab/<model>-DFlash` snapshots directly (currently public: `gpt-oss-20b-DFlash`, `Qwen3.5-27B-DFlash`, `Kimi-K2.5-DFlash`). Target models must conform to `HiddenStateCaptureModel & TokenEmbedderModel` (Qwen3 does; others rolling out).
+
+Full integration guide: [`Libraries/MLXLMCommon/SpecDec/OSAURUS-SPECDEC.md`](Libraries/MLXLMCommon/SpecDec/OSAURUS-SPECDEC.md).  
+Design + iter log: [`Libraries/MLXLMCommon/SpecDec/DDTREE-DESIGN.md`](Libraries/MLXLMCommon/SpecDec/DDTREE-DESIGN.md).
 
 ### VLM Detection
 

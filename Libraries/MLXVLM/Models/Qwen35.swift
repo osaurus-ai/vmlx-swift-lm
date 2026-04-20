@@ -1056,6 +1056,24 @@ enum Qwen35Language {
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil
         ) -> MLXArray {
+            let (h, _) = callAsFunctionCapturing(
+                inputs, inputsEmbeds: inputsEmbeds, cache: cache,
+                positionIds: positionIds, captureLayerIDs: [])
+            return h
+        }
+
+        /// Forward with optional per-block hidden-state capture. Mirrors
+        /// the Qwen35 LLM-path conformance — empty `captureLayerIDs`
+        /// yields byte-identical logits to the plain forward. Required
+        /// for DFlash / DDTree speculative decoding through the VLM
+        /// wrapper (iter 17).
+        func callAsFunctionCapturing(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            positionIds: MLXArray? = nil,
+            captureLayerIDs: Set<Int>
+        ) -> (MLXArray, [Int: MLXArray]) {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
                 hiddenStates = inputsEmbeds
@@ -1078,6 +1096,9 @@ enum Qwen35Language {
             }
             let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+            var captured: [Int: MLXArray] = [:]
+            captured.reserveCapacity(captureLayerIDs.count)
+
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
                 hiddenStates = layer(
@@ -1087,9 +1108,12 @@ enum Qwen35Language {
                     cache: cacheArray?[index],
                     positionIds: positionIds
                 )
+                if captureLayerIDs.contains(index) {
+                    captured[index] = hiddenStates
+                }
             }
 
-            return norm(hiddenStates)
+            return (norm(hiddenStates), captured)
         }
     }
 
@@ -1221,6 +1245,41 @@ enum Qwen35Language {
             return LMOutput(logits: out)
         }
 
+        /// Text-only `(MLXArray, [KVCache]?) -> MLXArray` forward used by
+        /// SpecDec — bypasses the vision RoPE-index bookkeeping and
+        /// the VLM-only `LMOutput` wrapper. No pixelValues / imageGrid.
+        /// Drafters feed plain text through this path.
+        func textOnlyForward(
+            _ inputs: MLXArray,
+            cache: [KVCache]?
+        ) -> MLXArray {
+            let (logits, _) = textOnlyForwardCapturing(
+                inputs, cache: cache, captureLayerIDs: [])
+            return logits
+        }
+
+        /// Same as `textOnlyForward` but records per-block hidden
+        /// states at the requested 0-based layer indices. Required for
+        /// DFlash / DDTree speculative decoding.
+        func textOnlyForwardCapturing(
+            _ inputs: MLXArray,
+            cache: [KVCache]?,
+            captureLayerIDs: Set<Int>
+        ) -> (MLXArray, [Int: MLXArray]) {
+            let cacheOpt: [KVCache?]? = cache?.map { $0 as KVCache? }
+            let (hidden, captured) = model.callAsFunctionCapturing(
+                inputs,
+                cache: cacheOpt,
+                captureLayerIDs: captureLayerIDs)
+            let logits: MLXArray
+            if let lmHead {
+                logits = lmHead(hidden)
+            } else {
+                logits = model.embedTokens.asLinear(hidden)
+            }
+            return (logits, captured)
+        }
+
         func makeCache(maxKVSize: Int?) -> [KVCache] {
             model.layers.map { layer in
                 if layer.isLinear {
@@ -1237,7 +1296,7 @@ enum Qwen35Language {
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+public class Qwen35: Module, VLMModel, HiddenStateCaptureModel, TokenEmbedderModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -1259,6 +1318,7 @@ public class Qwen35: Module, VLMModel {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.makeCache(maxKVSize: parameters?.maxKVSize)
     }
+
 
     private func mergeInputIdsWithImageFeatures(
         imageFeatures: MLXArray,
@@ -1395,6 +1455,34 @@ public class Qwen35: Module, VLMModel {
             videoGridTHW: nil
         )
         return result.logits
+    }
+
+    // MARK: - SpecDec conformance (iter 17)
+
+    /// `HiddenStateCaptureModel` conformance — routes through the
+    /// nested LanguageModel's text-only capturing forward so DFlash /
+    /// DDTree speculative decoding can read per-block hidden states
+    /// without going through the vision RoPE-bookkeeping path.
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        languageModel.textOnlyForwardCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+    }
+
+    /// `TokenEmbedderModel` conformance — exposes the target's shared
+    /// embedding and LM head for DFlash drafters.
+    public func embed(_ tokenIds: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokenIds)
+    }
+
+    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+        if let head = languageModel.lmHead {
+            return head(hidden)
+        }
+        return languageModel.model.embedTokens.asLinear(hidden)
     }
 
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
