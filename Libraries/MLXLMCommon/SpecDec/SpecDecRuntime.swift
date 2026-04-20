@@ -250,6 +250,245 @@ public enum SpecDecRuntimeLinear {
     }
 }
 
+// MARK: - DDTree (tree-verify) runtime — iter 9
+
+/// One DDTree generation call.
+public struct DDTreeArgs: @unchecked Sendable {
+    public let target: any (HiddenStateCaptureModel & TokenEmbedderModel)
+    public let drafter: DFlashDraftModel
+    public let targetBlockIDs: [Int]
+    public let maskTokenID: Int32
+    public let inputIds: MLXArray
+    public let maxNewTokens: Int
+    public let stopTokenIDs: Set<Int32>
+    public let temperature: Float
+    /// Max tree nodes (excluding root). 1 → linear chain (≈ DFlash linear);
+    /// >1 → branching tree. Paper recommends 32-64 for greedy.
+    public let branchingBudget: Int
+
+    public init(
+        target: any (HiddenStateCaptureModel & TokenEmbedderModel),
+        drafter: DFlashDraftModel,
+        targetBlockIDs: [Int],
+        maskTokenID: Int32,
+        inputIds: MLXArray,
+        maxNewTokens: Int,
+        stopTokenIDs: Set<Int32> = [],
+        temperature: Float = 0,
+        branchingBudget: Int = 8
+    ) {
+        self.target = target
+        self.drafter = drafter
+        self.targetBlockIDs = targetBlockIDs
+        self.maskTokenID = maskTokenID
+        self.inputIds = inputIds
+        self.maxNewTokens = maxNewTokens
+        self.stopTokenIDs = stopTokenIDs
+        self.temperature = temperature
+        self.branchingBudget = branchingBudget
+    }
+}
+
+/// Result of one DDTree generation call.
+public struct DDTreeResult: Sendable {
+    /// Full token sequence (prompt + accepted + bonuses).
+    public let tokenIds: [Int32]
+
+    /// Per-round (depth of accepted tree walk). 0 = no drafter acceptance,
+    /// bonus-only advance. Larger = more tree nodes matched target argmax.
+    public let acceptanceLengths: [Int]
+
+    /// Mean accepted tokens per round — paper's primary speedup metric.
+    public var meanAcceptanceLength: Double {
+        guard !acceptanceLengths.isEmpty else { return 0 }
+        return Double(acceptanceLengths.reduce(0, +))
+            / Double(acceptanceLengths.count)
+    }
+
+    public var rounds: Int { acceptanceLengths.count }
+}
+
+/// End-to-end DDTree decode loop.
+///
+/// Mirrors ``SpecDecRuntimeLinear/run(_:)`` but replaces the linear
+/// verify with a tree-verify:
+///
+/// 1. **Prefill.** Run target on prompt, capture hidden states at
+///    `targetBlockIDs`, sample initial bonus token.
+/// 2. **Decode loop:**
+///    a. Build block `[bonus, mask, ..., mask]` length `blockSize`.
+///    b. Drafter forward produces `(block_size-1, vocab)` logits.
+///    c. `TreeBuilder.build(draftLogits:budget:)` → tree of up to
+///       `branchingBudget` nodes.
+///    d. `TreeCompile.compile(tree:, rootTokenID: bonus, prefixLen:)`.
+///    e. `TreeVerify.verifyForward(target:compiled:prefixTokens:)` →
+///       posterior for every tree node.
+///    f. `TreeBuilder.followVerifiedTree(childMaps:posteriorTokens:)` →
+///       accepted-node indices + bonus for next round.
+///    g. Commit accepted nodes' tokens + bonus. Update target_hidden by
+///       re-prefilling target on the growing sequence (v1; iter 10+
+///       optimises via KV rollback).
+///
+/// Byte-parity with greedy AR holds by the same invariant as DFlash
+/// (iter 5): every posterior is a real AR argmax, and followVerifiedTree
+/// only accepts nodes that match those argmax picks.
+public enum SpecDecRuntimeDDTree {
+
+    public static func run(_ args: DDTreeArgs) throws -> DDTreeResult {
+        let blockSize = args.drafter.config.blockSize
+        precondition(blockSize >= 2, "DFlash block_size must be >= 2")
+        precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
+            "DDTree input_ids shape must be (1, prompt_len)")
+        precondition(args.branchingBudget >= 1,
+            "DDTree branchingBudget must be >= 1")
+
+        let promptLen = args.inputIds.dim(1)
+        let maxLen = promptLen + args.maxNewTokens
+        let targetLayerSet = Set(args.targetBlockIDs)
+
+        var tokens: [Int32] = []
+        tokens.reserveCapacity(maxLen + blockSize)
+        tokens.append(contentsOf: args.inputIds.asArray(Int32.self))
+
+        var acceptanceLengths: [Int] = []
+
+        // Prefill.
+        let (prefillLogits, prefillHidden) = args.target(
+            args.inputIds, cache: nil, captureLayerIDs: targetLayerSet)
+        materialize(prefillLogits)
+        var targetHidden = extractContextFeature(
+            captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
+        materialize(targetHidden)
+
+        var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
+        tokens.append(bonus)
+
+        while tokens.count < maxLen {
+            // Stop-token check on generated suffix.
+            if !args.stopTokenIDs.isEmpty {
+                for t in tokens[promptLen...] where args.stopTokenIDs.contains(t) {
+                    return DDTreeResult(
+                        tokenIds: tokens, acceptanceLengths: acceptanceLengths)
+                }
+            }
+
+            // Drafter block input.
+            var blockValues: [Int32] = Array(
+                repeating: args.maskTokenID, count: blockSize)
+            blockValues[0] = bonus
+            let blockIds = MLXArray(blockValues).reshaped(1, blockSize)
+
+            let noiseEmbedding = args.target.embed(blockIds)
+            let startPos = tokens.count - 1
+            let blockPositions = MLXArray(
+                (startPos..<startPos + blockSize).map { Int32($0) }
+            ).reshaped(1, blockSize)
+
+            let drafterOut = args.drafter(
+                noiseEmbedding: noiseEmbedding,
+                targetHidden: targetHidden,
+                positionIds: blockPositions,
+                attentionMask: .none)
+            // Last block-1 positions go through target LM head.
+            let drafterTail = drafterOut[0..., 1..., 0...]
+            let drafterLogits = args.target.projectToLogits(drafterTail)
+            materialize(drafterLogits)
+            // TreeBuilder expects (L, vocab) not (1, L, vocab).
+            let logits2D = drafterLogits[0, 0..., 0...]
+
+            // Build tree from drafter logits.
+            let tree = try TreeBuilder.build(
+                draftLogits: logits2D, budget: args.branchingBudget)
+
+            if tree.nodeCount == 0 {
+                // Empty tree → no drafter proposals. Degenerates to a
+                // single target forward for the next token.
+                acceptanceLengths.append(0)
+                let nextInput = MLXArray(tokens).reshaped(1, tokens.count)
+                let (nextLogits, nextHidden) = args.target(
+                    nextInput, cache: nil, captureLayerIDs: targetLayerSet)
+                materialize(nextLogits)
+                bonus = sampleArgmax(nextLogits, temperature: args.temperature)
+                tokens.append(bonus)
+                targetHidden = extractContextFeature(
+                    captured: nextHidden, targetLayerIDs: args.targetBlockIDs)
+                materialize(targetHidden)
+                continue
+            }
+
+            // Compile tree. Prefix = tokens minus current bonus (which
+            // sits as tree root at position tokens.count - 1).
+            let prefixTokens = Array(tokens.dropLast())
+            let compiled = try TreeCompile.compile(
+                tree: tree, rootTokenID: bonus, prefixLen: prefixTokens.count)
+
+            // Tree-verify.
+            let verifyResult = try TreeVerify.verifyForward(
+                target: args.target,
+                compiled: compiled,
+                prefixTokens: prefixTokens,
+                captureLayerIDs: [])
+
+            // Walk.
+            let (accepted, bonusToken) = try TreeBuilder.followVerifiedTree(
+                childMaps: tree.childMaps,
+                posteriorTokens: verifyResult.posteriorTokens)
+
+            // Commit. `accepted[0] == 0` (root); accepted[1..] are
+            // drafted-node tree indices. Their tokens live in
+            // `tree.nodeTokenIds[index - 1]`.
+            let acceptanceLength = accepted.count - 1
+            acceptanceLengths.append(acceptanceLength)
+            let treeNodeTokens = tree.nodeTokenIds.asArray(Int32.self)
+            for i in 1..<accepted.count {
+                let nodeIdx = Int(accepted[i])
+                tokens.append(treeNodeTokens[nodeIdx - 1])
+            }
+            bonus = bonusToken
+            tokens.append(bonus)
+
+            // Update target_hidden. v1: re-prefill on the growing
+            // sequence to produce fresh hiddens at the latest positions.
+            // Slice the last `accepted + 1` positions to match Python
+            // reference shape. Iter 10+ optimisation will reuse the
+            // verify pass's captured states.
+            let reprefill = MLXArray(tokens).reshaped(1, tokens.count)
+            let (_, reprefillHidden) = args.target(
+                reprefill, cache: nil, captureLayerIDs: targetLayerSet)
+            let feature = extractContextFeature(
+                captured: reprefillHidden, targetLayerIDs: args.targetBlockIDs)
+            let keep = acceptanceLength + 1
+            let start = tokens.count - keep
+            targetHidden = feature[0..., start..., 0...]
+            materialize(targetHidden)
+        }
+
+        let filtered = tokens.filter { $0 != args.maskTokenID }
+        return DDTreeResult(
+            tokenIds: filtered, acceptanceLengths: acceptanceLengths)
+    }
+
+    /// Duplicate of ``SpecDecRuntimeLinear/sampleArgmax(_:temperature:)``
+    /// — private there, mirrored here to avoid cross-module plumbing.
+    private static func sampleArgmax(
+        _ logits: MLXArray, temperature: Float
+    ) -> Int32 {
+        precondition(temperature < 1e-5,
+            "runDDTree iter 9: only temperature=0 supported")
+        let last: MLXArray
+        if logits.ndim == 3 {
+            last = logits[0, logits.dim(1) - 1, 0...]
+        } else if logits.ndim == 2 {
+            last = logits[logits.dim(0) - 1, 0...]
+        } else {
+            fatalError("unexpected logits shape: ndim=\(logits.ndim)")
+        }
+        let idx = argMax(last, axis: -1).asType(.int32)
+        materialize(idx)
+        return idx.item(Int32.self)
+    }
+}
+
 // MARK: - Actor + errors (preserved from Phase 0 stub)
 
 /// Main generation loop for block-diffusion speculative decoding.
