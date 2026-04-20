@@ -230,4 +230,5 @@ Phase 1 work targets gpt-oss-20b first (dense, smallest public drafter, pure-att
 
 ## 12. Iter log (commit SHAs)
 
-- **Iter 1 (TBD)** — Phase 0 scaffolding: this doc + stub SpecDec/*.swift files + `DraftStrategy` enum + `DDTreeDesignTests`. No runtime behaviour change.
+- **Iter 1 (89ea00f)** — Phase 0 scaffolding: this doc + stub SpecDec/*.swift files + `DraftStrategy` enum + `DDTreeDesignTests` (14 tests). No runtime behaviour change.
+- **Iter 2 (TBD)** — Phase 1 kickoff: `DFlashDraftModel.swift` (drafter architecture port of `dflash.py`) + `DFlashDrafterLoader.swift` (safetensors load from local HF snapshot) + `DFlashDrafterForwardTests.swift` (6 tests). Both `z-lab/gpt-oss-20b-DFlash` (1.5 GB) and `z-lab/Qwen3.5-27B-DFlash` (3.2 GB) load cleanly; drafter-specific `fc.weight` and `hidden_norm.weight` populate. Forward pass shape matches Python reference. Byte-parity vs reference still pending — requires hidden-state capture hook on target model and reference run against fixed `(noise_embedding, target_hidden, position_ids)` triples.
