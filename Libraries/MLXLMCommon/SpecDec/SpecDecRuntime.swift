@@ -49,6 +49,13 @@ public struct DFlashLinearArgs: @unchecked Sendable {
     /// Sampling temperature. `0` = greedy argmax.
     public let temperature: Float
 
+    /// KV compression mode applied to the persistent target cache on the
+    /// fast path. Defaults to `.none`. `.turboQuant(keyBits: 3, valueBits: 3)`
+    /// gives 4.7-5x memory compression; on memory-bandwidth-bound
+    /// decode paths this can translate into measurable tok/s gains for
+    /// long contexts. No effect on the hybrid-SSM fallback path.
+    public let kvMode: KVQuantizationMode
+
     public init(
         target: any (HiddenStateCaptureModel & TokenEmbedderModel),
         drafter: DFlashDraftModel,
@@ -57,7 +64,8 @@ public struct DFlashLinearArgs: @unchecked Sendable {
         inputIds: MLXArray,
         maxNewTokens: Int,
         stopTokenIDs: Set<Int32> = [],
-        temperature: Float = 0
+        temperature: Float = 0,
+        kvMode: KVQuantizationMode = .none
     ) {
         self.target = target
         self.drafter = drafter
@@ -67,6 +75,7 @@ public struct DFlashLinearArgs: @unchecked Sendable {
         self.maxNewTokens = maxNewTokens
         self.stopTokenIDs = stopTokenIDs
         self.temperature = temperature
+        self.kvMode = kvMode
     }
 }
 
@@ -136,7 +145,7 @@ public enum SpecDecRuntimeLinear {
         //    rolling back rejected draft positions is impossible without
         //    re-running. For those targets we fall back to re-prefill
         //    each round (correct, O(tokens_so_far²) total, works fine).
-        let targetCache: [KVCache] = args.target.newCache(parameters: nil)
+        var targetCache: [KVCache] = args.target.newCache(parameters: nil)
         // Gate the target-cache+rollback fast path. Disabled via env var
         // `DFLASH_DISABLE_FAST_PATH=1` when we're validating byte-parity
         // against the fallback; always disabled when any layer cache is
@@ -150,6 +159,14 @@ public enum SpecDecRuntimeLinear {
             cache: useRollbackFastPath ? targetCache : nil,
             captureLayerIDs: targetLayerSet)
         materialize(prefillLogits)
+
+        // After prefill, opt into TurboQuant / affine KV compression on
+        // the fast path. The compressed-cache classes stay trimmable so
+        // rollback still works. No-op on the fallback path (cache=nil).
+        if useRollbackFastPath && args.kvMode != .none {
+            maybeQuantizeKVCache(
+                cache: &targetCache, kvBits: nil, kvMode: args.kvMode)
+        }
         // `accumulatedHidden` holds every committed position's hidden.
         // Grows by (accepted + 1) positions per round. Drafter attends
         // to this full accumulated context on every call since we don't
