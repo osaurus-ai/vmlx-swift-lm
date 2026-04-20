@@ -375,6 +375,46 @@ struct ToolCallEdgeCasesTests {
             "Mistral EOS inline-parser behaviour (extract-or-buffer) pinned.")
     }
 
+    // MARK: - Pythonic multi-call parseEOS (iter 67, osaurus parity)
+
+    /// LFM2 can emit multiple calls inside one `[…]` block — e.g.
+    /// `[search(q="a"), search(q="b")]`. The default protocol `parseEOS`
+    /// only surfaces the first match, so `PythonicToolCallParser` must
+    /// override it to return every call. Regression test for drift vs
+    /// upstream ml-explore/mlx-swift-lm `main`.
+    @Test("Pythonic parseEOS extracts every call in one bracket block")
+    func testPythonicParseEOSReturnsAllCalls() {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let buffer = "<|tool_call_start|>[search(q='a'), fetch(url='https://x.io')]<|tool_call_end|>"
+        let calls = parser.parseEOS(buffer, tools: nil)
+        #expect(calls.count == 2,
+            "parseEOS must emit every call in the bracket list.")
+        #expect(calls.map(\.function.name) == ["search", "fetch"])
+        #expect(calls[0].function.arguments["q"] == .string("a"))
+        #expect(calls[1].function.arguments["url"] == .string("https://x.io"))
+    }
+
+    // MARK: - ToolCall.Function(name:arguments: JSONValue) upstream init
+
+    /// Upstream ship both `init(name:, arguments: [String: JSONValue])`
+    /// AND `init(name:, arguments: [String: any Sendable])`. Our earlier
+    /// drop of the typed-JSONValue init would silently break any caller
+    /// that passes through decoded `JSONValue` dicts. Regression pin.
+    @Test("ToolCall.Function init(JSONValue:) preserves typed args byte-for-byte")
+    func testToolCallFunctionJSONValueInit() {
+        let args: [String: JSONValue] = [
+            "location": .string("Tokyo"),
+            "unit": .string("celsius"),
+            "days": .int(7),
+        ]
+        let fn = ToolCall.Function(name: "get_weather", arguments: args)
+        #expect(fn.name == "get_weather")
+        #expect(fn.arguments["location"] == .string("Tokyo"))
+        #expect(fn.arguments["unit"] == .string("celsius"))
+        #expect(fn.arguments["days"] == .int(7))
+    }
+
     // MARK: - ModelConfiguration.reasoningParserName plumbing (iter 66)
 
     /// `ModelConfiguration.reasoningParserName` is the capability stamp

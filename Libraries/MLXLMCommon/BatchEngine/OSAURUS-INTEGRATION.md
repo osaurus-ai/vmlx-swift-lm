@@ -2,6 +2,8 @@
 
 **Link this file** from osaurus issues / Discord / PRs. Standalone, short, directly addresses the two referenced osaurus docs.
 
+**Looking for the full public-API surface?** See `OSAURUS-API-SURFACE.md` in this directory — per-symbol reference with shape + which osaurus file consumes it, cross-checked against osaurus `main` and PR #893.
+
 **Status** (2026-04-19): **production-ready** to flip `mlxBatchEngine=YES` as default. Verified 121 engine unit tests (0 failures), 25 bench scenarios across dense / hybrid-SSM / sliding-window / VL JANG / VL mlx-community model families.
 
 **Iter 66 closes tpae's tool-call-parsing request** — `BatchEngine.generate()` + `Evaluate.generate()` now emit authoritative `.toolCall(ToolCall)` events for every supported family (JSON, Qwen xml_function, Qwen 3.6 interleaved thinking, Mistral, GLM-4, LFM2, Kimi K2, Gemma-3/4, MiniMax M2). Osaurus no longer needs its own tool-call parser at the app layer. See §4 below.

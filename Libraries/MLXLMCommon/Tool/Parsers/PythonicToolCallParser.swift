@@ -61,6 +61,56 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
+    /// At end-of-sequence, extract every pythonic call in the buffer —
+    /// Pythonic models legitimately emit multiple `name(args)` invocations
+    /// inside one `[...]` block, and the default protocol `parseEOS` only
+    /// surfaces the first. Byte-compatible with upstream
+    /// ml-explore/mlx-swift-lm so `LFM2` streams behave identically.
+    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        if let startTag {
+            return
+                toolCallBuffer
+                .components(separatedBy: startTag)
+                .filter { !$0.isEmpty }
+                .flatMap { parseMultiple(content: $0, tools: tools) }
+        } else {
+            return parseMultiple(content: toolCallBuffer, tools: tools)
+        }
+    }
+
+    private func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        var text = content
+
+        if let end = endTag, let endRange = text.range(of: end) {
+            text = String(text[..<endRange.lowerBound])
+        }
+
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Match every `name(args)` — NSRegularExpression (not Swift regex
+        // literal) keeps us compatible with older Swift toolchains that
+        // don't parse `#/(?s)(\w+)\((.*?)\)/#` at compile time. The `(?s)`
+        // dotall flag is expressed via `.dotMatchesLineSeparators`.
+        let pattern = #"(\w+)\(([^)]*(?:\)[^)]*)*?)\)"#
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern, options: [.dotMatchesLineSeparators])
+        else { return [] }
+        let matches = regex.matches(
+            in: text, options: [], range: NSRange(text.startIndex..., in: text))
+
+        var results: [ToolCall] = []
+        for match in matches {
+            guard let nameRange = Range(match.range(at: 1), in: text),
+                let argsRange = Range(match.range(at: 2), in: text)
+            else { continue }
+            let funcName = String(text[nameRange])
+            let argsString = String(text[argsRange])
+            let arguments = parseArguments(argsString, funcName: funcName, tools: tools)
+            results.append(ToolCall(function: .init(name: funcName, arguments: arguments)))
+        }
+        return results
+    }
+
     /// Parse Pythonic keyword arguments: arg1='value1', arg2="value2", arg3=123
     private func parseArguments(
         _ argsString: String,
