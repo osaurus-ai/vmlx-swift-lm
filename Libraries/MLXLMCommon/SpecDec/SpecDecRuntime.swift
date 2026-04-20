@@ -101,7 +101,16 @@ public enum SpecDecRuntimeLinear {
     /// Python reference: we re-prefill the target on the growing
     /// sequence each round instead of cropping the KV cache. Correct but
     /// slower; iter 6 optimises via `CacheCoordinator` rollback.
-    public static func run(_ args: DFlashLinearArgs) throws -> DFlashLinearResult {
+    ///
+    /// - Parameter onCommitted: optional callback invoked after each
+    ///   decode round with the tokens committed that round (accepted
+    ///   block positions + the new bonus). Used by
+    ///   ``SpecDecStream`` to emit streaming `.chunk(String)` events
+    ///   without changing the bulk-return API.
+    public static func run(
+        _ args: DFlashLinearArgs,
+        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
+    ) throws -> DFlashLinearResult {
         let blockSize = args.drafter.config.blockSize
         precondition(blockSize >= 2, "DFlash block_size must be >= 2")
         precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
@@ -128,6 +137,7 @@ public enum SpecDecRuntimeLinear {
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
+        onCommitted?([bonus])
 
         // 2. Decode loop.
         while tokens.count < maxLen {
@@ -203,13 +213,17 @@ public enum SpecDecRuntimeLinear {
 
             // Commit accepted block tokens (positions 1..acceptanceLength)
             // and one bonus (posterior[acceptanceLength]).
+            var thisRoundTokens: [Int32] = []
             if acceptanceLength >= 1 {
                 for i in 1...acceptanceLength {
                     tokens.append(blockValues[i])
+                    thisRoundTokens.append(blockValues[i])
                 }
             }
             bonus = posterior[acceptanceLength]
             tokens.append(bonus)
+            thisRoundTokens.append(bonus)
+            onCommitted?(thisRoundTokens)
 
             // Update target_hidden: the captured hidden states for the
             // accepted+bonus positions. Slice the last `acceptance+1`
@@ -334,7 +348,12 @@ public struct DDTreeResult: Sendable {
 /// only accepts nodes that match those argmax picks.
 public enum SpecDecRuntimeDDTree {
 
-    public static func run(_ args: DDTreeArgs) throws -> DDTreeResult {
+    /// - Parameter onCommitted: optional per-round callback — see
+    ///   ``SpecDecRuntimeLinear/run(_:onCommitted:)``.
+    public static func run(
+        _ args: DDTreeArgs,
+        onCommitted: ((_ newTokens: [Int32]) -> Void)? = nil
+    ) throws -> DDTreeResult {
         let blockSize = args.drafter.config.blockSize
         precondition(blockSize >= 2, "DFlash block_size must be >= 2")
         precondition(args.inputIds.ndim == 2 && args.inputIds.dim(0) == 1,
@@ -362,6 +381,7 @@ public enum SpecDecRuntimeDDTree {
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
+        onCommitted?([bonus])
 
         while tokens.count < maxLen {
             // Stop-token check on generated suffix.
@@ -410,6 +430,7 @@ public enum SpecDecRuntimeDDTree {
                 materialize(nextLogits)
                 bonus = sampleArgmax(nextLogits, temperature: args.temperature)
                 tokens.append(bonus)
+                onCommitted?([bonus])
                 targetHidden = extractContextFeature(
                     captured: nextHidden, targetLayerIDs: args.targetBlockIDs)
                 materialize(targetHidden)
@@ -440,12 +461,17 @@ public enum SpecDecRuntimeDDTree {
             let acceptanceLength = accepted.count - 1
             acceptanceLengths.append(acceptanceLength)
             let treeNodeTokens = tree.nodeTokenIds.asArray(Int32.self)
+            var thisRoundTokens: [Int32] = []
             for i in 1..<accepted.count {
                 let nodeIdx = Int(accepted[i])
-                tokens.append(treeNodeTokens[nodeIdx - 1])
+                let t = treeNodeTokens[nodeIdx - 1]
+                tokens.append(t)
+                thisRoundTokens.append(t)
             }
             bonus = bonusToken
             tokens.append(bonus)
+            thisRoundTokens.append(bonus)
+            onCommitted?(thisRoundTokens)
 
             // Update target_hidden. v1: re-prefill on the growing
             // sequence to produce fresh hiddens at the latest positions.
