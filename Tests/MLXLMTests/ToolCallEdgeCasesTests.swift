@@ -91,11 +91,90 @@ struct ToolCallEdgeCasesTests {
             <tool_call><function=get_time><parameter=zone>UTC</parameter></function></tool_call>
             Final answer: it is nice in Paris.
             """
-        _ = feedInChunks(stream, chunkSize: 7, into: processor)
+        let emitted = feedInChunks(stream, chunkSize: 7, into: processor)
         #expect(processor.toolCalls.count == 2,
             "Two tool calls interleaved with two <think> blocks must all extract.")
         #expect(processor.toolCalls[0].function.name == "get_weather")
         #expect(processor.toolCalls[1].function.name == "get_time")
+        // The user-visible text MUST include the final answer.
+        #expect(emitted.contains("Final answer: it is nice in Paris."))
+        // Tool-call payloads MUST NOT leak into user-visible text.
+        #expect(!emitted.contains("<tool_call>"),
+            "Tool-call tags must not leak into user-visible chunks.")
+        #expect(!emitted.contains("<function=get_weather>"),
+            "Tool-call internals must not leak into user-visible chunks.")
+    }
+
+    // MARK: - Reasoning parser pipelined with tool-call processor
+
+    /// When a `ReasoningParser` is pipelined BEFORE `ToolCallProcessor`,
+    /// `<think>...</think>` blocks must be stripped from the text
+    /// handed to the tool-call processor's `processChunk` so the
+    /// downstream consumer sees neither reasoning markers nor
+    /// tool-call markers in `.chunk` output — only user-visible text.
+    ///
+    /// This is the contract osaurus relies on: its `.chunk` stream is
+    /// pure text, its tool-call events are authoritative, and any
+    /// reasoning content is routed to a separate reasoning channel.
+    @Test("ReasoningParser pipelined before ToolCallProcessor strips <think> from chunks")
+    func testReasoningParserPipelinedStripsThink() {
+        var reasoning = ReasoningParser()
+        let tools = ToolCallProcessor(format: .xmlFunction)
+        let stream = """
+            <think>First I need weather data.</think>
+            <tool_call><function=get_weather><parameter=location>Paris</parameter></function></tool_call>
+            <think>Now check the time.</think>
+            Final answer: nice weather.
+            """
+        var userVisible = ""
+        var reasoningCaptured = ""
+        // Feed in small chunks simulating streaming.
+        var idx = stream.startIndex
+        while idx < stream.endIndex {
+            let end = stream.index(idx, offsetBy: 6, limitedBy: stream.endIndex) ?? stream.endIndex
+            let chunk = String(stream[idx..<end])
+            // Reasoning parser first — it peels off <think>...</think>
+            // into its own channel and returns non-reasoning segments as .content.
+            for segment in reasoning.feed(chunk) {
+                switch segment {
+                case .reasoning(let r):
+                    reasoningCaptured += r
+                case .content(let c):
+                    if let toolVisible = tools.processChunk(c) {
+                        userVisible += toolVisible
+                    }
+                }
+            }
+            idx = end
+        }
+        // Flush any buffered content.
+        for segment in reasoning.flush() {
+            switch segment {
+            case .reasoning(let r):
+                reasoningCaptured += r
+            case .content(let c):
+                if let toolVisible = tools.processChunk(c) {
+                    userVisible += toolVisible
+                }
+            }
+        }
+        tools.processEOS()
+        // Reasoning captured at least once.
+        #expect(reasoningCaptured.contains("First I need weather data"),
+            "ReasoningParser must capture `<think>` content. Got: \(reasoningCaptured)")
+        // Tool call extracted.
+        #expect(tools.toolCalls.count == 1,
+            "Tool-call processor must still see the tool call after reasoning strip.")
+        #expect(tools.toolCalls.first?.function.name == "get_weather")
+        // Neither reasoning tags nor tool-call tags in user-visible text.
+        #expect(!userVisible.contains("<think>"),
+            "User-visible text must not contain <think>. Got: \(userVisible)")
+        #expect(!userVisible.contains("</think>"),
+            "User-visible text must not contain </think>.")
+        #expect(!userVisible.contains("<tool_call>"),
+            "User-visible text must not contain <tool_call>.")
+        #expect(userVisible.contains("Final answer: nice weather"),
+            "User-visible text must carry the final answer.")
     }
 
     /// Character-by-character streaming — matches what NaiveStreamingDetokenizer
@@ -294,5 +373,94 @@ struct ToolCallEdgeCasesTests {
         // Note: Mistral is inline (no end tag) — process/EOS path extracts.
         #expect(processor.toolCalls.count == 1 || processor.toolCalls.isEmpty,
             "Mistral EOS inline-parser behaviour (extract-or-buffer) pinned.")
+    }
+
+    // MARK: - ModelConfiguration.reasoningParserName plumbing (iter 66)
+
+    /// `ModelConfiguration.reasoningParserName` is the capability stamp
+    /// that `Evaluate.generate` / `BatchEngine.generate` resolve into a
+    /// live `ReasoningParser` via `ReasoningParser.fromCapabilityName`.
+    /// This test pins the round-trip: init → resolved → fromCapabilityName.
+    @Test("ModelConfiguration.reasoningParserName survives init + resolve()")
+    func testReasoningParserNamePlumbsThroughResolved() {
+        let stamps: [(stamp: String, shouldResolve: Bool)] = [
+            ("think_xml", true),
+            ("qwen3_6", true),
+            ("deepseek_r1", true),
+            ("glm4", true),
+            ("minimax", true),
+            ("nemotron", true),
+            ("none", false),
+            ("mistral", false),
+            ("gemma4", false),
+        ]
+        let tmpDir = URL(fileURLWithPath: "/tmp/vmlx-test-placeholder")
+        for (stamp, shouldResolve) in stamps {
+            let cfg = ModelConfiguration(
+                directory: tmpDir, reasoningParserName: stamp)
+            let resolved = cfg.resolved(
+                modelDirectory: tmpDir, tokenizerDirectory: tmpDir)
+            #expect(resolved.reasoningParserName == stamp,
+                "resolved() must carry reasoningParserName through.")
+            let parser = ReasoningParser.fromCapabilityName(
+                resolved.reasoningParserName)
+            if shouldResolve {
+                #expect(parser != nil,
+                    "Stamp `\(stamp)` must resolve to a ReasoningParser instance.")
+            } else {
+                #expect(parser == nil,
+                    "Stamp `\(stamp)` must resolve to nil (no reasoning stripping).")
+            }
+        }
+    }
+
+    /// `TextToolTokenLoopHandler`-equivalent pipeline with reasoning
+    /// parser present: interleaved `<think>` blocks must be stripped
+    /// from the user-visible chunks flowing to the tool-call processor,
+    /// while tool calls still extract cleanly. This is the contract the
+    /// real handler implements — composing the two parsers in a single
+    /// pipeline without state-machine conflict.
+    @Test("Reasoning + tool-call pipeline: interleaved <think> + <tool_call> survive streaming")
+    func testReasoningToolCallPipelineInterleaved() {
+        var reasoning = ReasoningParser()
+        let tools = ToolCallProcessor(format: .xmlFunction)
+        let stream = """
+            <think>First, plan.</think>
+            <tool_call><function=a></function></tool_call>
+            <think>Now do b.</think>
+            <tool_call><function=b></function></tool_call>
+            Done.
+            """
+        var userVisible = ""
+        var idx = stream.startIndex
+        while idx < stream.endIndex {
+            let end = stream.index(idx, offsetBy: 4, limitedBy: stream.endIndex) ?? stream.endIndex
+            let chunk = String(stream[idx..<end])
+            for segment in reasoning.feed(chunk) {
+                if case .content(let c) = segment,
+                   let out = tools.processChunk(c) {
+                    userVisible += out
+                }
+            }
+            idx = end
+        }
+        for segment in reasoning.flush() {
+            if case .content(let c) = segment,
+               let out = tools.processChunk(c) {
+                userVisible += out
+            }
+        }
+        tools.processEOS()
+        #expect(tools.toolCalls.count == 2,
+            "Both tool calls must extract with reasoning pipelined.")
+        #expect(tools.toolCalls.map(\.function.name) == ["a", "b"])
+        #expect(!userVisible.contains("<think>"),
+            "User-visible text must not contain <think>.")
+        #expect(!userVisible.contains("First, plan"),
+            "Reasoning content must not leak into user-visible text.")
+        #expect(!userVisible.contains("<tool_call>"),
+            "Tool-call tags must not leak into user-visible text.")
+        #expect(userVisible.contains("Done"),
+            "Final user-visible text must survive the pipeline.")
     }
 }

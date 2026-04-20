@@ -1728,7 +1728,9 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            reasoningParser: ReasoningParser.fromCapabilityName(
+                context.configuration.reasoningParserName)
         )
     )
     return stream
@@ -1811,7 +1813,9 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            reasoningParser: ReasoningParser.fromCapabilityName(
+                modelConfiguration.reasoningParserName)
         ),
         cacheStoreAction: cacheStoreAction
     )
@@ -2311,10 +2315,65 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
     var detokenizer: NaiveStreamingDetokenizer
     let toolCallProcessor: ToolCallProcessor
+    /// Optional `<think>...</think>` stripper pipelined BEFORE the tool-call
+    /// processor. When `nil` every decoded chunk goes straight to the
+    /// tool-call processor (matches upstream ml-explore/mlx-swift-lm
+    /// behaviour byte-for-byte).
+    var reasoningParser: ReasoningParser?
 
-    init(tokenizer: Tokenizer, format: ToolCallFormat) {
+    init(
+        tokenizer: Tokenizer,
+        format: ToolCallFormat,
+        reasoningParser: ReasoningParser? = nil
+    ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         toolCallProcessor = ToolCallProcessor(format: format)
+        self.reasoningParser = reasoningParser
+    }
+
+    /// Feed a raw decoded chunk through the reasoning parser (if any) and
+    /// the tool-call processor, yielding the user-visible text plus any
+    /// complete tool-call events.
+    ///
+    /// Returns `false` to stop the loop when the consumer terminates.
+    private mutating func dispatch(
+        _ chunk: String,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> Bool {
+        // 1. Reasoning pass (if configured). Reasoning segments are
+        //    silently dropped — the stream contract is `.chunk` = pure
+        //    user-visible text, and reasoning has no `Generation` case.
+        //    Callers that need `<think>` content can disable the
+        //    reasoning parser (leave `reasoningParserName` nil) and
+        //    parse raw themselves.
+        let contentChunks: [String]
+        if var parser = reasoningParser {
+            var pieces: [String] = []
+            for segment in parser.feed(chunk) {
+                if case .content(let c) = segment { pieces.append(c) }
+            }
+            reasoningParser = parser
+            contentChunks = pieces
+        } else {
+            contentChunks = [chunk]
+        }
+
+        // 2. Tool-call pass. Each content piece is processed in order so
+        //    the state machine inside `ToolCallProcessor` sees the same
+        //    byte stream it would have seen without a reasoning parser.
+        for contentChunk in contentChunks {
+            if let textToYield = toolCallProcessor.processChunk(contentChunk) {
+                if case .terminated = emit(.chunk(textToYield)) {
+                    return false
+                }
+            }
+            if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                if case .terminated = emit(.toolCall(toolCall)) {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     mutating func onToken(
@@ -2323,21 +2382,8 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     ) -> Bool {
         detokenizer.append(token: token)
         if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
-                }
-            }
-
-            // Check if we have a complete tool call.
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
-            }
+            return dispatch(chunk, emit: emit)
         }
-
         return true
     }
 
@@ -2351,6 +2397,30 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
+        // Flush the reasoning parser — any buffered tail becomes content
+        // so we never silently drop tokens (per ReasoningParser.flush
+        // contract). The tool-call processor then sees the final piece
+        // before we call processEOS.
+        if var parser = reasoningParser {
+            for segment in parser.flush() {
+                if case .content(let c) = segment,
+                    let textToYield = toolCallProcessor.processChunk(c)
+                {
+                    if case .terminated = emit(.chunk(textToYield)) {
+                        reasoningParser = parser
+                        return
+                    }
+                }
+                if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                    if case .terminated = emit(.toolCall(toolCall)) {
+                        reasoningParser = parser
+                        return
+                    }
+                }
+            }
+            reasoningParser = parser
+        }
+
         toolCallProcessor.processEOS()
 
         for toolCall in toolCallProcessor.toolCalls {

@@ -4,6 +4,8 @@
 
 **Status** (2026-04-19): **production-ready** to flip `mlxBatchEngine=YES` as default. Verified 121 engine unit tests (0 failures), 25 bench scenarios across dense / hybrid-SSM / sliding-window / VL JANG / VL mlx-community model families.
 
+**Iter 66 closes tpae's tool-call-parsing request** — `BatchEngine.generate()` + `Evaluate.generate()` now emit authoritative `.toolCall(ToolCall)` events for every supported family (JSON, Qwen xml_function, Qwen 3.6 interleaved thinking, Mistral, GLM-4, LFM2, Kimi K2, Gemma-3/4, MiniMax M2). Osaurus no longer needs its own tool-call parser at the app layer. See §4 below.
+
 ---
 
 ## Addressing tpae's two references
@@ -60,6 +62,82 @@ public enum Blocker: String, CaseIterable {
 | Turn-2 tokens = Turn-1 tokens (session replay) | Full hit. Dense: 40-70% prefill speedup. VL: vision tower skipped. Hybrid SSM: SSM state restored via `ssmStateCache`. |
 | Turn-2 = Turn-1 + new tokens, dense | Paged hit on shared prefix; remaining tokens prefill normally. 62% observed speedup on Qwen3-0.6B test harness. |
 | Turn-2 = Turn-1 + new tokens, VL or hybrid SSM | Partial hit reported by coordinator, **engine rolls back to full prefill** for correctness. No speedup; no corruption. |
+
+---
+
+## 4. Tool-call parsing: authoritative at library level (iter 66)
+
+### Contract
+
+`BatchEngine.generate(input:parameters:)` and `Evaluate.generate(...)` emit these three event cases. Every tool call the model emits is surfaced as `.toolCall(ToolCall)` — **osaurus should not parse tool calls at its level**.
+
+```swift
+public enum Generation: Sendable {
+    case chunk(String)            // pure user-visible text; no <think>, no <tool_call>
+    case toolCall(ToolCall)       // fully-parsed tool call, authoritative
+    case info(GenerateCompletionInfo)
+}
+```
+
+### Why this matters
+
+Before iter 66, `BatchEngine.generate` only emitted `.chunk(String)` — raw detokenized text including tool-call markers. Osaurus was forced to re-parse at the app layer, which meant:
+
+- **Two sources of truth** — vmlx's `ToolCallProcessor` (used on the `Evaluate` path) and osaurus's own parser. When a model-family wire format drifted, one or the other broke.
+- **Conflicting formats** — tpae reported "gemma4 is outputting harmony format" because the library wasn't extracting tool calls and osaurus's parser didn't know Gemma-4's `<|tool_call>call:name{k:<|"|>v<|"|>}<tool_call|>` syntax.
+
+After iter 66, the library does all parsing. Both paths (single-stream `Evaluate.generate` AND `BatchEngine.generate`) run identical pipelines:
+
+```
+detokenized chunk
+    → ReasoningParser.feed(_:)                    (strips <think>…</think>)
+    → ToolCallProcessor.processChunk(_:)          (extracts .toolCall + pure text)
+    → emit .chunk / .toolCall
+```
+
+### Auto-pickup for JANG / MLX / VL models
+
+Both `LLMModelFactory` and `VLMModelFactory` stamp the two capability fields on `ModelConfiguration` in this priority:
+
+1. Caller-supplied override (`ModelConfiguration.toolCallFormat` / `.reasoningParserName`)
+2. JANG `capabilities.tool_parser` / `capabilities.reasoning_parser` from `jang_config.json`
+3. `ToolCallFormat.infer(from: modelType)` / model-type reasoning heuristic
+
+`ToolCallFormat.fromCapabilityName` accepts every short alias the JANG converter produces (`qwen`, `qwen3_6`, `minimax`, `glm47`, `deepseek`, `nemotron`, etc.), so JANG-stamped models pick the right parser automatically.
+
+### Supported families
+
+| Family | `toolCallFormat` | Reasoning stamp | Interleaved thinking |
+|---|---|---|---|
+| Qwen 3 / 3.5 / 3.6 dense / 3 Coder / Nemotron | `.xmlFunction` | `qwen3` / `think_xml` | ✓ (Qwen 3.6 wire format) |
+| MiniMax M2 / M2.5 | `.minimaxM2` | `minimax` | ✓ |
+| GLM 4.x / DeepSeek-R1 | `.glm4` | `glm4` / `deepseek_r1` | ✓ |
+| Kimi K2 | `.kimiK2` | `think_xml` | ✓ |
+| Gemma 3 | `.gemma` | none | — |
+| Gemma 4 (incl. JANG Gemma4WithTools) | `.gemma4` | none | — |
+| Mistral (any variant) | `.mistral` | none | — |
+| LFM2 | `.lfm2` | none | — |
+| Standard JSON / unknown | `.json` | heuristic | ✓ if `<think>` present |
+
+### Verification
+
+| Test | Coverage |
+|---|---|
+| `Tests/MLXLMTests/ToolCallEdgeCasesTests.swift` (22 passes) | Qwen 3.6 interleaved thinking, MiniMax M2 interleaved thinking, Gemma-4 escape-marker regression, Gemma-4 channel + tool-call coexistence, char-by-char streaming, back-to-back calls, JANG stamp → format mapping, canonical rawValue round-trip, `reasoningParserName` plumb-through |
+| `Tests/MLXLMTests/ToolTests.swift` (42 passes, pre-existing) | Baseline per-family parsers |
+| `Tests/MLXLMTests/ReasoningParserTests.swift` (passes) | Streaming `<think>` strip + whole-string `split(_:)` |
+| `BENCH_BATCH_TOOLCALL=1` (manual, real model) | End-to-end on Qwen3-0.6B / Qwen3.6-35B-JANGTQ2 / Gemma-4-E2B — zero raw markers in `.chunk` |
+
+### What osaurus should do
+
+- **Remove or bypass** the app-layer tool-call parser for the MLX runtime path.
+- Consume `.toolCall(ToolCall)` events directly from the stream and forward to the OpenAI `tool_calls` response field.
+- Continue rendering `.chunk(String)` as assistant text — it is already reasoning-stripped and tool-call-stripped.
+
+If you want reasoning blocks surfaced (for a think-pane UI), the library does not currently emit a `.reasoning` event — the upstream `Generation` enum doesn't have one. Options:
+
+- Use `ReasoningParser.split(_:)` on the accumulated assistant text after the stream finishes (non-streaming reveal).
+- Call `Evaluate.generateTokens(...)` (raw token stream) and run your own `ReasoningParser` instance alongside — trades parsing back to app layer in exchange for streaming visibility of reasoning.
 
 ---
 

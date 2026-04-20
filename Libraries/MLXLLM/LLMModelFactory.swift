@@ -719,6 +719,29 @@ public final class LLMModelFactory: ModelFactory {
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
+        // Reasoning-parser stamp: same precedence ladder as the tool-call
+        // format. JANG `capabilities.reasoning_parser` wins when present;
+        // otherwise we pick a parser off the model_type heuristic. The
+        // stamp is the short capability name (e.g. `"qwen3_6"`, `"gemma4"`);
+        // Evaluate + BatchEngine resolve it to a live ReasoningParser
+        // instance via `ReasoningParser.fromCapabilityName(_:)`.
+        if mutableConfiguration.reasoningParserName == nil {
+            if let stamp = jangConfig?.capabilities?.reasoningParser {
+                mutableConfiguration.reasoningParserName = stamp
+            } else {
+                // Heuristic: families that emit `<think>...</think>` natively.
+                // Matches the ParserResolution facade but flattened to a
+                // canonical stamp string so we keep a single code path
+                // through the handler.
+                let t = baseConfig.modelType.lowercased()
+                if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                    mutableConfiguration.reasoningParserName = "none"
+                } else {
+                    mutableConfiguration.reasoningParserName = "think_xml"
+                }
+            }
+        }
+
         // Load tokenizer and weights in parallel.
         //
         // JANG / JANGTQ bundles ship weights-only — the snapshot directory
@@ -767,7 +790,8 @@ public final class LLMModelFactory: ModelFactory {
             defaultPrompt: configuration.defaultPrompt,
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            reasoningParserName: mutableConfiguration.reasoningParserName)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

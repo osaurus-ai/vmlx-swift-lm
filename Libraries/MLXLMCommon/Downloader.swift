@@ -75,6 +75,10 @@ public struct ResolvedModelConfiguration: Sendable {
     public var eosTokenIds: Set<Int>
     public var toolCallFormat: ToolCallFormat?
 
+    /// Reasoning-parser capability stamp. See
+    /// ``ModelConfiguration/reasoningParserName`` for accepted values.
+    public var reasoningParserName: String?
+
     public init(
         modelDirectory: URL,
         tokenizerDirectory: URL,
@@ -82,7 +86,8 @@ public struct ResolvedModelConfiguration: Sendable {
         defaultPrompt: String,
         extraEOSTokens: Set<String>,
         eosTokenIds: Set<Int>,
-        toolCallFormat: ToolCallFormat?
+        toolCallFormat: ToolCallFormat?,
+        reasoningParserName: String? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -91,6 +96,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.extraEOSTokens = extraEOSTokens
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
+        self.reasoningParserName = reasoningParserName
     }
 }
 
@@ -105,6 +111,7 @@ extension ResolvedModelConfiguration {
             defaultPrompt: "",
             extraEOSTokens: [],
             eosTokenIds: [],
-            toolCallFormat: nil)
+            toolCallFormat: nil,
+            reasoningParserName: nil)
     }
 }

@@ -375,6 +375,22 @@ public final class VLMModelFactory: ModelFactory {
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
+        // Reasoning-parser stamp (same precedence as LLMModelFactory).
+        // VL models that emit `<think>` follow the same Qwen / DeepSeek
+        // conventions as their text-only counterparts.
+        if mutableConfiguration.reasoningParserName == nil {
+            if let stamp = jangConfig?.capabilities?.reasoningParser {
+                mutableConfiguration.reasoningParserName = stamp
+            } else {
+                let t = baseConfig.modelType.lowercased()
+                if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
+                    mutableConfiguration.reasoningParserName = "none"
+                } else {
+                    mutableConfiguration.reasoningParserName = "think_xml"
+                }
+            }
+        }
+
         // Load tokenizer from model directory (or alternate tokenizer repo),
         // processor config, and weights in parallel using async let.
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
@@ -438,7 +454,8 @@ public final class VLMModelFactory: ModelFactory {
             defaultPrompt: configuration.defaultPrompt,
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            toolCallFormat: mutableConfiguration.toolCallFormat,
+            reasoningParserName: mutableConfiguration.reasoningParserName)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

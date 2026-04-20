@@ -212,6 +212,10 @@ public actor BatchEngine {
         parameters: GenerateParameters
     ) -> AsyncStream<Generation> {
         let tokenizer = context.tokenizer
+        // Snapshot format + reasoning stamp from the configuration so the
+        // background task doesn't need to reach back into the actor.
+        let toolCallFormat = context.configuration.toolCallFormat ?? .json
+        let reasoningParserName = context.configuration.reasoningParserName
         let (_, tokenStream) = submit(input: input, parameters: parameters)
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
@@ -219,17 +223,71 @@ public actor BatchEngine {
         // owns the continuation. `if let` (not `while let`) — calling
         // `NaiveStreamingDetokenizer.next()` in a loop produces empty
         // strings forever and melts throughput under a real HF tokenizer.
+        //
+        // The inner pipeline matches `TextToolTokenLoopHandler` in
+        // `Evaluate.swift` byte-for-byte: each decoded chunk runs through
+        // an optional `ReasoningParser` first (strips `<think>...</think>`),
+        // then through `ToolCallProcessor` which extracts authoritative
+        // `.toolCall(ToolCall)` events. Osaurus / callers never have to
+        // re-parse — tool-call parsing lives in the library.
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+            let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
+            var reasoningParser = ReasoningParser.fromCapabilityName(
+                reasoningParserName)
+
+            func pump(_ raw: String) {
+                let pieces: [String]
+                if var parser = reasoningParser {
+                    var kept: [String] = []
+                    for segment in parser.feed(raw) {
+                        if case .content(let c) = segment { kept.append(c) }
+                    }
+                    reasoningParser = parser
+                    pieces = kept
+                } else {
+                    pieces = [raw]
+                }
+                for piece in pieces {
+                    if let textToYield = toolCallProcessor.processChunk(piece) {
+                        continuation.yield(.chunk(textToYield))
+                    }
+                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                        continuation.yield(.toolCall(toolCall))
+                    }
+                }
+            }
+
+            func flush() {
+                if var parser = reasoningParser {
+                    for segment in parser.flush() {
+                        if case .content(let c) = segment,
+                            let textToYield = toolCallProcessor.processChunk(c)
+                        {
+                            continuation.yield(.chunk(textToYield))
+                        }
+                        if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                            continuation.yield(.toolCall(toolCall))
+                        }
+                    }
+                    reasoningParser = parser
+                }
+                toolCallProcessor.processEOS()
+                for toolCall in toolCallProcessor.toolCalls {
+                    continuation.yield(.toolCall(toolCall))
+                }
+            }
+
             for await event in tokenStream {
                 switch event {
                 case .token(let id):
                     detokenizer.append(token: id)
                     if let text = detokenizer.next() {
-                        continuation.yield(.chunk(text))
+                        pump(text)
                     }
                 case .info(let info):
+                    flush()
                     detokenizer.startNewSegment()
                     continuation.yield(.info(info))
                 }

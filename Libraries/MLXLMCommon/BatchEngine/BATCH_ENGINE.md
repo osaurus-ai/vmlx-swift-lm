@@ -2181,6 +2181,44 @@ The cross-validator now distinguishes "real divergence" from "engine honoured EO
 
 This is a meaningful property: `BatchEngine` is compositionally closer to `ChatSession` (which does enforce EOS) than to raw `TokenIterator`. Osaurus's user-facing behaviour matches `BatchEngine`'s.
 
+## Iter 66 addendum — library-level tool-call + reasoning parser, always (2026-04-19)
+
+Closes tpae's Discord request that "tool call parsing should be handled at the library level" and "on osaurus, we have another tool call parser which is conflicting". After this iter, **every `.toolCall(ToolCall)` event emitted by `BatchEngine.generate()` / `Evaluate.generate()` is authoritative** — osaurus never has to re-parse at its level.
+
+### What changed
+
+1. **`Libraries/MLXLMCommon/Tool/Parsers/GemmaFunctionParser.swift`** — default `escapeMarker` was `<|"\|>` (with a backslash that never appears in real Gemma-4 output). Changed to `<|"|>`. Regression test `testGemma4ParserDefaultEscapeMarkerIsCorrect` pins the fix.
+2. **`Libraries/MLXLLM/LLMModelFactory.swift` + `Libraries/MLXVLM/VLMModelFactory.swift`** — tool-format resolution priority was inverted (heuristic won over JANG stamp). Fixed to: (1) caller-supplied override → (2) JANG `capabilities.tool_parser` stamp via `fromCapabilityName` → (3) `ToolCallFormat.infer(from: modelType)`.
+3. **Same two factories** now also stamp `ModelConfiguration.reasoningParserName` from `capabilities.reasoning_parser` (JANG) or a `model_type` heuristic (`gemma*` / `mistral*` → `"none"`, else `"think_xml"`).
+4. **`Libraries/MLXLMCommon/Evaluate.swift`** — `TextToolTokenLoopHandler` now pipelines each decoded chunk through an optional `ReasoningParser` **before** the tool-call processor. `<think>...</think>` content is silently dropped from `.chunk(String)` (the upstream API has no `.reasoning(String)` case so we stay byte-compatible with ml-explore/mlx-swift-lm). Both `generate(...)` and `generateTask(...)` construct the parser from the stamp.
+5. **`Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift`** — `generate(input:parameters:)` used to emit raw `.chunk` only. Now builds a `ToolCallProcessor` + optional `ReasoningParser` per request and runs each detokenized chunk through the same pipeline as `Evaluate.generate`. This is the material fix osaurus was waiting on.
+6. **`Libraries/MLXLMCommon/ModelConfiguration.swift` + `Downloader.swift`** — new `reasoningParserName: String?` field, surfaced on `ResolvedModelConfiguration` too.
+7. **`Tests/MLXLMTests/ToolCallEdgeCasesTests.swift`** — new `@Suite("Tool-Call Edge Cases (iter 65+)")` grew from 21 to 22 passing tests. Covers Gemma-4 escape marker regression, Qwen 3.6 interleaved `<think>` + `<tool_call>`, MiniMax M2 interleaved thinking, Gemma-4 harmony-channel coexistence, character-by-character streaming, JANG capability-stamp mappings (`qwen`/`minimax`/`gemma4`/`glm4`/`nemotron`/`mistral`), canonical rawValue round-trip, `ModelConfiguration.reasoningParserName` plumbing.
+
+### Real-model verification
+
+`BENCH_BATCH_TOOLCALL=1` scenario submits a tool-bearing prompt through `BatchEngine.generate` and asserts neither raw tool-call markers (`<tool_call>`, `<|tool_call>`, `<minimax:tool_call>`, `[TOOL_CALLS]`) nor raw reasoning markers (`<think>` / `</think>`) leak into `.chunk(String)`.
+
+| Model | Tool format resolved | Reasoning stamp resolved | Leaked markers |
+|---|---|---|---|
+| Qwen3-0.6B-8bit (standard MLX) | `json` (default) | `think_xml` (model-type heuristic) | none |
+| Qwen3.6-35B-A3B-JANGTQ2 (hybrid SSM) | `xmlFunction` (JANG `tool_parser: "qwen"`) | `qwen3` (JANG `reasoning_parser: "qwen3"`) | none |
+| Gemma-4-E2B-4bit | `gemma4` (model-type heuristic) | `none` (JANG stamp `gemma4` → nil) | none |
+
+### Contract osaurus can rely on
+
+```swift
+for await event in await engine.generate(input: input, parameters: params) {
+    switch event {
+    case .chunk(let text):   // pure user-visible text — no <think>, no <tool_call>
+    case .toolCall(let call): // fully-parsed ToolCall — no re-parse needed
+    case .info(let info):    // completion metrics
+    }
+}
+```
+
+Osaurus can now drop its own tool-call parsing layer. The library does it.
+
 ## Iter 43 addendum — hybrid SSM real-model multi-turn (2026-04-19)
 
 Closes the "hybrid SSM real-model smoke" blocker. Two hybrid (Mamba + attention) MoE models run cleanly through BatchEngine multi-turn via `BENCH_BATCH_CHAT=1`:
