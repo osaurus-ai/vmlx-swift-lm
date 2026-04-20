@@ -3,8 +3,18 @@
 //
 // Port target: humanrouter/ddtree-mlx/ddtree_mlx/verify.py (810 lines)
 //
-// Phase 0 stub — public API only. Phase 2 lands the real tree-verify
-// forward pass, Phase 3 adds per-node recurrent state forking.
+// Iter 8 ships v1 — correct but slow:
+// - Attention-only path.
+// - For each tree node, run target ONCE on (prefix_tokens + path_to_node).
+//   O(N) forwards per verify round. Same wall time as plain AR with the
+//   same number of positions, so speedup is 0× for now.
+// - Correctness is the goal: `tree_verify_forward` posterior at node i
+//   must equal greedy AR's argmax at position (prefix_len + depth[i]).
+//
+// Phase 2 optimization (iter 10+) adds the single-forward path with
+// combined (1, 1, T, prefix_len+T) attention mask + per-token RoPE.
+// That's where the actual DDTree speedup comes from. Phase 3 adds
+// hybrid-SSM per-node recurrent-state forking.
 
 import Foundation
 import MLX
@@ -12,18 +22,19 @@ import MLX
 /// Result of one tree-verify forward pass.
 public struct TreeVerifyResult: @unchecked Sendable {
 
-    /// Posterior (greedy argmax) token for each tree position. Length =
-    /// `compiled.treeSize`. Consumed by ``TreeBuilder/followVerifiedTree(childMaps:posteriorTokens:)``.
+    /// Posterior (greedy argmax) token for each tree position. Length
+    /// = `compiled.treeSize`. Consumed by
+    /// ``TreeBuilder/followVerifiedTree(childMaps:posteriorTokens:)``.
     public let posteriorTokens: [Int32]
 
-    /// Target model logits for every tree position. Shape:
-    /// `(1, treeSize, vocab)`. Retained so sampling strategies other than
-    /// greedy argmax can swap in later.
+    /// Target model logits for every tree position. Shape
+    /// `(1, treeSize, vocab)`. Retained so sampling strategies other
+    /// than greedy argmax can swap in later.
     public let logits: MLXArray
 
-    /// Final-accepted-node per-layer recurrent state snapshots, keyed by
-    /// layer index. `nil` for pure-attention target models. Populated in
-    /// Phase 3 when hybrid SSM support lands.
+    /// Final-accepted-node per-layer recurrent state snapshots, keyed
+    /// by layer index. `nil` for pure-attention target models;
+    /// populated in Phase 3 when hybrid SSM support lands.
     public let recurrentSnapshots: [Int: RecurrentSnapshot]?
 
     public init(
@@ -38,46 +49,119 @@ public struct TreeVerifyResult: @unchecked Sendable {
 }
 
 /// Per-layer recurrent state captured during a tree-verify forward.
-///
-/// For GatedDeltaNet / Mamba / hybrid-SSM families we need to capture state
-/// at every tree node (not just the final DFS position) so
-/// ``SpecDecCache/treeAwarePathCommit(cacheEntries:prefixLen:acceptedIndices:treeCacheState:)``
-/// can install the exact state the accepted path produced.
+/// Populated in Phase 3 when hybrid-SSM per-node forking lands.
 public struct RecurrentSnapshot: @unchecked Sendable {
-
-    /// Convolutional state. Shape: `(treeSize, conv_kernel, hidden)`.
     public let convStates: MLXArray
-
-    /// Recurrent / SSM state. Shape: `(treeSize, state_dim, hidden)`.
     public let states: MLXArray
-
     public init(convStates: MLXArray, states: MLXArray) {
         self.convStates = convStates
         self.states = states
     }
 }
 
-/// Runs one target-model forward pass over the whole compiled tree.
-///
-/// Phase 0 stub. Phase 2 lands the attention-only path (byte-identical vs
-/// autoregressive at temp 0). Phase 3 adds hybrid-SSM per-node forking.
 public enum TreeVerify {
 
+    /// Correct-but-slow tree verify (v1). Runs the target model once per
+    /// tree node with a freshly-built `(prefix_tokens + path_tokens)`
+    /// input. Produces the same posterior set as a single-forward
+    /// tree-verify would, byte-for-byte.
+    ///
     /// - Parameters:
-    ///   - target: the target ``LanguageModel``.
+    ///   - target: any model conforming to ``HiddenStateCaptureModel``.
     ///   - compiled: from ``TreeCompile/compile(tree:rootTokenID:prefixLen:)``.
-    ///   - cache: per-layer target caches. Will be written to in-place.
-    ///     Callers must have taken a ``SpecDecCache/snapshotCaches(_:)``
-    ///     beforehand so they can restore on reject.
-    ///   - prefixLen: number of tokens already in `cache` (context length).
+    ///   - prefixTokens: `(prefix_len,)` Int32 tokens already consumed
+    ///     by the target (prompt + accepted tokens so far).
+    ///   - captureLayerIDs: which target blocks to capture hidden states
+    ///     from. Set to the DFlash drafter's `target_layer_ids` to feed
+    ///     back into the next round.
     public static func verifyForward(
-        target: any LanguageModel,
+        target: any HiddenStateCaptureModel,
         compiled: CompiledTree,
-        cache: [KVCache],
-        prefixLen: Int
+        prefixTokens: [Int32],
+        captureLayerIDs: Set<Int> = []
     ) throws -> TreeVerifyResult {
-        throw SpecDecError.notImplemented(
-            "TreeVerify.verifyForward — Phase 2 (attention-only), Phase 3 (hybrid SSM)"
-        )
+        let treeSize = compiled.treeSize
+        precondition(treeSize >= 1, "verifyForward: tree must have root")
+
+        let inputIds = compiled.inputIds.asType(.int32).asArray(Int32.self)
+        let parents = compiled.parents
+
+        // Per-tree-node walk: index 0 is root, then each node's path
+        // goes root → parent(parent(...i)) → i (reversed).
+        var posteriorTokens: [Int32] = Array(repeating: 0, count: treeSize)
+        // Gather captured hidden state per tree index.
+        // For now we don't stitch per-node captures into a single
+        // `(1, tree_size, hidden)` tensor — the linear-verify
+        // runtime path only needs the tail slice anyway. Phase 3 will
+        // revisit.
+        var perNodeCaptured: [Int: [Int: MLXArray]] = [:]
+
+        // For each tree node, build the input `prefix + path_to_node`.
+        // Walk parents[] from the node up to root, then reverse.
+        for i in 0..<treeSize {
+            var path: [Int32] = []
+            path.reserveCapacity(treeSize)
+            var cursor = i
+            while cursor != 0 {
+                path.append(inputIds[cursor])
+                cursor = Int(parents[cursor])
+                precondition(cursor >= 0,
+                    "verifyForward: parent chain broken at node \(i)")
+            }
+            path.append(inputIds[0])   // root
+            path.reverse()
+            // Full model input = prefix + path.
+            var full = prefixTokens
+            full.append(contentsOf: path)
+            let mlxInput = MLXArray(full).reshaped(1, full.count)
+            let (logits, captured) = target(
+                mlxInput, cache: nil, captureLayerIDs: captureLayerIDs)
+            let lastPos = logits.dim(1) - 1
+            let lastLogits = logits[0, lastPos, 0...]
+            let argmaxIdx = argMax(lastLogits, axis: -1).asType(.int32)
+            posteriorTokens[i] = argmaxIdx.item(Int32.self)
+            if !captureLayerIDs.isEmpty {
+                perNodeCaptured[i] = captured
+            }
+        }
+
+        // Build (1, tree_size, vocab) logits via a final one-shot target
+        // forward on the flattened DFS-ordered sequence. We don't need
+        // this for the walk (posterior is already computed), but consumers
+        // of `TreeVerifyResult` may want it for temperature / top-K
+        // sampling in Phase 3+. For the v1 attention-only build we
+        // populate a (1, tree_size, vocab) logits tensor whose row `i`
+        // holds the last-position logits from the path-to-node-i forward.
+        //
+        // Cheaper: we already ran those forwards above. Re-capture them.
+        // For simplicity and v1 correctness, we re-run the argmax path
+        // once more and stack last-position logits.
+        var lastRowLogits: [MLXArray] = []
+        for i in 0..<treeSize {
+            var path: [Int32] = []
+            var cursor = i
+            while cursor != 0 {
+                path.append(inputIds[cursor])
+                cursor = Int(parents[cursor])
+            }
+            path.append(inputIds[0])
+            path.reverse()
+            var full = prefixTokens
+            full.append(contentsOf: path)
+            let mlxInput = MLXArray(full).reshaped(1, full.count)
+            let (logits, _) = target(
+                mlxInput, cache: nil, captureLayerIDs: [])
+            let lastPos = logits.dim(1) - 1
+            // Shape: (vocab,) — unsqueeze to (1, vocab) for stacking.
+            lastRowLogits.append(
+                logits[0, lastPos, 0...].expandedDimensions(axis: 0))
+        }
+        let stackedLogits = concatenated(lastRowLogits, axis: 0)
+            .expandedDimensions(axis: 0)  // (1, tree_size, vocab)
+
+        return TreeVerifyResult(
+            posteriorTokens: posteriorTokens,
+            logits: stackedLogits,
+            recurrentSnapshots: nil)
     }
 }
