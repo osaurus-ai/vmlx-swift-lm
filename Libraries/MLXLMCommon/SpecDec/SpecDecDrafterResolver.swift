@@ -13,6 +13,13 @@ import MLX
 /// osaurus can hold one on the runtime container.
 public actor SpecDecDrafterResolver {
 
+    /// Package-wide shared resolver used by the `Evaluate.generate`
+    /// dispatch when a caller sets
+    /// ``GenerateParameters/draftStrategy``. Applications that want a
+    /// private cache lifetime (e.g. osaurus per-container) can
+    /// instantiate their own ``SpecDecDrafterResolver`` with `init()`.
+    public static let shared = SpecDecDrafterResolver()
+
     /// Thread-safe by-path drafter cache. Keys are `resolvingSymlinksInPath`
     /// of each drafter directory so aliased paths hit.
     private var cache: [String: DFlashDraftModel] = [:]

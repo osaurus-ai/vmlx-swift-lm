@@ -1658,6 +1658,24 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<Generation> {
+    // Block-diffusion speculative decoding dispatch. When
+    // parameters.draftStrategy is .dflash or .ddtree AND the target
+    // model conforms to HiddenStateCaptureModel + TokenEmbedderModel,
+    // route through SpecDecStream. Zero API churn for callers using
+    // .none / nil / .autoregressive — those fall through to the
+    // existing TokenIterator path below.
+    if let strategy = parameters.draftStrategy,
+        strategy.usesBlockDiffusion,
+        let stream = SpecDecStream.streamViaStrategy(
+            strategy: strategy,
+            inputIds: input.text.tokens,
+            context: context,
+            maxNewTokens: parameters.maxTokens ?? 256,
+            stopTokenIDs: [],
+            temperature: parameters.temperature)
+    {
+        return stream
+    }
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)

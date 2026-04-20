@@ -152,6 +152,130 @@ public enum SpecDecStream {
         }
     }
 
+    // MARK: - Strategy-driven dispatch (consumed by Evaluate.generate)
+
+    /// Build an `AsyncStream<Generation>` for a block-diffusion draft
+    /// strategy without requiring the caller to pre-load the drafter.
+    ///
+    /// Used by `Evaluate.generate(input:cache:parameters:context:…)` when
+    /// `parameters.draftStrategy ∈ {.dflash, .ddtree}`. Returns `nil`
+    /// when the strategy is `.none` / `.autoregressive` / `nil` or the
+    /// target model doesn't conform to both
+    /// ``HiddenStateCaptureModel`` and ``TokenEmbedderModel`` — callers
+    /// fall back to the existing non-speculative path.
+    ///
+    /// Drafter loading happens asynchronously inside the stream's Task,
+    /// so the dispatch site stays synchronous and doesn't block on
+    /// disk I/O.
+    public static func streamViaStrategy(
+        strategy: DraftStrategy,
+        inputIds: MLXArray,
+        context: ModelContext,
+        maxNewTokens: Int,
+        stopTokenIDs: Set<Int32> = [],
+        temperature: Float = 0,
+        resolver: SpecDecDrafterResolver = .shared
+    ) -> AsyncStream<Generation>? {
+        guard strategy.usesBlockDiffusion else { return nil }
+        guard let targetCheck = context.model
+            as? any (HiddenStateCaptureModel & TokenEmbedderModel)
+        else { return nil }
+
+        let (stream, continuation) = AsyncStream<Generation>.makeStream()
+        let toolCallFormat = context.configuration.toolCallFormat ?? .json
+        let reasoningParserName = context.configuration.reasoningParserName
+        let tokenizer = context.tokenizer
+        // Boxed non-Sendable references — SpecDec types are @unchecked
+        // Sendable but the Task-capture compile-check needs a synthetic
+        // nonisolated wrapper.
+        let box = _SpecDecDispatchBox(
+            inputIds: inputIds, target: targetCheck)
+
+        Task { @Sendable in
+            do {
+                let resolved: ResolvedDrafter
+                do {
+                    resolved = try await resolver.resolve(strategy: strategy)
+                } catch {
+                    continuation.finish()
+                    return
+                }
+                let startTime = Date()
+                let promptTokenCount = box.inputIds.dim(1)
+                var detokenizer = NaiveStreamingDetokenizer(
+                    tokenizer: tokenizer)
+                let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
+                var reasoningParser = ReasoningParser
+                    .fromCapabilityName(reasoningParserName)
+
+                let onCommitted: ([Int32]) -> Void = { batch in
+                    pushBatch(
+                        tokens: batch,
+                        detokenizer: &detokenizer,
+                        toolCallProcessor: toolCallProcessor,
+                        reasoningParser: &reasoningParser,
+                        continuation: continuation)
+                }
+
+                let resultCount: Int
+                switch strategy {
+                case .dflash(_, let blockSize):
+                    _ = blockSize  // blockSize is a drafter-config field;
+                                   // the runtime reads it from the loaded
+                                   // drafter model (ignored here).
+                    let args = DFlashLinearArgs(
+                        target: box.target,
+                        drafter: resolved.model,
+                        targetBlockIDs: resolved.targetBlockIDs,
+                        maskTokenID: resolved.maskTokenID,
+                        inputIds: box.inputIds,
+                        maxNewTokens: maxNewTokens,
+                        stopTokenIDs: stopTokenIDs,
+                        temperature: temperature)
+                    let r = try SpecDecRuntimeLinear.run(
+                        args, onCommitted: onCommitted)
+                    resultCount = r.tokenIds.count
+                case .ddtree(_, let branchingBudget, _):
+                    let args = DDTreeArgs(
+                        target: box.target,
+                        drafter: resolved.model,
+                        targetBlockIDs: resolved.targetBlockIDs,
+                        maskTokenID: resolved.maskTokenID,
+                        inputIds: box.inputIds,
+                        maxNewTokens: maxNewTokens,
+                        stopTokenIDs: stopTokenIDs,
+                        temperature: temperature,
+                        branchingBudget: branchingBudget)
+                    let r = try SpecDecRuntimeDDTree.run(
+                        args, onCommitted: onCommitted)
+                    resultCount = r.tokenIds.count
+                default:
+                    continuation.finish()
+                    return
+                }
+
+                flush(
+                    detokenizer: &detokenizer,
+                    toolCallProcessor: toolCallProcessor,
+                    reasoningParser: &reasoningParser,
+                    continuation: continuation)
+
+                let elapsed = Date().timeIntervalSince(startTime)
+                let info = GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: max(0, resultCount - promptTokenCount),
+                    promptTime: 0,
+                    generationTime: elapsed,
+                    stopReason: .length)
+                continuation.yield(.info(info))
+                continuation.finish()
+            } catch {
+                continuation.finish()
+            }
+        }
+        return stream
+    }
+
     // MARK: - Internals
 
     /// Feed one round's committed tokens through the detokenizer +
@@ -222,4 +346,13 @@ public enum SpecDecStream {
             continuation.yield(.toolCall(call))
         }
     }
+}
+
+/// Sendable wrapper for the strategy-driven dispatch's non-Sendable
+/// references. MLXArray and the target composite protocol are both
+/// `@unchecked Sendable` at the type level but Swift's closure-capture
+/// sending-safety check needs a struct-level escape hatch.
+private struct _SpecDecDispatchBox: @unchecked Sendable {
+    let inputIds: MLXArray
+    let target: any (HiddenStateCaptureModel & TokenEmbedderModel)
 }
