@@ -162,19 +162,38 @@ public class Qwen3ModelInner: Module {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        let (h, _) = callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: [])
+        return h
+    }
+
+    /// Forward with optional per-block hidden-state capture. When
+    /// `captureLayerIDs` is empty this is byte-identical to
+    /// ``callAsFunction(_:cache:)``.
+    public func callAsFunctionCapturing(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        captureLayerIDs: Set<Int>
+    ) -> (MLXArray, [Int: MLXArray]) {
         var h = embedTokens(inputs)
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
+        var captured: [Int: MLXArray] = [:]
+        captured.reserveCapacity(captureLayerIDs.count)
+
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
+            if captureLayerIDs.contains(i) {
+                captured[i] = h
+            }
         }
 
-        return norm(h)
+        return (norm(h), captured)
     }
 }
 
-public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider, HiddenStateCaptureModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -202,6 +221,26 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    /// `HiddenStateCaptureModel` conformance — exposes per-block hidden
+    /// states so DFlash drafters can read the target's layer outputs at
+    /// specified indices. Empty `captureLayerIDs` yields byte-identical
+    /// logits to the plain forward.
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureLayerIDs: Set<Int>
+    ) -> (logits: MLXArray, capturedHiddenStates: [Int: MLXArray]) {
+        let (finalHidden, captured) = model.callAsFunctionCapturing(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(finalHidden)
+        } else {
+            logits = model.embedTokens.asLinear(finalHidden)
+        }
+        return (logits, captured)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
