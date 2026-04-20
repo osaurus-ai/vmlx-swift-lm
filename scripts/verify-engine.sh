@@ -88,11 +88,11 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-echo "=== Unit tests (121 expected) ==="
+echo "=== Unit tests (121 XCTest + Swift Testing suites) ==="
 /usr/bin/pkill -9 xctest 2>/dev/null || true
 /bin/sleep 1
 if swift test \
-  --filter "BatchCompile|CompilableCacheList|CompilableMambaCache|CompilableRotatingKVCache|CompilableTurboQuantKVCache|RotatingKVCacheCompile|MambaCacheCompile|TurboQuantCompile|SSMStateCache|JangTokenizerFallback|Gemma4ChatTemplateProbe|CacheCoordinatorRotating|CacheCoordinatorMediaSalt|CacheCoordinatorConcurrency|UserInputInitSemantics|BucketHandle|BatchEngineCompileWiring|ChatTemplateOverrideIntegration|TokenizerClassSubstitution|JANGTQKernelsTests" \
+  --filter "BatchCompile|CompilableCacheList|CompilableMambaCache|CompilableRotatingKVCache|CompilableTurboQuantKVCache|RotatingKVCacheCompile|MambaCacheCompile|TurboQuantCompile|SSMStateCache|JangTokenizerFallback|Gemma4ChatTemplateProbe|CacheCoordinatorRotating|CacheCoordinatorMediaSalt|CacheCoordinatorConcurrency|UserInputInitSemantics|BucketHandle|BatchEngineCompileWiring|ChatTemplateOverrideIntegration|TokenizerClassSubstitution|JANGTQKernelsTests|DDTreeDesignTests" \
   2>&1 | /usr/bin/grep -E "Executed [0-9]+ tests.*in " | /usr/bin/tail -1; then
   pass "unit tests"
 else
