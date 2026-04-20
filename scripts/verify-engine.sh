@@ -187,6 +187,22 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# SpecDec (DFlash + DDTree) — iter 16. Runs only when both a compatible
+# target AND a drafter are on disk. Qwen3.5-27B pair lives at the
+# standard /tmp/ddtree-downloads mirror from the Phase 0 download task.
+: "${SPECDEC_TARGET:=/tmp/ddtree-downloads/Qwen3.5-27B-target}"
+: "${SPECDEC_DRAFTER:=/tmp/ddtree-downloads/Qwen3.5-27B-DFlash}"
+if [ -e "$SPECDEC_TARGET" ] && [ -e "$SPECDEC_DRAFTER/config.json" ]; then
+  echo "=== SpecDec (Qwen3.5-27B target + z-lab drafter) ==="
+  run_scenario "Qwen3.5-27B BENCH_BATCH_SPECDEC" \
+    env BENCH_MODEL="$SPECDEC_TARGET" BENCH_SPECDEC_DRAFTER="$SPECDEC_DRAFTER" \
+    BENCH_BATCH_SPECDEC=1 BENCH_MAX_TOKENS=6 .build/debug/RunBench
+  echo ""
+else
+  skip "SpecDec (target or drafter missing: target=$SPECDEC_TARGET, drafter=$SPECDEC_DRAFTER)"
+fi
+
+# ---------------------------------------------------------------------------
 printf '=== Summary: %d passed, %d failed, %d skipped ===\n' "$PASS" "$FAIL" "$SKIP"
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"
