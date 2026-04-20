@@ -713,8 +713,13 @@ public final class LLMModelFactory: ModelFactory {
         // `resolveTokenizerDirectory` returns the original directory unchanged
         // when there is no fallback to perform, so this is a no-op for
         // standard models.
-        let tokenizerDirectory = JangLoader.resolveTokenizerDirectory(
+        let jangResolvedDir = JangLoader.resolveTokenizerDirectory(
             for: configuration.tokenizerDirectory)
+        // Then rewrite `tokenizer_class` if swift-transformers doesn't know
+        // it (TokenizersBackend → Qwen2Tokenizer for Qwen VL). Returns
+        // the input unchanged for already-supported classes.
+        let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
+            for: jangResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
 
         // When JANG, skip config.json's perLayerQuantization — JANG infers correct

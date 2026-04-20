@@ -429,6 +429,122 @@ public struct JangLoader: Sendable {
         return false
     }
 
+    // MARK: - tokenizer_class substitution
+
+    /// swift-transformers 0.1.21's `knownTokenizers` doesn't include
+    /// `TokenizersBackend` (used by some mlx-community snapshots like
+    /// `mlx-community/Qwen3.5-VL-9B-8bit`) — loads throw
+    /// `TokenizerError.unsupportedTokenizer("TokenizersBackend")`. This
+    /// set lists all classes we know swift-transformers accepts. Callers
+    /// that need different substitutions can override via env var
+    /// `VMLX_TOKENIZER_CLASS_OVERRIDE=<target>`.
+    public static let knownSupportedTokenizerClasses: Set<String> = [
+        "CodeGenTokenizer", "CodeLlamaTokenizer", "FalconTokenizer",
+        "GemmaTokenizer", "GPT2Tokenizer", "LlamaTokenizer", "T5Tokenizer",
+        "WhisperTokenizer", "CohereTokenizer", "Qwen2Tokenizer",
+        "PreTrainedTokenizer",
+    ]
+
+    /// Substitution map: when `tokenizer_class` is a key in this map
+    /// and no env override is set, rewrite to the value. Tuned from
+    /// real-world snapshots: `TokenizersBackend` on Qwen-family VL
+    /// models is functionally `Qwen2Tokenizer`.
+    public static let defaultTokenizerClassSubstitutions: [String: String] = [
+        "TokenizersBackend": "Qwen2Tokenizer",
+    ]
+
+    /// Like `resolveTokenizerDirectory(for:)` but also fixes
+    /// `tokenizer_class` in `tokenizer_config.json` to an entry that
+    /// swift-transformers 0.1.21 knows. If the class is already known,
+    /// returns the input directory unchanged. If unknown and no
+    /// substitute is available, returns unchanged (let the loader
+    /// surface the clear error).
+    ///
+    /// When a substitution is required, writes a shim directory into
+    /// `<tmp>/vmlx-tokenizer-shim-<uuid>/` containing the rewritten
+    /// `tokenizer_config.json` plus symlinks to every other tokenizer
+    /// file (tokenizer.json, chat_template.jinja, etc.). The caller
+    /// should clean up the shim dir when done, but since they live in
+    /// the OS temp dir the OS sweeps them eventually.
+    ///
+    /// Order of operations for a full load:
+    ///
+    /// 1. Caller has a model directory (maybe JANG, maybe not).
+    /// 2. `resolveTokenizerDirectory(for:)` redirects weights-only JANG
+    ///    bundles to their source-model snapshot.
+    /// 3. `resolveTokenizerClassSubstitution(for:)` (this function)
+    ///    rewrites `tokenizer_class` if it's unsupported.
+    /// 4. The returned URL is passed to
+    ///    `AutoTokenizer.from(modelFolder:)`.
+    public static func resolveTokenizerClassSubstitution(
+        for directory: URL,
+        overrideClass: String? = nil,
+        fileManager: FileManager = .default
+    ) -> URL {
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard fileManager.fileExists(atPath: configURL.path) else {
+            return directory  // nothing to rewrite; downstream loader errors
+        }
+        guard let data = try? Data(contentsOf: configURL),
+              var json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return directory
+        }
+
+        let currentClass = json["tokenizer_class"] as? String ?? ""
+        let trimmedCurrent = currentClass.replacingOccurrences(of: "Fast", with: "")
+
+        // Decide the target class.
+        let target: String
+        let envOverride = overrideClass
+            ?? ProcessInfo.processInfo.environment["VMLX_TOKENIZER_CLASS_OVERRIDE"]
+        if let envOverride, !envOverride.isEmpty {
+            target = envOverride
+        } else if knownSupportedTokenizerClasses.contains(trimmedCurrent) {
+            return directory  // already supported
+        } else if let mapped = defaultTokenizerClassSubstitutions[currentClass]
+                            ?? defaultTokenizerClassSubstitutions[trimmedCurrent] {
+            target = mapped
+        } else {
+            return directory  // unknown class, no known substitute
+        }
+
+        // If nothing to change, skip.
+        if target == currentClass { return directory }
+
+        json["tokenizer_class"] = target
+
+        // Write to a shim dir next to the original.
+        let shimDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "vmlx-tokenizer-shim-\(UUID().uuidString)")
+        do {
+            try fileManager.createDirectory(
+                at: shimDir, withIntermediateDirectories: true)
+            let rewritten = try JSONSerialization.data(
+                withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
+            try rewritten.write(
+                to: shimDir.appendingPathComponent("tokenizer_config.json"))
+            // Symlink all OTHER files — tokenizer.json especially is often
+            // large and we don't want to duplicate it.
+            let entries = (try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)) ?? []
+            for entry in entries where entry.lastPathComponent != "tokenizer_config.json" {
+                let dest = shimDir.appendingPathComponent(entry.lastPathComponent)
+                // Some tokenizer caches already contain symlinks — follow them
+                // so our shim links to the actual file, not another link.
+                let real = (try? fileManager.destinationOfSymbolicLink(atPath: entry.path))
+                    .flatMap { relative in
+                        URL(fileURLWithPath: relative, relativeTo: entry.deletingLastPathComponent())
+                            .standardizedFileURL
+                    } ?? entry
+                try? fileManager.createSymbolicLink(at: dest, withDestinationURL: real)
+            }
+            return shimDir
+        } catch {
+            return directory
+        }
+    }
+
     /// Default HuggingFace hub cache root. Honours `HF_HOME` and `HF_HUB_CACHE`
     /// environment variables, otherwise falls back to `~/.cache/huggingface/hub`
     /// — matching the Python `huggingface_hub` resolution order.

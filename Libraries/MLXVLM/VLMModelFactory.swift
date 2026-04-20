@@ -378,8 +378,10 @@ public final class VLMModelFactory: ModelFactory {
         // weights-only. `resolveTokenizerDirectory` falls back to the cached
         // source model's tokenizer when that happens; otherwise returns the
         // original directory unchanged.
-        let tokenizerDirectory = JangLoader.resolveTokenizerDirectory(
+        let jangResolvedDir = JangLoader.resolveTokenizerDirectory(
             for: configuration.tokenizerDirectory)
+        let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
+            for: jangResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
