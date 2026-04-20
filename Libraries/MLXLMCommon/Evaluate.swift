@@ -1705,7 +1705,9 @@ public func generate(
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
-        extraStopStrings: parameters.extraStopStrings)
+        extraStopStrings: parameters.extraStopStrings,
+        promptTail: _decodePromptTail(
+            input: input, tokenizer: context.tokenizer, tokens: 64))
     return stream
 }
 
@@ -1782,8 +1784,10 @@ public func generate(
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
             format: context.configuration.toolCallFormat ?? .json,
-            reasoningParser: ReasoningParser.fromCapabilityName(
-                context.configuration.reasoningParserName),
+            reasoningParser: ReasoningParser.forPrompt(
+                stampName: context.configuration.reasoningParserName,
+                promptTail: _decodePromptTail(
+                    input: input, tokenizer: context.tokenizer, tokens: 64)),
             stopStringMatcher: StopStringMatcher(
                 stopStrings: parameters.extraStopStrings)
         )
@@ -1829,7 +1833,8 @@ public func generateTask(
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
-    extraStopStrings: [String] = []
+    extraStopStrings: [String] = [],
+    promptTail: String? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
     //
@@ -1870,8 +1875,9 @@ public func generateTask(
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
-            reasoningParser: ReasoningParser.fromCapabilityName(
-                modelConfiguration.reasoningParserName),
+            reasoningParser: ReasoningParser.forPrompt(
+                stampName: modelConfiguration.reasoningParserName,
+                promptTail: promptTail),
             stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings)
         ),
         cacheStoreAction: cacheStoreAction
@@ -2663,4 +2669,37 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
     func infoEvent(_ info: GenerateCompletionInfo) -> TokenGeneration {
         .info(info)
     }
+}
+
+// MARK: - Prompt-tail decoding helper (file-private, used by generate paths)
+
+/// Decode the last `tokens` token ids of a prompt into text for use
+/// with `ReasoningParser.forPrompt(stampName:promptTail:)`. Tells the
+/// parser whether the prompt ends inside a think/harmony block (so
+/// the model's first output byte is reasoning) or after a closed
+/// block (content).
+///
+/// Returns `nil` on empty input or decode failure — the caller then
+/// falls back to the stamp-inferred default in `forPrompt`.
+internal func _decodePromptTail(
+    input: LMInput,
+    tokenizer: any Tokenizer,
+    tokens: Int
+) -> String? {
+    let promptTokens = input.text.tokens
+    guard promptTokens.ndim >= 1 else { return nil }
+    let total = promptTokens.ndim == 1
+        ? promptTokens.dim(0)
+        : promptTokens.dim(promptTokens.ndim - 1)
+    guard total > 0 else { return nil }
+    let tailLen = min(tokens, total)
+    let startIdx = total - tailLen
+    let tailArray: MLXArray
+    if promptTokens.ndim == 1 {
+        tailArray = promptTokens[startIdx ..< total]
+    } else {
+        tailArray = promptTokens[.ellipsis, startIdx ..< total]
+    }
+    let tailInts = tailArray.asArray(Int32.self).map { Int($0) }
+    return tokenizer.decode(tokenIds: tailInts, skipSpecialTokens: false)
 }

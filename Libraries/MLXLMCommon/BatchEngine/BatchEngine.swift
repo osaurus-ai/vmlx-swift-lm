@@ -238,6 +238,22 @@ public actor BatchEngine {
         let toolCallFormat = context.configuration.toolCallFormat ?? .json
         let reasoningParserName = context.configuration.reasoningParserName
         let extraStopStrings = parameters.extraStopStrings
+
+        // Decode the tail of the prompt for `ReasoningParser.forPrompt`
+        // auto-detection. This tells the parser whether the prompt
+        // ended inside a think/harmony block (e.g. Qwen 3.x default
+        // `enable_thinking=true` → prompt ends `<think>\n` so the
+        // model's first output byte is already reasoning) or after
+        // a closed block (enable_thinking=false → prompt ends
+        // `</think>\n\n` so the model starts in content).
+        //
+        // Tail of ~64 tokens is plenty for any realistic opener/closer
+        // pair — the longest we handle is Gemma-4's `<|channel>thought\n`
+        // (18 chars, ≤ 8 tokens). Using tokens not characters because
+        // we have the tokenizer on hand.
+        let promptTail = _decodePromptTail(
+            input: input, tokenizer: tokenizer, tokens: 64)
+
         let (requestId, tokenStream) = submit(input: input, parameters: parameters)
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
@@ -258,8 +274,9 @@ public actor BatchEngine {
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
-            var reasoningParser = ReasoningParser.fromCapabilityName(
-                reasoningParserName)
+            var reasoningParser = ReasoningParser.forPrompt(
+                stampName: reasoningParserName,
+                promptTail: promptTail)
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
 
@@ -1157,3 +1174,7 @@ public actor BatchEngine {
         }
     }
 }
+
+// BatchEngine uses the shared `_decodePromptTail` helper from Evaluate.swift
+// (same module, internal visibility) for `ReasoningParser.forPrompt`
+// auto-detection of prompt-end state.

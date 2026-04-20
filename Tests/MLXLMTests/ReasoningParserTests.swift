@@ -644,6 +644,102 @@ struct HarmonyParserStreamingTests {
         let tailContent = tail.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
         #expect(content + tailContent == "plain answer, no channel markers")
     }
+
+    // MARK: - Category A (edge-case audit 2026-04-20)
+
+    @Test("A1: empty channel body — zero-byte reasoning")
+    func testA1EmptyChannelBody() {
+        // Model emits `<|channel><channel|>` immediately — e.g., Gemma-4
+        // when `enable_thinking=false` and the template prefills an
+        // empty thought block (chat_template.jinja line 344).
+        var p = harmonyParser
+        var segs = p.feed("before<|channel><channel|>after")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning.isEmpty)
+        #expect(content == "beforeafter")
+    }
+
+    @Test("A2: nested `<|channel>` inside reasoning body — first closer wins")
+    func testA2NestedOpenerInBody() {
+        // State machine is toggle-based: once inside reasoning, a
+        // second `<|channel>` is just bytes until we see `<channel|>`.
+        var p = harmonyParser
+        var segs = p.feed("<|channel>outer<|channel>nested<channel|>after")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "outer<|channel>nested")
+        #expect(content == "after")
+    }
+
+    @Test("A3: closer before opener is literal content")
+    func testA3OrphanCloser() {
+        // `<channel|>` before any opener should NOT flip state — it's
+        // just bytes in the content stream.
+        var p = harmonyParser
+        var segs = p.feed("foo<channel|>bar<|channel>inner<channel|>tail")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "inner")
+        #expect(content == "foo<channel|>bartail")
+    }
+
+    @Test("A4: closer split across feeds — no leak")
+    func testA4CloserSplitAcrossFeeds() {
+        var p = harmonyParser
+        var segs: [ReasoningSegment] = []
+        segs += p.feed("<|channel>thought\ninner reasoning<chan")
+        // Partial closer — must not flip state yet.
+        segs += p.feed("nel|>visible answer")
+        segs += p.flush()
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "thought\ninner reasoning")
+        #expect(content == "visible answer")
+    }
+
+    @Test("A5: opener split across feeds — no leak")
+    func testA5OpenerSplitAcrossFeeds() {
+        var p = harmonyParser
+        var segs: [ReasoningSegment] = []
+        segs += p.feed("prefix<|cha")
+        segs += p.feed("nnel>thought\ninner<channel|>after")
+        segs += p.flush()
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "thought\ninner")
+        #expect(content == "prefixafter")
+    }
+
+    @Test("A7: maxTokens truncates mid-opener — partial opener is content")
+    func testA7TruncatedMidOpener() {
+        // Model started to emit `<|cha` then hit max_tokens. State
+        // never flipped to reasoning, so the partial opener bytes are
+        // plain content.
+        var p = harmonyParser
+        var segs = p.feed("the answer is<|cha")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning.isEmpty)
+        #expect(content == "the answer is<|cha")
+    }
+
+    @Test("A8: maxTokens truncates mid-closer inside reasoning — tail is reasoning")
+    func testA8TruncatedMidCloser() {
+        // Inside a reasoning block, maxTokens hits mid-closer. Flush
+        // must emit the held bytes as reasoning (not content).
+        var p = harmonyParser
+        var segs = p.feed("<|channel>thought\nlots of reasoning<chann")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "thought\nlots of reasoning<chann")
+        #expect(content.isEmpty)
+    }
 }
 
 @Suite("startInReasoning=true (Qwen 3.6 enable_thinking prefill)")
@@ -706,5 +802,125 @@ struct StartInReasoningTests {
         let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
         #expect(reasoning == "hidden")
         #expect(content == "visiblemore visible")
+    }
+
+    // MARK: - Category B (edge-case audit 2026-04-20)
+
+    @Test("B1: enable_thinking=false with think_xml stamp — no leak into reasoning")
+    func testB1EnableThinkingFalse() {
+        // When the caller passes `enable_thinking=false` to the Qwen 3.x
+        // chat template, the prompt body already contains
+        // `<think>\n\n</think>\n\n` so the model output starts in
+        // CONTENT mode (no opener, no closer in the output stream).
+        //
+        // `fromCapabilityName("think_xml")` returns startInReasoning=true
+        // because the DEFAULT template branch prefills `<think>\n`. That
+        // default is wrong for enable_thinking=false callers — the
+        // parser would route the entire output to `.reasoning`.
+        //
+        // Correct API to use in that case: `ReasoningParser.forPrompt`
+        // with the decoded prompt tail. If the tail contains an
+        // un-matched `</think>` (meaning the prompt already closed a
+        // think block), start in content mode.
+        let promptTail = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: "think_xml",
+            promptTail: promptTail)
+        else {
+            Issue.record("forPrompt should return a non-nil parser for think_xml")
+            return
+        }
+        var p = parser
+        // Model output: just plain content (no tags).
+        var segs = p.feed("the answer is 4")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning.isEmpty,
+            "enable_thinking=false prompt must not force all output into .reasoning")
+        #expect(content == "the answer is 4")
+    }
+
+    @Test("B1: enable_thinking=true (default) still auto-detects startInReasoning=true")
+    func testB1EnableThinkingTrueAutoDetects() {
+        // Default Qwen template branch: prompt ends with `<think>\n`.
+        // `forPrompt` must detect the open think block and start the
+        // parser in reasoning state.
+        let promptTail = "<|im_start|>assistant\n<think>\n"
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: "think_xml",
+            promptTail: promptTail)
+        else {
+            Issue.record("forPrompt should return a non-nil parser for think_xml")
+            return
+        }
+        var p = parser
+        // Model output: reasoning text then closer then answer.
+        var segs = p.feed("thinking hard</think>answer is 4")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "thinking hard")
+        #expect(content == "answer is 4")
+    }
+
+    @Test("B1: no prompt tail given → falls back to stamp default")
+    func testB1NoPromptTailFallsBackToStampDefault() {
+        // forPrompt without promptTail should behave exactly like
+        // fromCapabilityName.
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: "think_xml",
+            promptTail: nil)
+        else {
+            Issue.record("forPrompt should return a non-nil parser")
+            return
+        }
+        var p = parser
+        // If startInReasoning=true default fires, `</think>answer`
+        // flips to content at the closer.
+        var segs = p.feed("thinking</think>answer")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "thinking")
+        #expect(content == "answer")
+    }
+
+    @Test("B2: interleaved thinking — multiple <think> blocks mid-response")
+    func testB2InterleavedThinking() {
+        // Qwen 3.6's interleaved-thinking family can emit multiple
+        // <think>…</think> blocks mid-response. With startInReasoning
+        // either way, the state-machine toggle must correctly split
+        // every block.
+        var p = ReasoningParser(startInReasoning: true)
+        var segs = p.feed(
+            "first thought</think>answer part 1<think>second thought</think>answer part 2")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "first thoughtsecond thought")
+        #expect(content == "answer part 1answer part 2")
+    }
+
+    @Test("B4: partial </think> at EOS flushes as reasoning")
+    func testB4PartialCloserAtEOS() {
+        var p = ReasoningParser(startInReasoning: true)
+        var segs = p.feed("reasoning text</thi")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "reasoning text</thi")
+        #expect(content.isEmpty)
+    }
+
+    @Test("B5: entire output is reasoning when no closer arrives")
+    func testB5NoCloserAllReasoning() {
+        var p = ReasoningParser(startInReasoning: true)
+        var segs = p.feed("model ran out mid-thought without closing the tag")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "model ran out mid-thought without closing the tag")
+        #expect(content.isEmpty)
     }
 }

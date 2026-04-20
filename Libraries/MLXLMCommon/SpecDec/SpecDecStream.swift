@@ -185,6 +185,21 @@ public enum SpecDecStream {
         let toolCallFormat = context.configuration.toolCallFormat ?? .json
         let reasoningParserName = context.configuration.reasoningParserName
         let tokenizer = context.tokenizer
+        // Decode the prompt tail so the reasoning parser starts in
+        // the correct state (inside reasoning if the chat template
+        // prefilled an opener). See
+        // `Libraries/MLXLMCommon/BatchEngine/RALPH-EDGE-TASK.md` B1.
+        let promptTailText: String? = {
+            let n = inputIds.ndim == 1 ? inputIds.dim(0) : inputIds.dim(inputIds.ndim - 1)
+            guard n > 0 else { return nil }
+            let tailLen = min(64, n)
+            let start = n - tailLen
+            let tail = inputIds.ndim == 1
+                ? inputIds[start ..< n]
+                : inputIds[.ellipsis, start ..< n]
+            let ints = tail.asArray(Int32.self).map { Int($0) }
+            return tokenizer.decode(tokenIds: ints, skipSpecialTokens: false)
+        }()
         // Boxed non-Sendable references — SpecDec types are @unchecked
         // Sendable but the Task-capture compile-check needs a synthetic
         // nonisolated wrapper.
@@ -206,7 +221,9 @@ public enum SpecDecStream {
                     tokenizer: tokenizer)
                 let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
                 var reasoningParser = ReasoningParser
-                    .fromCapabilityName(reasoningParserName)
+                    .forPrompt(
+                        stampName: reasoningParserName,
+                        promptTail: promptTailText)
 
                 let onCommitted: ([Int32]) -> Void = { batch in
                     pushBatch(

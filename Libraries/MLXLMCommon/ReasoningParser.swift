@@ -238,6 +238,69 @@ extension ReasoningParser {
             return nil
         }
     }
+
+    /// Build a parser that accounts for the actual prompt state.
+    ///
+    /// Some chat templates prefill the reasoning opener (e.g. Qwen 3.x
+    /// default emits `<think>\n` at prompt tail so the model output
+    /// begins ALREADY inside a think block) while other template
+    /// branches fully open AND close it inside the prompt (e.g. Qwen
+    /// 3.x with `enable_thinking=false` emits `<think>\n\n</think>\n\n`
+    /// — the model's output is pure content).
+    ///
+    /// `fromCapabilityName` can only return a stamp-based default.
+    /// This method takes the DECODED tail of the prompt and overrides
+    /// `startInReasoning` based on which state the prompt ends in.
+    ///
+    /// - Parameters:
+    ///   - stampName: the `reasoningParserName` capability stamp.
+    ///   - promptTail: decoded tail of the prompt (enough bytes to
+    ///     contain any relevant opener/closer tags). Typically the
+    ///     last ~100 characters of the prompt suffice. Pass `nil` to
+    ///     fall back to stamp defaults.
+    /// - Returns: a parser, or nil if the stamp resolves to no parser.
+    public static func forPrompt(
+        stampName: String?,
+        promptTail: String?
+    ) -> ReasoningParser? {
+        guard let base = fromCapabilityName(stampName) else { return nil }
+
+        // No prompt hint → use stamp default (whatever insideReasoning
+        // was baked into `base` by fromCapabilityName).
+        guard let promptTail, !promptTail.isEmpty else { return base }
+
+        // Detect the last tag at the prompt tail.
+        let startTag = base.startTag
+        let endTag = base.endTag
+        let lastOpener = promptTail.range(of: startTag, options: .backwards)
+        let lastCloser = promptTail.range(of: endTag, options: .backwards)
+
+        let startInReasoning: Bool
+        switch (lastOpener, lastCloser) {
+        case (let o?, let c?):
+            // Whichever tag appears LATER wins. If closer is after opener
+            // (the full block closed in the prompt), we start in content.
+            // If opener is after closer (the model already re-opened a
+            // block), start in reasoning.
+            startInReasoning = o.lowerBound > c.lowerBound
+        case (.some, nil):
+            // Opener with no closer → prompt ends inside a think block.
+            startInReasoning = true
+        case (nil, .some):
+            // Closer with no opener → prompt ends in content.
+            startInReasoning = false
+        case (nil, nil):
+            // Neither tag seen in the tail — trust stamp default.
+            // Reconstruct the parser with its stamp-inferred initial
+            // state by re-calling fromCapabilityName.
+            return base
+        }
+
+        return ReasoningParser(
+            startTag: startTag,
+            endTag: endTag,
+            startInReasoning: startInReasoning)
+    }
 }
 
 // MARK: - Whole-string convenience
