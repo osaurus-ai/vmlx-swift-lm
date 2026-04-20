@@ -1,9 +1,78 @@
 # Continuous Batching Engine
 
-**Branch**: `feature/continuous-batching`
-**Base**: `main` (commit `2671c4c`)
+**Status**: **PRODUCTION-READY** as of 2026-04-19 (iter 63) for `mlxBatchEngine=YES` default flip on osaurus's side.
 
-Real continuous batching for mlx-swift-lm. Multiple generation requests are batched through a single model forward pass during decode. All model families supported — LLM, VLM, MoE, hybrid SSM, JANG quantized.
+Real continuous batching for mlx-swift-lm. Multiple generation requests are batched through a single model forward pass during decode. All model families supported — LLM, VLM, MoE, hybrid SSM, JANG quantized, Gemma-4 sliding-window.
+
+## Osaurus integration (read first)
+
+### Both `BatchEnginePlan.openBlockers` are closed upstream
+
+From osaurus's `Packages/OsaurusCore/Services/ModelRuntime/BatchEnginePlan.swift`:
+
+- `kvQuantization` — **closed** (iter 17, Stage 0 TurboQuant). `BatchEngine.stepPrefill` calls `BatchQuantize.maybeCompress` post-prefill. TurboQuant KV mode supported; legacy affine modes deliberately not (see Stage 0 note below).
+- `compileSupport` — **closed** (iters 9-22, Stages 1A-5). `BatchEngine.maybePromoteToCompiledDecode` + `CompilableKVCache`/`CompilableTurboQuant`/`CompilableRotating`/`CompilableCacheList`. Heterogeneous/mamba families correctly fall through to uncompiled.
+
+Osaurus can update `BatchEnginePlan.openBlockers` → `[]` and flip `InferenceFeatureFlags.mlxBatchEngineEnabled` default → `true`.
+
+### Feature flag coverage vs osaurus's INFERENCE_RUNTIME.md
+
+| Osaurus flag | vmlx-swift-lm readiness |
+|---|---|
+| `mlxBatchEngine` (default OFF) | **ready to default ON** — 25/25 `verify-engine.sh` scenarios pass across 5 families |
+| `mlxBatchEngineMaxBatchSize` (default 4) | works at 4 and 8 — slot 0 byte-identical to solo reference under both |
+| `mlxAllowConcurrentStreams` (default OFF) | vmlx-side thread-safety covered; MLX-vs-MLX safety is osaurus's call per its own doc |
+| `cooperativeYield` (default OFF) | osaurus-side only (StreamAccumulator) |
+
+### Load-time shims osaurus needs to know about
+
+Two escape hatches ship as env-var opt-ins; defaults preserved.
+
+1. **`VMLX_CHAT_TEMPLATE_OVERRIDE=/path/to/template.jinja`** — the tokenizer bridge reads the template from this file instead of the tokenizer's shipped `chat_template`. Needed for Gemma-4 whose native template trips a swift-jinja 1.3.0 interaction bug (iter 31 diagnosis). Ship templates:
+   - `Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja` — text + image/video/audio content parts (no tools)
+   - `Libraries/MLXLMCommon/ChatTemplates/Gemma4WithTools.jinja` — adds `tool_calls` + `tool_responses`
+
+2. **`VMLX_TOKENIZER_CLASS_OVERRIDE=Qwen2Tokenizer`** — tokenizer-class substitution at load. Auto-activates on `TokenizersBackend` → `Qwen2Tokenizer` for mlx-community/Qwen3.5-VL-9B-8bit class of model. Env override lets callers force a different class manually.
+
+Both are no-ops when unset — zero impact on default osaurus loads.
+
+### Multi-turn cache behaviour osaurus should expect
+
+- **Full-replay hit** (same tokens, same mediaSalt if VL): paged + disk tiers both hit. `turn 2 prefill time` drops 40-70% on dense models; VL skips vision tower entirely.
+- **Prefix-extend hit** (turn N+1 = turn N + new tokens): paged hit on the shared prefix, remaining tokens prefill normally. Dense models get the speedup.
+- **Prefix-extend on VL or hybrid SSM**: engine **auto-rolls back to full prefill** for correctness. Rationale: vision-token region can't split (MLX merge-features crash), SSM recurrence is path-dependent (silent output degradation). Coordinator probe still reports hit; engine log says `rolling back to full prefill (VL vision-token region can't be split)` or `(hybrid SSM recurrence path-dependent on full prefix)`.
+
+### Production bugs fixed along the way (iters 28-64)
+
+Each of these would crash or silently corrupt under osaurus production load. Listed so an integrator can verify they're observing the fixed behaviour.
+
+| Bug | Closed by |
+|---|---|
+| `BatchEngine.generate()` hung multi-turn under real HF tokenizer | iter 28 |
+| `UserInput(prompt:, images:)` silently dropped images | iter 45 |
+| VL partial cache-hit crashed vision-feature merge | iter 48 |
+| JANGTQ4 bundles crashed at first forward ("sidecar not loaded") | iter 49 |
+| Hybrid SSM partial cache-hit silently degraded output | iter 57 |
+| Coordinator `isHybrid` had to be set manually per hybrid model | iter 57 |
+| JANG/JANGTQ weights-only bundles had no chat template | iter 29 |
+| `mlx-community/Qwen3.5-VL-9B-8bit` crashed on `TokenizersBackend` tokenizer class | iter 59 |
+| `DiskCache.store` not thread-safe across MLX realize + save + SQLite insert | iter 61 |
+
+### How to verify
+
+Cold clone, then:
+
+```bash
+swift test                                    # 121 engine tests, 4 skips, 0 failures
+./scripts/verify-engine.sh                    # 25 bench scenarios, 0 failed, 0 skipped
+./scripts/verify-engine.sh --tests-only       # tests only (~20s)
+./scripts/verify-engine.sh --quick            # skip 35B hybrid (~5 min)
+./scripts/soak-engine.sh --duration 3600      # 1-hour rotating-model soak (manual)
+```
+
+Model families covered in the bench sweep: dense (Qwen3-0.6B-8bit), hybrid SSM (Qwen3.6-35B-JANGTQ2), VL JANG (Qwen3.5-VL-4B-JANG), VL mlx-community (Qwen3.5-VL-9B-8bit via TokenizersBackend shim), sliding-window (Gemma-4-E2B-4bit via template override).
+
+
 
 ## Quick Start
 
