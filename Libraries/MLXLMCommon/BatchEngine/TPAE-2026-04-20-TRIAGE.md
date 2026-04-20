@@ -318,6 +318,30 @@ inline in `.chunk`, preceded by 50+ chars of reasoning text.
 
 ### 3:54 PM — "gemma4 still weird" — non-`thought` harmony channel
 
+**Plus edge-case audit (A1–A8, B1–B5) on branch
+`fix/reasoning-edge-audit`** — systematic pass through 12 plausible
+failure modes of the harmony + `<think>`-family parsers. Documented
+in `RALPH-EDGE-CASE-STATE.md`. Outcomes:
+
+- **7 already-handled** (A1–A5, A7, A8) — parser state machine
+  already correct. Now pinned by regression tests.
+- **1 new real fix — B1**: `ReasoningParser.forPrompt(stampName:,
+  promptTail:)` auto-detects whether the prompt ends inside a
+  reasoning block. Before this, `fromCapabilityName("think_xml")`
+  unconditionally returned `startInReasoning=true`, which was WRONG
+  when the caller set `enable_thinking=false` (the Qwen 3.x template
+  then prefills `<think>\n\n</think>\n\n` — output starts in
+  content, not reasoning). `forPrompt` scans the prompt tail for the
+  last opener / closer and picks the right initial state.
+  Plumbed into all three generation paths
+  (`Evaluate.generate`, `BatchEngine.generate`,
+  `SpecDecStream.streamViaStrategy`) via a shared
+  `_decodePromptTail` helper that decodes the last 64 prompt tokens.
+- **4 already-handled** (B2 interleaved, B4 truncated closer, B5
+  no-closer-at-all, stamp fallback) — pinned by regression tests.
+
+
+
 tpae screenshot shows Gemma-4-26B-A4B-mxfp4 on "what's the weather in
 irvine?" emitting a JSON action block inside a harmony channel that's
 NOT named `thought`:
