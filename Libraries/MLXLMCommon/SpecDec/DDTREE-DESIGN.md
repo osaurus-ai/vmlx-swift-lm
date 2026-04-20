@@ -250,4 +250,16 @@ Phase 1 work targets gpt-oss-20b first (dense, smallest public drafter, pure-att
 
   Iter 13 next: single-forward `TreeVerify` with combined `(1, 1, T, prefix_len + T)` attention mask + per-token RoPE (the speedup optimisation) so criteria 2 + 3 can close on real benchmarks.
 - **Iter 13 (475d5e8)** — Phase 5 JANG stamp. `JangCapabilities` + `ParserResolution.draftStrategy(capabilities:modelDirectory:)` + 12/12 `JANGSpecDecCapabilityTests`.
-- **Iter 14 (TBD)** — Phase 4 test-matrix row closed. `BatchEngineSpecDecTests` (5/5 green) pins the BatchEngine.generate dispatch contract: `.none` + `nil` strategies take the existing batched-decode path; `.dflash` on a conforming target returns a SpecDecStream (tested with the downloaded 3.2 GB Qwen3.5-27B-DFlash checkpoint); non-conforming targets (LanguageModel that doesn't implement HiddenStateCaptureModel + TokenEmbedderModel) gracefully fall through to the existing path by `streamViaStrategy` returning nil; `.autoregressive` strategy bypasses SpecDec. Phase 4 test-matrix row checked off. Now **8/9 test-matrix rows pinned** — only `DDTreeHybridSSMTests` (Phase 3 hybrid SSM conformance) remains. Iter 15 candidates: Phase 3 hybrid SSM conformance OR single-forward TreeVerify optimisation (unblocks criteria 2 + 3 real benchmarks).
+- **Iter 14 (48da8be)** — `BatchEngineSpecDecTests` (5/5) — BatchEngine dispatch contract pinned.
+- **Iter 15 (TBD)** — **Phase 3 hybrid SSM conformance + criterion #1 closes.** `Qwen35TextModel` + `Qwen35Model` now conform to `HiddenStateCaptureModel` + `TokenEmbedderModel`. `Qwen35TextModelInner.callAsFunctionCapturing` added — mirrors the Qwen3 iter 3 pattern: empty `captureLayerIDs` yields byte-identical logits to plain forward; non-empty set captures post-block hidden states across BOTH linear (GatedDeltaNet-like SSM) AND full-attention decoder layers. 5/5 `DDTreeHybridSSMTests` green:
+  1. Protocol conformance verified at runtime.
+  2. Empty-capture byte-identity with plain forward.
+  3. Mixed SSM + attention capture fills right keys with `(B, L, hidden)` shape.
+  4. DDTree on Qwen35 hybrid SSM == greedy AR (byte-identical at temp 0).
+  5. DFlash linear on Qwen35 hybrid SSM == greedy AR.
+
+  **Every row of the test-matrix is now green.** Completion criterion #1 satisfied.
+
+  Per-node SSM recurrent-state forking (to remove the paper's "hybrid SSM ceiling" + unlock real >1.5× speedup on Qwen 3.5) is late-Phase-3 optimisation work. v1 multi-run TreeVerify keeps byte-parity because each path is an independent sequential forward — SSM recurrence is correct-by-construction.
+
+  **Completion-criterion status now: 1 ✅ / 2 ⏳ / 3 ⏳ / 4 ✅ / 5 ✅ / 6 ✅ / 7 ⏳.** Only performance work (2 + 3) and user approval (7) remain.
