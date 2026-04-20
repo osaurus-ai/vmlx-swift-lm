@@ -126,14 +126,31 @@ public enum SpecDecRuntimeLinear {
 
         var acceptanceLengths: [Int] = []
 
-        // 1. Prefill — run target on prompt, capture hidden states at
-        //    `targetBlockIDs`, sample the initial bonus token.
+        // 1. Prefill — run target on prompt. If the model's cache array
+        //    is fully trimmable (pure-attention models), we use the fast
+        //    path: persistent target cache + rollback after each round,
+        //    turning verify from O(tokens_so_far) into O(blockSize).
+        //
+        //    Hybrid SSM models (e.g. Qwen3.5 with interleaved Mamba +
+        //    attention layers) have non-trimmable `MambaCache` slots, so
+        //    rolling back rejected draft positions is impossible without
+        //    re-running. For those targets we fall back to re-prefill
+        //    each round (correct, O(tokens_so_far²) total, works fine).
+        let targetCache: [KVCache] = args.target.newCache(parameters: nil)
+        let useRollbackFastPath = canTrimPromptCache(targetCache)
+
         let (prefillLogits, prefillHidden) = args.target(
-            args.inputIds, cache: nil, captureLayerIDs: targetLayerSet)
+            args.inputIds,
+            cache: useRollbackFastPath ? targetCache : nil,
+            captureLayerIDs: targetLayerSet)
         materialize(prefillLogits)
-        var targetHidden = extractContextFeature(
+        // `accumulatedHidden` holds every committed position's hidden.
+        // Grows by (accepted + 1) positions per round. Drafter attends
+        // to this full accumulated context on every call since we don't
+        // yet have a drafter KV cache.
+        var accumulatedHidden = extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
-        materialize(targetHidden)
+        materialize(accumulatedHidden)
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
@@ -167,14 +184,14 @@ public enum SpecDecRuntimeLinear {
                 (startPos..<startPos + blockSize).map { Int32($0) }
             ).reshaped(1, blockSize)
 
-            // Drafter forward. Output shape: (1, blockSize, hidden).
+            // Drafter forward with the accumulated committed hidden as
+            // context. Output shape: (1, blockSize, hidden).
             let drafterOut = args.drafter(
                 noiseEmbedding: noiseEmbedding,
-                targetHidden: targetHidden,
+                targetHidden: accumulatedHidden,
                 positionIds: blockPositions,
                 attentionMask: .none)
             // Last block_size-1 positions → target LM head → draft logits.
-            // Equivalent Python: `drafter_out[:, -block_size+1:, :]`.
             let drafterTail = drafterOut[0..., 1..., 0...]
             let drafterLogits = args.target.projectToLogits(drafterTail)
             let drafterPredArr: MLXArray =
@@ -186,20 +203,38 @@ public enum SpecDecRuntimeLinear {
                 blockValues[i + 1] = drafterPredictions[i]
             }
 
-            // 3. Target verification on the full proposed block.
-            var verifyInput: [Int32] = Array(tokens.dropLast())
-            verifyInput.append(contentsOf: blockValues)
-            let verifyArray = MLXArray(verifyInput).reshaped(
-                1, verifyInput.count)
-            let (verifyLogits, verifyHidden) = args.target(
-                verifyArray, cache: nil, captureLayerIDs: targetLayerSet)
+            // 3. Target verify.
+            //
+            //    Fast path (trimmable cache): pass ONLY the NEW bs
+            //    positions + persistent cache. Cache grows by bs.
+            //    Rejected positions get trimmed after acceptance is known.
+            //
+            //    Fallback (hybrid SSM): re-prefill the full committed
+            //    prefix + block as a fresh forward (cache: nil), read
+            //    only the last bs positions' logits.
+            let verifyArray: MLXArray
+            let verifyLogits: MLXArray
+            let verifyHidden: [Int: MLXArray]
+            let blockStartIdx: Int
+            if useRollbackFastPath {
+                verifyArray = MLXArray(blockValues).reshaped(1, blockSize)
+                (verifyLogits, verifyHidden) = args.target(
+                    verifyArray, cache: targetCache, captureLayerIDs: targetLayerSet)
+                blockStartIdx = 0
+            } else {
+                var verifyInput: [Int32] = Array(tokens.dropLast())
+                verifyInput.append(contentsOf: blockValues)
+                verifyArray = MLXArray(verifyInput).reshaped(1, verifyInput.count)
+                (verifyLogits, verifyHidden) = args.target(
+                    verifyArray, cache: nil, captureLayerIDs: targetLayerSet)
+                blockStartIdx = verifyInput.count - blockSize
+            }
             materialize(verifyLogits)
 
-            // Posterior over the block positions: last blockSize logits.
-            let blockStartIdx = verifyInput.count - blockSize
-            let verifyLogitsLast = verifyLogits[0..., blockStartIdx..., 0...]
+            // Posterior over the block positions.
+            let verifyLogitsBlock = verifyLogits[0..., blockStartIdx..., 0...]
             let posteriorArr: MLXArray =
-                argMax(verifyLogitsLast, axis: -1).asType(.int32)
+                argMax(verifyLogitsBlock, axis: -1).asType(.int32)
             materialize(posteriorArr)
             let posterior = posteriorArr.asArray(Int32.self)
 
@@ -229,18 +264,32 @@ public enum SpecDecRuntimeLinear {
             thisRoundTokens.append(bonus)
             onCommitted?(thisRoundTokens)
 
-            // Update target_hidden: slice to the FULL committed prefix
-            // (original tokens before this round + accepted + new bonus).
-            // z-lab/dflash accumulates via a drafter KV cache; without
-            // that cache our drafter sees no context from prior rounds,
-            // so we feed the entire committed sequence each round.
-            let verifyFeature = extractContextFeature(
+            // Accumulate hidden for committed-this-round positions.
+            //   Fast path: `verifyHidden` has shape (1, bs, *). Slice
+            //   the first (accepted + 1) rows — those are the committed
+            //   tokens' hiddens; the rest were rejected drafts.
+            //   Fallback: `verifyHidden` has shape (1, verifyInput.count,
+            //   *). Slice positions [blockStartIdx ..< blockStartIdx +
+            //   accepted + 1].
+            let commitCount = acceptanceLength + 1
+            let newHidden = extractContextFeature(
                 captured: verifyHidden, targetLayerIDs: args.targetBlockIDs)
-            // Committed positions = verifyInput[0..(verifyInput.count - blockSize) + acceptanceLength + 1]
-            // I.e., everything before the block + accepted drafts + new bonus.
-            let committedEnd = verifyInput.count - blockSize + acceptanceLength + 1
-            targetHidden = verifyFeature[0..., 0..<committedEnd, 0...]
-            materialize(targetHidden)
+            let hiddenStart = blockStartIdx
+            let commitHidden = newHidden[
+                0..., hiddenStart..<(hiddenStart + commitCount), 0...]
+            accumulatedHidden = concatenated(
+                [accumulatedHidden, commitHidden], axis: 1)
+            materialize(accumulatedHidden)
+
+            // Roll back the target cache by `rejectedCount` positions so
+            // the next round's forward starts from the committed prefix.
+            // Only meaningful on the fast path; fallback uses cache=nil.
+            if useRollbackFastPath {
+                let rejectedCount = blockSize - commitCount
+                if rejectedCount > 0 {
+                    _ = trimPromptCache(targetCache, numTokens: rejectedCount)
+                }
+            }
         }
 
         // Trim any mask tokens that leaked in — matches Python's
