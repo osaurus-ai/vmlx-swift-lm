@@ -232,11 +232,13 @@ public actor BatchEngine {
         }
 
         let tokenizer = context.tokenizer
-        // Snapshot format + reasoning stamp from the configuration so the
-        // background task doesn't need to reach back into the actor.
+        // Snapshot format + reasoning stamp + stop strings from the
+        // configuration so the background task doesn't need to reach
+        // back into the actor.
         let toolCallFormat = context.configuration.toolCallFormat ?? .json
         let reasoningParserName = context.configuration.reasoningParserName
-        let (_, tokenStream) = submit(input: input, parameters: parameters)
+        let extraStopStrings = parameters.extraStopStrings
+        let (requestId, tokenStream) = submit(input: input, parameters: parameters)
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
         // `AsyncStream.makeStream()` with an unstructured `Task {}` that
@@ -246,18 +248,37 @@ public actor BatchEngine {
         //
         // The inner pipeline matches `TextToolTokenLoopHandler` in
         // `Evaluate.swift` byte-for-byte: each decoded chunk runs through
-        // an optional `ReasoningParser` first (strips `<think>...</think>`),
-        // then through `ToolCallProcessor` which extracts authoritative
-        // `.toolCall(ToolCall)` events. Osaurus / callers never have to
-        // re-parse — tool-call parsing lives in the library.
+        // an optional `ReasoningParser` first (peels off `<think>…</think>`
+        // into `.reasoning` events), then through `ToolCallProcessor`
+        // which extracts authoritative `.toolCall(ToolCall)` events,
+        // then (if `extraStopStrings` set) through a `StopStringMatcher`
+        // which halts upstream generation on substring match.
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
+        let engineRef = self
         Task {
             var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             let toolCallProcessor = ToolCallProcessor(format: toolCallFormat)
             var reasoningParser = ReasoningParser.fromCapabilityName(
                 reasoningParserName)
+            var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
+            var stopMatched = false
+
+            func emitChunkThroughStop(_ text: String) {
+                guard stopMatcher.isEnabled else {
+                    continuation.yield(.chunk(text))
+                    return
+                }
+                switch stopMatcher.feed(text) {
+                case .streaming(let out):
+                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                case .stopped(let out):
+                    if !out.isEmpty { continuation.yield(.chunk(out)) }
+                    stopMatched = true
+                }
+            }
 
             func pump(_ raw: String) {
+                if stopMatched { return }
                 let pieces: [String]
                 if var parser = reasoningParser {
                     var kept: [String] = []
@@ -276,7 +297,8 @@ public actor BatchEngine {
                 }
                 for piece in pieces {
                     if let textToYield = toolCallProcessor.processChunk(piece) {
-                        continuation.yield(.chunk(textToYield))
+                        emitChunkThroughStop(textToYield)
+                        if stopMatched { return }
                     }
                     if let toolCall = toolCallProcessor.toolCalls.popLast() {
                         continuation.yield(.toolCall(toolCall))
@@ -290,7 +312,7 @@ public actor BatchEngine {
                         switch segment {
                         case .content(let c):
                             if let textToYield = toolCallProcessor.processChunk(c) {
-                                continuation.yield(.chunk(textToYield))
+                                emitChunkThroughStop(textToYield)
                             }
                             if let toolCall = toolCallProcessor.toolCalls.popLast() {
                                 continuation.yield(.toolCall(toolCall))
@@ -302,6 +324,16 @@ public actor BatchEngine {
                     reasoningParser = parser
                 }
                 toolCallProcessor.processEOS()
+
+                // Drain the stop-string matcher's held tail — no more
+                // tokens are coming, whatever is held is safe to emit.
+                // Skipped when stopMatched: the matcher already returned
+                // its tail (pre-match prefix) at stop time.
+                if stopMatcher.isEnabled && !stopMatched {
+                    let tail = stopMatcher.flush()
+                    if !tail.isEmpty { continuation.yield(.chunk(tail)) }
+                }
+
                 for toolCall in toolCallProcessor.toolCalls {
                     continuation.yield(.toolCall(toolCall))
                 }
@@ -314,10 +346,30 @@ public actor BatchEngine {
                     if let text = detokenizer.next() {
                         pump(text)
                     }
+                    if stopMatched {
+                        // Tell the BatchEngine actor to halt this slot
+                        // on its next scheduling tick. The actor's
+                        // `cancel(id:)` flips `isFinished` and emits
+                        // its own `.info`; we transform that info's
+                        // stopReason from `.cancelled` to `.stop`
+                        // below when it arrives.
+                        await engineRef.cancel(requestId)
+                    }
                 case .info(let info):
                     flush()
                     detokenizer.startNewSegment()
-                    continuation.yield(.info(info))
+                    let finalInfo: GenerateCompletionInfo
+                    if stopMatched {
+                        finalInfo = GenerateCompletionInfo(
+                            promptTokenCount: info.promptTokenCount,
+                            generationTokenCount: info.generationTokenCount,
+                            promptTime: info.promptTime,
+                            generationTime: info.generateTime,
+                            stopReason: .stop)
+                    } else {
+                        finalInfo = info
+                    }
+                    continuation.yield(.info(finalInfo))
                 }
             }
             continuation.finish()

@@ -194,6 +194,24 @@ public struct GenerateParameters: Sendable {
     /// `DDTREE-DESIGN.md` for the full spec.
     public var draftStrategy: DraftStrategy? = nil
 
+    /// Additional text-level stop sequences. When any of these strings
+    /// appears in the user-visible assistant output, the library halts
+    /// generation, truncates the match and everything after it, and
+    /// emits `.info(stopReason: .stop)`.
+    ///
+    /// Matching happens against the `.chunk(String)` stream — i.e.,
+    /// reasoning and tool-call bytes are NOT candidates for a
+    /// stop-sequence match, matching the semantics an OpenAI-compatible
+    /// server expects.
+    ///
+    /// Empty, orthogonal to `ModelConfiguration.extraEOSTokens` (which
+    /// is token-level). Callers can combine both: EOS tokens halt on
+    /// token-id match before detokenization; stop strings halt on
+    /// decoded-text match after the reasoning + tool-call pipeline.
+    ///
+    /// See `Libraries/MLXLMCommon/BatchEngine/STOP-SEQUENCES-CONTRACT.md`.
+    public var extraStopStrings: [String] = []
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -215,7 +233,8 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        extraStopStrings: [String] = []
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -238,6 +257,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.extraStopStrings = extraStopStrings
     }
 
     public func sampler() -> LogitSampler {
@@ -1684,7 +1704,8 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
-        wiredMemoryTicket: wiredMemoryTicket)
+        wiredMemoryTicket: wiredMemoryTicket,
+        extraStopStrings: parameters.extraStopStrings)
     return stream
 }
 
@@ -1762,7 +1783,9 @@ public func generate(
             tokenizer: context.tokenizer,
             format: context.configuration.toolCallFormat ?? .json,
             reasoningParser: ReasoningParser.fromCapabilityName(
-                context.configuration.reasoningParserName)
+                context.configuration.reasoningParserName),
+            stopStringMatcher: StopStringMatcher(
+                stopStrings: parameters.extraStopStrings)
         )
     )
     return stream
@@ -1805,7 +1828,8 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
-    wiredMemoryTicket: WiredMemoryTicket? = nil
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    extraStopStrings: [String] = []
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     // Capture cache coordinator state and extract KV data before consuming the iterator.
     //
@@ -1847,7 +1871,8 @@ public func generateTask(
             tokenizer: tokenizer,
             format: modelConfiguration.toolCallFormat ?? .json,
             reasoningParser: ReasoningParser.fromCapabilityName(
-                modelConfiguration.reasoningParserName)
+                modelConfiguration.reasoningParserName),
+            stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings)
         ),
         cacheStoreAction: cacheStoreAction
     )
@@ -2100,7 +2125,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
                 tokenCount += 1
                 if !handler.onToken(token, emit: continuation.yield) {
-                    stopReason = .cancelled
+                    // Distinguish "downstream consumer terminated the
+                    // stream" from "library-internal stop-sequence
+                    // match" — the latter should report `stopReason =
+                    // .stop`, not `.cancelled`.
+                    stopReason = handler.stopSequenceHit ? .stop : .cancelled
                     break
                 }
             }
@@ -2374,6 +2403,17 @@ private protocol TokenLoopHandler: Sendable {
     )
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
+
+    /// True when the last `onToken` returned false because a text-level
+    /// stop sequence matched — the generation loop uses this to set
+    /// `stopReason = .stop` rather than `.cancelled` on the terminal
+    /// `.info` event. Default `false` for handlers that don't consume
+    /// text (e.g., the raw-token handler).
+    var stopSequenceHit: Bool { get }
+}
+
+extension TokenLoopHandler {
+    var stopSequenceHit: Bool { false }
 }
 
 private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
@@ -2386,15 +2426,26 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// tool-call processor (matches upstream ml-explore/mlx-swift-lm
     /// behaviour byte-for-byte).
     var reasoningParser: ReasoningParser?
+    /// Text-level stop-sequence matcher. Runs at the tail of the
+    /// pipeline against `.chunk` text only (reasoning + tool-call bytes
+    /// are scoped out by construction). When a stop string matches,
+    /// `onToken` returns false to halt the loop; the `.info` event
+    /// reports `stopReason = .stop`.
+    var stopStringMatcher: StopStringMatcher
+    /// Flipped by `dispatch` when the stop matcher fires, so the loop
+    /// task can signal `.stop` in its terminal `.info` event.
+    private(set) var stopSequenceHit: Bool = false
 
     init(
         tokenizer: Tokenizer,
         format: ToolCallFormat,
-        reasoningParser: ReasoningParser? = nil
+        reasoningParser: ReasoningParser? = nil,
+        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         toolCallProcessor = ToolCallProcessor(format: format)
         self.reasoningParser = reasoningParser
+        self.stopStringMatcher = stopStringMatcher
     }
 
     /// Feed a raw decoded chunk through the reasoning parser (if any) and
@@ -2433,12 +2484,45 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         // 2. Tool-call pass. Each content piece is processed in order so
         //    the state machine inside `ToolCallProcessor` sees the same
         //    byte stream it would have seen without a reasoning parser.
+        //
+        // 3. Stop-string pass (if configured). Runs at the TAIL — only
+        //    user-visible `.chunk` text is a candidate for a stop match,
+        //    matching OpenAI semantics where stop sequences match the
+        //    assistant answer, not the reasoning or tool envelope.
         for contentChunk in contentChunks {
-            if let textToYield = toolCallProcessor.processChunk(contentChunk) {
+            guard let textToYield = toolCallProcessor.processChunk(contentChunk) else {
+                if let toolCall = toolCallProcessor.toolCalls.popLast() {
+                    if case .terminated = emit(.toolCall(toolCall)) {
+                        return false
+                    }
+                }
+                continue
+            }
+
+            if stopStringMatcher.isEnabled {
+                switch stopStringMatcher.feed(textToYield) {
+                case .streaming(let emitText):
+                    if !emitText.isEmpty {
+                        if case .terminated = emit(.chunk(emitText)) {
+                            return false
+                        }
+                    }
+                case .stopped(let emitText):
+                    if !emitText.isEmpty {
+                        if case .terminated = emit(.chunk(emitText)) {
+                            stopSequenceHit = true
+                            return false
+                        }
+                    }
+                    stopSequenceHit = true
+                    return false
+                }
+            } else {
                 if case .terminated = emit(.chunk(textToYield)) {
                     return false
                 }
             }
+
             if let toolCall = toolCallProcessor.toolCalls.popLast() {
                 if case .terminated = emit(.toolCall(toolCall)) {
                     return false
@@ -2472,13 +2556,16 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         // Flush the reasoning parser — any buffered tail becomes content
         // (or a trailing `.reasoning` segment if the model stopped mid-
         // think block) per ReasoningParser.flush contract. The tool-call
-        // processor then sees the final content piece before processEOS.
+        // processor then sees the final content piece, then goes through
+        // the stop matcher tail before processEOS.
         if var parser = reasoningParser {
             for segment in parser.flush() {
                 switch segment {
                 case .content(let c):
                     if let textToYield = toolCallProcessor.processChunk(c) {
-                        if case .terminated = emit(.chunk(textToYield)) {
+                        if case .terminated = emitChunkThroughStopMatcher(
+                            textToYield, emit: emit)
+                        {
                             reasoningParser = parser
                             return
                         }
@@ -2501,10 +2588,43 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
 
         toolCallProcessor.processEOS()
 
+        // Drain the stop-string matcher's tail (anything held back while
+        // waiting for disambiguation is now safe — no more tokens).
+        if stopStringMatcher.isEnabled {
+            let tail = stopStringMatcher.flush()
+            if !tail.isEmpty {
+                if case .terminated = emit(.chunk(tail)) {
+                    return
+                }
+            }
+        }
+
         for toolCall in toolCallProcessor.toolCalls {
             if case .terminated = emit(.toolCall(toolCall)) {
                 break
             }
+        }
+    }
+
+    /// Emit a `.chunk` through the stop-string matcher. Returns
+    /// `.terminated` when the downstream consumer stops OR when the
+    /// stop matcher fires (so the caller halts the loop).
+    private mutating func emitChunkThroughStopMatcher(
+        _ text: String,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> AsyncStream<Generation>.Continuation.YieldResult {
+        guard stopStringMatcher.isEnabled else {
+            return emit(.chunk(text))
+        }
+        switch stopStringMatcher.feed(text) {
+        case .streaming(let out):
+            if out.isEmpty { return .enqueued(remaining: 0) }
+            return emit(.chunk(out))
+        case .stopped(let out):
+            stopSequenceHit = true
+            if out.isEmpty { return .terminated }
+            _ = emit(.chunk(out))
+            return .terminated
         }
     }
 
