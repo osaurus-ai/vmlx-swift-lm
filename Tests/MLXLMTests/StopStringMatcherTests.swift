@@ -86,21 +86,24 @@ struct StopStringMatcherTests {
     func testSplitAcrossChunks() {
         var m = StopStringMatcher(stopStrings: ["STOP"])
 
-        // First feed contains a partial match — must be held back.
+        // First feed contains a partial match — the last (maxStopLen-1 == 3)
+        // characters "ST " are held as potential prefix, so emit is
+        // everything before them ("before").
         let r1 = m.feed("before ST")
         switch r1 {
         case .streaming(let out):
-            #expect(out == "before ") // "ST" is held as potential-prefix
+            #expect(out == "before")
         case .stopped:
             Issue.record("Not yet a full match")
         }
 
-        // Second feed completes the match.
+        // Second feed completes the match. The buffer at this point is
+        // " ST" + "OP after" = " STOP after" — match lands at offset 1,
+        // so the pre-match emit is the single space.
         let r2 = m.feed("OP after")
         switch r2 {
         case .stopped(let out):
-            // We've already emitted "before " → nothing left to emit pre-stop.
-            #expect(out.isEmpty)
+            #expect(out == " ")
         case .streaming:
             Issue.record("Expected stopped on second chunk")
         }

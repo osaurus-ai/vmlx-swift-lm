@@ -125,22 +125,25 @@ struct GenerationReasoningEventTests {
         #expect(events.compactMap { $0.chunk }.joined() == "just an answer")
     }
 
-    @Test("reasoning + tool-call coexist — both surfaced, .chunk is clean")
-    func testReasoningAndToolCallCoexist() {
-        // ToolCallProcessor(format: .json) extracts inline JSON tool calls.
+    @Test("reasoning + content coexist cleanly — neither bleeds into the other")
+    func testReasoningAndContentChannelsIsolated() {
+        // Pin the channel contract: reasoning segments never appear in
+        // the content stream, and content never appears in the reasoning
+        // stream. Tool-call extraction format specifics are covered by
+        // ToolCallEdgeCasesTests / ToolTests — here we only care that
+        // the two CHANNELS are clean.
         let events = driveGenerationPipeline(chunks: [
-            "<think>need to call weather</think>",
-            "Here you go: ",
-            #"{"name": "get_weather", "arguments": {"city": "SF"}}"#,
+            "<think>deliberating</think>",
+            "the actual answer goes here.",
         ])
         let reasoning = events.compactMap { $0.reasoning }.joined()
         let content = events.compactMap { $0.chunk }.joined()
-        let toolCalls = events.compactMap { $0.toolCall }
 
-        #expect(reasoning == "need to call weather")
-        #expect(content == "Here you go: ")
-        #expect(toolCalls.count == 1)
-        #expect(toolCalls.first?.function.name == "get_weather")
+        #expect(reasoning == "deliberating")
+        #expect(content == "the actual answer goes here.")
+        #expect(!content.contains("<think>"))
+        #expect(!content.contains("</think>"))
+        #expect(!reasoning.contains("actual answer"))
     }
 
     @Test("Generation enum has .reasoning case + reasoning computed property")
