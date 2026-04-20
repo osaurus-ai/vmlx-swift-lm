@@ -1,0 +1,35 @@
+{{- bos_token -}}
+{%- macro render_content(content) -%}
+    {%- if content is string -%}
+        {{- content | trim -}}
+    {%- elif content is sequence -%}
+        {%- for item in content -%}
+            {%- if item['type'] == 'text' -%}
+                {{- item['text'] | trim -}}
+            {%- elif item['type'] == 'image' -%}
+                {{- '\n\n<|image|>\n\n' -}}
+            {%- elif item['type'] == 'video' -%}
+                {{- '\n\n<|video|>\n\n' -}}
+            {%- elif item['type'] == 'audio' -%}
+                {{- '\n\n<|audio|>\n\n' -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- if messages[0]['role'] == 'system' -%}
+    {{- '<|turn>system\n' -}}
+    {{- render_content(messages[0]['content']) -}}
+    {{- '<turn|>\n' -}}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{%- for message in loop_messages -%}
+    {%- set role = 'model' if message['role'] == 'assistant' else message['role'] -%}
+    {{- '<|turn>' + role + '\n' -}}
+    {{- render_content(message['content']) -}}
+    {{- '<turn|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|turn>model\n' -}}
+{%- endif -%}

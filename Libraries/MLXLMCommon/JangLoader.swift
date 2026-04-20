@@ -54,16 +54,33 @@ public struct JangQuantization: Sendable, Equatable {
 /// Source model info from jang_config.json `source_model` block.
 public struct JangSourceModel: Sendable, Equatable {
     public let name: String
+    public let org: String
+    public let architecture: String
     public let dtype: String
     public let parameters: String
 
-    public init(name: String = "", dtype: String = "bfloat16", parameters: String = "0") {
+    public init(
+        name: String = "",
+        org: String = "",
+        architecture: String = "",
+        dtype: String = "bfloat16",
+        parameters: String = "0"
+    ) {
         self.name = name
+        self.org = org
+        self.architecture = architecture
         self.dtype = dtype
         self.parameters = parameters
     }
 
     public var parameterCount: Int { Int(parameters) ?? 0 }
+
+    /// HuggingFace canonical repo id, e.g. `MiniMaxAI/MiniMax-M2.7`. Empty if
+    /// either `org` or `name` is missing.
+    public var huggingFaceRepoID: String {
+        guard !org.isEmpty, !name.isEmpty else { return "" }
+        return "\(org)/\(name)"
+    }
 }
 
 /// Architecture info from jang_config.json `architecture` block.
@@ -320,6 +337,113 @@ public struct JangLoader: Sendable {
         return nil
     }
 
+    /// Resolve the directory that holds tokenizer files for a given model.
+    ///
+    /// The HuggingFace tokenizer loader (`AutoTokenizer.from(modelFolder:)`)
+    /// expects `tokenizer.json` and/or `tokenizer_config.json` (plus optionally
+    /// `chat_template.jinja`) in the directory it is pointed at. Most JANG /
+    /// JANGTQ bundles ship **weights-only** — the snapshot directory contains
+    /// `model.safetensors`, `config.json`, `jang_config.json` (and sometimes
+    /// `jangtq_runtime.safetensors`) but no tokenizer files. Users are
+    /// expected to re-use the tokenizer from the source model declared in
+    /// `jang_config.json["source_model"]`.
+    ///
+    /// This helper implements that fallback for local-directory loads:
+    ///
+    /// 1. If `modelDirectory` itself has `tokenizer_config.json` or
+    ///    `tokenizer.json` → return it unchanged (standard path).
+    /// 2. Else if `modelDirectory` has `jang_config.json` with a populated
+    ///    `source_model.org` + `source_model.name` → look up the HuggingFace
+    ///    cache directory for that repo (`~/.cache/huggingface/hub/models--<org>--<name>`)
+    ///    and return the first snapshot that has tokenizer files.
+    /// 3. Else → return `modelDirectory` unchanged. The tokenizer loader will
+    ///    surface its own error, which is the same behaviour as before this
+    ///    helper existed.
+    ///
+    /// The fallback path **does not** perform network downloads. It only
+    /// finds a tokenizer that has already been cached by `Downloader`. If the
+    /// source model isn't cached, the returned URL still won't have
+    /// tokenizer files and the loader will fail with a clear "no tokenizer"
+    /// error — which is the signal for callers to `.download(id:)` the source
+    /// repo first.
+    ///
+    /// - Parameters:
+    ///   - modelDirectory: Directory of the model being loaded.
+    ///   - huggingFaceCacheRoot: Override for the HF cache root. Defaults to
+    ///     `~/.cache/huggingface/hub`. Exposed for unit tests.
+    ///   - fileManager: File-manager used for probe. Exposed for unit tests.
+    /// - Returns: A directory that should be passed to the tokenizer loader.
+    public static func resolveTokenizerDirectory(
+        for modelDirectory: URL,
+        huggingFaceCacheRoot: URL? = nil,
+        fileManager: FileManager = .default
+    ) -> URL {
+        if hasTokenizerFiles(at: modelDirectory, fileManager: fileManager) {
+            return modelDirectory
+        }
+        guard isJangModel(at: modelDirectory) else { return modelDirectory }
+
+        // Read source_model from jang_config.json. Any parse failure or
+        // missing org/name → caller gets the default (unchanged) path.
+        let config: JangConfig
+        do {
+            config = try loadConfig(at: modelDirectory)
+        } catch {
+            return modelDirectory
+        }
+        let repo = config.sourceModel.huggingFaceRepoID
+        guard !repo.isEmpty else { return modelDirectory }
+
+        let cacheRoot = huggingFaceCacheRoot ?? defaultHuggingFaceCacheRoot()
+        let cacheDirName = "models--\(config.sourceModel.org)--\(config.sourceModel.name)"
+        let snapshotsRoot = cacheRoot
+            .appendingPathComponent(cacheDirName)
+            .appendingPathComponent("snapshots")
+
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: snapshotsRoot,
+            includingPropertiesForKeys: nil
+        ) else {
+            return modelDirectory
+        }
+
+        // First snapshot directory that actually has tokenizer files wins.
+        // HuggingFace snapshots are immutable per revision, so any of them
+        // with the files is equally good; the presence check is what matters.
+        for snapshot in entries where hasTokenizerFiles(at: snapshot, fileManager: fileManager) {
+            return snapshot
+        }
+        return modelDirectory
+    }
+
+    /// Check whether a directory already has the files that the HuggingFace
+    /// tokenizer loader needs. Used by `resolveTokenizerDirectory(for:)`.
+    public static func hasTokenizerFiles(
+        at directory: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            let url = directory.appendingPathComponent(name)
+            if fileManager.fileExists(atPath: url.path) { return true }
+        }
+        return false
+    }
+
+    /// Default HuggingFace hub cache root. Honours `HF_HOME` and `HF_HUB_CACHE`
+    /// environment variables, otherwise falls back to `~/.cache/huggingface/hub`
+    /// — matching the Python `huggingface_hub` resolution order.
+    public static func defaultHuggingFaceCacheRoot() -> URL {
+        let env = ProcessInfo.processInfo.environment
+        if let hubCache = env["HF_HUB_CACHE"], !hubCache.isEmpty {
+            return URL(fileURLWithPath: hubCache)
+        }
+        if let hfHome = env["HF_HOME"], !hfHome.isEmpty {
+            return URL(fileURLWithPath: hfHome).appendingPathComponent("hub")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub")
+    }
+
     /// Load and parse the JANG config from a model directory.
     public static func loadConfig(at modelPath: URL) throws -> JangConfig {
         guard let configURL = findConfigPath(at: modelPath) else {
@@ -367,6 +491,8 @@ public struct JangLoader: Sendable {
             }
             sourceModel = JangSourceModel(
                 name: smDict["name"] as? String ?? "",
+                org: smDict["org"] as? String ?? "",
+                architecture: smDict["architecture"] as? String ?? "",
                 dtype: smDict["dtype"] as? String ?? "bfloat16",
                 parameters: params
             )

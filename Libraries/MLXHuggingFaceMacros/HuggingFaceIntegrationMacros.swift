@@ -113,6 +113,25 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         tools: [[String: any Sendable]]?,
                         additionalContext: [String: any Sendable]?
                     ) throws -> [Int] {
+                        // Iter 50 escape hatch: `VMLX_CHAT_TEMPLATE_OVERRIDE=/path/to/template.jinja`
+                        // bypasses the tokenizer's shipped chat template. Motivation: Gemma-4's
+                        // native template trips a swift-jinja 1.3.0 interaction bug — all
+                        // constructs parse individually (see Gemma4ChatTemplateProbeTests)
+                        // but the full assembly fails. The override lets callers ship
+                        // `Libraries/MLXLMCommon/ChatTemplates/Gemma4Minimal.jinja` (or any
+                        // other compatible template) for models blocked by upstream gaps.
+                        // Default behaviour (no env var) is unchanged.
+                        let env = ProcessInfo.processInfo.environment
+                        if let path = env["VMLX_CHAT_TEMPLATE_OVERRIDE"], !path.isEmpty,
+                           let src = try? String(contentsOfFile: path, encoding: .utf8) {
+                            do {
+                                return try upstream.applyChatTemplate(
+                                    messages: messages,
+                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(src))
+                            } catch Tokenizers.TokenizerError.missingChatTemplate {
+                                throw MLXLMCommon.TokenizerError.missingChatTemplate
+                            }
+                        }
                         do {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: additionalContext)

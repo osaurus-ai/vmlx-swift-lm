@@ -373,8 +373,14 @@ public final class VLMModelFactory: ModelFactory {
         // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
         // parallel scheduling. This may briefly block a cooperative thread pool thread,
         // but the config file is small and model loading is not a high-concurrency path.
-        async let tokenizerTask = tokenizerLoader.load(
-            from: configuration.tokenizerDirectory)
+        //
+        // JANG VL bundles (e.g. Qwen3.5-VL-*-JANG_*) may also ship
+        // weights-only. `resolveTokenizerDirectory` falls back to the cached
+        // source model's tokenizer when that happens; otherwise returns the
+        // original directory unchanged.
+        let tokenizerDirectory = JangLoader.resolveTokenizerDirectory(
+            for: configuration.tokenizerDirectory)
+        async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 
         try loadWeights(
@@ -409,11 +415,14 @@ public final class VLMModelFactory: ModelFactory {
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
 
-        // Build a ModelConfiguration for the ModelContext
+        // Build a ModelConfiguration for the ModelContext. When the JANG
+        // fallback resolved to a different directory than the caller
+        // requested, surface that in the `tokenizerSource` so any re-load
+        // via this config uses the same tokenizer.
         let tokenizerSource: TokenizerSource? =
-            configuration.tokenizerDirectory == modelDirectory
+            tokenizerDirectory == modelDirectory
             ? nil
-            : .directory(configuration.tokenizerDirectory)
+            : .directory(tokenizerDirectory)
         let modelConfig = ModelConfiguration(
             directory: modelDirectory,
             tokenizerSource: tokenizerSource,
