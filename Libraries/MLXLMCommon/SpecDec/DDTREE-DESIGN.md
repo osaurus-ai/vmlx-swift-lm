@@ -255,6 +255,31 @@ Apple M4 Max 128GB, swift-build `-c release`, temperature 0, prompt `"The capita
 
 Set `DFLASH_DISABLE_FAST_PATH=1` to force fallback on pure-attention models for A/B testing.
 
+### Which caches does SpecDec actually use?
+
+`SpecDecRuntimeLinear` currently leverages:
+
+- **`KVCacheSimple`** (default `newCache` return for pure-attention Qwen3) — persistent, trimmable. Used for the fast-path target cache. ✓
+- **`RotatingKVCache`** — when the model's `newCache(parameters:)` picks one (e.g., sliding-window VLMs). Trimmable (with `keep` prefix). Would work if encountered. ✓
+- **`MambaCache`** — Qwen3.5 hybrid SSM slots. NOT trimmable (SSM state is recurrent and path-dependent). The runtime detects this via `canTrimPromptCache(...)` and automatically falls back to full re-prefill per round. ✗
+- **`TurboQuantKVCache`** — optional, opt-in via `DFlashLinearArgs.kvMode = .turboQuant(...)`. Post-prefill the runtime calls `maybeQuantizeKVCache` to convert each `KVCacheSimple` to a compressed `TurboQuantKVCache`. Trimmable, so rollback still works. Trade-off measured below.
+- **`QuantizedKVCache`** (affine) — same opt-in hook via `.affine(bits:groupSize:)`. Trimmable.
+
+What SpecDec does NOT (yet) use:
+
+- **`CacheCoordinator` / prefix cache** — operates at the `ChatSession` / `BatchEngine` layer, not inside SpecDec. If the caller reuses a warm prefix cache across turns, that's unaffected by SpecDec; the SpecDec runtime creates its own fresh cache per call.
+- **Paged KV / batch cache** (`BatchKVCache`) — SpecDec currently assumes batch size 1. Batched SpecDec is a larger refactor tracked as follow-up.
+- **Drafter KV cache** (`ContextOnlyDraftKVCache` from z-lab) — the drafter still sees the full accumulated target hidden every round. This is the main blocker to sustained throughput at long generations.
+
+TurboQuant measurement (Qwen3-8B-4bit, 256 tokens, M4 Max):
+
+| kvMode | DFlash tok/s | Byte-parity | Acceptance |
+|---|---|---|---|
+| `.none` (default) | 31.9 | 100% | 1.44 / 15 |
+| `.turboQuant(3,3)` | 29.7 | 16% | 2.44 / 15 |
+
+TurboQuant's 4.7× KV memory compression doesn't translate to decode speed on short-medium contexts (the compression/decompression overhead is in the same ballpark as the memory-bandwidth savings), and the quantization noise breaks byte-parity with greedy AR. For long-context serving (10k+) or memory-constrained devices, the flag is there; for max throughput right now, leave it `.none`.
+
 ### Known follow-ups (not merge-blocking)
 
 - **Drafter KV cache** — port z-lab/dflash `ContextOnlyDraftKVCache` into our `DFlashAttention` so per-round context grows from O(blockSize) instead of O(accumulated). This is the main blocker to sustained throughput on long generations.
