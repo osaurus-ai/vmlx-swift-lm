@@ -354,18 +354,25 @@ public final class VLMModelFactory: ModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
 
-        // Auto-detect tool call format from model type if not explicitly set
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
-        }
-
-        // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.
-        // Standard MLX models skip this entirely (jangConfig stays nil).
+        // Detect JANG model BEFORE tool-format selection so the `capabilities.tool_parser`
+        // stamp is authoritative for JANG bundles. Standard MLX models skip this and
+        // jangConfig stays nil, in which case we fall through to the model_type heuristic.
         let jangConfig: JangConfig?
         if JangLoader.isJangModel(at: modelDirectory) {
             jangConfig = try JangLoader.loadConfig(at: modelDirectory)
         } else {
             jangConfig = nil
+        }
+
+        // Tool-format resolution priority (same rationale as LLMModelFactory):
+        //   1. Caller-supplied `configuration.toolCallFormat` (explicit override).
+        //   2. JANG `capabilities.tool_parser` stamp — authoritative when set.
+        //   3. `ToolCallFormat.infer(from: modelType)` heuristic — last resort.
+        if mutableConfiguration.toolCallFormat == nil {
+            let jangStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.capabilities?.toolParser)
+            mutableConfiguration.toolCallFormat = jangStamped
+                ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
         // Load tokenizer from model directory (or alternate tokenizer repo),

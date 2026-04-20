@@ -689,13 +689,6 @@ public final class LLMModelFactory: ModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
-        // Build a ModelConfiguration with loaded EOS token IDs and tool call format
-        var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
-        }
-
         // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.
         // Standard MLX models skip this entirely (jangConfig stays nil).
         let jangConfig: JangConfig?
@@ -703,6 +696,27 @@ public final class LLMModelFactory: ModelFactory {
             jangConfig = try JangLoader.loadConfig(at: modelDirectory)
         } else {
             jangConfig = nil
+        }
+
+        // Build a ModelConfiguration with loaded EOS token IDs and tool call format.
+        //
+        // Tool-format resolution priority (highest first):
+        //   1. Caller-supplied `configuration.toolCallFormat` (explicit override).
+        //   2. JANG `capabilities.tool_parser` stamp from jang_config.json — authoritative
+        //      when set, covers the short family names (`qwen`, `minimax`, `glm47`, …) the
+        //      JANG converter stamps vs the canonical enum raw values.
+        //   3. `ToolCallFormat.infer(from: modelType)` heuristic on config.json's
+        //      `model_type`. Last resort for non-JANG standard MLX models.
+        //
+        // Previous code called `infer()` before the JANG load, so JANG models whose
+        // `tool_parser` stamp disagreed with `model_type` were silently miscategorised.
+        var mutableConfiguration = configuration
+        mutableConfiguration.eosTokenIds = eosTokenIds
+        if mutableConfiguration.toolCallFormat == nil {
+            let jangStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.capabilities?.toolParser)
+            mutableConfiguration.toolCallFormat = jangStamped
+                ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
         // Load tokenizer and weights in parallel.

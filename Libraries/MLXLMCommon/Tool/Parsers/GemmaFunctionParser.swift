@@ -18,7 +18,11 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     }
 
     /// Initialize with custom tags (for Gemma 4 which uses `<|tool_call>` / `<tool_call|>`)
-    public init(startTag: String, endTag: String, escapeMarker: String = "<|\"\\|>") {
+    /// Default escape marker is Gemma-4's `<|"|>` (three characters: `<`, `|`, `"`, `|`, `>`).
+    /// Previous default contained a spurious backslash (`<|"\|>`) that never appeared in
+    /// real Gemma-4 output; callers using this init directly without the `.gemma4` factory
+    /// would silently fail to decode string values. Factory path was always correct.
+    public init(startTag: String, endTag: String, escapeMarker: String = "<|\"|>") {
         self.startTag = startTag
         self.endTag = endTag
         self.escapeMarker = escapeMarker

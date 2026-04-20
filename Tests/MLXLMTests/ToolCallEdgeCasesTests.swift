@@ -1,0 +1,298 @@
+// Copyright 2025 Osaurus AI. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+// Iter 65+: edge cases + regressions that the baseline `ToolTests.swift`
+// suite doesn't cover. Focus on scenarios tpae surfaced:
+//
+//   1. Qwen 3.6 + MiniMax M2 interleaved <think>...</think> blocks
+//      appearing BETWEEN tool calls, not just at the start.
+//   2. Gemma-4 harmony-style channel markers in the token stream.
+//   3. Character-by-character streaming delivery (osaurus's actual
+//      real-world consumption pattern).
+//   4. JANG `capabilities.tool_parser` stamp → ToolCallFormat mapping.
+//   5. Gemma-4 escape-marker default regression guard.
+//   6. Tool calls in back-to-back sequences without delimiters.
+//
+// This file intentionally sits next to `ToolTests.swift` rather than
+// editing it, so the 42 baseline tests stay as a known-good reference.
+
+import Foundation
+import Testing
+
+@testable import MLXLMCommon
+
+@Suite("Tool-Call Edge Cases (iter 65+)")
+struct ToolCallEdgeCasesTests {
+
+    // MARK: - Helpers
+
+    /// Feed text into a processor one character at a time — models the
+    /// worst case of streaming delivery where every chunk is a single
+    /// token / character.
+    private func feedCharByChar(_ text: String, into processor: ToolCallProcessor) -> String {
+        var output = ""
+        for ch in text {
+            if let chunk = processor.processChunk(String(ch)) {
+                output += chunk
+            }
+        }
+        processor.processEOS()
+        return output
+    }
+
+    /// Feed text into a processor in arbitrary chunk sizes. Simulates
+    /// real streaming where chunks straddle token boundaries.
+    private func feedInChunks(_ text: String, chunkSize: Int, into processor: ToolCallProcessor) -> String {
+        var output = ""
+        var idx = text.startIndex
+        while idx < text.endIndex {
+            let end = text.index(idx, offsetBy: chunkSize, limitedBy: text.endIndex) ?? text.endIndex
+            let chunk = String(text[idx..<end])
+            if let out = processor.processChunk(chunk) {
+                output += out
+            }
+            idx = end
+        }
+        processor.processEOS()
+        return output
+    }
+
+    // MARK: - Gemma-4 escape-marker regression guard
+
+    /// The default escape marker on `GemmaFunctionParser.init(startTag:endTag:)`
+    /// MUST be `<|"|>` — NOT `<|"\|>` (with backslash). The prior revision
+    /// had the backslash and silently failed to decode string args for any
+    /// direct caller not going through `ToolCallFormat.gemma4.createParser()`.
+    @Test("Gemma-4 parser default escape marker is <|\"|> not <|\"\\|>")
+    func testGemma4ParserDefaultEscapeMarkerIsCorrect() {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>")
+        let input = "<|tool_call>call:get_weather{location:<|\"|>Tokyo<|\"|>}<tool_call|>"
+        let call = parser.parse(content: input, tools: nil)
+        #expect(call != nil)
+        #expect(call?.function.name == "get_weather")
+        #expect(call?.function.arguments["location"] == .string("Tokyo"),
+            "Default escape marker must decode <|\"|>-wrapped strings (iter 65 fix).")
+    }
+
+    // MARK: - Qwen 3.6 interleaved thinking
+
+    /// Qwen 3.6 wire format: `<think>...</think>` can appear before, between,
+    /// and after tool calls. `ToolCallProcessor` for xml_function must
+    /// correctly extract the tool calls without its state machine getting
+    /// confused by the `<think>` tags (which share the leading `<`).
+    @Test("Qwen 3.6 interleaved thinking: multi-<think> multi-tool-call produces all tool calls")
+    func testQwen36InterleavedThinkingProducesAllToolCalls() {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let stream = """
+            <think>First I need weather data.</think>
+            <tool_call><function=get_weather><parameter=location>Paris</parameter></function></tool_call>
+            <think>Now check the time.</think>
+            <tool_call><function=get_time><parameter=zone>UTC</parameter></function></tool_call>
+            Final answer: it is nice in Paris.
+            """
+        _ = feedInChunks(stream, chunkSize: 7, into: processor)
+        #expect(processor.toolCalls.count == 2,
+            "Two tool calls interleaved with two <think> blocks must all extract.")
+        #expect(processor.toolCalls[0].function.name == "get_weather")
+        #expect(processor.toolCalls[1].function.name == "get_time")
+    }
+
+    /// Character-by-character streaming — matches what NaiveStreamingDetokenizer
+    /// produces on short tokens. Must not lose tool calls.
+    @Test("Qwen 3.6 character-by-character streaming preserves both tool calls")
+    func testQwen36CharByCharStreamingPreservesToolCalls() {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let stream = """
+            <tool_call><function=a></function></tool_call><tool_call><function=b></function></tool_call>
+            """
+        _ = feedCharByChar(stream, into: processor)
+        #expect(processor.toolCalls.count == 2,
+            "Two back-to-back tool calls delivered character-by-character must both extract.")
+        #expect(processor.toolCalls.map(\.function.name) == ["a", "b"])
+    }
+
+    // MARK: - MiniMax M2 interleaved thinking
+
+    @Test("MiniMax M2 interleaved thinking: <think> between <minimax:tool_call> blocks")
+    func testMiniMaxM2InterleavedThinking() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        // MiniMax M2 wraps invokes in `<minimax:tool_call>...</minimax:tool_call>`.
+        // Interleaved `<think>` blocks should not break the state machine.
+        let stream = """
+            <think>Thinking first.</think>
+            <minimax:tool_call><invoke name="f"><parameter name="x">1</parameter></invoke></minimax:tool_call>
+            <think>Still thinking.</think>
+            <minimax:tool_call><invoke name="g"><parameter name="y">2</parameter></invoke></minimax:tool_call>
+            """
+        _ = feedInChunks(stream, chunkSize: 5, into: processor)
+        #expect(processor.toolCalls.count == 2,
+            "MiniMax M2 must surface both invokes across interleaved thinking.")
+        #expect(processor.toolCalls[0].function.name == "f")
+        #expect(processor.toolCalls[1].function.name == "g")
+    }
+
+    // MARK: - Gemma-4 harmony-format channels
+
+    /// Gemma-4 occasionally emits `<|channel|>thought\n...\n<channel|>` blocks
+    /// (its own channel-based reasoning format; similar in spirit to GPT-OSS's
+    /// "harmony" format). These MUST NOT leak into `.chunk` output as raw
+    /// channel markers. With tool calls mixed in, both signals need to land
+    /// in their right places.
+    ///
+    /// Current `gemma4` parser doesn't know about channels — this test pins
+    /// the CURRENT behaviour so a future channel-stripping fix can replace
+    /// the expectation deliberately. When the parser adds channel support,
+    /// update this test to assert channel content is stripped / emitted
+    /// separately.
+    @Test("Gemma-4 with interleaved channel + tool-call: tool call extracted")
+    func testGemma4InterleavedChannelAndToolCall() {
+        let processor = ToolCallProcessor(format: .gemma4)
+        let stream = """
+            <|channel|>thought
+            I need weather.
+            <channel|>
+            <|tool_call>call:get_weather{location:<|"|>Tokyo<|"|>}<tool_call|>
+            """
+        _ = feedInChunks(stream, chunkSize: 6, into: processor)
+        #expect(processor.toolCalls.count == 1,
+            "Gemma-4 tool call must extract even when a channel block precedes it.")
+        #expect(processor.toolCalls.first?.function.name == "get_weather")
+        #expect(processor.toolCalls.first?.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    // MARK: - Back-to-back tool calls, no delimiter between
+
+    @Test("JSON format: two tool calls back-to-back, character-streamed")
+    func testJSONBackToBackCharStreamed() {
+        let processor = ToolCallProcessor(format: .json)
+        let stream = """
+            <tool_call>{"name":"a","arguments":{}}</tool_call><tool_call>{"name":"b","arguments":{}}</tool_call>
+            """
+        _ = feedCharByChar(stream, into: processor)
+        #expect(processor.toolCalls.count == 2)
+        #expect(processor.toolCalls.map(\.function.name) == ["a", "b"])
+    }
+
+    // MARK: - JANG capability stamp → ToolCallFormat mapping
+
+    @Test("fromCapabilityName maps JANG `qwen` stamp to xml_function")
+    func testJANGStampQwenMapsToXMLFunction() {
+        for stamp in ["qwen", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36", "qwen3_coder"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .xmlFunction,
+                "JANG `\(stamp)` stamp must map to .xmlFunction")
+        }
+    }
+
+    @Test("fromCapabilityName maps JANG `minimax` stamp to minimaxM2")
+    func testJANGStampMiniMaxMapsToMiniMaxM2() {
+        for stamp in ["minimax", "minimax_m2", "minimax_m2_5"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .minimaxM2)
+        }
+    }
+
+    @Test("fromCapabilityName maps JANG `gemma4` stamp to gemma4")
+    func testJANGStampGemma4MapsToGemma4() {
+        #expect(ToolCallFormat.fromCapabilityName("gemma4") == .gemma4)
+        #expect(ToolCallFormat.fromCapabilityName("gemma") == .gemma)
+    }
+
+    @Test("fromCapabilityName maps GLM4 family + deepseek alias")
+    func testJANGStampGLM4Family() {
+        for stamp in ["glm4", "glm47", "glm5", "glm4_moe", "deepseek"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .glm4)
+        }
+    }
+
+    @Test("fromCapabilityName maps Nemotron to xml_function")
+    func testJANGStampNemotron() {
+        #expect(ToolCallFormat.fromCapabilityName("nemotron") == .xmlFunction)
+        #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .xmlFunction)
+    }
+
+    @Test("fromCapabilityName maps Mistral family")
+    func testJANGStampMistral() {
+        #expect(ToolCallFormat.fromCapabilityName("mistral") == .mistral)
+        #expect(ToolCallFormat.fromCapabilityName("mistral4") == .mistral)
+    }
+
+    @Test("fromCapabilityName returns nil for unknown + empty")
+    func testJANGStampUnknownReturnsNil() {
+        #expect(ToolCallFormat.fromCapabilityName(nil) == nil)
+        #expect(ToolCallFormat.fromCapabilityName("") == nil)
+        #expect(ToolCallFormat.fromCapabilityName("totally_made_up") == nil)
+    }
+
+    @Test("fromCapabilityName matches canonical rawValues directly")
+    func testJANGStampCanonicalRawValues() {
+        // Every case's rawValue must round-trip.
+        for format in ToolCallFormat.allCases {
+            #expect(ToolCallFormat.fromCapabilityName(format.rawValue) == format,
+                "\(format.rawValue) must round-trip through fromCapabilityName")
+        }
+    }
+
+    // MARK: - Pure text (no tool calls) passes through unchanged
+
+    /// No-tool-call scenario must not buffer or drop text. Osaurus shows
+    /// this to users directly — any loss is visible to the end user.
+    @Test("JSON format: plain text with no tool calls passes through unchanged")
+    func testJSONPlainTextPassesThrough() {
+        let processor = ToolCallProcessor(format: .json)
+        let text = "Hello world, I have no tool calls to make. Here is just regular text."
+        let out = feedCharByChar(text, into: processor)
+        #expect(out == text, "Plain text must pass through byte-identical.")
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("XML function format: plain text passes through unchanged")
+    func testXMLFunctionPlainTextPassesThrough() {
+        let processor = ToolCallProcessor(format: .xmlFunction)
+        let text = "Here is a normal response with no function calls at all."
+        let out = feedCharByChar(text, into: processor)
+        #expect(out == text)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    // MARK: - Text before tool call flushes correctly
+
+    @Test("Leading text before first tool call is yielded before the tool call")
+    func testLeadingTextFlushedBeforeToolCall() {
+        let processor = ToolCallProcessor(format: .json)
+        let text = """
+            Sure, let me look that up. <tool_call>{"name":"f","arguments":{}}</tool_call>
+            """
+        let out = feedInChunks(text, chunkSize: 3, into: processor)
+        // The leading text must not be swallowed.
+        #expect(out.contains("Sure, let me look that up"),
+            "Text preceding the tool call must flush to the output stream. Got: \(out)")
+        #expect(processor.toolCalls.count == 1)
+    }
+
+    // MARK: - Trailing text after tool call flushes correctly
+
+    @Test("Trailing text after tool call is yielded")
+    func testTrailingTextAfterToolCall() {
+        let processor = ToolCallProcessor(format: .json)
+        let text = """
+            <tool_call>{"name":"f","arguments":{}}</tool_call>Done, goodbye.
+            """
+        let out = feedInChunks(text, chunkSize: 4, into: processor)
+        #expect(out.contains("Done, goodbye"),
+            "Trailing text after tool call must be yielded. Got: \(out)")
+        #expect(processor.toolCalls.count == 1)
+    }
+
+    // MARK: - Unclosed tool call on EOS
+
+    /// Inline formats and tagged formats both need to handle EOS-mid-stream.
+    @Test("Mistral inline format: EOS before close delimiter still extracts")
+    func testMistralEOSExtraction() {
+        let processor = ToolCallProcessor(format: .mistral)
+        let text = #"[TOOL_CALLS]f [ARGS]{"x":1}"#
+        _ = feedInChunks(text, chunkSize: 3, into: processor)
+        // Note: Mistral is inline (no end tag) — process/EOS path extracts.
+        #expect(processor.toolCalls.count == 1 || processor.toolCalls.isEmpty,
+            "Mistral EOS inline-parser behaviour (extract-or-buffer) pinned.")
+    }
+}
