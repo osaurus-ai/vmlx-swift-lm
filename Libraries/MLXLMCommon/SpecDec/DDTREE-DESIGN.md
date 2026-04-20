@@ -228,31 +228,47 @@ Public `z-lab/<name>-DFlash` checkpoints that return a `config.json` (unauthenti
 
 Phase 1 work targets gpt-oss-20b first (dense, smallest public drafter, pure-attention). Phase 3's hybrid SSM story then brings in Qwen 3.5-27B where the speedup vs autoregressive is ceiling-limited until per-node SSM fork lands.
 
-## 11a. Real-model tok/s measurements (iter 17)
+## 11a. Real-model tok/s measurements (commits 7b04129 + 982a656)
 
-Measured on **Apple M4 Max 128GB**, swift-build debug, temperature 0, BENCH_MAX_TOKENS=20. Target + drafter pair: `mlx-community/Qwen3.5-27B-4bit` (loads as `Qwen35` VLM-wrapper) + `z-lab/Qwen3.5-27B-DFlash` (3.2 GB, 5 layers, block_size=16). Deterministic prompt `"The capital of France is"` via HF chat template.
+Measured on **Apple M4 Max 128GB**, swift-build **release** (`-c release`), temperature 0. Target + drafter pair: `mlx-community/Qwen3.5-27B-4bit` (loads as VLM-wrapped `Qwen35`) + `z-lab/Qwen3.5-27B-DFlash` (3.2 GB, 5 layers, block_size=16, target_layer_ids=[1,16,31,46,61]). Deterministic prompt `"The capital of France is"` via HF chat template.
 
-| Path | Wall time | Tokens | tok/s | vs AR | Byte-identical? |
-|---|---|---|---|---|---|
-| Plain greedy AR | 4.11 s | 20 | 4.9 | 1.00× | — |
-| DFlash linear | 3.45 s | 20 | 5.8 | **1.18×** | ✅ |
-| DDTree budget=8 (v1 multi-run) | 22.02 s | 20 | 0.9 | 0.19× | ✅ |
+### BENCH_MAX_TOKENS=64
 
-Interpretation:
+| Path | Wall time | Tokens | tok/s | vs AR | Byte-identical? | Acceptance |
+|---|---|---|---|---|---|---|
+| Plain greedy AR | 18.81 s | 64 | 3.4 | 1.00× | — | — |
+| DFlash linear | 4.23 s | 71 | 16.8 | **4.94×** | ✅ | 6.00 / 15 per block (40%) |
+| DDTree budget=8 | 165.62 s | 65 | 0.4 | 0.12× | ✅ | 0.52 depth/round |
 
-- **DFlash 1.18× is close to the paper's 1.3× ceiling for hybrid-SSM** targets (Qwen 3.5 interleaves GatedDeltaNet + full attention). Paper number is on CUDA with KV cache rollback; ours is on Metal without rollback — the v1 runtime re-prefills the target each round which caps the speedup. Closing the gap to 1.3× is `CacheCoordinator` rollback work (post-iter-17).
-- **DDTree 0.19× (slower than AR) is expected for v1 multi-run TreeVerify.** For a budget-8 tree with ~3 rounds per generation, that's ~27 target forwards vs 20 for plain AR. The paper's 1.5× DDTree-over-DFlash requires the single-forward tree-verify path (combined `(1, 1, T, prefix_len+T)` attention mask + per-token RoPE) — iter 18+ work.
-- **Both SpecDec paths produce output byte-identical to greedy AR at temperature 0.** Correctness contract holds regardless of wall-clock speedup. Drafter affects speed; target argmax determines output.
+### BENCH_MAX_TOKENS=128
 
-Commit SHA that produced these numbers: **d7d59da** (iter 17).
+| Path | Wall time | Tokens | tok/s | vs AR | Byte-identical? | Acceptance |
+|---|---|---|---|---|---|---|
+| Plain greedy AR | 60.55 s | 128 | 2.1 | 1.00× | — | — |
+| DFlash linear | 15.21 s | 128 | 8.4 | **4.00×** | ✅ | 4.62 / 15 per block (31%) |
+| DDTree budget=8 | 500.52 s | 128 | 0.3 | 0.14× | ✅ | 1.06 depth/round |
 
-Reproduction:
+### Notes
+
+- **Earlier 1.18× number was a measurement error** — a layer-index off-by-one bug (converting HF `target_layer_ids` as 1-based when z-lab/dflash's `_patch_model` uses them directly as 0-based) was handing the drafter garbage context, so acceptance was 0.25/15 (~1.7%) and the "speedup" came purely from the drafter's marginal overhead saved on the few tokens that happened to match. Fixed in **7b04129**.
+- **Caveat — uncached AR baseline**: The bench's plain AR path re-prefills the full sequence on every token (no KV cache), so it's O(N²). The 4× ratio is "uncached AR vs uncached DFlash". A properly cached AR would be ~10-15× faster in absolute terms, which would compress the measured ratio. The acceptance rate (31-40%) is independent of the harness and is the true correctness indicator.
+- **DDTree still slow** because v1 `TreeVerify` runs one target forward per tree node (O(budget) forwards per round). The single-forward tree-verify path (combined `(1, 1, T, prefix_len+T)` attention mask + per-token RoPE) is the next perf milestone.
+- **Byte-parity vs greedy AR holds on both paths.** Drafter affects speed; target argmax determines output.
+
+### Known follow-ups (not merge-blocking)
+
+- Drafter KV cache (z-lab/dflash's `ContextOnlyDraftKVCache`): currently we pass full committed `target_hidden` every round (O(N) per round). Proper cache would be O(blockSize). Cost-effective for sequences > ~512 new tokens.
+- CacheCoordinator rollback for target KV cache: we re-prefill the target from scratch per round; rollback-and-patch would reduce target forward cost.
+- Single-forward TreeVerify: unlocks DDTree > DFlash speedup.
+
+### Reproduction
 
 ```bash
+swift build -c release
 BENCH_MODEL=/tmp/ddtree-downloads/Qwen3.5-27B-target \
   BENCH_SPECDEC_DRAFTER=/tmp/ddtree-downloads/Qwen3.5-27B-DFlash \
-  BENCH_BATCH_SPECDEC=1 BENCH_MAX_TOKENS=20 \
-  ./.build/debug/RunBench
+  BENCH_BATCH_SPECDEC=1 BENCH_MAX_TOKENS=128 \
+  ./.build/release/RunBench
 ```
 
 ## 12. Iter log (commit SHAs)

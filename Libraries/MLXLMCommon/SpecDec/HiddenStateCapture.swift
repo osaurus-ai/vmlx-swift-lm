@@ -23,9 +23,10 @@ import MLX
 /// Layer indexing is **0-based on the block output**: `captureLayerIDs
 /// = {0, 5, 10, 15, 20}` captures `h` after blocks 0, 5, 10, 15, 20
 /// respectively. Implementers must capture *after* the block and *before*
-/// passing to the next block (or to the final norm). For the drafter's
-/// `target_layer_ids` in HF config.json (1-based post-embedding), subtract
-/// one when translating to this protocol.
+/// passing to the next block (or to the final norm). HF config's
+/// `dflash_config.target_layer_ids` ARE 0-based indices into
+/// `target.model.layers` (per z-lab/dflash `_patch_model`) — pass them
+/// through directly, no shift needed.
 ///
 /// Models that don't conform to this protocol cannot be used as DFlash
 /// targets — `SpecDecRuntime` throws
@@ -64,8 +65,8 @@ extension HiddenStateCaptureModel {
 /// the hidden dimension in the order `target_layer_ids` specifies.
 ///
 /// Matches the Python reference `extract_context_feature(hidden_states,
-/// target_layer_ids)` except that our `captured` is already 0-based;
-/// the caller converted from HF's 1-based `target_layer_ids`.
+/// target_layer_ids)`. HF `target_layer_ids` are already 0-based indices
+/// into `target.model.layers`; pass them through unchanged.
 ///
 /// - Returns: `(B, L, len(targetLayerIDs) * hidden)` tensor ready for
 ///   `DFlashDraftModel.fc`.
