@@ -197,6 +197,7 @@ Each would crash or silently corrupt under osaurus production load.
 | JANG weights-only bundles had no chat template | `bca0786` (iter 29) |
 | `mlx-community/Qwen3.5-VL-9B-8bit` unsupported `TokenizersBackend` tokenizer class | `cc1ee54` (iter 59) |
 | `DiskCache.store` not thread-safe across `MLX.eval` + `save` + SQLite (MTL command-buffer crash under concurrent writers) | `30e00a1` (iter 61) |
+| `BatchKVCache.makeMask` sized mask key-dim at `offset+n`, ignoring `RotatingKVCache` slot's `maxSize` cap — crashed any sliding-window family (Gemma-3/4, Mistral-3/4, MiMoV2Flash, BaichuanM1) with `broadcast_shapes (1,1,1,offset+1)` vs `(1,H,1,maxSize)` on the first batched decode step after prefilling past the window. See `GEMMA4-SLIDING-WINDOW-CRASH.md`. | `fix/osaurus-integration-issues` |
 
 ---
 

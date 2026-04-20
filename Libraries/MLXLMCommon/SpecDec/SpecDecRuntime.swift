@@ -167,13 +167,16 @@ public enum SpecDecRuntimeLinear {
             maybeQuantizeKVCache(
                 cache: &targetCache, kvBits: nil, kvMode: args.kvMode)
         }
-        // `accumulatedHidden` holds every committed position's hidden.
-        // Grows by (accepted + 1) positions per round. Drafter attends
-        // to this full accumulated context on every call since we don't
-        // yet have a drafter KV cache.
-        var accumulatedHidden = extractContextFeature(
+        // Drafter KV cache accumulates ctx keys/values across rounds.
+        // On round 1 we feed prompt hidden (promptLen positions); on
+        // round N+1 we feed just commitHidden from round N (acc+1 positions).
+        // Per-round drafter cost becomes O(block_size + new_ctx) instead
+        // of O(committed_count + block_size).
+        let drafterCache: [KVCache] = args.drafter.newCache()
+        // newCtxHidden = the ctx positions to feed drafter on NEXT call.
+        var newCtxHidden = extractContextFeature(
             captured: prefillHidden, targetLayerIDs: args.targetBlockIDs)
-        materialize(accumulatedHidden)
+        materialize(newCtxHidden)
 
         var bonus: Int32 = sampleArgmax(prefillLogits, temperature: args.temperature)
         tokens.append(bonus)
@@ -201,18 +204,15 @@ public enum SpecDecRuntimeLinear {
 
             // Drafter input = target's shared embedding of the block.
             let noiseEmbedding = args.target.embed(blockIds)
-            // Drafter position IDs span `startPos..startPos+blockSize`.
             let startPos = tokens.count - 1
-            let blockPositions = MLXArray(
-                (startPos..<startPos + blockSize).map { Int32($0) }
-            ).reshaped(1, blockSize)
 
-            // Drafter forward with the accumulated committed hidden as
-            // context. Output shape: (1, blockSize, hidden).
+            // Drafter forward — feeds ONLY the new ctx positions since
+            // last round. Cache carries prior ctx.
             let drafterOut = args.drafter(
                 noiseEmbedding: noiseEmbedding,
-                targetHidden: accumulatedHidden,
-                positionIds: blockPositions,
+                targetHidden: newCtxHidden,
+                qOffset: startPos,
+                cache: drafterCache,
                 attentionMask: .none)
             // Last block_size-1 positions → target LM head → draft logits.
             let drafterTail = drafterOut[0..., 1..., 0...]
@@ -287,22 +287,18 @@ public enum SpecDecRuntimeLinear {
             thisRoundTokens.append(bonus)
             onCommitted?(thisRoundTokens)
 
-            // Accumulate hidden for committed-this-round positions.
-            //   Fast path: `verifyHidden` has shape (1, bs, *). Slice
-            //   the first (accepted + 1) rows — those are the committed
-            //   tokens' hiddens; the rest were rejected drafts.
-            //   Fallback: `verifyHidden` has shape (1, verifyInput.count,
-            //   *). Slice positions [blockStartIdx ..< blockStartIdx +
-            //   accepted + 1].
+            // Slice committed-this-round hiddens for next round's drafter.
+            //   Fast path: `verifyHidden` has shape (1, bs, *) — take the
+            //     first (accepted + 1) rows.
+            //   Fallback: `verifyHidden` covers the full re-prefill — take
+            //     positions [blockStartIdx..blockStartIdx+accepted+1].
             let commitCount = acceptanceLength + 1
             let newHidden = extractContextFeature(
                 captured: verifyHidden, targetLayerIDs: args.targetBlockIDs)
             let hiddenStart = blockStartIdx
-            let commitHidden = newHidden[
+            newCtxHidden = newHidden[
                 0..., hiddenStart..<(hiddenStart + commitCount), 0...]
-            accumulatedHidden = concatenated(
-                [accumulatedHidden, commitHidden], axis: 1)
-            materialize(accumulatedHidden)
+            materialize(newCtxHidden)
 
             // Roll back the target cache by `rejectedCount` positions so
             // the next round's forward starts from the committed prefix.
@@ -487,14 +483,11 @@ public enum SpecDecRuntimeDDTree {
 
             let noiseEmbedding = args.target.embed(blockIds)
             let startPos = tokens.count - 1
-            let blockPositions = MLXArray(
-                (startPos..<startPos + blockSize).map { Int32($0) }
-            ).reshaped(1, blockSize)
 
             let drafterOut = args.drafter(
                 noiseEmbedding: noiseEmbedding,
                 targetHidden: targetHidden,
-                positionIds: blockPositions,
+                qOffset: startPos,
                 attentionMask: .none)
             // Last block-1 positions go through target LM head.
             let drafterTail = drafterOut[0..., 1..., 0...]

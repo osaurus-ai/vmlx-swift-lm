@@ -116,11 +116,32 @@ public final class BatchKVCache: BaseKVCache {
     ///
     /// Always returns `.array(mask)` because batched sequences at different
     /// positions cannot use the symbolic `.causal` or `.none` shortcuts.
+    ///
+    /// Slots backed by a bounded cache (e.g., `RotatingKVCache` — any cache
+    /// that reports a non-nil `maxSize`) have their effective key length
+    /// capped at `maxSize` once the ring wraps, matching the number of keys
+    /// the slot's `update(...)` actually returns. Without this, the mask's
+    /// last axis would be `offset + n` while the attention scores' last
+    /// axis would be `maxSize`, and MLX would crash in `broadcast_shapes`
+    /// on Gemma-3/4 SWA, Mistral-4, MiMoV2Flash, BaichuanM1, and any
+    /// other sliding-window family under the batch engine. See
+    /// `GEMMA4-SLIDING-WINDOW-CRASH.md` in this directory.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let offsets = slotCaches.map(\.offset)
-        return .array(createBatchCausalMask(queryLen: n, offsets: offsets, windowSize: windowSize))
+        let effectiveKeyLens: [Int] = slotCaches.map { slot in
+            let logical = slot.offset + n
+            if let maxSize = slot.maxSize, logical > maxSize {
+                return maxSize
+            }
+            return logical
+        }
+        return .array(createBatchCausalMask(
+            queryLen: n,
+            offsets: offsets,
+            effectiveKeyLens: effectiveKeyLens,
+            windowSize: windowSize))
     }
 
     public override var maxSize: Int? { nil }

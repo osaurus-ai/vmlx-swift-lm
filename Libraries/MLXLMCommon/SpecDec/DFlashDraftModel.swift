@@ -156,15 +156,18 @@ final class DFlashAttention: Module {
     /// - Parameters:
     ///   - hiddenStates: `(B, q_len, hidden)` drafter input (noise embedding).
     ///   - targetHidden: `(B, ctx_len, hidden)` post-`fc`+`hidden_norm`
-    ///     target context projection.
-    ///   - positionIds: `(B, q_len)` Int32 absolute positions for the
-    ///     drafter queries.
+    ///     target context projection — NEW committed positions this round.
+    ///   - qOffset: absolute RoPE offset for the block queries (position
+    ///     of `hiddenStates[0]` in the target sequence). Passed as Int to
+    ///     avoid per-layer CPU-GPU sync on position arrays.
+    ///   - cache: optional KV cache that accumulates ctx keys/values
+    ///     across rounds. Port of z-lab's `ContextOnlyDraftKVCache`.
     ///   - mask: `(..., q_len, ctx_len + q_len)` additive attention mask.
-    ///     `nil` → causal-over-concat default.
     public func callAsFunction(
         hiddenStates: MLXArray,
         targetHidden: MLXArray,
-        positionIds: MLXArray,
+        qOffset: Int,
+        cache: KVCache? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         let b = hiddenStates.dim(0)
@@ -174,33 +177,42 @@ final class DFlashAttention: Module {
         let kvHeads = args.numKeyValueHeads
         let headDim = args.headDim
 
-        // Q comes only from hidden_states (drafter's own sequence).
         var q = wq(hiddenStates)
             .reshaped(b, qLen, heads, headDim)
         q = qNorm(q).transposed(0, 2, 1, 3)
 
-        // K/V come from concat(target_hidden, hidden_states) — this is the
-        // "KV injection" of the DFlash paper.
-        let kCtx = wk(targetHidden)
-        let kNoise = wk(hiddenStates)
-        let vCtx = wv(targetHidden)
-        let vNoise = wv(hiddenStates)
-        var k = concatenated([kCtx, kNoise], axis: 1)
-            .reshaped(b, ctxLen + qLen, kvHeads, headDim)
-        var v = concatenated([vCtx, vNoise], axis: 1)
-            .reshaped(b, ctxLen + qLen, kvHeads, headDim)
-        k = kNorm(k).transposed(0, 2, 1, 3)
-        v = v.transposed(0, 2, 1, 3)
+        // ctx K/V from target_hidden — cached across rounds.
+        var kCtx = wk(targetHidden).reshaped(b, ctxLen, kvHeads, headDim)
+        var vCtx = wv(targetHidden).reshaped(b, ctxLen, kvHeads, headDim)
+        kCtx = kNorm(kCtx).transposed(0, 2, 1, 3)
+        vCtx = vCtx.transposed(0, 2, 1, 3)
 
-        // RoPE applies to q over its own positions; k uses its "full"
-        // positions which include the ctx_len prefix. The Python reference
-        // rotates both with the same (cos, sin) but using the last q_len
-        // slice for q. We match by applying RoPE to q at `positionIds`
-        // and to k at the concatenated range `[0..ctxLen+qLen)` —
-        // equivalent because ctx_len positions are assumed continuous with
-        // the q positions (the target provided them in order).
-        q = rope(q, offset: positionIds.asArray(Int.self).first ?? 0)
-        k = rope(k, offset: 0)
+        // prop K/V from hiddenStates — NOT cached (block tokens may reject).
+        var kNoise = wk(hiddenStates).reshaped(b, qLen, kvHeads, headDim)
+        var vNoise = wv(hiddenStates).reshaped(b, qLen, kvHeads, headDim)
+        kNoise = kNorm(kNoise).transposed(0, 2, 1, 3)
+        vNoise = vNoise.transposed(0, 2, 1, 3)
+
+        // RoPE rotation at absolute positions:
+        //   cached ctx (pre-existing): [0..cacheOffset-1]           (already rotated)
+        //   new ctx (this call):       [cacheOffset..cacheOffset+ctxLen-1]
+        //   prop block:                [qOffset..qOffset+qLen-1]
+        // Caller ensures qOffset == cacheOffset + ctxLen in steady state.
+        let cacheOffset = cache?.offset ?? 0
+        kCtx = rope(kCtx, offset: cacheOffset)
+        let kNoiseRot = rope(kNoise, offset: qOffset)
+        q = rope(q, offset: qOffset)
+
+        let k: MLXArray
+        let v: MLXArray
+        if let cache = cache {
+            let (accumK, accumV) = cache.update(keys: kCtx, values: vCtx)
+            k = concatenated([accumK, kNoiseRot], axis: 2)
+            v = concatenated([accumV, vNoise], axis: 2)
+        } else {
+            k = concatenated([kCtx, kNoiseRot], axis: 2)
+            v = concatenated([vCtx, vNoise], axis: 2)
+        }
 
         let output = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: scale, mask: mask
@@ -253,14 +265,16 @@ final class DFlashDecoderLayer: Module {
     public func callAsFunction(
         hiddenStates: MLXArray,
         targetHidden: MLXArray,
-        positionIds: MLXArray,
+        qOffset: Int,
+        cache: KVCache? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> MLXArray {
         var h = hiddenStates
         let r1 = attention(
             hiddenStates: inputLayerNorm(h),
             targetHidden: targetHidden,
-            positionIds: positionIds,
+            qOffset: qOffset,
+            cache: cache,
             mask: mask)
         h = h + r1
         let r2 = mlp(postAttentionLayerNorm(h))
@@ -313,28 +327,38 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     ///     `target.embed_tokens([bonus, mask, mask, ..., mask])`. Shared
     ///     embedding with target.
     ///   - targetHidden: `(B, ctx_len, len(target_layer_ids) * hidden)` —
-    ///     concatenation along the last dim of target hidden states at
-    ///     `target_layer_ids`.
-    ///   - positionIds: `(B, block_size)` absolute positions.
+    ///     NEW committed-this-round target hidden states. Prior rounds'
+    ///     ctx lives in `cache` (if provided).
+    ///   - qOffset: absolute RoPE offset for the block queries.
+    ///   - cache: optional per-layer drafter KV cache; when passed, ctx
+    ///     K/V accumulate across rounds so per-round cost is O(block_size).
     ///   - attentionMask: `(1, 1, q_len, ctx_len + q_len)` additive mask
     ///     or `nil` for causal-over-concat default.
-    /// - Returns: `(B, block_size, hidden)` post-LN drafter output ready
-    ///   for the target's LM head.
     public func callAsFunction(
         noiseEmbedding: MLXArray,
         targetHidden: MLXArray,
-        positionIds: MLXArray,
+        qOffset: Int,
+        cache: [KVCache]? = nil,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
         var h = noiseEmbedding
         let projected = hiddenNorm(fc(targetHidden))
-        for layer in layers {
+        for (i, layer) in layers.enumerated() {
             h = layer(
                 hiddenStates: h,
                 targetHidden: projected,
-                positionIds: positionIds,
+                qOffset: qOffset,
+                cache: cache?[i],
                 mask: attentionMask)
         }
         return norm(h)
+    }
+
+    /// Build a fresh per-layer KV cache sized to this drafter. Each layer
+    /// gets a `KVCacheSimple` that stores post-RoPE ctx keys/values; the
+    /// accumulating ctx cache is the drafter-side half of the DFlash fast
+    /// path (z-lab's `ContextOnlyDraftKVCache`).
+    public func newCache() -> [KVCache] {
+        (0..<config.numHiddenLayers).map { _ in KVCacheSimple() }
     }
 }

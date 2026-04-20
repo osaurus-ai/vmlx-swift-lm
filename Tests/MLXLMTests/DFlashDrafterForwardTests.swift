@@ -187,13 +187,11 @@ struct DFlashDrafterForwardTests {
         let noise = MLXArray.zeros([1, block, hidden])
         // (B=1, ctx, nTargetLayers * hidden) concatenated target hidden states.
         let targetHidden = MLXArray.zeros([1, ctx, nTargetLayers * hidden])
-        // (1, block) absolute positions.
-        let positionIds = MLXArray((ctx..<ctx + block).map { Int32($0) })[.newAxis]
 
         let out = model(
             noiseEmbedding: noise,
             targetHidden: targetHidden,
-            positionIds: positionIds,
+            qOffset: ctx,
             attentionMask: .none)
         materialize(out)
 

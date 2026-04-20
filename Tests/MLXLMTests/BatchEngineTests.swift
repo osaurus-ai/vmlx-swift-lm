@@ -206,6 +206,160 @@ struct BatchCausalMaskTests {
     }
 }
 
+// MARK: - BatchKVCache with Rotating Slots (Gemma-4 SWA regression)
+
+/// Regression suite for the broadcast_shapes crash on Gemma-4 / Mistral-4 /
+/// MiMoV2Flash / BaichuanM1 and any other sliding-window model under the
+/// batch engine.
+///
+/// Without the effective-key-length fix, `BatchKVCache.makeMask` produced a
+/// mask whose last axis was `offset + n` while `RotatingKVCache.update` only
+/// returned `maxCacheSize` keys after wrap, so MLX trapped in
+/// `broadcast_shapes` on the very first decode step.
+///
+/// See `Libraries/MLXLMCommon/BatchEngine/GEMMA4-SLIDING-WINDOW-CRASH.md`.
+@Suite("BatchKVCache rotating-slot (Gemma-4 SWA regression)", .serialized)
+struct BatchKVCacheRotatingSlotTests {
+
+    @Test("makeMask last axis matches update key count after ring wrap")
+    func testMaskMatchesUpdatedKeyShape() {
+        // Tiny window so we can wrap cheaply in-test. Real Gemma-4 has
+        // maxSize 1024 and prompt 2152 — same topology, bigger numbers.
+        let maxSize = 16
+        let prompt = 40
+        let H = 4
+        let D = 8
+        let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+
+        // Prefill: single multi-token update past the ring (matches how
+        // non-chunked VLM prepare populates Gemma-4's sliding layers).
+        _ = rotating.update(
+            keys: MLXArray.ones([1, H, prompt, D]),
+            values: MLXArray.ones([1, H, prompt, D]))
+        #expect(rotating.offset == prompt)
+
+        // One decode step with n = 1 — this is the step that used to crash.
+        let batchCache = BatchKVCache(slotCaches: [rotating])
+        let mask = batchCache.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+        let newK = MLXArray.ones([1, H, 1, D])
+        let newV = MLXArray.ones([1, H, 1, D])
+        let (rk, _) = batchCache.update(keys: newK, values: newV)
+
+        // After update, rotating slot has wrapped: keys shape last axis = maxSize.
+        #expect(rk.shape == [1, H, maxSize, D])
+
+        // The fix: mask's last axis equals update's key length. Without the
+        // fix this was `offset + n == prompt + 1 == 41` and MLX crashed.
+        if case .array(let maskArray) = mask {
+            #expect(maskArray.shape.last == rk.shape[2])
+            #expect(maskArray.shape == [1, 1, 1, maxSize])
+
+            // Post-wrap ring → every stored key is a valid attention target.
+            for j in 0 ..< maxSize {
+                #expect(maskArray[0, 0, 0, j].item(Bool.self) == true)
+            }
+        } else {
+            Issue.record("Expected .array mask, got \(mask)")
+        }
+    }
+
+    @Test("pre-wrap rotating slot still gets standard causal mask")
+    func testPreWrapMaskUnchanged() {
+        // Before wrap: rotating cache behaves like a standard growing cache.
+        let maxSize = 32
+        let prompt = 8 // well under maxSize
+        let H = 2
+        let D = 4
+        let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+        _ = rotating.update(
+            keys: MLXArray.ones([1, H, prompt, D]),
+            values: MLXArray.ones([1, H, prompt, D]))
+
+        let batchCache = BatchKVCache(slotCaches: [rotating])
+        let mask = batchCache.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+        if case .array(let maskArray) = mask {
+            // Pre-wrap: mask last axis = offset + n = 9
+            #expect(maskArray.shape == [1, 1, 1, prompt + 1])
+            // Query at logical pos 8 attends to [0..8]
+            for j in 0 ..< prompt + 1 {
+                #expect(maskArray[0, 0, 0, j].item(Bool.self) == true)
+            }
+        } else {
+            Issue.record("Expected .array mask, got \(mask)")
+        }
+    }
+
+    @Test("mixed batch: wrapped rotating + unbounded slot produces compatible mask")
+    func testMixedBatchWrappedAndUnbounded() {
+        // NOTE: in the real engine, slots for a given layer always share cache
+        // type (one BatchKVCache per layer). This test is a belt-and-braces
+        // check that createBatchCausalMask handles the mixed case gracefully
+        // — e.g., if a future model puts different layer topologies behind
+        // the same BatchKVCache, the mask shouldn't corrupt either slot.
+        let maxSize = 16
+        let rotating = RotatingKVCache(maxSize: maxSize, keep: 0)
+        _ = rotating.update(
+            keys: MLXArray.ones([1, 2, 40, 4]),
+            values: MLXArray.ones([1, 2, 40, 4])) // wrapped: offset=40, keys=maxSize
+
+        let simple = KVCacheSimple()
+        _ = simple.update(
+            keys: MLXArray.ones([1, 2, 5, 4]),
+            values: MLXArray.ones([1, 2, 5, 4])) // offset=5, keys=5
+
+        let batch = BatchKVCache(slotCaches: [rotating, simple])
+        let mask = batch.makeMask(n: 1, windowSize: maxSize, returnArray: false)
+
+        if case .array(let maskArray) = mask {
+            // maxTotal = max(16 (capped rotating), 6 (simple)) = 16
+            #expect(maskArray.shape == [2, 1, 1, maxSize])
+
+            // Slot 0 (wrapped rotating): all 16 positions valid (ring full).
+            for j in 0 ..< maxSize {
+                #expect(maskArray[0, 0, 0, j].item(Bool.self) == true)
+            }
+
+            // Slot 1 (unbounded): valid through position 5, padded [6..16) = false.
+            for j in 0 ..< 6 {
+                #expect(maskArray[1, 0, 0, j].item(Bool.self) == true)
+            }
+            for j in 6 ..< maxSize {
+                #expect(maskArray[1, 0, 0, j].item(Bool.self) == false)
+            }
+        } else {
+            Issue.record("Expected .array mask, got \(mask)")
+        }
+    }
+
+    @Test("explicit effectiveKeyLens parameter caps maxTotal")
+    func testCreateBatchCausalMaskWithEffectiveKeyLens() {
+        // Call the low-level helper directly — slot A wrapped, slot B unbounded.
+        let mask = createBatchCausalMask(
+            queryLen: 1,
+            offsets: [100, 5],
+            effectiveKeyLens: [16, 6], // slot A ring cap = 16, slot B = offset + n
+            windowSize: nil)
+
+        // maxTotal = max(16, 6) = 16
+        #expect(mask.shape == [2, 1, 1, 16])
+
+        // Slot A (wrapped): all 16 positions valid.
+        for j in 0 ..< 16 {
+            #expect(mask[0, 0, 0, j].item(Bool.self) == true)
+        }
+
+        // Slot B (unbounded, offset=5): valid through position 5, rest padding.
+        for j in 0 ..< 6 {
+            #expect(mask[1, 0, 0, j].item(Bool.self) == true)
+        }
+        for j in 6 ..< 16 {
+            #expect(mask[1, 0, 0, j].item(Bool.self) == false)
+        }
+    }
+}
+
 // MARK: - BatchEngine Integration Tests (uses small Llama model)
 
 /// Integration tests that create a small Llama model and run BatchEngine
