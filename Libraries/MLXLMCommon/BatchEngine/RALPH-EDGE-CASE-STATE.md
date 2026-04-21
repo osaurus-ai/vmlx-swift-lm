@@ -18,3 +18,4 @@ completing an item. Do NOT edit older rows.
 | B2 | interleaved thinking | 1 | test-only ✓ | `23e9ae7` | Toggle state-machine handles multiple `<think>...</think>` blocks mid-response. |
 | B4 | partial `</think>` at EOS | 1 | test-only ✓ | `23e9ae7` | Inside-state flush emits held bytes as reasoning. |
 | B5 | entire output is reasoning | 1 | test-only ✓ | `23e9ae7` | With startInReasoning=true and no closer, flush drains all to reasoning. |
+| C1 | 55K-token translation OOM | 2 | **shipped** ✓ | `35820ba` | Coordinator-owned KV sizing contract (`KV-SIZING-CONTRACT.md`). `CacheCoordinatorConfig.defaultKVMode` + `.defaultMaxKVSize` fill per-request gaps at `BatchEngine.admitPendingRequests`. 10 unit tests cover all resolution paths. |

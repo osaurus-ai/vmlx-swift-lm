@@ -177,3 +177,15 @@ prefill), but the common path is a single ticket.
 - Include **prefill workspace** in your peak estimate (it is transient, but can dominate memory).
 - For hybrid models, sum all components (full-attention KV + linear/SSM cache + workspace).
 - When using KV quantization, change `bytesPerElement` accordingly.
+
+## Sticky wired limit across process restarts
+
+`WiredMemoryManager.applyLimit` eventually reaches `mlx_set_wired_limit`, which writes the macOS **kernel sysctl `iogpu.wired_limit_mb`**. That sysctl is system-wide and **persists across process restarts until the next reboot**. When the manager's `end()` unwinds normally it restores the baseline, but if the process is killed mid-request — OOM, `SIGKILL` from Activity Monitor, hard crash — the elevated limit stays set.
+
+Symptom on next app launch: even short prompts behave as though the Mac is under memory pressure, because a large slice of unified memory remains wired for the GPU regardless of current workload. Ferebee's 2026-04-21 report (Osaurus, 55K-token translation crash followed by "2K-token prompts crash until reboot") matches this pattern.
+
+Recommended mitigations at the **host app** layer (`mlx-swift-lm` only consumes tickets, never creates them):
+
+1. **Size tickets conservatively.** Don't reserve your whole working-set-size budget up front; grow through multiple smaller tickets so an OOM in any one leaves less stranded.
+2. **Reset the limit at app startup.** Before the first inference, drive `WiredMemoryManager.shared` through a no-op ticket cycle (`start` → `end` with `size: 0`) so any residual from a prior crashed session is explicitly restored. If you manage the sysctl yourself, `sysctl iogpu.wired_limit_mb=0` (or the machine's default) resets it.
+3. **Register a signal handler.** Fatal-signal handlers that best-effort call `mlx_set_wired_limit(baseline)` before re-raising cover the common crash paths (`SIGABRT`, `SIGSEGV`). `SIGKILL` cannot be intercepted — only a reboot or an app-startup reset clears the kernel state after a kill.

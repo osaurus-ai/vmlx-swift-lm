@@ -42,6 +42,10 @@ Both are no-ops when unset — zero impact on default osaurus loads.
 - **Prefix-extend hit** (turn N+1 = turn N + new tokens): paged hit on the shared prefix, remaining tokens prefill normally. Dense models get the speedup.
 - **Prefix-extend on VL or hybrid SSM**: engine **auto-rolls back to full prefill** for correctness. Rationale: vision-token region can't split (MLX merge-features crash), SSM recurrence is path-dependent (silent output degradation). Coordinator probe still reports hit; engine log says `rolling back to full prefill (VL vision-token region can't be split)` or `(hybrid SSM recurrence path-dependent on full prefix)`.
 
+### Coordinator-owned KV sizing (2026-04-21)
+
+`CacheCoordinatorConfig.defaultKVMode` / `.defaultMaxKVSize` / `.longPromptMultiplier` implement the contract osaurus 0.17.0 assumed but vmlx had not yet shipped: "KV cache sizing is owned end-to-end by vmlx-swift-lm's CacheCoordinator". `BatchEngine.admitPendingRequests` calls `CacheCoordinatorConfig.resolveKVPolicy(...)` before `newCache(...)` and fills gaps in the request's `kvMode` / `maxKVSize`. Explicit caller values always win. Closed ferebee's 55K-token translation crash (see `KV-SIZING-CONTRACT.md` for full rules + resolution table).
+
 ### Production bugs fixed along the way (iters 28-64)
 
 Each of these would crash or silently corrupt under osaurus production load. Listed so an integrator can verify they're observing the fixed behaviour.

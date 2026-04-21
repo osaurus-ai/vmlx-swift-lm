@@ -1,5 +1,56 @@
 # CHANGELOG — vmlx-swift-lm (osaurus-ai/vmlx-swift-lm)
 
+## [2026-04-21] — Coordinator-owned KV sizing + BatchEngine decode perf
+
+### Feature: `CacheCoordinator` now owns KV sizing end-to-end
+Driver: ferebee's Osaurus 0.17.0 report — 200K-char / 55K-token translation reliably OOM'd the app. Root cause was a contract gap: osaurus 0.17.0 removed its per-request `maxKVSize` UI knob with the comment "KV cache sizing is owned end-to-end by vmlx-swift-lm's CacheCoordinator", but vmlx had no such logic. Every request arrived `maxKVSize: nil, kvMode: .none` → unbounded `KVCacheSimple` + no quantization fallback.
+
+- New fields on `CacheCoordinatorConfig`:
+  - `defaultKVMode: KVQuantizationMode = .none` — applied to slots whose request `kvMode` is `.none`
+  - `defaultMaxKVSize: Int? = nil` — applied when `maxKVSize` is nil AND prompt > `longPromptMultiplier × defaultMaxKVSize`
+  - `longPromptMultiplier: Double = 2.0` — gate keeping short chat turns out of the rotating-window cap
+- `CacheCoordinatorConfig.resolveKVPolicy(kvMode:maxKVSize:promptTokenCount:)` — pure function encoding the rules. Explicit caller values always win; defaults only fill gaps.
+- `BatchEngine.admitPendingRequests` calls `resolveKVPolicy` before `context.model.newCache(...)`.
+- `BatchPendingRequest.parameters` changed from `let` to `var` to allow the admission-path gap-fill.
+- New docs: `Libraries/MLXLMCommon/BatchEngine/KV-SIZING-CONTRACT.md` with the full resolution table, osaurus wiring example, and out-of-scope items.
+- New tests: `Tests/MLXLMTests/CacheCoordinatorKVPolicyTests.swift` — 10 unit tests covering every path (explicit-wins, gap-fill, short/long prompt gate, ferebee scenario, custom multiplier).
+
+**Verification (no regressions, 94 tests green):**
+- 10/10 `CacheCoordinatorKVPolicyTests`
+- 7/7 `BatchEngineIntegrationTests`
+- 6/6 `BatchEngineTurboQuantIntegrationTests`
+- 6/6 `BatchEngineMultiTurnTests`
+- 75/75 reasoning/harmony/tool-call tests (`ReasoningParser`, Harmony Gemma-4 streaming, `StopStringMatcher`, startInReasoning Qwen3.6 enable_thinking, `Generation.reasoning`, `ToolCallFormat`)
+
+**Recommended osaurus wiring** (one-time at model load):
+```swift
+CacheCoordinatorConfig(
+    defaultKVMode: .turboQuant(keyBits: 3, valueBits: 3),
+    defaultMaxKVSize: 8192,
+    longPromptMultiplier: 2.0
+)
+```
+
+### Perf: `BatchEngine` decode — +1-2 tok/s across all variants
+- B=1 cache bypass in `stepBatchDecode` — skip `BatchKVCache` wrappers at batch size 1 (48+ Swift allocations per token saved on Qwen 35B-A3B MoE)
+- Conditional `Task.yield()` — only yield when work pending
+- `asyncEval(logits)` + `asyncEval(sampledTokens)` — mirrors `TokenIterator.next()` idiom
+
+**Measured (M4 Max 128GB, median of 3, 128-token decode):**
+
+| Variant | Before | After | Δ |
+|---|---|---|---|
+| Qwen3.5-35B-A3B-4bit | 87.1 | 89.4 | +2.3 |
+| Qwen3.6-35B-A3B-MXFP4 | 86.2 | 88.4 | +2.2 |
+| Qwen3.6-35B-A3B-JANGTQ2 | 76.3 | 77.8 | +1.5 |
+| Qwen3.6-35B-A3B-JANGTQ4 | 70.5 | 71.4 | +0.9 |
+| Gemma-4 E2B 4bit | 120.6 | 122.0 | +1.4 |
+| Gemma-4 E4B 4bit | 71.9 | 73.5 | +1.6 |
+
+### Out of scope (pinned in KV-SIZING-CONTRACT.md)
+1. **Wired-memory sticky state across reboot** — `mlx-swift`'s `WiredMemoryManager` calls `mlx_set_wired_limit` (kernel sysctl `iogpu.wired_limit_mb`), which persists across process restart until reboot. Fix belongs upstream in mlx-swift (signal handler) or in osaurus (conservative ticket sizing + startup reset). vmlx-swift-lm only consumes tickets.
+2. **Gemma looping** — 75/75 parser tests green post-fix. Needs real-model byte-level repro before a parser change can land.
+
 ## [2026-04-12] — AsType Cascade Elimination (Complete)
 
 ### Fix 1: Float32 Scalar Contamination

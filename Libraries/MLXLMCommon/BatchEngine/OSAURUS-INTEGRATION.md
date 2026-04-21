@@ -68,6 +68,18 @@ public enum Blocker: String, CaseIterable {
 ### Auto-detected behaviour (no env var needed)
 
 - **`CacheCoordinator.isHybrid` auto-flip**: when the first slot's cache contains a Mamba/SSM layer, `BatchEngine.admitPendingRequests` calls `coordinator.setHybrid(true)` automatically. Osaurus no longer needs to remember per-model.
+- **Coordinator-owned KV sizing** (2026-04-21 contract, see `KV-SIZING-CONTRACT.md`): when `CacheCoordinatorConfig.defaultKVMode` / `.defaultMaxKVSize` are set, `BatchEngine.admitPendingRequests` fills those values into any request that submitted `kvMode: .none` / `maxKVSize: nil`. Explicit per-request values always win. Recommended osaurus config for memory-bounded inference across arbitrary prompt lengths:
+  ```swift
+  CacheCoordinatorConfig(
+      usePagedCache: true,
+      enableDiskCache: true,
+      modelKey: modelID,
+      defaultKVMode: .turboQuant(keyBits: 3, valueBits: 3),  // ~5× KV savings
+      defaultMaxKVSize: 8192,                                 // 8K ring window
+      longPromptMultiplier: 2.0                               // >16K → cap
+  )
+  ```
+  This closes the gap that ferebee's 55K-token translation crash exposed: osaurus 0.17.0 removed its per-request `maxKVSize` UI knob assuming vmlx would own KV sizing; now vmlx actually does.
 - **JANG weights-only tokenizer fallback**: `JangLoader.resolveTokenizerDirectory` redirects to the cached source-model snapshot when a JANG bundle ships without tokenizer files (MiniMax JANGTQ et al.).
 - **VL / hybrid SSM partial cache-hit rollback**: when a prefix-extend cache hit would split the vision-token region or interrupt the SSM recurrence, the engine rolls back to full prefill instead of producing corrupted output. Log line: `rolling back to full prefill (VL vision-token region can't be split)` or `(hybrid SSM recurrence path-dependent on full prefix)`.
 

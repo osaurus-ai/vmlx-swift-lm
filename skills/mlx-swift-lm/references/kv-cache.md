@@ -217,6 +217,23 @@ let params = GenerateParameters()  // Simple unbounded cache
 await session.clear()
 ```
 
+### Coordinator-owned defaults (host-app pattern)
+
+When running under `BatchEngine` with a `CacheCoordinator` attached, the host app can set KV-sizing defaults **once** at model load instead of on every request. See `Libraries/MLXLMCommon/BatchEngine/KV-SIZING-CONTRACT.md`.
+
+```swift
+let coordinatorCfg = CacheCoordinatorConfig(
+    usePagedCache: true,
+    enableDiskCache: true,
+    modelKey: modelID,
+    defaultKVMode: .turboQuant(keyBits: 3, valueBits: 3),  // ~5× KV savings
+    defaultMaxKVSize: 8192,                                 // 8K ring window
+    longPromptMultiplier: 2.0                               // >16K → apply cap
+)
+```
+
+With those defaults, any request that arrives with `kvMode: .none` and `maxKVSize: nil` (e.g., a chat UI that doesn't expose those knobs) runs under TurboQuant; prompts longer than `2 × 8192 = 16384` tokens additionally adopt the 8K ring-buffer cap. Per-request values set by the caller always win — the coordinator only fills gaps.
+
 ## Quantized Attention
 
 Use with QuantizedKVCache for efficient attention:
