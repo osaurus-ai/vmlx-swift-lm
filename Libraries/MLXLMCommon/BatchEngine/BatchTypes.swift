@@ -53,7 +53,11 @@ public enum BatchGeneration: Sendable {
 struct BatchPendingRequest {
     let id: BatchRequestID
     let input: LMInput
-    let parameters: GenerateParameters
+    // `var` (not `let`) so the admission path can apply
+    // `CacheCoordinatorConfig.resolveKVPolicy(...)` defaults before the
+    // slot's cache is allocated. Per-request values set by the caller
+    // always win; the coordinator only fills nils.
+    var parameters: GenerateParameters
     let continuation: AsyncStream<BatchGeneration>.Continuation
     let submittedAt: Date
 

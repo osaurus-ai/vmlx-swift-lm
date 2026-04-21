@@ -520,7 +520,43 @@ public actor BatchEngine {
     /// Move requests from the wait queue into active slots up to `maxBatchSize`.
     private func admitPendingRequests() {
         while activeSlots.count < maxBatchSize && !waitQueue.isEmpty {
-            let request = waitQueue.removeFirst()
+            var request = waitQueue.removeFirst()
+
+            // LONG-CTX (2026-04-21): apply the coordinator's KV-sizing
+            // defaults before we allocate the slot's cache.
+            //
+            // Osaurus 0.17.0 removed its per-request `maxKVSize` UI knob
+            // with the comment "KV cache sizing is owned end-to-end by
+            // vmlx-swift-lm's CacheCoordinator". The coordinator honors
+            // that contract here: when `GenerateParameters.kvMode` is
+            // `.none` or `maxKVSize` is nil, the coordinator's
+            // `defaultKVMode` / `defaultMaxKVSize` fill the gap. Requests
+            // that did set their own values are untouched.
+            //
+            // The default `maxKVSize` is only applied to prompts that
+            // exceed `longPromptMultiplier × defaultMaxKVSize` — short
+            // chat turns never take a rotating-window hit from a global
+            // cap they didn't opt into.
+            if let coordinator = cacheCoordinator {
+                let promptCount = request.input.text.tokens.size
+                let (effMode, effMax) = coordinator.config.resolveKVPolicy(
+                    kvMode: request.parameters.kvMode,
+                    maxKVSize: request.parameters.maxKVSize,
+                    promptTokenCount: promptCount
+                )
+                if effMode != request.parameters.kvMode {
+                    request.parameters.kvMode = effMode
+                    Self.logger.info(
+                        "Slot \(request.id.description, privacy: .public): applied coordinator defaultKVMode"
+                    )
+                }
+                if effMax != request.parameters.maxKVSize {
+                    request.parameters.maxKVSize = effMax
+                    Self.logger.info(
+                        "Slot \(request.id.description, privacy: .public): applied coordinator defaultMaxKVSize=\(effMax ?? -1) for \(promptCount)-token prompt"
+                    )
+                }
+            }
 
             // Stage 0: warn if the request asks for a KV-quant mode not yet
             // supported under batched decode (affine / legacy kvBits).
