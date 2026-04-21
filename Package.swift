@@ -36,7 +36,15 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/osaurus-ai/mlx-swift", branch: "osaurus-0.31.3"),
+        // Phase 0.5 (2026-04-21) switched to the `-distributed-phase0`
+        // branch which enables mlx-c's distributed bridge + the ring
+        // TCP backend. The base `osaurus-0.31.3` branch excluded those
+        // sources ("do not build distributed support (yet)"), which
+        // left our Swift distributed bindings linking only against
+        // weak-alias fallback stubs. The distributed-phase0 branch adds
+        // them back. See `Libraries/MLXLMCommon/Distributed/DISTRIBUTED-DESIGN.md`
+        // and commit 8de8295 on osaurus-ai/mlx-swift for the exact patch.
+        .package(url: "https://github.com/osaurus-ai/mlx-swift", branch: "osaurus-0.31.3-distributed-phase0"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.21"),
     ],

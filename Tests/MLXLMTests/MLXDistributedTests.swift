@@ -3,16 +3,21 @@
 //
 // Phase 0 tests for the Swift distributed bindings.
 //
-// These tests cover the SINGLE-RANK fallback semantics. The fallback is
-// linked via `MLXDistributedCFallback` as weak-alias stubs that treat
-// every collective as the identity on a size-1 group — which is provably
-// correct.
+// On a dev box running a single process (no MLX_HOSTS env var, no peer
+// process), mlx-core returns an "EmptyGroup" whose collective methods
+// deliberately throw "Communication not implemented in an empty
+// distributed group" — see mlx/distributed/distributed.cpp. That's the
+// documented behaviour: real collectives require a real multi-rank world.
+// These tests cover exactly that surface:
 //
-// Once we patch osaurus-ai/mlx-swift to enable real distributed
-// compilation (Phase 0.5 in DISTRIBUTED-DESIGN.md), a separate
-// multi-rank test suite will exercise the real collectives on a 2-process
-// loopback. Those tests are gated on the `VMLX_DISTRIBUTED_MULTIRANK=1`
-// env var so they only run when a real backend is linked in.
+//   1. isAvailable / initialize work on a single process.
+//   2. split on a size-1 group is rejected cleanly.
+//   3. Transport probe short-circuits on size 1.
+//
+// The real collectives are exercised only in the multi-rank suite
+// `MLXDistributedMultiRankTests` below, which is gated on the env var
+// `VMLX_DISTRIBUTED_MULTIRANK=1` and typically run via a two-process
+// launcher against two Macs over bridge0 / TB.
 
 import Foundation
 import MLX
@@ -20,22 +25,31 @@ import Testing
 
 @testable import MLXLMCommon
 
-@Suite("MLXDistributed bindings — single-rank fallback")
+@Suite("MLXDistributed bindings — single-rank")
 struct MLXDistributedSingleRankTests {
 
-    @Test("isAvailable reports true")
-    func isAvailableTrue() {
-        // The fallback always reports availability so callers get a
-        // consistent affirmative regardless of backend choice. Real
-        // multi-rank availability is observable via `worldGroup.isMultiRank`.
+    @Test("isAvailable reports availability for `any`")
+    func isAvailableAny() {
+        // `any` always picks a backend — with the ring backend compiled
+        // in (osaurus-ai/mlx-swift @ osaurus-0.31.3-distributed-phase0)
+        // this returns true. Specific backends may return false on
+        // hosts without the required runtime (e.g. `mpi` without an MPI
+        // install), which is correct — that's what `isAvailable(backend:)`
+        // is for. We don't assert specific backend availability because
+        // it's host-dependent.
         #expect(MLXDistributed.isAvailable() == true)
-        #expect(MLXDistributed.isAvailable(backend: "ring") == true)
-        #expect(MLXDistributed.isAvailable(backend: "jaccl") == true)
+        _ = MLXDistributed.isAvailable(backend: "ring")
+        _ = MLXDistributed.isAvailable(backend: "jaccl")
     }
 
-    @Test("initialize returns a single-rank world group")
+    @Test("initialize returns a single-rank world group on dev host")
     func initializeSingleRank() {
+        // On a dev box with no MLX_HOSTS env var and no peer process,
+        // init(strict: false) returns the EmptyGroup singleton —
+        // rank 0, size 1. A real multi-rank launcher gives size > 1,
+        // covered by the multi-rank suite.
         let group = MLXDistributed.initialize()
+        #expect(group.isValid)
         #expect(group.rank == 0)
         #expect(group.size == 1)
         #expect(group.isMultiRank == false)
@@ -43,82 +57,15 @@ struct MLXDistributedSingleRankTests {
         #expect(MLXDistributed.worldGroup?.size == 1)
     }
 
-    @Test("split returns a group with the same rank/size on size 1")
+    @Test("split on a size-1 group returns nil with a logged error")
     func splitOnSizeOne() {
+        // mlx-core's `Group::split` throws "Cannot split the distributed
+        // group further" on a size-1 parent. The mlx-c bridge catches
+        // and returns a zero-initialized group; our Swift wrapper maps
+        // that to `nil`. Callers decide whether to treat this as fatal.
         let world = MLXDistributed.initialize()
         let sub = world.split(color: 0, key: 0)
-        #expect(sub.rank == 0)
-        #expect(sub.size == 1)
-    }
-
-    // MARK: - Identity semantics on size-1 collectives
-
-    @Test("allSum is identity on size 1")
-    func allSumIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(1.0), 2.0, 3.0, 4.0])
-        let y = MLXDistributed.allSum(x)
-        #expect(y.shape == [4])
-        let values = y.asArray(Float.self)
-        #expect(values == [1.0, 2.0, 3.0, 4.0])
-    }
-
-    @Test("allGather is identity on size 1")
-    func allGatherIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(5.0), 6.0])
-        let y = MLXDistributed.allGather(x)
-        let values = y.asArray(Float.self)
-        #expect(values == [5.0, 6.0])
-    }
-
-    @Test("allMax is identity on size 1")
-    func allMaxIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(1.0), -2.0, 3.5])
-        let y = MLXDistributed.allMax(x)
-        let values = y.asArray(Float.self)
-        #expect(values == [1.0, -2.0, 3.5])
-    }
-
-    @Test("allMin is identity on size 1")
-    func allMinIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(-1.0), 0.0, 1.0])
-        let y = MLXDistributed.allMin(x)
-        let values = y.asArray(Float.self)
-        #expect(values == [-1.0, 0.0, 1.0])
-    }
-
-    @Test("sumScatter is identity on size 1")
-    func sumScatterIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(1.0), 2.0, 3.0, 4.0])
-        let y = MLXDistributed.sumScatter(x)
-        let values = y.asArray(Float.self)
-        #expect(values == [1.0, 2.0, 3.0, 4.0])
-    }
-
-    @Test("send on size 1 returns the input unchanged")
-    func sendIdentity() {
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(7.0), 8.0])
-        let placeholder = MLXDistributed.send(x, dst: 0)
-        let values = placeholder.asArray(Float.self)
-        #expect(values == [7.0, 8.0])
-    }
-
-    // MARK: - Shape + dtype plumbing
-
-    @Test("send/recv signatures accept expected shape/dtype arguments")
-    func sendRecvSignaturesCompile() {
-        // Compilation-only check: exercise every overload so a signature
-        // regression trips at build time rather than first real use.
-        _ = MLXDistributed.initialize()
-        let x = MLXArray([Float(1.0), 2.0, 3.0, 4.0]).reshaped([2, 2])
-        _ = MLXDistributed.send(x, dst: 0)
-        // recv/recvLike return errors on size-1 (no peer); we don't call
-        // them here. The real test for these is the multi-rank suite.
+        #expect(sub == nil)
     }
 }
 
@@ -158,5 +105,76 @@ struct TransportProbeSingleRankTests {
             medianBandwidthMBps: 10485.76
         )
         #expect(abs(r.medianBandwidthGbps - 87.96) < 0.1)
+    }
+}
+
+// MARK: - Multi-rank suite (gated)
+//
+// When running under a real multi-rank launcher (two processes with
+// `MLX_HOSTS=ip1,ip2` or equivalent), set `VMLX_DISTRIBUTED_MULTIRANK=1`
+// and this suite activates. Otherwise the tests return without asserting
+// — cheap to keep in the suite, dormant on the dev box.
+//
+// The real collective tests belong here because the EmptyGroup returned
+// on a single process throws "Communication not implemented" when any
+// collective is invoked; those throws are the documented behaviour and
+// testing against them is covered at the `split` boundary above.
+
+@Suite("MLXDistributed — multi-rank (gated on VMLX_DISTRIBUTED_MULTIRANK=1)")
+struct MLXDistributedMultiRankTests {
+
+    private var isEnabled: Bool {
+        ProcessInfo.processInfo.environment["VMLX_DISTRIBUTED_MULTIRANK"] == "1"
+    }
+
+    @Test("allSum sums contributions across ranks")
+    func allSumAcrossRanks() {
+        guard isEnabled else { return }
+        _ = MLXDistributed.initialize()
+        guard let world = MLXDistributed.worldGroup, world.isMultiRank else {
+            return
+        }
+        // Each rank contributes `rank + 1`. The sum across N ranks is
+        // N*(N+1)/2 — a stable scalar result.
+        let x = MLXArray([Float(world.rank + 1)])
+        let y = MLXDistributed.allSum(x)
+        let expected = Float((world.size * (world.size + 1)) / 2)
+        #expect(abs(y.item(Float.self) - expected) < 1e-3)
+    }
+
+    @Test("allGather concatenates rank order")
+    func allGatherConcatenation() {
+        guard isEnabled else { return }
+        _ = MLXDistributed.initialize()
+        guard let world = MLXDistributed.worldGroup, world.isMultiRank else {
+            return
+        }
+        let x = MLXArray([Float(world.rank)])
+        let y = MLXDistributed.allGather(x)
+        let values = y.asArray(Float.self)
+        let expected = (0 ..< world.size).map { Float($0) }
+        #expect(values == expected)
+    }
+
+    @Test("send/recv round-trip between adjacent ranks")
+    func sendRecvRoundTrip() {
+        guard isEnabled else { return }
+        _ = MLXDistributed.initialize()
+        guard let world = MLXDistributed.worldGroup, world.isMultiRank else {
+            return
+        }
+        // Rank 0 → rank 1 handshake, then rank 1 → rank 0. Values chosen
+        // so a byte-flip shows up immediately.
+        let payload = MLXArray([Float(1.0), 2.0, 3.0, 4.0])
+        if world.rank == 0 {
+            _ = MLXDistributed.send(payload, dst: 1)
+            let echo = MLXDistributed.recv(
+                shape: [4], dtype: .float32, src: 1)
+            #expect(echo.asArray(Float.self) == [1.0, 2.0, 3.0, 4.0])
+        } else if world.rank == 1 {
+            let received = MLXDistributed.recv(
+                shape: [4], dtype: .float32, src: 0)
+            _ = MLXDistributed.send(received, dst: 0)
+        }
     }
 }

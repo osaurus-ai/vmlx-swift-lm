@@ -63,11 +63,30 @@ public enum MLXDistributed {
     /// Must be called exactly once per process before any collective op runs.
     /// The returned group represents the process's membership in the cluster.
     ///
+    /// ## Side effect: error-handler installation
+    ///
+    /// mlx-c's default C error handler calls `exit(-1)` on any caught C++
+    /// exception (see `mlx-c/mlx/c/error.cpp:14`). That's fatal for any
+    /// recoverable condition surfaced through the distributed surface — for
+    /// example calling `split` on a size-1 group raises "Cannot split the
+    /// distributed group further". To let callers handle such conditions
+    /// from Swift, ``initialize(strict:backend:)`` replaces the default
+    /// handler with one that logs via the `vmlx / MLXDistributed` subsystem
+    /// and returns normally. The binding's Swift methods already expose
+    /// error conditions through nil-returning or fallible APIs (e.g.
+    /// ``MLXDistributedGroup/split(color:key:)`` returns `Optional`) so
+    /// callers never see an unhandled termination.
+    ///
+    /// The error handler is process-wide, so this affects every mlx-c
+    /// operation from this point on — not just distributed ops. That is
+    /// the correct Swift-application behavior: a library should never
+    /// `exit()` on a host app's behalf.
+    ///
     /// - Parameters:
     ///   - strict: when `true`, fail hard if the requested backend is not
     ///     available. When `false`, fall back to a single-rank stand-in so
-    ///     callers can unconditionally write distributed-aware code that runs
-    ///     correctly on a single machine with no external launcher.
+    ///     callers can unconditionally write distributed-aware code that
+    ///     runs correctly on a single machine with no external launcher.
     ///   - backend: `"jaccl"`, `"ring"`, `"mpi"`, `"nccl"`, or `"any"` (the
     ///     default) to let mlx-core pick the first available backend.
     /// - Returns: the world group for this process.
@@ -76,6 +95,7 @@ public enum MLXDistributed {
         strict: Bool = false,
         backend: String = "any"
     ) -> MLXDistributedGroup {
+        installErrorHandlerIfNeeded()
         let raw = backend.withCString { cStr in
             mlx_distributed_init(strict, cStr)
         }
@@ -85,6 +105,30 @@ public enum MLXDistributed {
         )
         Self.storedWorldGroup = group
         return group
+    }
+
+    /// Install a non-exiting error handler on the process-wide mlx-c slot.
+    ///
+    /// Idempotent — the first call replaces the default handler and
+    /// subsequent calls are a no-op.
+    nonisolated(unsafe) private static var errorHandlerInstalled = false
+
+    private static func installErrorHandlerIfNeeded() {
+        guard !errorHandlerInstalled else { return }
+        errorHandlerInstalled = true
+        mlx_set_error_handler(
+            { msg, _ in
+                // Just log; do not exit(-1) like the default handler.
+                if let msg = msg {
+                    let text = String(cString: msg)
+                    MLXDistributed.logger.error(
+                        "mlx C error: \(text, privacy: .public)"
+                    )
+                }
+            },
+            nil,
+            nil
+        )
     }
 
     /// Process-wide shared world group handle, populated by ``initialize(strict:backend:)``.
@@ -288,9 +332,23 @@ public final class MLXDistributedGroup: @unchecked Sendable {
 
     init(raw: mlx_distributed_group) {
         self.raw = raw
-        self.rank = Int(mlx_distributed_group_rank(raw))
-        self.size = Int(mlx_distributed_group_size(raw))
+        // If `raw.ctx` is nullptr we're wrapping an error-case group that
+        // `mlx_distributed_group_{rank,size}` cannot dereference without
+        // null-derefing. The mlx-c bridge does catch C++ exceptions from
+        // rank/size and return 0, but the accessor does still hit
+        // `*static_cast<Group*>(d.ctx)` before the catch, so defend here.
+        if raw.ctx != nil {
+            self.rank = Int(mlx_distributed_group_rank(raw))
+            self.size = Int(mlx_distributed_group_size(raw))
+        } else {
+            self.rank = 0
+            self.size = 0
+        }
     }
+
+    /// Whether this group is a valid (non-empty) handle. An invalid handle is
+    /// returned from the mlx-c bridge on error paths (see ``split(color:key:)``).
+    public var isValid: Bool { raw.ctx != nil }
 
     /// Split this group into sub-groups by `color`. Ranks that pass the same
     /// `color` value land in the same sub-group; `key` breaks ties for the
@@ -298,8 +356,16 @@ public final class MLXDistributedGroup: @unchecked Sendable {
     ///
     /// Mirrors MPI's `MPI_Comm_split`. Use this to carve out per-layer
     /// tensor-parallel sub-groups inside a larger pipeline-parallel world.
-    public func split(color: Int, key: Int = -1) -> MLXDistributedGroup {
+    ///
+    /// Returns `nil` when the underlying call failed — for example, calling
+    /// `split` on a size-1 group ("Cannot split the distributed group
+    /// further"). The mlx-c bridge logs the specific reason via
+    /// `mlx_error(...)` on the way out.
+    public func split(color: Int, key: Int = -1) -> MLXDistributedGroup? {
         let sub = mlx_distributed_group_split(raw, Int32(color), Int32(key))
+        // On error the mlx-c bridge returns a zero-initialized group
+        // (ctx = nullptr). Reading rank/size from that would null-deref.
+        guard sub.ctx != nil else { return nil }
         return MLXDistributedGroup(raw: sub)
     }
 }
