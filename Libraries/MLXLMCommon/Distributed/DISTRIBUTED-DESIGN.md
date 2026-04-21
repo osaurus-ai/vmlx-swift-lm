@@ -114,6 +114,63 @@ variant. I've read every one of these.
 | Speculative decoding | `SpecDec/` | Last-stage concern. Drafter can run fully on the last stage or on a dedicated node. |
 | Coordinator-owned KV sizing contract (just shipped) | `KV-SIZING-CONTRACT.md` | Composes cleanly — each stage applies the same policy to the fraction of layers it owns. |
 
+## Upstream blocker found during Phase 0 build
+
+`osaurus-ai/mlx-swift` at `osaurus-0.31.3` deliberately excludes distributed
+compilation in its `Package.swift`:
+
+```
+// line 193
+// do not build distributed support (yet)
+"mlx/mlx/distributed/mpi/mpi.cpp",
+"mlx/mlx/distributed/ring/ring.cpp",
+"mlx/mlx/distributed/nccl/nccl.cpp",
+"mlx/mlx/distributed/nccl/nccl_stub",
+"mlx/mlx/distributed/jaccl/jaccl.cpp",
+"mlx/mlx/distributed/jaccl/mesh.cpp",
+"mlx/mlx/distributed/jaccl/ring.cpp",
+"mlx/mlx/distributed/jaccl/utils.cpp",
+```
+
+and on lines 116–117 additionally excludes the mlx-c bridge that our Swift
+layer links against:
+
+```
+// example code + mlx-c distributed
+"mlx-c/mlx/c/distributed.cpp",
+"mlx-c/mlx/c/distributed_group.cpp",
+```
+
+Result: headers visible, symbols unresolved. Our Swift bindings link-fail
+until the exclude list is shortened and at least one backend is compiled in.
+
+**Phase 0 mitigation (shipped in commit on this branch):**
+`Libraries/MLXLMCommon/Distributed/CFallback/MLXDistributedFallback.c`
+provides **weak-alias** stubs for every `mlx_distributed_*` symbol the
+Swift layer imports. Semantics are identity-on-size-1 — provably correct for
+single-rank operation and serves as a complete dev-box target. Every stub is
+`__attribute__((weak))` so when Phase 0.5 patches mlx-swift to include the
+real implementations, the linker picks the real symbols automatically with
+no Swift-side change.
+
+**Phase 0.5 (upstream patch — owner: vmlx maintainer):**
+Branch `osaurus-0.31.3-distributed-phase0` off `osaurus-ai/mlx-swift`:
+
+1. Remove `"mlx-c/mlx/c/distributed.cpp"` and
+   `"mlx-c/mlx/c/distributed_group.cpp"` from the `mlxSwiftExcludes` list.
+2. Remove `"mlx/mlx/distributed/ring/ring.cpp"` from the excludes (keep the
+   jaccl + mpi + nccl excludes — ring alone is sufficient for TCP over
+   Thunderbolt Bridge / Ethernet).
+3. Keep `no_jaccl.cpp`, `no_nccl.cpp` included (they're already included by
+   default; they stub the non-compiled backends).
+4. Verify `swift build -c release` in mlx-swift itself passes.
+5. Update `vmlx-swift-lm/Package.swift` to track the patched branch. At that
+   point our weak stubs fall out of the binary automatically.
+
+Phase 0.5 is a mechanical change but requires a standalone round of testing
+on the mlx-swift side (we must not regress upstream's existing build
+matrix). Expect a half-day of work + CI run.
+
 ## Phased plan
 
 Each phase ships with a concrete benchmark on **real** hardware before the next

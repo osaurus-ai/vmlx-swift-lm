@@ -67,6 +67,25 @@ let package = Package(
                 "README.md"
             ]
         ),
+        // Single-rank fallback for the mlx-core distributed C API.
+        //
+        // Upstream mlx-swift deliberately excludes mlx's distributed sources
+        // from its Cmlx build (`do not build distributed support (yet)` —
+        // Package.swift line 193 in osaurus-ai/mlx-swift @ osaurus-0.31.3).
+        // That leaves the `mlx_distributed_*` symbols declared in public
+        // Cmlx headers but not linked. This C target supplies weak-alias
+        // stubs so `MLXDistributed.swift` links today on a single host.
+        //
+        // When upstream mlx-swift is patched to include the distributed
+        // sources + at least one backend (Phase 0.5 in
+        // `Libraries/MLXLMCommon/Distributed/DISTRIBUTED-DESIGN.md`), the
+        // real symbols take precedence over these weak stubs automatically
+        // — no Swift-side change required.
+        .target(
+            name: "MLXDistributedCFallback",
+            path: "Libraries/MLXLMCommon/Distributed/CFallback",
+            publicHeadersPath: "include"
+        ),
         .target(
             name: "MLXLMCommon",
             dependencies: [
@@ -74,10 +93,12 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
+                "MLXDistributedCFallback",
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
-                "README.md"
+                "README.md",
+                "Distributed/CFallback",
             ]
         ),
         .target(
@@ -130,7 +151,9 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
+                "MLXHuggingFace",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "RunBench"
         ),
@@ -140,10 +163,12 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXHuggingFace",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
