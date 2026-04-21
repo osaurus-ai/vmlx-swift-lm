@@ -1171,28 +1171,7 @@ public actor BatchEngine {
         // ring buffer + 5-tuple metaState via `.rotating` LayerKind. The
         // `mediaSalt` is passed through so the stored key matches the key
         // the next fetch will look for (VL multi-turn cache hits).
-        //
-        // LONG-CTX (2026-04-21): cap cache-coordinator store by prompt size.
-        // A 55K-token prompt on a 48-layer 35B MoE already holds ~11 GB of
-        // live KV. Running `storeAfterGeneration` on top pipes that through
-        // `extractLayerData` + `TQDiskSerializer.serialize` + `save()` —
-        // which materializes the full serialized dict CPU-side for the
-        // safetensors writer and retains block refs in the paged cache.
-        // Net: a ~2× memory spike right as the slot is tearing down,
-        // exactly when macOS is most likely to kill us for pressure.
-        //
-        // The cost/benefit for very-long one-shot prompts (summaries,
-        // translations) is bad: cache-hit on turn N+1 is near-zero because
-        // each turn is a different document. Skip store above the
-        // threshold — short chats still benefit from full cache reuse.
-        //
-        // Threshold picked as 16K to cover every typical chat turn while
-        // guarding against the catastrophic 55K+ case ferebee reported.
-        let longPromptStoreThreshold = 16384
-        if reason != .cancelled,
-           let coordinator = cacheCoordinator,
-           slot.promptTokenCount <= longPromptStoreThreshold
-        {
+        if reason != .cancelled, let coordinator = cacheCoordinator {
             let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
             let perLayerData = extractLayerData(from: slot.cache)
             let ssmStates: [MLXArray]? = coordinator.isHybrid
@@ -1206,12 +1185,6 @@ public actor BatchEngine {
             )
             Self.logger.debug(
                 "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"
-            )
-        } else if reason != .cancelled, cacheCoordinator != nil,
-                  slot.promptTokenCount > longPromptStoreThreshold
-        {
-            Self.logger.info(
-                "Skipping cache-coordinator store for slot \(slot.id): \(slot.promptTokenCount) tokens exceeds long-prompt threshold \(longPromptStoreThreshold)"
             )
         }
 
@@ -1231,10 +1204,11 @@ public actor BatchEngine {
         // degraded subsequent requests by holding onto the pool — manifesting
         // as decode-speed cratering on the next request submitted.
         //
-        // Threshold lowered from 4096 → 2048 (LONG-CTX 2026-04-21): the
-        // store path above can hold the pool on prompts well below 4K,
-        // and the C call cost is negligible at slot teardown.
-        let longContextPurgeThreshold = 2048
+        // Trigger a targeted purge when the just-finished slot had a
+        // non-trivially-long prompt. 4096 tokens is the threshold: short
+        // chat requests skip the extra C call (~100us) while long-context
+        // or document-QA requests reclaim the pool at request boundaries.
+        let longContextPurgeThreshold = 4096
         if slot.promptTokenCount >= longContextPurgeThreshold {
             Memory.clearCache()
             // Reset the global counter too so we don't double-purge on the
