@@ -130,7 +130,9 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
+                "MLXHuggingFace",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "RunBench"
         ),
@@ -140,10 +142,12 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXHuggingFace",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
