@@ -496,8 +496,20 @@ public actor BatchEngine {
                 stepsSinceMemoryPurge = 0
             }
 
-            // 5. Yield to allow submit() calls and stream consumers to run
-            await Task.yield()
+            // 5. Yield to allow submit() calls and stream consumers to
+            //    run. `Task.yield()` in the hot decode path costs
+            //    ~1-2ms per token on Apple M-series (a full scheduler
+            //    round-trip). At B == 1 steady state with no pending
+            //    work, the continuation.yield(.token) we already do
+            //    above is a non-blocking enqueue and the consumer Task
+            //    runs in parallel on the async executor — we don't
+            //    need the extra yield. Only yield when there's work
+            //    that could be starved (new admissions waiting or
+            //    multi-slot fan-out where the scheduler needs to
+            //    interleave with submit() on the actor).
+            if !waitQueue.isEmpty || activeSlots.count > 1 {
+                await Task.yield()
+            }
         }
 
         loopTask = nil
@@ -1021,33 +1033,40 @@ public actor BatchEngine {
         let tokenArrays = slotIndices.map { activeSlots[$0].nextToken! }
         let batchTokens = stacked(tokenArrays).reshaped(B, 1)
 
-        // Build per-layer batched cache wrappers.
-        // Each cache type gets its appropriate batch wrapper:
-        // - KVCacheSimple/RotatingKVCache → BatchKVCache (split/pad/stack)
-        // - ArraysCache/MambaCache → BatchArraysCache (merge along batch dim)
-        // - CacheList → BatchCacheList (wraps each sub-cache appropriately)
+        // Per-layer batched cache wrappers. For B > 1 we need the
+        // Batch wrappers to split/pad/stack per-slot caches across the
+        // batch dim. For B == 1 the wrappers are pure overhead:
+        // BatchKVCache allocates an offsetArray and adds a Swift
+        // dispatch per update() call on every layer on every token.
+        // On a hybrid-SSM 35B-A3B MoE decode with 48 plus layers that
+        // is meaningful. Direct-pass at B == 1 recovers the overhead.
         let numLayers = activeSlots[slotIndices[0]].cache.count
         var layerCaches = [KVCache]()
         var batchArraysCaches = [BatchArraysCache]()  // track for splitBack
         var batchCacheLists = [BatchCacheList]()       // track for splitBack
         layerCaches.reserveCapacity(numLayers)
 
-        for layer in 0 ..< numLayers {
-            let slotCachesForLayer = slotIndices.map { activeSlots[$0].cache[layer] }
-            let representative = slotCachesForLayer[0]
+        if B == 1 {
+            // Direct pass-through — no per-token wrapper allocation.
+            layerCaches.append(contentsOf: activeSlots[slotIndices[0]].cache)
+        } else {
+            for layer in 0 ..< numLayers {
+                let slotCachesForLayer = slotIndices.map { activeSlots[$0].cache[layer] }
+                let representative = slotCachesForLayer[0]
 
-            if let _ = representative as? CacheList {
-                let cacheLists = slotCachesForLayer.map { $0 as! CacheList }
-                let batchCL = BatchCacheList(slotCacheLists: cacheLists)
-                layerCaches.append(batchCL)
-                batchCacheLists.append(batchCL)
-            } else if let _ = representative as? ArraysCache {
-                let arraysCaches = slotCachesForLayer.map { $0 as! ArraysCache }
-                let batchAC = BatchArraysCache(slotCaches: arraysCaches)
-                layerCaches.append(batchAC)
-                batchArraysCaches.append(batchAC)
-            } else {
-                layerCaches.append(BatchKVCache(slotCaches: slotCachesForLayer))
+                if let _ = representative as? CacheList {
+                    let cacheLists = slotCachesForLayer.map { $0 as! CacheList }
+                    let batchCL = BatchCacheList(slotCacheLists: cacheLists)
+                    layerCaches.append(batchCL)
+                    batchCacheLists.append(batchCL)
+                } else if let _ = representative as? ArraysCache {
+                    let arraysCaches = slotCachesForLayer.map { $0 as! ArraysCache }
+                    let batchAC = BatchArraysCache(slotCaches: arraysCaches)
+                    layerCaches.append(batchAC)
+                    batchArraysCaches.append(batchAC)
+                } else {
+                    layerCaches.append(BatchKVCache(slotCaches: slotCachesForLayer))
+                }
             }
         }
 
@@ -1059,8 +1078,14 @@ public actor BatchEngine {
         )
         // result.logits shape: [B, 1, vocabSize]
 
-        // Synchronize — we need to read token values for EOS checking
-        MLX.eval(result.logits)
+        // Async-eval the logits so GPU work kicks off while we do the
+        // Swift-side bookkeeping below. We MUST still materialize
+        // `tokenID` via `.item(Int.self)` for the EOS check (forces a
+        // sync point), but by that time the forward has already been
+        // in flight — saving the serialized `eval` → wait → sample
+        // path that cost ~15% decode tok/s on hybrid-SSM 35B-A3B. This
+        // mirrors `TokenIterator.next()`'s `asyncEval(token)` pattern.
+        asyncEval(result.logits)
 
         // Split SSM states back to per-sequence caches
         for batchAC in batchArraysCaches {
@@ -1070,13 +1095,31 @@ public actor BatchEngine {
             batchCL.splitBack()
         }
 
+        // Sample per sequence (lazy MLXArrays), then asyncEval the
+        // whole batch of sampled tokens so the GPU sampling work
+        // runs concurrently with the Swift-side bookkeeping below.
+        // Mirrors `TokenIterator.next()`'s `asyncEval(token)` idiom
+        // which is what gave the non-batch path its +15% edge on
+        // 35B-A3B models.
+        var sampledTokens: [MLXArray] = []
+        sampledTokens.reserveCapacity(slotIndices.count)
+        for (batchIdx, slotIdx) in slotIndices.enumerated() {
+            let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
+            var slot = activeSlots[slotIdx]
+            let token = slot.sampleToken(from: logits)
+            sampledTokens.append(token)
+            activeSlots[slotIdx] = slot
+        }
+        asyncEval(sampledTokens)
+
         // Sample per sequence and route results
         for (batchIdx, slotIdx) in slotIndices.enumerated() {
             var slot = activeSlots[slotIdx]
-
-            // Extract this sequence's logits as [1, vocabSize] (2D) for processor compatibility.
-            let logits = result.logits[batchIdx ..< batchIdx + 1, 0, 0...]
-            let token = slot.sampleToken(from: logits)
+            let token = sampledTokens[batchIdx]
+            // `.item(Int.self)` forces eval of the sampled-token op.
+            // GPU is already running (kicked off by asyncEval above
+            // of both the logits and the sampled tokens) — this wait
+            // is much shorter than a synchronous eval + sample chain.
             let tokenID = token.item(Int.self)
 
             // Stage 0: per-step KV-quant compression hook. For slots with
