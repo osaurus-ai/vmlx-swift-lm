@@ -97,6 +97,22 @@ public final class DiskCache: @unchecked Sendable {
         let url = safetensorsURL(for: hash)
         let tokenCount = tokens.count
 
+        // LONG-CTX (2026-04-21): refuse to store single entries larger than
+        // 25% of the disk budget. A 55K-token 35B MoE KV cache is ~11 GB —
+        // trying to materialize that CPU-side for safetensors serialization
+        // causes a ~2× peak memory spike and leaves one entry that then
+        // evicts every other cached prompt on the next store. Skip loudly
+        // rather than OOM the process.
+        let estimatedBytes = arrays.values.reduce(0) { $0 + $1.nbytes }
+        let singleEntryCap = maxSizeBytes / 4
+        if estimatedBytes > singleEntryCap {
+            let msg = "[vmlx][cache/disk] skipping store for \(tokenCount) tokens: "
+                + "\(estimatedBytes / 1_048_576) MB exceeds single-entry cap "
+                + "\(singleEntryCap / 1_048_576) MB\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return
+        }
+
         // Iter 61: the full write path (realize + save + SQLite insert)
         // must be serialized. MLX.eval AND the safetensors save both
         // submit Metal command-buffer work, and two threads overlapping
