@@ -200,32 +200,59 @@ deps. Fallback: force `ring` backend in init and ship that.
 
 ### Phase 1 — Pipeline parallel, 2-way, single-request, text-only
 
-**Ship:** a `PipelineEngine` that wraps `ModelContext` and partitions a model's
-layers into N stages. For N = 2. Text-only. `KVCacheSimple` only.
+**Ship:** a `PipelineEngine` that orchestrates a forward pass across N
+stages. For N = 2. Text-only. `KVCacheSimple` only. Single request at a
+time (continuous batching is Phase 3).
 
-**Required pieces:**
-- `ModelPartition` — owns `[startLayer, endLayer)` range, materializes only
-  those layers' weights. JANG weights already partitioned by layer name, so
-  selective load is straightforward.
-- `StageForward` — stage 0 runs embed + layers[0..N/2]; last stage runs
-  layers[N/2..] + lm_head + sampler. Hidden state passes via
-  `MLXDistributed.send`/`recv` between stages.
-- `DistributedModelFactory` — same surface as `LLMModelFactory` but takes a
-  stage assignment.
-- Reference model: **Qwen 3-0.6B** (tiny, fast iteration). Then Qwen 3-4B.
+**Shipped in this phase so far:**
+- `Libraries/MLXLMCommon/Distributed/ModelPartition.swift` — partition
+  struct + uniform allocator. 8/8 unit tests cover even split,
+  remainder distribution, full-coverage property, neighbor helpers,
+  first/last flags.
+- `Libraries/MLXLMCommon/Distributed/PipelineEngine.swift` —
+  orchestrator. Rank 0 drives
+  `runPrompt(tokens:parameters:maxNewTokens:stopTokenIDs:)`; non-zero
+  ranks drive `runWorker(parameters:)`. Size-envelope + hidden-tensor
+  send protocol between stages; int32 `[1]` sampled-token broadcast
+  back to rank 0; zero-envelope terminator propagated through every
+  middle stage before exit.
+- `PipelineStageModel` protocol — the contract a model adapts to so
+  the engine can call per-stage forward slices. Four requirements:
+  `embedTokens(_:)`, `runLayers(hidden:partition:cache:)`,
+  `finalizeLogits(_:)`, `newCache(parameters:)`, plus
+  `totalLayerCount: Int`.
 
-**Shipping criterion:**
-- End-to-end forward pass produces byte-identical logits vs. a single-device
-  run on Qwen 3-0.6B for N=2 stages.
-- Measured decode tok/s on a Qwen 3-4B 4-bit 2-Mac TB4 setup, compared to
-  single-Mac. Target: per-token latency increase < 2× (pipeline adds one
-  inter-stage hop per token; with a 200-500 μs hop over TB this is realistic).
+**What's NOT yet shipped (tracked for the next iteration):**
+- A concrete `PipelineStageModel` conformance on a real model. Qwen 3
+  is the first target. Adapting the model requires exposing a
+  per-layer-range forward entry point in
+  `Libraries/MLXLLM/Models/Qwen3.swift` — currently monolithic via
+  `callAsFunction`.
+- Byte-identical-logits regression test — needs the Qwen 3-0.6B
+  adapter above AND a real-model fixture. Runs a single-device
+  reference forward, then the two-process pipeline, asserts argmax
+  (and top-k for fp tolerance) match.
+- `PipelineRun` executable target — the launcher binary that reads
+  `MLX_HOSTS` / rank, loads the model, builds the partition, and
+  dispatches to `runPrompt` or `runWorker`.
+- Cross-Mac TB4 real-bandwidth numbers. `TransportProbe` (Phase 0)
+  is the tool; the data collection happens once a two-Mac rig
+  exists.
 
-**Complexity:** medium. The partition + selective load is a real refactor.
+**Shipping criterion (to fully close Phase 1):**
+- End-to-end forward pass produces byte-identical logits vs. a
+  single-device run on Qwen 3-0.6B for N=2 stages.
+- Measured decode tok/s on a Qwen 3-4B 4-bit 2-Mac TB4 setup.
+- Pipeline-engine unit tests + integration tests (mock model) green.
 
-**Risk:** chat-template / tokenizer / reasoning parser must live only on the
-final stage. Existing BatchEngine emits `.chunk` / `.reasoning` / `.toolCall`
-from the sampling point, which is already last-stage only.
+**Complexity:** medium. The per-layer forward exposure + selective
+load are the real work; the orchestrator is ~330 lines.
+
+**Risk:** chat-template / tokenizer / reasoning parser live only on
+the final stage — aligns with existing BatchEngine which emits
+`.chunk` / `.reasoning` / `.toolCall` from the sampling point (already
+last-stage only). The Phase 1 MVP is raw-token-out; streaming
+integration is Phase 3 when BatchEngine composes with the pipeline.
 
 ### Phase 2 — Pipeline parallel, N-way, heterogeneous partitioning
 
