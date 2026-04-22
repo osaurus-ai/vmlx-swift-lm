@@ -69,6 +69,24 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// The SSM state companion cache for hybrid models.
     public let ssmStateCache: SSMStateCache
 
+    /// Re-deriver for SSM companion state — the bridge between attention
+    /// KV cache hits and the path-dependent SSM recurrence in hybrid
+    /// models (Qwen3.6-MoE, Mistral4-MoE, Nemotron Cascade, and any VLM
+    /// wrapping one of those).
+    ///
+    /// Created lazily on first hybrid-model admission because it needs
+    /// a forward-closure wiring that only exists after a model is
+    /// loaded. Null until then. See ``SSMReDeriver`` for the full
+    /// behavioral contract — in short, re-derives unblock paged-KV cache
+    /// hits for hybrid-SSM partial matches that would otherwise have to
+    /// roll back to full prefill (the "0% cache hit on the hot path"
+    /// regression).
+    ///
+    /// Exposed as a public read-only so ``BatchEngine`` can call
+    /// `wireModel(...)` after allocating the first slot's cache and
+    /// consume checkpoints during partial-hit resolution.
+    public private(set) var ssmReDeriver: SSMReDeriver?
+
     /// Whether the model has hybrid (attention + SSM) layers.
     private var _isHybrid: Bool = false
 
@@ -114,9 +132,22 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// When hybrid mode is active, the coordinator will also fetch/store
     /// SSM companion states alongside the KV cache data.
     ///
+    /// Side effect: lazily instantiates ``ssmReDeriver`` (once per
+    /// coordinator) when `isHybrid` flips to `true`. The re-deriver is
+    /// idle until its `wireModel(...)` method is called with a forward
+    /// closure and cache allocator from ``BatchEngine``. Before wiring,
+    /// every `requestReDerive` call short-circuits to `nil` — the
+    /// coordinator treats that as "no checkpoint, fall through to full
+    /// prefill" the same way as a cache miss.
+    ///
     /// - Parameter isHybrid: `true` for hybrid models.
     public func setHybrid(_ isHybrid: Bool) {
-        lock.withLock { _isHybrid = isHybrid }
+        lock.withLock {
+            _isHybrid = isHybrid
+            if isHybrid && ssmReDeriver == nil {
+                ssmReDeriver = SSMReDeriver(ssmCache: ssmStateCache)
+            }
+        }
     }
 
     /// Whether the model is hybrid (has both attention and SSM layers).
