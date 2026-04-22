@@ -154,6 +154,14 @@ let package = Package(
             path: "CompileBench"
         ),
         .executableTarget(
+            name: "PipelineRun",
+            dependencies: [
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "PipelineRun"
+        ),
+        .executableTarget(
             name: "RunBench",
             dependencies: [
                 "MLXLMCommon",
