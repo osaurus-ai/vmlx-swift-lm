@@ -484,7 +484,7 @@ public actor BatchEngine {
             admitPendingRequests()
 
             // 2. Run one scheduling step
-            await step()
+            step()
 
             // 3. Remove finished slots
             activeSlots.removeAll { $0.isFinished }
@@ -594,32 +594,6 @@ public actor BatchEngine {
                         Self.logger.info(
                             "Coordinator flipped to isHybrid=true on first hybrid slot admission"
                         )
-                        // Wire the SSM re-deriver's forward closure now
-                        // that we know the model has hybrid layers and
-                        // have `context.model` available. The closures
-                        // are `@Sendable` — they capture only the model
-                        // handle (already `@unchecked Sendable`) and the
-                        // parameters (a value type). Detached Task so
-                        // the actor-hop doesn't serialize on the hot
-                        // admission path.
-                        if let reDeriver = coordinator.ssmReDeriver {
-                            // See ``SSMForwardWiring`` for why the
-                            // closures bypass strict concurrency. MLX
-                            // ops are thread-safe at the Metal command-
-                            // buffer level so the cross-actor call is
-                            // safe in practice; strict concurrency
-                            // can't infer that without an annotation.
-                            let wiring = SSMForwardWiring(
-                                model: context.model,
-                                parameters: request.parameters
-                            )
-                            Task {
-                                await reDeriver.wireModel(
-                                    forward: wiring.makeForward(),
-                                    newCache: wiring.makeNewCache()
-                                )
-                            }
-                        }
                     }
                 }
             }
@@ -632,16 +606,12 @@ public actor BatchEngine {
     // MARK: - Step Logic
 
     /// Run one scheduling step: prefill pending slots, then batch-decode active slots.
-    ///
-    /// Async because ``stepPrefill(slotIndex:)`` needs to cross the
-    /// ``SSMReDeriver`` actor boundary to query for re-derived SSM
-    /// checkpoints on partial cache hits.
-    private func step() async {
+    private func step() {
         // Phase 1: Process one prefill chunk per slot that's still prefilling.
         // Prefill is done sequentially per slot (each chunk is large, batching
         // prefill chunks of different lengths wastes compute on padding).
         for i in activeSlots.indices where activeSlots[i].phase == .prefill {
-            await stepPrefill(slotIndex: i)
+            stepPrefill(slotIndex: i)
         }
 
         // Phase 2: Batch-decode all slots that are in decode phase.
@@ -661,7 +631,7 @@ public actor BatchEngine {
     ///   and full prompt processing including multimodal fusion
     ///
     /// After prefill, samples the first decode token and transitions the slot to `.decode`.
-    private func stepPrefill(slotIndex: Int) async {
+    private func stepPrefill(slotIndex: Int) {
         var slot = activeSlots[slotIndex]
 
         // Check multi-tier cache for a prefix match before running full prefill.
@@ -711,83 +681,36 @@ public actor BatchEngine {
                 }
 
                 if restored {
-                    // Two classes of partial-restore that need extra care
-                    // before feeding "remaining" tokens into model.prepare:
+                    // Two classes of partial-restore that must roll back to
+                    // full prefill rather than feed "remaining" tokens into
+                    // model.prepare — correctness over speed in both cases:
                     //
-                    // 1. VL content: `mergeInputIdsWithImageFeatures`
-                    //    aligns vision tokens by count against
-                    //    `imageFeatures[]`. Splitting the vision-token
-                    //    region across a cache boundary makes MLX trap
-                    //    `SmallVector out of range`. Detect via
-                    //    `slot.originalInput.image/video` presence.
-                    //    Rollback always — the vision tower can't be
-                    //    partially-replayed through a paged KV hit.
+                    // 1. VL content: `mergeInputIdsWithImageFeatures` aligns
+                    //    vision tokens by count against `imageFeatures[]`.
+                    //    Splitting the vision-token region across a cache
+                    //    boundary makes MLX trap `SmallVector out of range`.
+                    //    Detect via `slot.originalInput.image/video` presence.
                     //
-                    // 2. Hybrid SSM: the Mamba/SSM branch's recurrence
-                    //    is path-dependent. Restoring SSM state that
-                    //    was computed over the FULL prefix and then
-                    //    only feeding "remaining" tokens double-counts
-                    //    some positions and the resulting state
-                    //    diverges from what a clean prefill would
-                    //    produce — model output degrades. Detect by
-                    //    checking cache for MambaCache/ArraysCache.
-                    //
-                    //    The re-deriver (``SSMReDeriver``) rescues this
-                    //    case. If a checkpoint exists for the matched
-                    //    prefix, we consume it, restore the SSM state
-                    //    alongside the KV, and proceed with partial
-                    //    prefill of just `remaining` — same fast path
-                    //    as non-SSM models. If no checkpoint yet, kick
-                    //    off an async re-derive (for next turn) and
-                    //    roll back this turn. Applies uniformly to LLM
-                    //    and VLM / MLLM paths — any request whose cache
-                    //    contains a hybrid-SSM layer benefits.
+                    // 2. Hybrid SSM: the Mamba/SSM branch's recurrence is
+                    //    path-dependent. Restoring SSM state that was
+                    //    computed over the FULL prefix and then only feeding
+                    //    "remaining" tokens double-counts some positions
+                    //    and the resulting state diverges from what a clean
+                    //    prefill would produce — model output degrades.
+                    //    Detect by checking cache for MambaCache/ArraysCache
+                    //    layers.
                     let hasVisualContent =
                         slot.originalInput.image != nil ||
                         slot.originalInput.video != nil
                     let hasSSMLayer = slot.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache
                     }
-                    let partialHit = !remaining.isEmpty
-
-                    var unsafePartial = partialHit && hasVisualContent
-                    var ssmRescueFailed = partialHit && hasSSMLayer
-
-                    if ssmRescueFailed, let reDeriver = coordinator.ssmReDeriver {
-                        // Consult the re-deriver for a ready checkpoint
-                        // covering `tokens[0..<matchedTokens]`. Rescue
-                        // this turn if one is available.
-                        let matchedTokens = tokenIds.count - remaining.count
-                        let hash = SSMStateCache.makeKey(
-                            tokens: tokenIds, boundary: matchedTokens
-                        )
-                        if let checkpoint = await reDeriver.consumeCheckpoint(
-                            tokenHash: hash
-                        ) {
-                            restoreSSMStates(checkpoint.ssmStates, into: slot.cache)
-                            ssmRescueFailed = false
-                            Self.logger.info(
-                                "Slot \(slot.id.description, privacy: .public): consumed SSM re-derive checkpoint for \(matchedTokens) tokens — keeping cache hit on hybrid-SSM partial"
-                            )
-                        } else {
-                            // No checkpoint yet — kick off an async
-                            // re-derive so the next turn can take this
-                            // path. This turn still falls back to full
-                            // prefill below.
-                            Task { [tokenIds, matchedTokens] in
-                                _ = try? await reDeriver.requestReDerive(
-                                    tokens: tokenIds,
-                                    stableBoundary: matchedTokens,
-                                    forceSync: false
-                                )
-                            }
-                        }
-                    }
-
-                    if unsafePartial || ssmRescueFailed {
+                    let unsafePartial = !remaining.isEmpty &&
+                        (hasVisualContent || hasSSMLayer)
+                    if unsafePartial {
                         let why: String
-                        if unsafePartial { why = "VL vision-token region can't be split" }
-                        else             { why = "hybrid SSM — no re-derive checkpoint (launched async for next turn)" }
+                        if hasVisualContent { why = "VL vision-token region can't be split" }
+                        else                { why = "hybrid SSM recurrence path-dependent on full prefix" }
                         let slotIDStr = slot.id.description
                         Self.logger.info(
                             "Slot \(slotIDStr, privacy: .public): partial cache hit — rolling back to full prefill (\(why))"
