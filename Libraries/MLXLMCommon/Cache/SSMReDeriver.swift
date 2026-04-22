@@ -421,22 +421,21 @@ public actor SSMReDeriver {
 
     /// Force materialization of every lazy array referenced by the cache
     /// layers. Used between chunks so we don't build an unbounded graph.
-    ///
-    /// Calls through an MLX sync primitive via the ``syncMaterialize``
-    /// indirection so the chunked-prefill loop actually completes each
-    /// chunk's GPU work before launching the next one. Without this,
-    /// long prefixes balloon the lazy graph to every chunk's depth
-    /// before the final `extractSSMStates` forces it.
     private static func forceMaterialize(cache: [KVCache]) {
-        let allArrays = cache.flatMap { $0.state }
-        guard !allArrays.isEmpty else { return }
-        syncMaterialize(allArrays)
-    }
-
-    /// Thin wrapper around MLX's synchronous evaluator. Exists so the
-    /// call site in ``forceMaterialize(cache:)`` stays readable and so
-    /// the one place that names MLX's sync primitive is easy to audit.
-    private static func syncMaterialize(_ arrays: [MLXArray]) {
-        MLX.eval(arrays)
+        for layer in cache {
+            let arrays = layer.state
+            if !arrays.isEmpty {
+                asyncEval(arrays)
+                // Read one scalar per array to force the sync point.
+                // The arrays are fp16 / bf16 / int8 depending on cache
+                // type; read as Float through a safe path. Any scalar
+                // read triggers the same underlying completion.
+                for arr in arrays {
+                    if arr.size > 0 {
+                        _ = arr.reshaped([-1])[0].item(Float.self)
+                    }
+                }
+            }
+        }
     }
 }
