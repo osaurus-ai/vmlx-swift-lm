@@ -158,29 +158,30 @@ func parseMode(_ args: [String]) -> Mode? {
 
 func runServer(name: String?, port: Int) async throws {
     print("[vmlx] starting pipeline worker")
-    print("[vmlx]   service: \(BonjourAdvertiser.serviceType)")
-    print("[vmlx]   name: \(name ?? "<system hostname>")")
-    print("[vmlx]   port: \(port)")
-
-    // Bonjour advertise is for peer DISCOVERY only — mlx-core ring's
-    // actual data plane uses its own TCP sockets via MLX_HOSTFILE +
-    // MLX_RANK. We advertise so the driver can locate us; the driver
-    // then writes a hostfile and tells us to initialize with MLX_RANK=1.
-    //
-    // For the minimal Phase-1 path we let the driver pre-configure the
-    // hostfile via env (set before SSH-launching the server) OR we wait
-    // for the hostfile path to appear. Simplest: require the caller to
-    // set MLX_HOSTFILE + MLX_RANK before running `server`, and the
-    // launcher auto-writes one in `driver` mode via the ring-init
-    // handshake.
-    let advertiser = BonjourAdvertiser(serviceName: name, port: port)
-    try await advertiser.start()
-    print("[vmlx] advertising — waiting for driver")
-    print("[vmlx] (press ctrl-c to stop)")
-
     let env = ProcessInfo.processInfo.environment
     let backend = env["VMLX_PIPELINE_BACKEND"] ?? "ring"
     let hasHostfile = env["MLX_HOSTFILE"] != nil && env["MLX_RANK"] != nil
+
+    // Bonjour advertising is for peer DISCOVERY. When MLX_HOSTFILE is
+    // pre-set the operator already knows the topology — skip Bonjour
+    // so the same port can be used by the ring backend's own listener
+    // (Bonjour would otherwise hold the port and the ring init would
+    // fail to bind, leaving both ranks stuck "accepting"). This is
+    // the typical path for explicit-peer operations (Tailscale, VPN,
+    // cross-subnet cases where mDNS doesn't work anyway).
+    var advertiser: BonjourAdvertiser?
+    if !hasHostfile {
+        print("[vmlx]   service: \(BonjourAdvertiser.serviceType)")
+        print("[vmlx]   name: \(name ?? "<system hostname>")")
+        print("[vmlx]   port: \(port)")
+        let adv = BonjourAdvertiser(serviceName: name, port: port)
+        try await adv.start()
+        advertiser = adv
+        print("[vmlx] advertising — waiting for driver")
+    } else {
+        print("[vmlx]   (skipping Bonjour advertise — MLX_HOSTFILE pre-set)")
+    }
+    print("[vmlx] (press ctrl-c to stop)")
 
     if hasHostfile {
         print("[vmlx] MLX_HOSTFILE=\(env["MLX_HOSTFILE"] ?? "")")
@@ -206,7 +207,7 @@ func runServer(name: String?, port: Int) async throws {
         }
     }
 
-    await advertiser.stop()
+    if let advertiser { await advertiser.stop() }
 }
 
 func runDriver(timeout: TimeInterval, explicitPeer: String?) async throws {
@@ -242,34 +243,50 @@ func runDriver(timeout: TimeInterval, explicitPeer: String?) async throws {
 
     // mlx-core's ring backend reads a JSON HOSTFILE + MLX_RANK.
     // Format: [["ip:port"], ["ip:port"]] — one outer entry per rank.
-    // We write the file to /tmp, set the envs, and (for now) require
-    // the operator to have already launched the worker with the SAME
-    // hostfile + MLX_RANK=1. The next commit adds an SSH-based auto-
-    // launch so the driver starts the worker transparently.
-    let driverHost = env["VMLX_DRIVER_HOST"] ?? "localhost"
-    let driverPort = env["VMLX_DRIVER_PORT"] ?? "7436"
-    let hostfileJSON = """
-    [
-      ["\(driverHost):\(driverPort)"],
-      ["\(peer.host):\(peer.port)"]
-    ]
-    """
-    let hostfilePath = "/tmp/vmlx-pipeline-hosts-\(getpid()).json"
-    try hostfileJSON.write(
-        toFile: hostfilePath, atomically: true, encoding: .utf8)
-    setenv("MLX_HOSTFILE", hostfilePath, 1)
-    setenv("MLX_RANK", "0", 1)
+    //
+    // If the operator has already set MLX_HOSTFILE + MLX_RANK we
+    // honor those — typical when the same hostfile has been copied
+    // to both machines and the driver is using it verbatim.
+    // Otherwise we write a default hostfile to /tmp and set the envs.
+    let hadPresetHostfile = env["MLX_HOSTFILE"] != nil
+        && env["MLX_RANK"] != nil
+    if hadPresetHostfile {
+        print("[vmlx] honoring pre-set MLX_HOSTFILE=\(env["MLX_HOSTFILE"] ?? "")")
+        print("[vmlx] honoring pre-set MLX_RANK=\(env["MLX_RANK"] ?? "")")
+        if let contents = try? String(
+            contentsOfFile: env["MLX_HOSTFILE"] ?? "", encoding: .utf8)
+        {
+            print("[vmlx] hostfile contents:")
+            for line in contents.split(separator: "\n") {
+                print("[vmlx]   \(line)")
+            }
+        }
+    } else {
+        let driverHost = env["VMLX_DRIVER_HOST"] ?? "localhost"
+        let driverPort = env["VMLX_DRIVER_PORT"] ?? "7436"
+        let hostfileJSON = """
+        [
+          ["\(driverHost):\(driverPort)"],
+          ["\(peer.host):\(peer.port)"]
+        ]
+        """
+        let hostfilePath = "/tmp/vmlx-pipeline-hosts-\(getpid()).json"
+        try hostfileJSON.write(
+            toFile: hostfilePath, atomically: true, encoding: .utf8)
+        setenv("MLX_HOSTFILE", hostfilePath, 1)
+        setenv("MLX_RANK", "0", 1)
 
-    print("[vmlx] wrote hostfile: \(hostfilePath)")
-    print("[vmlx] MLX_RANK=0 (driver)")
-    print("[vmlx] hostfile contents:")
-    for line in hostfileJSON.split(separator: "\n") {
-        print("[vmlx]   \(line)")
+        print("[vmlx] wrote hostfile: \(hostfilePath)")
+        print("[vmlx] MLX_RANK=0 (driver)")
+        print("[vmlx] hostfile contents:")
+        for line in hostfileJSON.split(separator: "\n") {
+            print("[vmlx]   \(line)")
+        }
+        print("[vmlx] worker must be running with:")
+        print("[vmlx]   scp \(hostfilePath) \(peer.host):\(hostfilePath)")
+        print("[vmlx]   ssh \(peer.host) MLX_HOSTFILE=\(hostfilePath) MLX_RANK=1 PipelineRun server")
+        print("")
     }
-    print("[vmlx] worker must be running with:")
-    print("[vmlx]   scp \(hostfilePath) \(peer.host):\(hostfilePath)")
-    print("[vmlx]   ssh \(peer.host) MLX_HOSTFILE=\(hostfilePath) MLX_RANK=1 PipelineRun server")
-    print("")
 
     let backend = env["VMLX_PIPELINE_BACKEND"] ?? "ring"
     _ = MLXDistributed.initialize(strict: false, backend: backend)
