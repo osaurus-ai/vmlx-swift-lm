@@ -774,6 +774,46 @@ public actor BatchEngine {
         slot.decodeStartTime = Date()
         slot.pendingTokens = MLXArray([Int32]()) // clear
 
+        // Hybrid-SSM cross-turn cache seed: after prefill completes for
+        // a hybrid-SSM slot, snapshot the SSM companion state keyed by
+        // the prompt length and store it into the coordinator's
+        // ``SSMStateCache``. On the next turn where a paged KV cache
+        // hit covers a prefix ending at this same boundary, the
+        // coordinator fetches the SSM state alongside the KV blocks,
+        // and the partial-hit-rollback is no longer needed.
+        //
+        // Runs INLINE on the BatchEngine actor after MLX eval has
+        // already completed — no detached Task, no cross-actor MLX
+        // submission. Safe under strict concurrency and Metal
+        // command-encoder lifetime (unlike the earlier SSMReDeriver
+        // attempt; see TOOL-CALL-STRUCTURED-CONTRACT.md for the
+        // regression + revert history).
+        //
+        // Heuristic gate: only emit the seed when the slot cache
+        // contains a Mamba or ArraysCache layer. Pure-attention
+        // models carry no SSM companion state; emitting a zero-array
+        // entry would needlessly cost LRU budget.
+        if let coordinator = cacheCoordinator, coordinator.isHybrid {
+            let hasSSM = slot.cache.contains {
+                $0 is MambaCache || $0 is ArraysCache
+            }
+            if hasSSM {
+                let promptTokens = slot.originalInput.text.tokens
+                    .asArray(Int.self)
+                let ssmStates = extractSSMStates(from: slot.cache)
+                if !ssmStates.isEmpty {
+                    coordinator.ssmStateCache.store(
+                        ssmStates: ssmStates,
+                        tokens: promptTokens,
+                        boundary: promptTokens.count
+                    )
+                    Self.logger.debug(
+                        "Slot \(slot.id.description, privacy: .public): stored SSM seed at boundary=\(promptTokens.count) (\(ssmStates.count) state arrays)"
+                    )
+                }
+            }
+        }
+
         // Stage 0: KV-quant compression hook. For requests with
         // `kvMode: .turboQuant(...)`, this swaps `KVCacheSimple` layers for
         // `TurboQuantKVCache` once the first KV layer's offset exceeds the
