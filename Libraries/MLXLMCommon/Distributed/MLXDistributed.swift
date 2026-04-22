@@ -157,7 +157,7 @@ public enum MLXDistributed {
     public static func allSum(
         _ x: MLXArray,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -175,7 +175,7 @@ public enum MLXDistributed {
     public static func allGather(
         _ x: MLXArray,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -187,7 +187,7 @@ public enum MLXDistributed {
     public static func allMax(
         _ x: MLXArray,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -199,7 +199,7 @@ public enum MLXDistributed {
     public static func allMin(
         _ x: MLXArray,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -215,7 +215,7 @@ public enum MLXDistributed {
     public static func sumScatter(
         _ x: MLXArray,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -236,7 +236,7 @@ public enum MLXDistributed {
         _ x: MLXArray,
         dst: Int,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -258,7 +258,7 @@ public enum MLXDistributed {
         dtype: DType,
         src: Int,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -283,7 +283,7 @@ public enum MLXDistributed {
         _ template: MLXArray,
         src: Int,
         group: MLXDistributedGroup? = nil,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .cpu
     ) -> MLXArray {
         let g = (group ?? storedWorldGroup)?.raw ?? emptyGroup
         var result = mlx_array_new()
@@ -303,6 +303,21 @@ public enum MLXDistributed {
     /// concurrency. The construction is effectively free.
     private static var emptyGroup: mlx_distributed_group {
         mlx_distributed_group(ctx: nil)
+    }
+}
+
+// MARK: - StreamOrDevice.cpu shortcut
+
+extension StreamOrDevice {
+    /// CPU stream. Every distributed-collective default uses this because
+    /// mlx-core's `Send::eval_gpu` / `Recv::eval_gpu` (and friends) have
+    /// no GPU implementation — attempting to evaluate on `.gpu` trips
+    /// `[Recv::eval_gpu] has no GPU implementation` at runtime. The CPU
+    /// stream is the correct home for every distributed op; it's cheap,
+    /// it serializes cleanly through the existing `evalLock`, and the
+    /// bytes reach the peer socket the same way regardless.
+    public static var cpu: StreamOrDevice {
+        .device(Device.cpu)
     }
 }
 
