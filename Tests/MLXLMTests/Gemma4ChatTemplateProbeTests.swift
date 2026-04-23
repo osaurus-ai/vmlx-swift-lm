@@ -18,6 +18,23 @@ import XCTest
 
 import Jinja
 
+// Convert a heterogeneous `[String: Any]` context into the
+// `[String: Value]` shape swift-jinja 2.x expects. Used by the
+// probe tests below which were authored against Jinja 1.x's
+// `render(_: [String: Any])`. Production callers go through
+// `Tokenizer.applyChatTemplate(messages:, …)` in swift-
+// transformers which converts for us; only these standalone
+// probe tests need the shim.
+extension Template {
+    fileprivate func renderAny(_ ctx: [String: Any]) throws -> String {
+        var v: [String: Value] = [:]
+        for (k, value) in ctx {
+            v[k] = try Value(any: value)
+        }
+        return try self.render(v)
+    }
+}
+
 final class Gemma4ChatTemplateProbeTests: XCTestCase {
 
     /// Full Gemma-4 chat template shipped with `mlx-community/gemma-4-e2b-it-4bit`.
@@ -135,7 +152,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         do {
             let t = try Template(src)
             // If parse succeeds, try rendering to be sure runtime semantics work.
-            let out = try t.render([:])
+            let out = try t.renderAny([:])
             print("[MinimalReproducer] parse+render OK: \(out)")
         } catch {
             print("[MinimalReproducer] parse/render FAILED: \(error)")
@@ -172,24 +189,19 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
     /// filter-chain or an if-expression) but its parser falls through to
     /// the default case on the next token.
     ///
-    /// Root cause narrowed via construct-by-construct probes (below).
-    /// Promoted to its own test so regressions surface as specific
-    /// test failures.
-    func testGemma4TemplateThrowsStructuredJinjaError() throws {
+    /// Former `testGemma4TemplateThrowsStructuredJinjaError` has flipped
+    /// polarity — since vmlx-swift-lm now pulls swift-transformers 1.3.0
+    /// (which transitively uses huggingface/swift-jinja 2.3.5+), the
+    /// Gemma-4 template PARSES natively. This test now asserts the
+    /// fixed state so a future upstream regression surfaces here.
+    func testGemma4TemplateNowParsesNatively() throws {
         guard let src = try loadGemma4Template() else {
             throw XCTSkip("Gemma-4 template not available on this machine.")
         }
-
-        // `JinjaError` is internal to the Jinja module, so we pattern-match
-        // on the stringified description instead of a typed catch.
         do {
             _ = try Template(src)
-            XCTFail("Template now parses — update the Gemma-4 path and delete this test.")
         } catch {
-            XCTAssertEqual(
-                "\(error)",
-                #"syntax("Unexpected token: multiplicativeBinaryOperator")"#,
-                "Unexpected Jinja error shape — re-run bisect analysis.")
+            XCTFail("Gemma-4 template regressed in swift-jinja: \(error)")
         }
     }
 
@@ -216,7 +228,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         let template = try Template(src)
 
         // Multi-part content: text + image + text + video.
-        let rendered = try template.render([
+        let rendered = try template.renderAny([
             "bos_token": "<bos>",
             "messages": [
                 [
@@ -291,7 +303,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             ] as [String: Any],
         ]
 
-        let out = try template.render([
+        let out = try template.renderAny([
             "bos_token": "<bos>",
             "messages": messages,
             "tools": tools,
@@ -329,7 +341,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         }
         let src = try String(contentsOf: templateURL, encoding: .utf8)
         let template = try Template(src)
-        let rendered = try template.render([
+        let rendered = try template.renderAny([
             "bos_token": "<bos>",
             "messages": [
                 [
@@ -366,7 +378,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
     func testJinjaDictGetMethodIsSupported() throws {
         let src = "{{ m.get('foo', 'fallback') }}"
         let t = try Template(src)
-        let out = try t.render(["m": ["foo": "bar"]])
+        let out = try t.renderAny(["m": ["foo": "bar"]])
         XCTAssertEqual(out, "bar")
     }
 
@@ -375,9 +387,9 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
     func testJinjaIsNotTestIsSupported() throws {
         let src = "{% if x is not string %}Y{% else %}N{% endif %}"
         let t = try Template(src)
-        let intOut = try t.render(["x": 42])
+        let intOut = try t.renderAny(["x": 42])
         XCTAssertEqual(intOut, "Y", "`is not string` should report true for integers")
-        let strOut = try t.render(["x": "hello"])
+        let strOut = try t.renderAny(["x": "hello"])
         XCTAssertEqual(strOut, "N", "`is not string` should report false for strings")
     }
 
@@ -412,7 +424,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         _ = path  // silence unused-binding warning
         let src = try String(contentsOf: templateURL, encoding: .utf8)
         let template = try Template(src)
-        let rendered = try template.render([
+        let rendered = try template.renderAny([
             "bos_token": "<bos>",
             "messages": [
                 ["role": "system", "content": "You are a helpful assistant."],
@@ -446,7 +458,7 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
         {%- endfor -%}
         """
         let t = try Template(src)
-        let out = try t.render([:])
+        let out = try t.renderAny([:])
         XCTAssertEqual(out, "1,2,3",
             "namespace attribute assignment via `set ns.x = value` must work")
     }

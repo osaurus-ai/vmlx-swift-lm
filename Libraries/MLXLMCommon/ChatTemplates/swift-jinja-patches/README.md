@@ -1,11 +1,25 @@
-# swift-jinja root-cause fixes — OSAURUS FORK
+# swift-jinja root-cause fixes — HISTORICAL / ARCHIVAL
 
-> **⚠️ This is the in-tree documentation for a FORKED dependency.**
-> vmlx-swift-lm pins `osaurus-ai/Jinja` at tag `1.3.1` in
-> `Package.swift`. That pin **MUST be declared before**
-> `swift-transformers` in the dependencies list so SPM's package-
-> identity resolution picks our fork over the upstream that
-> swift-transformers transitively depends on.
+> **📜 ARCHIVAL — the fork is no longer pinned in `Package.swift`.**
+>
+> As of the swift-transformers 1.3.0 bump, vmlx-swift-lm transitively
+> pulls `huggingface/swift-jinja` 2.3.5+, which contains all three
+> root-cause fixes documented below (independently discovered by the
+> upstream maintainers after our fork diverged). The
+> `osaurus-ai/Jinja 1.3.1` fork at
+> <https://github.com/osaurus-ai/Jinja> still exists as a reference
+> implementation for anyone pinned to the 1.3.0 line, but vmlx no
+> longer needs it.
+>
+> **What stays:** `ChatTemplateFallbacks.swift` + `TokenizerBridge`
+> auto-engage. These sit above any Jinja version and catch future
+> template regressions regardless of which upstream you're on.
+>
+> **Original writeup below kept verbatim** because the root-cause
+> analysis is still useful context for anyone debugging the next
+> Jinja regression.
+>
+> ---
 >
 > **Fork source:** https://github.com/osaurus-ai/Jinja
 > **Branch:** `osaurus/1.3.0-patched`
