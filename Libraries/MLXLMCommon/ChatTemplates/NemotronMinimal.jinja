@@ -1,0 +1,82 @@
+{#-
+  Minimal Nemotron-Cascade-2 chat template. The upstream Nemotron
+  template uses `for k in dict if k not in handled_keys` — a pattern
+  the swift-jinja runtime (johnmai-dev/Jinja 1.3.x) mis-iterates as
+  [key, value] ArrayValue tuples, which then breaks the `not in`
+  containment check against `ArrayValue + ArrayValue`. This drop-in
+  avoids dict filtering and keeps the prompt contract osaurus needs:
+  `<extra_id_1>` turn markers, `<think>` stripping in history, and a
+  `<tools>...</tools>` block before the first user turn when tools are
+  present. No function-definition formatting — the model's own prior
+  is relied on to call tools via the XML form it was trained on.
+-#}
+{%- set loop_messages = messages -%}
+{%- if messages[0]['role'] == 'system' -%}
+    {%- set system_message = messages[0]['content'] -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set system_message = 'You are a helpful and harmless assistant.' -%}
+{%- endif -%}
+<extra_id_0>System
+{{ system_message }}
+{%- if tools %}
+
+<AVAILABLE_TOOLS>
+{%- for tool in tools %}
+  {%- set fn = tool['function'] if tool.get('function') else tool -%}
+  <tool>
+    <name>{{ fn['name'] }}</name>
+    {%- if fn.get('description') %}
+    <description>{{ fn['description'] | trim }}</description>
+    {%- endif %}
+    {%- if fn.get('parameters') and fn['parameters'].get('properties') %}
+    <parameters>
+      {%- for param_name, param in fn['parameters']['properties'] | dictsort %}
+      <parameter>
+        <name>{{ param_name }}</name>
+        {%- if param.get('type') %}<type>{{ param['type'] }}</type>{%- endif %}
+        {%- if param.get('description') %}<description>{{ param['description'] | trim }}</description>{%- endif %}
+      </parameter>
+      {%- endfor %}
+    </parameters>
+    {%- endif %}
+  </tool>
+{%- endfor %}
+</AVAILABLE_TOOLS>
+{%- endif %}
+
+{% for message in loop_messages -%}
+{%- if message['role'] == 'user' -%}
+<extra_id_1>User
+{{ message['content'] }}
+{%- elif message['role'] == 'assistant' -%}
+<extra_id_1>Assistant
+{%- if message.get('content') -%}
+{{ message['content'] }}
+{%- endif %}
+{%- if message.get('tool_calls') %}
+{%- for tc in message['tool_calls'] %}
+<tool_call>
+<function={{ tc['function']['name'] }}>
+{%- if tc['function']['arguments'] is mapping %}
+{%- for k, v in tc['function']['arguments'] | dictsort %}
+<parameter={{ k }}>
+{{ v }}
+</parameter>
+{%- endfor %}
+{%- elif tc['function']['arguments'] is string -%}
+{{ tc['function']['arguments'] }}
+{%- endif %}
+</function>
+</tool_call>
+{%- endfor %}
+{%- endif %}
+{%- elif message['role'] == 'tool' -%}
+<extra_id_1>Tool
+{{ message['content'] }}
+{%- endif -%}
+
+{% endfor -%}
+{%- if add_generation_prompt %}
+<extra_id_1>Assistant
+{%- endif %}
