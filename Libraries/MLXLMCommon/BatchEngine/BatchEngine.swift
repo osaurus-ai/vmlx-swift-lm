@@ -615,7 +615,20 @@ public actor BatchEngine {
         }
 
         // Phase 2: Batch-decode all slots that are in decode phase.
-        let decodeIndices = activeSlots.indices.filter { activeSlots[$0].phase == .decode }
+        // Pick slots that are (a) in decode phase AND (b) not already
+        // finished. The `!isFinished` check catches the edge case where
+        // `stepPrefill` sampled an EOS as the very first decode token —
+        // it sets `phase = .decode` before the EOS check, calls
+        // `finishSlot`, sets `isFinished = true`, and leaves `nextToken`
+        // nil (the non-EOS branch is where `nextToken` gets assigned).
+        // Without this guard, `stepBatchDecode` force-unwraps that nil
+        // `nextToken` at the `stacked(...)` call and crashes. The
+        // `activeSlots.removeAll { $0.isFinished }` sweep runs AFTER
+        // this phase, so finished slots remain visible here within the
+        // same scheduling iteration.
+        let decodeIndices = activeSlots.indices.filter {
+            activeSlots[$0].phase == .decode && !activeSlots[$0].isFinished
+        }
         if !decodeIndices.isEmpty {
             stepBatchDecode(slotIndices: decodeIndices)
         }
@@ -1103,10 +1116,29 @@ public actor BatchEngine {
             return
         }
 
+        // Defensive filter: drop any slot whose `nextToken` is nil
+        // instead of force-unwrapping. The caller already filters on
+        // `phase == .decode && !isFinished`, so this path SHOULD never
+        // surface a nil — but a future regression (new stepPrefill
+        // branch that transitions to .decode without setting
+        // nextToken, cancel race, etc.) would crash the whole engine
+        // instead of dropping one slot. Log when it happens so the
+        // invariant violation is observable, not silent.
+        let liveIndices = slotIndices.compactMap { idx -> (Int, MLXArray)? in
+            if let tok = self.activeSlots[idx].nextToken {
+                return (idx, tok)
+            }
+            Self.logger.error(
+                "Slot \(self.activeSlots[idx].id.description, privacy: .public): nil nextToken in stepBatchDecode — dropping from batch"
+            )
+            return nil
+        }
+        guard !liveIndices.isEmpty else { return }
+        let slotIndices = liveIndices.map { $0.0 }
+        let tokenArrays = liveIndices.map { $0.1 }
         let B = slotIndices.count
 
         // Build batched input: [B, 1]
-        let tokenArrays = slotIndices.map { activeSlots[$0].nextToken! }
         let batchTokens = stacked(tokenArrays).reshaped(B, 1)
 
         // Per-layer batched cache wrappers. For B > 1 we need the
