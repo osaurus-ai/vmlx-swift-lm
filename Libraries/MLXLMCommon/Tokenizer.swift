@@ -95,6 +95,26 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
 
     public mutating func next() -> String? {
         let newSegment = tokenizer.decode(tokenIds: segmentTokens)
+
+        // Decode can produce a SHORTER string than the previous segment
+        // when the tokenizer's stateful reassembly reinterprets earlier
+        // tokens — e.g. `cleanUpTokenizationSpaces` substitutions
+        // (" 's" → "'s", " ." → "."), byte-level BPE completing a
+        // multi-byte UTF-8 grapheme that previously rendered as one or
+        // more `\u{fffd}` replacements, or two adjacent specials
+        // collapsing to a shorter rendered marker. Passing a negative
+        // length to `String.suffix(_:)` traps with
+        //   "Can't take a suffix of negative length from a collection"
+        // which surfaces as a Swift `_assertionFailure` on the
+        // generate()-pipeline Task (reproduced via
+        // `NaiveStreamingDetokenizerShrinkTests`). Reconcile our
+        // baseline and yield nothing for this step — the detokenizer
+        // remains usable for future `append(token:)` calls.
+        guard newSegment.count >= segment.count else {
+            self.segment = newSegment
+            return nil
+        }
+
         let new = newSegment.suffix(newSegment.count - segment.count)
 
         // if the new segment ends with REPLACEMENT CHARACTER this means
