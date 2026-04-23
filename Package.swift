@@ -38,6 +38,23 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", branch: "osaurus-0.31.3"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
+        // ⚠️ IMPORTANT: Jinja MUST be declared BEFORE swift-transformers
+        // so SPM resolves OUR patched fork for the `Jinja` package
+        // identity instead of the upstream `johnmai-dev/Jinja`
+        // transitively pulled in by swift-transformers. The fork
+        // carries three root-cause fixes that let Gemma-4, Nemotron-
+        // Cascade-2, and any other template using the same constructs
+        // (literal `{` before `{%-` / `{{-`, single-identifier dict
+        // loop, inline `X if Y`) render natively. Removing this pin
+        // silently regresses those families back to the hand-authored
+        // fallback templates in `ChatTemplateFallbacks.swift` — which
+        // still work, but use Gemma-shaped output for Nemotron etc.
+        //
+        // Patch details + minimal reproducers:
+        //   Libraries/MLXLMCommon/ChatTemplates/swift-jinja-patches/README.md
+        .package(
+            url: "https://github.com/osaurus-ai/Jinja",
+            exact: "1.3.1"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.21"),
     ],
     targets: [

@@ -1,0 +1,52 @@
+diff --git a/Sources/Runtime.swift b/Sources/Runtime.swift
+index 3269eb9..b16f215 100644
+--- a/Sources/Runtime.swift
++++ b/Sources/Runtime.swift
+@@ -438,14 +438,25 @@ struct Interpreter {
+             }
+             // Handle ObjectValue (dictionary)
+         } else if let objectIterable = iterable as? ObjectValue {
+-            // Treat the dictionary as an iterable of key-value pairs
++            // Match CPython Jinja2: `for k in dict` binds `k` to each
++            // key (string); `for k, v in dict` binds `(k, v)` via
++            // tuple unpacking. The prior behaviour bound a single
++            // identifier to an ArrayValue([key, value]) tuple, which
++            // then broke containment (`k in handled_keys` where
++            // handled_keys is a list of strings) because it hit the
++            // ArrayValue × ArrayValue code path that only implements
++            // `+`. Reproduced on Nemotron-Cascade-2's chat template.
+             for (key, value) in objectIterable {
++                // `current` is kept as ArrayValue for the tuple-
++                // unpacking branch below; the single-identifier
++                // branch binds the key directly.
+                 let current = ArrayValue(value: [StringValue(value: key), value])
+                 let loopScope = Environment(parent: scope)
+                 var scopeUpdateFunction: (Environment) throws -> Void
+                 if let identifier = node.loopvar as? Identifier {
++                    let keyValue = StringValue(value: key)
+                     scopeUpdateFunction = { scope in
+-                        try scope.setVariable(name: identifier.value, value: current)
++                        try scope.setVariable(name: identifier.value, value: keyValue)
+                     }
+                 } else if let tupleLiteral = node.loopvar as? TupleLiteral {
+                     // Support unpacking of key-value pairs into two variables
+@@ -1187,6 +1198,19 @@ struct Interpreter {
+                 return ObjectValue(value: mapping)
+             case let statement as Macro:
+                 return try self.evaluateMacro(node: statement, environment: environment)
++            case let statement as SelectExpression:
++                // Standalone `X if Y` (no `else`) — the Jinja inline
++                // conditional. `evaluateFor` handles the same node as
++                // a loop-iterable filter. In expression position the
++                // semantics match Python: return X when the test is
++                // truthy; otherwise UndefinedValue (renders as empty
++                // string). Required by Gemma-4's
++                // `{{- ',' if not loop.last -}}` at tools loop tail.
++                let testValue = try self.evaluate(statement: statement.test, environment: environment)
++                if testValue.bool() {
++                    return try self.evaluate(statement: statement.iterable, environment: environment)
++                }
++                return UndefinedValue()
+             case is NullLiteral:
+                 return NullValue()
+             default:

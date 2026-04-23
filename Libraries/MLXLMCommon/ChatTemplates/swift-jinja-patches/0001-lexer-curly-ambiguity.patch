@@ -1,0 +1,58 @@
+diff --git a/Sources/Lexer.swift b/Sources/Lexer.swift
+index 23c4425..38430a7 100644
+--- a/Sources/Lexer.swift
++++ b/Sources/Lexer.swift
+@@ -196,11 +196,48 @@ func tokenize(_ source: String, options: PreprocessOptions = PreprocessOptions()
+         if lastTokenType == nil || lastTokenType == .closeStatement || lastTokenType == .closeExpression {
+             var text = ""
+ 
+-            while cursorPosition < src.count,
+-                !(src[cursorPosition] == "{" && (src[cursorPosition + 1] == "%" || src[cursorPosition + 1] == "{"))
+-            {
+-                text.append(src[cursorPosition])
+-                cursorPosition += 1
++            while cursorPosition < src.count {
++                // Exit text mode on a delimiter. The raw conditions:
++                //   {%  → statement opener
++                //   {{  → expression opener
++                // EXCEPT: preprocess strips whitespace between a
++                // trailing literal `{` in a text region and the next
++                // `{%-` / `{{-` delimiter, which can collapse into
++                // ambiguous sequences:
++                //   `{\s+{%-` → `{{%`   → literal `{` + statement `{%`
++                //   `{\s+{{-` → `{{{`   → literal `{` + expression `{{`
++                // Without these carve-outs the lexer greedily consumes
++                // `{{` as an expression opener and then mis-reads the
++                // following character: `%` as multiplicativeBinary-
++                // Operator (Gemma-4's
++                // `{{ key }}:{` → `\n    {%- if ... -%}` pattern), or
++                // `{` as openCurlyBracket — an object-literal start
++                // (Gemma-4's `properties:{ {{- foo() -}} },` pattern).
++                let here = src[cursorPosition]
++                guard here == "{" else {
++                    text.append(here); cursorPosition += 1; continue
++                }
++                let next = cursorPosition + 1 < src.count ? src[cursorPosition + 1] : " "
++                if next == "%" {
++                    break                   // {% — statement opener
++                }
++                if next == "{" {
++                    let after = cursorPosition + 2 < src.count ? src[cursorPosition + 2] : " "
++                    if after == "%" {
++                        // {{% — literal `{` + statement `{%`. Consume
++                        // the first `{` as text; the next iteration
++                        // exits cleanly on `{%`.
++                        text.append(here); cursorPosition += 1; continue
++                    }
++                    if after == "{" {
++                        // {{{ — literal `{` + expression `{{`. Same
++                        // treatment: consume the first `{` as text.
++                        text.append(here); cursorPosition += 1; continue
++                    }
++                    break                   // {{ — expression opener
++                }
++                // Bare literal `{` not followed by delimiter — consume.
++                text.append(here); cursorPosition += 1
+             }
+ 
+             if !text.isEmpty {
