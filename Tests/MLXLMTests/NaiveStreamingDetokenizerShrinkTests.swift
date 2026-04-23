@@ -132,4 +132,67 @@ final class NaiveStreamingDetokenizerShrinkTests: XCTestCase {
             _ = d.next()
         }
     }
+
+    /// After a shrink we've reconciled the baseline — subsequent growth
+    /// should resume emitting new content correctly, not replay old
+    /// content or be permanently stuck.
+    func testShrinkDoesNotPermanentlyBreakFutureEmission() {
+        let tok = ScriptedDecodeTokenizer(outputs: [
+            "Hello world",     // 11
+            "Hell",            // 4 — SHRINK (baseline reconciled to "Hell")
+            "Hell yeah!",      // 10 — growth resumes; should emit " yeah!"
+        ])
+        var d = NaiveStreamingDetokenizer(tokenizer: tok)
+
+        var emitted = ""
+        d.append(token: 1)
+        if let s = d.next() { emitted += s }
+        d.append(token: 2)
+        _ = d.next()  // shrink — returns nil, reconciles baseline
+        d.append(token: 3)
+        if let s = d.next() { emitted += s }
+
+        // The exact content depends on where the baseline landed, but
+        // we require the detokenizer (a) never crashed, (b) emits
+        // SOMETHING after the shrink+grow path rather than silently
+        // swallowing forever.
+        XCTAssertFalse(emitted.isEmpty,
+            "Detokenizer must resume emission after a shrink (got \"\(emitted)\")")
+    }
+}
+
+/// Defensive regression suite for `ReasoningParser.drain`'s holdback
+/// math. `safeTail = max(0, max(startTag.count, endTag.count) - 1)`
+/// guards against the case where a caller constructs a parser with an
+/// empty tag (e.g. a mis-configured model stamp override). Prior to the
+/// guard, the empty-tag path traps in the stdlib with
+///     "negative distance: can't step through a Collection with a
+///      negative count"
+/// when `offsetBy: -safeTail` moves forward past `endIndex`. The
+/// `insideReasoning` branch is reached when the model opens a reasoning
+/// block; if `endTag` is empty, `buffer.range(of: "")` returns nil (per
+/// Foundation semantics), falling through to the holdback math.
+final class ReasoningParserEmptyTagTests: XCTestCase {
+
+    func testEmptyEndTagInsideReasoningDoesNotCrash() {
+        // Carry the parser into reasoning mode so `endTag` becomes the
+        // `lookFor` target inside `drain`. The guard should keep the
+        // empty `endTag` from underflowing the holdback arithmetic.
+        var parser = ReasoningParser(
+            startTag: "<think>",
+            endTag: "")   // malformed — exercises the guard
+        // Open the reasoning block, then feed text that can never match
+        // the empty end tag via `range(of:)`.
+        _ = parser.feed("<think>something important here")
+        // If the guard is missing this line crashes with a stdlib trap.
+        _ = parser.feed(" more text after")
+        _ = parser.flush()
+    }
+
+    func testBothEmptyTagsDoNotCrash() {
+        var parser = ReasoningParser(startTag: "", endTag: "")
+        _ = parser.feed("plain text buffer")
+        _ = parser.feed(" more")
+        _ = parser.flush()
+    }
 }

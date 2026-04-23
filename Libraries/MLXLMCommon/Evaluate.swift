@@ -819,10 +819,13 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // when fed a 1D tensor. Emitting 2D works uniformly
                     // because all `callAsFunction` paths either broadcast
                     // 2D already or tolerate the extra leading axis.
-                    if remainingTokens.isEmpty {
+                    if remainingTokens.isEmpty, let last = promptTokenIds.last {
                         // Full cache hit — feed just the last token to seed decode.
                         // prepare() needs at least 1 token to produce initial logits.
-                        let lastToken = MLXArray([Int32(promptTokenIds.last!)])
+                        // `let last` defensively guards the "shouldn't happen" case
+                        // where the coordinator hands back .hit with empty tokens;
+                        // falling through to the remaining branch preserves safety.
+                        let lastToken = MLXArray([Int32(last)])
                             .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: lastToken),

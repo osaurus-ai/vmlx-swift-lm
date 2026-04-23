@@ -150,7 +150,12 @@ public struct ReasoningParser: Sendable {
             // a tag prefix at the end, hold back enough characters that a
             // future chunk can complete it.
             if allowPartialTagAtEnd {
-                let safeTail = max(startTag.count, endTag.count) - 1
+                // `max(startTag, endTag).count - 1` — use `max(0, …)` so
+                // an edge-case empty tag (e.g. a model-specific override
+                // mis-configured at init) doesn't produce a negative
+                // `safeTail`, which would make the `offsetBy: -safeTail`
+                // move forward past `endIndex` and trap in the stdlib.
+                let safeTail = max(0, max(startTag.count, endTag.count) - 1)
                 if buffer.count > safeTail {
                     let splitAt = buffer.index(buffer.endIndex, offsetBy: -safeTail)
                     let safe = String(buffer[..<splitAt])

@@ -730,12 +730,23 @@ public actor BatchEngine {
                         )
                         slot.cache = context.model.newCache(parameters: slot.parameters)
                         inputForPrepare = slot.originalInput
-                    } else if remaining.isEmpty {
-                        // Full cache hit — feed last token to seed decode
-                        let lastToken = MLXArray([Int32(tokenIds.last!)])
+                    } else if remaining.isEmpty, let last = tokenIds.last {
+                        // Full cache hit — feed last token to seed decode.
+                        // The `let last` pattern defensively handles the
+                        // "shouldn't happen but don't crash if it does"
+                        // case where coordinator.fetch returns `.hit`
+                        // with an empty token set.
+                        let lastToken = MLXArray([Int32(last)])
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: lastToken),
                             image: nil, video: nil)
+                    } else if remaining.isEmpty {
+                        // Defensive fallback: no last token → roll back.
+                        slot.cache = context.model.newCache(parameters: slot.parameters)
+                        inputForPrepare = slot.originalInput
+                        Self.logger.error(
+                            "Slot \(slot.id.description, privacy: .public): cache .hit returned empty tokenIds — rolling back to full prefill"
+                        )
                     } else {
                         let remainingArray = MLXArray(remaining.map { Int32($0) })
                         inputForPrepare = LMInput(
