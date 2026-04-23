@@ -732,11 +732,16 @@ public actor BatchEngine {
                         inputForPrepare = slot.originalInput
                     } else if remaining.isEmpty, let last = tokenIds.last {
                         // Full cache hit — feed last token to seed decode.
-                        // The `let last` pattern defensively handles the
-                        // "shouldn't happen but don't crash if it does"
-                        // case where coordinator.fetch returns `.hit`
-                        // with an empty token set.
+                        // Tensor must be 2D `[1, 1]`: the Qwen3_5 VLM
+                        // `Qwen35Language.LanguageModel` reads
+                        // `inputs.dim(1)` during position-id compute and
+                        // crashes MLX with `SmallVector out of range`
+                        // (array.cpp:335) on a 1D input. All other
+                        // model forwards either broadcast 2D already
+                        // or tolerate the extra leading axis — matches
+                        // the sibling `Evaluate.swift:825` fix.
                         let lastToken = MLXArray([Int32(last)])
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: lastToken),
                             image: nil, video: nil)
@@ -748,7 +753,9 @@ public actor BatchEngine {
                             "Slot \(slot.id.description, privacy: .public): cache .hit returned empty tokenIds — rolling back to full prefill"
                         )
                     } else {
+                        // Remaining tokens path — same 2D shape contract.
                         let remainingArray = MLXArray(remaining.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
                             text: LMInput.Text(tokens: remainingArray),
                             image: nil, video: nil)

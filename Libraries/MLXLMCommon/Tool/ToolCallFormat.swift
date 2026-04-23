@@ -212,6 +212,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .mistral
         }
 
+        // Kimi family (kimi_k2, kimi_k15, etc.). JANG converters stamp
+        // `capabilities.toolParser = "kimi_k2"`; non-JANG bundles fall
+        // through to this model_type sniff.
+        if type.hasPrefix("kimi") {
+            return .kimiK2
+        }
+
         return nil
     }
 

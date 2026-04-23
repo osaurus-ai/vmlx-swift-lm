@@ -215,7 +215,8 @@ extension ReasoningParser {
         switch name.lowercased() {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
-            "nemotron", "nemotron_h", "minimax", "minimax_m2":
+            "nemotron", "nemotron_h", "minimax", "minimax_m2",
+            "kimi", "kimi_k2", "kimik2":
             // Start inside the reasoning block — matches the Qwen 3.x
             // family's chat-template default (`enable_thinking=true`
             // prefills `<think>\n` at prompt tail).
