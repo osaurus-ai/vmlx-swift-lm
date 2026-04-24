@@ -99,7 +99,31 @@ Source of truth: `jang/research/DSV-FAMILY-RUNTIME-GUIDE.md` §2, §12,
 
 ## Port plan (recommended sequence)
 
-### Phase 1 — Minimal text forward (prefill-style, no optimization)
+### Phase 1a — Landed 2026-04-24 (chat template + config + math helpers)
+
+Canonical ref: `jang/research/DSV4-RUNTIME-ARCHITECTURE.md`.
+
+- [x] `Libraries/MLXLLM/Models/DeepseekV4Configuration.swift` —
+      full config struct mirroring Python `ModelArgs` (mHC, attn_sink,
+      compress_ratios, o_groups, hash_layers, swiglu_limit, YaRN,
+      sliding_window). Provides `isHashLayer` / `hasCompressor` /
+      `ropeTheta(forLayer:)` helpers.
+- [x] `Libraries/MLXLMCommon/DeepseekV4ChatEncoder.swift` —
+      verbatim Swift port of `encoding_dsv4.py` (744 LOC Python).
+      Handles `chat` vs `thinking` modes, reasoning_effort=max
+      preface, drop_earlier_reasoning multi-turn rule (forced off
+      when tools present), DSML tool-call encoding, tool_result
+      merging into user contentBlocks, sort_tool_results_by_call_order,
+      latest_reminder role, developer role. 15 round-trip tests green.
+- [x] `Libraries/MLXLLM/Models/DeepseekV4MathHelpers.swift` —
+      pure-math kernels usable without model weights: `hcSplitSinkhorn`
+      (20-iter row/col normalize on `comb`), `applyPartialRoPE` (with
+      inverse branch for attention output), `dsv4SwiGLU(gate, up, limit)`,
+      `sqrtSoftplus`, `sqrtSoftplusSelect` (bias-for-selection /
+      unbiased-for-weighting per §6 bug fix), `yarnInvFreq` with
+      `high = min(..., dim-1)` clamp.
+
+### Phase 1b — Minimal text forward (prefill-style, no optimization)
 1. `DeepseekV4Configuration` — parse all new fields (mHC, attn_sink,
    compress_ratios, hash_layers, sliding_window, o_groups).
 2. `DeepseekV4SwiGLU` with `swiglu_limit=10.0` clamp.
