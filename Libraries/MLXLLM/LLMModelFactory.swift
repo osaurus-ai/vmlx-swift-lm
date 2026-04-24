@@ -71,6 +71,23 @@ public enum LLMTypeRegistry {
             "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
             "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
             "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+            // Kimi K2.6 = DeepseekV3-family MLA + MoE. Upstream writes
+            // `model_type = "kimi_k25"` in config.json (aliased to the
+            // same text backbone as DeepSeek-V3). Pure-text bundles and
+            // the JANGTQ → JANG conversion escape-hatch path described
+            // in jang/research/KIMI-K2.6-VMLX-INTEGRATION.md land here.
+            // VL variants need a separate `KimiVLM` wrapper (MoonViT
+            // + `multi_modal_projector`) in VLMModelFactory — not yet
+            // ported, text path only for now.
+            //
+            // NOTE: the current `DeepseekV3Attention` uses prefill-style
+            // K/V materialization on every step (no L==1 absorb branch),
+            // so it does NOT need the MLA fp32-SDPA patch that the
+            // Python runtime requires. ~1.5× decode slowdown vs Python's
+            // absorb path — acceptable correctness-over-speed trade-off
+            // (see section 4 of KIMI-K2.6-IMPLEMENTATION.md).
+            "kimi_k25": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+            "kimi_k2": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
             "granite": create(GraniteConfiguration.self, GraniteModel.init),
             "granitemoehybrid": create(
                 GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
