@@ -209,21 +209,59 @@ public enum LLMTypeRegistry {
     ///
     /// Follow `Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md` to finish.
     private static func dispatchDeepseekV4(data: Data) throws -> any LanguageModel {
-        // Phase 1b landed 2026-04-24 — DeepseekV4Model wires the full
-        // forward (mHC + MLA + sinks + inverse RoPE + grouped O +
-        // sqrtsoftplus MoE + DSV4 SwiGLU + HyperHead). JANGTQ variant
-        // swap routes through `DeepseekV4JANGTQModel` when the bundle
-        // stamps `weight_format: "mxtq"` in config.json.
+        // DeepseekV4 (JANGTQ + JANG family). The right variant depends
+        // on whether routed experts are stored as MXTQ codebook
+        // (TurboQuantSwitchGLU) or plain affine (SwitchGLU).
+        //
+        // Detection priority:
+        //   1. `weight_format: "mxtq"` in config.json — authoritative
+        //      when present (jang_config.json typically carries this
+        //      but some bundles stamp it on config.json instead).
+        //   2. `DSV4_FORCE_JANGTQ=1` env override — for bundles with
+        //      mislabeled jang_config (we've seen "bf16" stamped on
+        //      JANGTQ bundles in the wild). Sets the JANGTQ path.
+        //   3. Heuristic: DSV4 + `quantization.bits in {2, 4}` AND
+        //      `quantization.group_size == 32` AND no overriding
+        //      affine signal → JANGTQ. Reflects research §5: the
+        //      only DSV4-Flash distributions are JANGTQ_2L/4 and
+        //      JANG_2L/4. Both quant ladders. JANG_2L/JANG4 use
+        //      uniform affine (no `tq_packed` keys) — but they're
+        //      experimental per the bundle cheat-sheet, not the
+        //      primary production target.
+        //   4. Fallback: affine `DeepseekV4Model`.
         struct FormatCheck: Codable {
             let weightFormat: String?
-            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+            let quantization: QuantInfo?
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case quantization
+            }
         }
+        struct QuantInfo: Codable {
+            let bits: Int?
+            let groupSize: Int?
+            enum CodingKeys: String, CodingKey {
+                case bits
+                case groupSize = "group_size"
+            }
+        }
+
         let config = try JSONDecoder.json5().decode(
             DeepseekV4Configuration.self, from: data)
-        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
-            check.weightFormat == "mxtq"
-        {
-            return DeepseekV4JANGTQModel(config)
+        let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data)
+        let forced = ProcessInfo.processInfo.environment["DSV4_FORCE_JANGTQ"] == "1"
+        let weightFormat = check?.weightFormat?.lowercased()
+        let isMxtqStamp =
+            weightFormat == "mxtq" || weightFormat == "jangtq2"
+            || weightFormat == "jangtq4"
+        // Heuristic match: need explicit force OR explicit mxtq stamp
+        // — purely heuristic dispatch on bits=2/4 alone is unsafe
+        // because JANG_2L (uniform affine 2-bit) shares those config
+        // values. Future improvement: peek the safetensors index for
+        // `tq_packed` keys when neither stamp nor env is set.
+        if isMxtqStamp || forced {
+            let mxtqBits = check?.quantization?.bits ?? 2
+            return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
     }

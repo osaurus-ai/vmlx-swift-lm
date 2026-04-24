@@ -763,66 +763,152 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // attention. Layers with compress_ratio == 0 carry no such
         // weights; layers with >0 carry `self_attn.compressor.*` and
         // (for ratio=4) `self_attn.indexer.*`.
+        // Mirrors `Model.sanitize` in
+        // jang-tools/jang_tools/dsv4/mlx_model.py:1124. Per-prefix
+        // structural matching — avoids over-broad string replace bugs
+        // (e.g. ".w1." colliding outside MLP contexts).
+        let projForW = ["w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"]
         for (rawKey, value) in weights {
-            if rawKey.contains("mtp.") { continue }
+            if rawKey.hasPrefix("mtp.") { continue }
 
-            var k = rawKey
-
-            // Top-level renames
-            k = k.replacingOccurrences(of: "embed.weight", with: "model.embed_tokens.weight")
-            if k == "norm.weight" { k = "model.norm.weight" }
-            if k == "head.weight" { k = "lm_head.weight" }
-
-            // HyperHead at model root
-            if k.hasPrefix("hc_head_") {
-                // Rename hc_head_{fn,base,scale} → model.hc_head.hc_head_{...}
-                k = "model.hc_head." + k
+            // Top-level (no `layers.N.` prefix).
+            if rawKey == "embed.weight" || rawKey == "embed.scales"
+                || rawKey == "embed.biases"
+            {
+                let suffix = String(rawKey.dropFirst("embed.".count))
+                out["model.embed_tokens.\(suffix)"] = value
+                continue
+            }
+            if rawKey.hasPrefix("head.") {
+                // head.{weight,scales,biases} → lm_head.*
+                let suffix = String(rawKey.dropFirst("head.".count))
+                out["lm_head.\(suffix)"] = value
+                continue
+            }
+            if rawKey == "norm.weight" {
+                out["model.norm.weight"] = value
+                continue
+            }
+            if rawKey == "hc_head_fn" || rawKey == "hc_head_base"
+                || rawKey == "hc_head_scale"
+            {
+                // `@ParameterInfo(key: "hc_head_*")` lives at
+                // `model.hc_head.hc_head_*`.
+                out["model.hc_head.\(rawKey)"] = value
+                continue
             }
 
-            // Per-layer renames — prepend model. and rewrite segments.
-            if k.hasPrefix("layers.") || k.hasPrefix("model.layers.") {
-                if !k.hasPrefix("model.layers.") {
-                    k = "model." + k
+            // layers.N.{...} branch
+            guard rawKey.hasPrefix("layers.") else {
+                out["model.\(rawKey)"] = value
+                continue
+            }
+            let afterLayers = rawKey.dropFirst("layers.".count)
+            guard let dotIdx = afterLayers.firstIndex(of: ".") else { continue }
+            let layerStr = String(afterLayers[..<dotIdx])
+            guard Int(layerStr) != nil else { continue }
+            let rest = String(afterLayers[afterLayers.index(after: dotIdx)...])
+            let pfx = "model.layers.\(layerStr)"
+
+            // Norms
+            if rest == "attn_norm.weight" {
+                out["\(pfx).input_layernorm.weight"] = value
+                continue
+            }
+            if rest == "ffn_norm.weight" {
+                out["\(pfx).post_attention_layernorm.weight"] = value
+                continue
+            }
+
+            // mHC per-layer (hc_attn_*, hc_ffn_*).
+            if rest.hasPrefix("hc_attn_") {
+                let field = String(rest.dropFirst("hc_attn_".count))
+                out["\(pfx).attn_hc.\(field)"] = value
+                continue
+            }
+            if rest.hasPrefix("hc_ffn_") {
+                let field = String(rest.dropFirst("hc_ffn_".count))
+                out["\(pfx).ffn_hc.\(field)"] = value
+                continue
+            }
+
+            // Attention subtree (q_norm / kv_norm / wq_a / wq_b / wkv /
+            // wo_a / wo_b / attn_sink / compressor.* / indexer.*).
+            if rest.hasPrefix("attn.") {
+                let inner = String(rest.dropFirst("attn.".count))
+                out["\(pfx).self_attn.\(inner)"] = value
+                continue
+            }
+
+            // FFN subtree.
+            if rest.hasPrefix("ffn.") {
+                let inner = String(rest.dropFirst("ffn.".count))
+                if inner.hasPrefix("gate.") {
+                    let f = String(inner.dropFirst("gate.".count))
+                    out["\(pfx).mlp.gate.\(f)"] = value
+                    continue
                 }
-                // attn → self_attn (only as a segment)
-                k = k.replacingOccurrences(of: ".attn.", with: ".self_attn.")
-                // attn_norm → input_layernorm
-                k = k.replacingOccurrences(
-                    of: ".attn_norm.", with: ".input_layernorm.")
-                // ffn_norm → post_attention_layernorm
-                k = k.replacingOccurrences(
-                    of: ".ffn_norm.", with: ".post_attention_layernorm.")
-                // ffn → mlp
-                k = k.replacingOccurrences(of: ".ffn.", with: ".mlp.")
-                // hc_attn / hc_ffn (prefix-only — matches "layer.N.hc_attn_fn",
-                // the suffix after the final _ is the field name).
-                for which in ["hc_attn", "hc_ffn"] {
-                    for field in ["fn", "base", "scale"] {
-                        let src = ".\(which)_\(field)"
-                        let dst = ".\(which.replacingOccurrences(of: "hc_", with: ""))_hc.\(field)"
-                        if k.contains(src) {
-                            k = k.replacingOccurrences(of: src, with: dst)
-                        }
+                if inner.hasPrefix("shared_experts.") {
+                    let f = String(inner.dropFirst("shared_experts.".count))
+                    if let firstDot = f.firstIndex(of: "."),
+                        let proj = projForW[String(f[..<firstDot])]
+                    {
+                        let suffix = String(f[f.index(after: firstDot)...])
+                        out["\(pfx).mlp.shared_experts.\(proj).\(suffix)"] = value
+                        continue
                     }
+                    out["\(pfx).mlp.shared_experts.\(f)"] = value
+                    continue
                 }
+                if inner.hasPrefix("experts.") {
+                    let after = String(inner.dropFirst("experts.".count))
+                    guard let eDot = after.firstIndex(of: ".") else { continue }
+                    let eStr = String(after[..<eDot])
+                    let tail = String(after[after.index(after: eDot)...])
+                    if let firstDot = tail.firstIndex(of: "."),
+                        let proj = projForW[String(tail[..<firstDot])]
+                    {
+                        let suffix = String(tail[tail.index(after: firstDot)...])
+                        out["\(pfx).mlp.experts.\(eStr).\(proj).\(suffix)"] = value
+                        continue
+                    }
+                    out["\(pfx).mlp.experts.\(eStr).\(tail)"] = value
+                    continue
+                }
+                out["\(pfx).mlp.\(inner)"] = value
+                continue
             }
 
-            out[k] = value
+            out["\(pfx).\(rest)"] = value
         }
 
-        // Second pass: stack per-expert weights into switch_mlp.{gate,up,down}_proj.*
-        // Source shape: (out, in) each; stacked shape: (n_experts, out, in).
+        // Second pass: stack per-expert weights into switch_mlp.{gate,
+        // up,down}_proj.*. Two formats supported:
+        //
+        // Affine (JANG_2L / JANG4): suffixes weight / scales / biases.
+        //   Source per expert: (out, in) [+ (out, in/group)] [+ (out, in/group)]
+        //   Stacked shape: (n_experts, ...).
+        //
+        // JANGTQ (JANGTQ2 / JANGTQ4 routed experts): suffixes
+        // tq_packed / tq_norms. tq_bits is a per-tensor int constant
+        // — we drop it (TurboQuantSwitchLinear configures bits at
+        // construction time from the model_factory).
+        //   Source per expert: tq_packed (out, packed_cols), tq_norms (out,)
+        //   Stacked shape: (n_experts, out, packed_cols) / (n_experts, out)
+        // The first pass already rewrote `.w1.` → `.gate_proj.` (etc.)
+        // globally, so per-expert keys live at
+        // `model.layers.L.mlp.experts.E.gate_proj.{suffix}`. Stack into
+        // `model.layers.L.mlp.switch_mlp.{gate,down,up}_proj.{suffix}`.
+        let suffixes = ["weight", "scales", "biases", "tq_packed", "tq_norms"]
         for layerIdx in 0..<config.numHiddenLayers {
             let prefix = "model.layers.\(layerIdx).mlp.experts"
-            for (src, dst) in [
-                ("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"),
-            ] {
-                for suffix in ["weight", "scales", "biases"] {
-                    let first = "\(prefix).0.\(src).\(suffix)"
+            for projName in ["gate_proj", "down_proj", "up_proj"] {
+                for suffix in suffixes {
+                    let first = "\(prefix).0.\(projName).\(suffix)"
                     guard out[first] != nil else { continue }
                     var tensors: [MLXArray] = []
                     for e in 0..<config.nRoutedExperts {
-                        let key = "\(prefix).\(e).\(src).\(suffix)"
+                        let key = "\(prefix).\(e).\(projName).\(suffix)"
                         guard let t = out[key] else {
                             tensors = []
                             break
@@ -831,13 +917,19 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     }
                     if tensors.count == config.nRoutedExperts {
                         let stackedKey =
-                            "model.layers.\(layerIdx).mlp.switch_mlp.\(dst).\(suffix)"
+                            "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(suffix)"
                         out[stackedKey] = stacked(tensors)
-                        // Remove the per-expert originals.
                         for e in 0..<config.nRoutedExperts {
-                            out.removeValue(forKey: "\(prefix).\(e).\(src).\(suffix)")
+                            out.removeValue(
+                                forKey: "\(prefix).\(e).\(projName).\(suffix)")
                         }
                     }
+                }
+                // Drop per-expert tq_bits scalars — TurboQuantSwitchLinear
+                // gets bit width from the JANGTQ config, not weights.
+                for e in 0..<config.nRoutedExperts {
+                    out.removeValue(
+                        forKey: "\(prefix).\(e).\(projName).tq_bits")
                 }
             }
         }
