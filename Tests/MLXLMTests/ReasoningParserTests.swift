@@ -864,6 +864,63 @@ struct StartInReasoningTests {
         #expect(content == "answer is 4")
     }
 
+    @Test("B1: prompt tail with NEITHER <think> nor </think> → start in content (mis-stamp safety net)")
+    func testB1NoTagsInTailStartsInContent() {
+        // Defense-in-depth against mis-stamped bundles. If a JANG
+        // bundle or caller passes `stampName="think_xml"` but the
+        // prompt tail contains no `<think>` or `</think>` at all, the
+        // chat template almost certainly did NOT prefill a think
+        // block — so starting in reasoning would route the entire
+        // response into `.reasoning`. Reported 2026-04-24 for LFM2
+        // models that some older JANG converters stamped as
+        // `reasoning_parser=think_xml`.
+        //
+        // Safer default: start in content. The parser still latches
+        // on `<think>` mid-stream if the model actually emits one,
+        // so Qwen 3.6 interleaved thinking remains correct.
+        let promptTail = "<|im_start|>assistant\n"  // no <think>, no </think>
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: "think_xml",
+            promptTail: promptTail)
+        else {
+            Issue.record("forPrompt should return a non-nil parser for think_xml")
+            return
+        }
+        var p = parser
+        // Model output: plain content, never emits any tag.
+        var segs = p.feed("the answer is 4")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(
+            reasoning.isEmpty,
+            "Mis-stamped model with no <think> in prompt tail must not route content into .reasoning")
+        #expect(content == "the answer is 4")
+    }
+
+    @Test("B1: prompt tail has no tags but model later emits <think> — still latches correctly")
+    func testB1NoTagsInTailButModelEmitsThink() {
+        // Follow-up to the mis-stamp safety net: even when we force
+        // startInReasoning=false because of no tail tags, a model that
+        // legitimately emits `<think>…</think>` mid-stream must still
+        // have those segments routed to `.reasoning`.
+        let promptTail = "<|im_start|>assistant\n"
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: "think_xml",
+            promptTail: promptTail)
+        else {
+            Issue.record("forPrompt should return a non-nil parser")
+            return
+        }
+        var p = parser
+        var segs = p.feed("prefix <think>mid-stream thought</think>answer")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "mid-stream thought")
+        #expect(content == "prefix answer")
+    }
+
     @Test("B1: no prompt tail given → falls back to stamp default")
     func testB1NoPromptTailFallsBackToStampDefault() {
         // forPrompt without promptTail should behave exactly like

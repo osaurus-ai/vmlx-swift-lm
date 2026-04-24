@@ -296,10 +296,19 @@ extension ReasoningParser {
             // Closer with no opener → prompt ends in content.
             startInReasoning = false
         case (nil, nil):
-            // Neither tag seen in the tail — trust stamp default.
-            // Reconstruct the parser with its stamp-inferred initial
-            // state by re-calling fromCapabilityName.
-            return base
+            // Neither opener nor closer in the prompt tail. The stamps
+            // that bake `startInReasoning=true` (think_xml / qwen family)
+            // do so to match chat templates that PREFILL `<think>` at
+            // the prompt tail. If the tail is missing that opener
+            // entirely, the template didn't prefill — e.g. the model
+            // is mis-stamped, or an upstream consumer built its own
+            // prompt. Starting in reasoning in that case routes the
+            // entire answer into `.reasoning` which osaurus renders in
+            // the thinking block (reported 2026-04-24 for LFM2 bundles
+            // with stale stamps). Safer default: start in content; the
+            // parser still latches on `<think>` mid-stream if the model
+            // emits one, so Qwen 3.6 interleaved thinking still works.
+            startInReasoning = false
         }
 
         return ReasoningParser(
