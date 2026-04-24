@@ -209,15 +209,23 @@ public enum LLMTypeRegistry {
     ///
     /// Follow `Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md` to finish.
     private static func dispatchDeepseekV4(data: Data) throws -> any LanguageModel {
-        _ = data
-        // `.unsupportedModelType` is the cleanest error type for this
-        // case even though the model_type itself is registered — we're
-        // signalling that the handler exists but the model isn't yet
-        // supported. The attached string is the full guidance; osaurus
-        // displays the error verbatim.
-        throw ModelFactoryError.unsupportedModelType(
-            "deepseek_v4 (see Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md — DSV4 is architecturally distinct from DSV3 and needs its own model class; routing through DeepseekV3Model would produce garbage output)"
-        )
+        // Phase 1b landed 2026-04-24 — DeepseekV4Model wires the full
+        // forward (mHC + MLA + sinks + inverse RoPE + grouped O +
+        // sqrtsoftplus MoE + DSV4 SwiGLU + HyperHead). JANGTQ variant
+        // swap routes through `DeepseekV4JANGTQModel` when the bundle
+        // stamps `weight_format: "mxtq"` in config.json.
+        struct FormatCheck: Codable {
+            let weightFormat: String?
+            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+        }
+        let config = try JSONDecoder.json5().decode(
+            DeepseekV4Configuration.self, from: data)
+        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+            check.weightFormat == "mxtq"
+        {
+            return DeepseekV4JANGTQModel(config)
+        }
+        return DeepseekV4Model(config)
     }
 
     private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {

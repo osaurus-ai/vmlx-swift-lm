@@ -183,66 +183,73 @@ final class KimiK25RoutingTests: XCTestCase {
         }
     }
 
-    // MARK: - DSV4 placeholder (architecturally distinct from DSV3)
+    // MARK: - DSV4 live dispatch (Phase 1b landed)
 
-    /// `model_type = "deepseek_v4"` must throw a clear error until
-    /// the full DSV4 model lands — routing DSV4 weights through
-    /// `DeepseekV3Model` would produce garbage (mHC + CSA/HCA +
-    /// sqrtsoftplus gate + grouped-O are all different). The
-    /// registration exists so the factory returns a helpful
-    /// `unsupportedModelType(...)` message pointing at the port
-    /// plan doc instead of silently producing an unexpected error.
-    func testDeepseekV4ThrowsUntilPorted() async throws {
+    /// `model_type = "deepseek_v4"` now instantiates a live
+    /// `DeepseekV4Model` (Phase 1b wired: mHC + MLA + attn sinks +
+    /// inverse RoPE + grouped O + sqrtsoftplus MoE + DSV4 SwiGLU +
+    /// HyperHead). `weight_format = "mxtq"` routes to
+    /// `DeepseekV4JANGTQModel` with TurboQuantSwitchGLU for routed
+    /// experts.
+    func testDeepseekV4DispatchesToLiveModel() async throws {
         let typeRegistry = LLMModelFactory.shared.typeRegistry
         let cfg = """
             {
               "model_type": "deepseek_v4",
-              "hidden_size": 4096,
-              "num_hidden_layers": 43,
-              "intermediate_size": 12288,
-              "moe_intermediate_size": 2048,
-              "num_attention_heads": 64,
+              "hidden_size": 16,
+              "num_hidden_layers": 2,
+              "moe_intermediate_size": 16,
+              "num_attention_heads": 2,
               "num_key_value_heads": 1,
-              "v_head_dim": 512,
-              "qk_nope_head_dim": 448,
-              "qk_rope_head_dim": 64,
-              "q_lora_rank": 1024,
-              "kv_lora_rank": 0,
-              "vocab_size": 129280,
-              "rms_norm_eps": 1e-6,
-              "rope_theta": 10000.0,
-              "max_position_embeddings": 1048576,
-              "attention_bias": false,
-              "norm_topk_prob": true,
-              "routed_scaling_factor": 1.5,
-              "first_k_dense_replace": 3,
-              "moe_layer_freq": 1,
-              "n_routed_experts": 256,
-              "num_experts_per_tok": 6,
-              "n_shared_experts": 1
+              "head_dim": 8,
+              "qk_rope_head_dim": 4,
+              "q_lora_rank": 8,
+              "o_groups": 2,
+              "o_lora_rank": 4,
+              "vocab_size": 256,
+              "n_routed_experts": 4,
+              "num_experts_per_tok": 2,
+              "n_shared_experts": 1,
+              "hc_mult": 2,
+              "compress_ratios": [0, 0]
             }
             """
-        do {
-            _ = try await typeRegistry.createModel(
-                configuration: cfg.data(using: .utf8)!,
-                modelType: "deepseek_v4")
-            XCTFail("deepseek_v4 must not silently dispatch — DSV4 is arch-distinct from DSV3")
-        } catch let err as ModelFactoryError {
-            // Accept ANY factory error — the specific one is
-            // `.unsupportedModelType(String)` with the help message
-            // but we don't want to lock the error shape (future port
-            // will replace this with a real model and flip the test).
-            switch err {
-            case .unsupportedModelType(let msg):
-                XCTAssertTrue(
-                    msg.contains("deepseek_v4") && msg.contains("DSV4-PORT-STATUS"),
-                    "unsupportedModelType message must name deepseek_v4 and point at port doc, got: \(msg)")
-            default:
-                XCTFail("Unexpected factory error: \(err)")
+        let model = try await typeRegistry.createModel(
+            configuration: cfg.data(using: .utf8)!,
+            modelType: "deepseek_v4")
+        XCTAssertTrue(model is DeepseekV4Model,
+            "affine deepseek_v4 must dispatch to DeepseekV4Model")
+    }
+
+    func testDeepseekV4MxtqDispatchesToJANGTQ() async throws {
+        let typeRegistry = LLMModelFactory.shared.typeRegistry
+        let cfg = """
+            {
+              "model_type": "deepseek_v4",
+              "weight_format": "mxtq",
+              "hidden_size": 16,
+              "num_hidden_layers": 2,
+              "moe_intermediate_size": 16,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "head_dim": 8,
+              "qk_rope_head_dim": 4,
+              "q_lora_rank": 8,
+              "o_groups": 2,
+              "o_lora_rank": 4,
+              "vocab_size": 256,
+              "n_routed_experts": 4,
+              "num_experts_per_tok": 2,
+              "n_shared_experts": 1,
+              "hc_mult": 2,
+              "compress_ratios": [0, 0]
             }
-        } catch {
-            XCTFail("Unexpected error: \(error)")
-        }
+            """
+        let model = try await typeRegistry.createModel(
+            configuration: cfg.data(using: .utf8)!,
+            modelType: "deepseek_v4")
+        XCTAssertTrue(model is DeepseekV4JANGTQModel,
+            "mxtq deepseek_v4 must dispatch to DeepseekV4JANGTQModel")
     }
 
     /// Non-mxtq configs with the same model_type MUST fall through to
