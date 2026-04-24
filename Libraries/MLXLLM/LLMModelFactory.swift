@@ -776,27 +776,25 @@ public final class LLMModelFactory: ModelFactory {
         // stamp is the short capability name (e.g. `"qwen3_6"`, `"gemma4"`);
         // Evaluate + BatchEngine resolve it to a live ReasoningParser
         // instance via `ReasoningParser.fromCapabilityName(_:)`.
+        //
+        // CORRECTNESS CRITICAL: historically this was a reverse-allowlist
+        // that defaulted ANY model_type outside {gemma4, gemma, mistral}
+        // to `"think_xml"`. `think_xml` starts with `startInReasoning: true`
+        // to match Qwen's `<think>`-prefilled prompt tail — so for every
+        // non-reasoning family (LFM2, LLaMA, Phi, StarCoder2, Cohere,
+        // OpenELM, InternLM2, GPT-OSS, NanoChat, …) every decoded chunk
+        // came out as `Generation.reasoning(_)` and osaurus rendered the
+        // entire answer into the thinking block. Fixed by flipping to an
+        // explicit allowlist of the model_types that ACTUALLY emit a
+        // `<think>…</think>` envelope natively (Qwen 3.x, DeepSeek-V3/V4,
+        // GLM 4/5, MiniMax M2+, Kimi K2.x, Nemotron-H). Every other
+        // model_type falls through to `"none"` and emits plain `.chunk`.
         if mutableConfiguration.reasoningParserName == nil {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
-                // Heuristic: families that emit `<think>...</think>` natively,
-                // vs. Gemma-4's harmony-channel envelope
-                // (`<|channel>thought\n…<channel|>`), vs. plain models with
-                // no reasoning tags.
-                //
-                // Matches the ParserResolution facade but flattened to a
-                // canonical stamp string so we keep a single code path
-                // through the handler.
-                let t = baseConfig.modelType.lowercased()
-                if t.hasPrefix("gemma4") {
-                    mutableConfiguration.reasoningParserName = "harmony"
-                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
-                    // Gemma 3 / 3n / Mistral: no reasoning envelope.
-                    mutableConfiguration.reasoningParserName = "none"
-                } else {
-                    mutableConfiguration.reasoningParserName = "think_xml"
-                }
+                mutableConfiguration.reasoningParserName =
+                    reasoningStampFromModelType(baseConfig.modelType)
             }
         }
 

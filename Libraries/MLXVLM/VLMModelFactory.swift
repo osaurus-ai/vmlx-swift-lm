@@ -378,18 +378,16 @@ public final class VLMModelFactory: ModelFactory {
         // Reasoning-parser stamp (same precedence as LLMModelFactory).
         // VL models that emit `<think>` follow the same Qwen / DeepSeek
         // conventions as their text-only counterparts.
+        //
+        // See the LLMModelFactory twin for the full writeup on why
+        // this is an explicit allowlist rather than a reverse-allowlist
+        // default — shared helper in MLXLMCommon.
         if mutableConfiguration.reasoningParserName == nil {
             if let stamp = jangConfig?.capabilities?.reasoningParser {
                 mutableConfiguration.reasoningParserName = stamp
             } else {
-                let t = baseConfig.modelType.lowercased()
-                if t.hasPrefix("gemma4") {
-                    mutableConfiguration.reasoningParserName = "harmony"
-                } else if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
-                    mutableConfiguration.reasoningParserName = "none"
-                } else {
-                    mutableConfiguration.reasoningParserName = "think_xml"
-                }
+                mutableConfiguration.reasoningParserName =
+                    reasoningStampFromModelType(baseConfig.modelType)
             }
         }
 
