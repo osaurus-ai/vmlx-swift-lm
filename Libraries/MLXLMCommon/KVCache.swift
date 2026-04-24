@@ -91,6 +91,22 @@ public protocol KVCache: Evaluatable, Updatable {
 ///     let output = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, ...)
 /// }
 /// ```
+
+/// Composite caches that internally wrap a `RotatingKVCache` expose
+/// the inner cache so the disk-serialization path (`TQDiskSerializer`
+/// + `restoreRotatingLayer`) can read/write the rotating state
+/// transparently without needing a cross-module reference to the
+/// wrapper's concrete type.
+///
+/// Example: `DeepseekV4Cache` (in MLXLLM) composes a RotatingKVCache
+/// for its local sliding window plus extra per-branch buffer state
+/// for the Compressor/Indexer. The extra state is ephemeral
+/// (recomputable from prompt tokens on reload), so serializing just
+/// the inner rotating cache is the correct contract.
+public protocol RotatingKVCacheWrapper: KVCache {
+    var rotating: RotatingKVCache { get }
+}
+
 public protocol QuantizedKVCacheProtocol: KVCache {
     /// The quantization group size used
     var groupSize: Int { get }

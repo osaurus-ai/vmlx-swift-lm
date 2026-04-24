@@ -158,9 +158,23 @@ public final class DeepseekV4JANGTQModel:
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
+    /// Mirrors `DeepseekV4Model.newCache`. Default path: plain
+    /// RotatingKVCache per layer (compressor fast-path handles long
+    /// prompts during prefill). `DSV4_LONG_CTX=1` opt-in:
+    /// DeepseekV4Cache on compress_ratio>0 layers.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0..<config.numHiddenLayers).map { _ in
-            DeepseekV4Cache(slidingWindow: config.slidingWindow)
+        let longCtxEnabled =
+            ProcessInfo.processInfo.environment["DSV4_LONG_CTX"] == "1"
+        return (0..<config.numHiddenLayers).map { layerIdx in
+            if longCtxEnabled {
+                let cr =
+                    config.compressRatios.count > layerIdx
+                    ? config.compressRatios[layerIdx] : 0
+                if cr > 0 {
+                    return DeepseekV4Cache(slidingWindow: config.slidingWindow)
+                }
+            }
+            return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
         }
     }
 

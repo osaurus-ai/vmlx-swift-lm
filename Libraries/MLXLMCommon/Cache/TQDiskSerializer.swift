@@ -196,6 +196,13 @@ public enum TQDiskSerializer {
             } else if let mamba = layer as? MambaCache {
                 serializeMambaLayer(mamba, index: i, into: &result)
                 result[kindKey(for: i)] = kindArray(.mamba)
+            } else if let wrapper = layer as? RotatingKVCacheWrapper {
+                // Composite cache that wraps a rotating cache (e.g.
+                // DeepseekV4Cache). Serialize the inner rotating state —
+                // the wrapper's extra buffers (compressor/indexer pool)
+                // are ephemeral and get recomputed from prompt tokens
+                // on the next prefill.
+                serializeRotatingLayer(wrapper.rotating, index: i, into: &result)
             } else if let rot = layer as? RotatingKVCache {
                 serializeRotatingLayer(rot, index: i, into: &result)
                 // serializeRotatingLayer sets the kind tag itself so it can

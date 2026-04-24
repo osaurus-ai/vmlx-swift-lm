@@ -32,7 +32,12 @@ import MLXNN
 // attention forward takes a fast-path that skips the compressor
 // entirely (Python mirror: `if v4_cache is None and L < compress_ratio
 // → skip`).
-public final class DeepseekV4Cache: KVCache {
+public final class DeepseekV4Cache: RotatingKVCacheWrapper {
+    /// Expose the inner rotating cache so `TQDiskSerializer` and
+    /// `restoreRotatingLayer` can round-trip the sliding-window state.
+    /// Compressor/Indexer pool buffers are NOT serialized — they get
+    /// recomputed from prompt tokens on the next prefill.
+    public var rotating: RotatingKVCache { local }
     /// Local sliding-window cache (compress_ratio-agnostic).
     public let local: RotatingKVCache
     let slidingWindow: Int
@@ -92,15 +97,18 @@ public final class DeepseekV4Cache: KVCache {
         return dup
     }
 
-    // State accessors for Compressor/Indexer.
-    func getBuffers(_ key: BranchKey) -> (kv: MLXArray?, gate: MLXArray?) {
+    // State accessors for Compressor/Indexer. Public so disk round-trip
+    // tests and any future cache-inspection code can verify the
+    // ephemeral buffers are cleared on restore (they recompute from
+    // prompt tokens on the next prefill).
+    public func getBuffers(_ key: BranchKey) -> (kv: MLXArray?, gate: MLXArray?) {
         switch key {
         case .compressor: return (compBufferKV, compBufferGate)
         case .indexer: return (idxBufferKV, idxBufferGate)
         }
     }
 
-    func setBuffers(_ key: BranchKey, kv: MLXArray?, gate: MLXArray?) {
+    public func setBuffers(_ key: BranchKey, kv: MLXArray?, gate: MLXArray?) {
         switch key {
         case .compressor:
             compBufferKV = kv
@@ -111,11 +119,11 @@ public final class DeepseekV4Cache: KVCache {
         }
     }
 
-    func getPooled(_ key: BranchKey) -> MLXArray? {
+    public func getPooled(_ key: BranchKey) -> MLXArray? {
         key == .compressor ? compPooled : idxPooled
     }
 
-    func setPooled(_ key: BranchKey, value: MLXArray) {
+    public func setPooled(_ key: BranchKey, value: MLXArray) {
         if key == .compressor {
             compPooled = value
         } else {
@@ -123,7 +131,7 @@ public final class DeepseekV4Cache: KVCache {
         }
     }
 
-    enum BranchKey { case compressor, indexer }
+    public enum BranchKey { case compressor, indexer }
 }
 
 // MARK: - Compressor

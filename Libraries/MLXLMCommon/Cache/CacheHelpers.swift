@@ -623,10 +623,21 @@ private func restoreRotatingLayer(
         apply(rot)
         return
     }
+    // Composite cache that wraps a RotatingKVCache (e.g. DeepseekV4Cache).
+    // Restores the inner rotating state; the wrapper's ephemeral buffer
+    // state is cleared and will be repopulated on the next prefill.
+    if let wrapper = layer as? RotatingKVCacheWrapper {
+        apply(wrapper.rotating)
+        return
+    }
     if let cacheList = layer as? CacheList {
         for i in 0..<cacheList.count {
             if let rot = cacheList[i] as? RotatingKVCache {
                 apply(rot)
+                return
+            }
+            if let wrapper = cacheList[i] as? RotatingKVCacheWrapper {
+                apply(wrapper.rotating)
                 return
             }
         }

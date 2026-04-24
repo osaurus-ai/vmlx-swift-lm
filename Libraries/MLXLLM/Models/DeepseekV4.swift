@@ -694,13 +694,43 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
-    /// Build per-layer DeepseekV4Cache so the Compressor/Indexer get
-    /// persistent buffer state across turns. Without this, long-context
-    /// (L > sliding_window) would re-pool from scratch each call and
-    /// lose the global-context summary.
+    /// Build per-layer caches. Per `research/DSV-EXHAUSTIVE-VARIABLES-
+    /// GUIDE.md §12` + `DSV4-RUNTIME-ARCHITECTURE.md §17`:
+    ///
+    /// **Default (safe) path** — plain `RotatingKVCache` for every
+    /// layer. Long prompts work correctly because during prefill, the
+    /// attention's compressor fast-path triggers on `L >= compress_
+    /// ratio` (cache=nil branch in the Compressor) and pools global
+    /// context into full_kv before SDPA. During decode (L=1), the
+    /// compressor auto-skips (L < compress_ratio) and local sliding-
+    /// window attention proceeds. Verified coherent on Python ref
+    /// across 148 / 288 / 358 / 708 / 1024+ token prompts on
+    /// JANGTQ2. NO state needs to persist across calls.
+    ///
+    /// **Opt-in (`DSV4_LONG_CTX=1`)** — `DeepseekV4Cache` on
+    /// compress_ratio>0 layers so the compressor/indexer state
+    /// PERSISTS across decode steps (extends pooled context
+    /// incrementally as new tokens arrive). Python reference warns
+    /// this path has unresolved edge cases in the prefill→decode
+    /// transition; keep behind the flag until hardened.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        (0..<config.numHiddenLayers).map { _ in
-            DeepseekV4Cache(slidingWindow: config.slidingWindow)
+        let longCtxEnabled =
+            ProcessInfo.processInfo.environment["DSV4_LONG_CTX"] == "1"
+        return (0..<config.numHiddenLayers).map { layerIdx in
+            if longCtxEnabled {
+                let cr =
+                    config.compressRatios.count > layerIdx
+                    ? config.compressRatios[layerIdx] : 0
+                if cr > 0 {
+                    return DeepseekV4Cache(slidingWindow: config.slidingWindow)
+                }
+            }
+            // Default path. Note: `RotatingKVCache(maxSize:, keep:)`
+            // rotates once the window fills during prefill, but the
+            // compressor branch has already pooled the older tokens
+            // into `full_kv` before SDPA sees them — so no context
+            // is actually lost on compress_ratio>0 layers.
+            return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
         }
     }
 
