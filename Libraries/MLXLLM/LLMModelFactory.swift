@@ -167,6 +167,21 @@ public enum LLMTypeRegistry {
                 return Mistral3TextModel(config)
             },
             "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+            // DSV4 (DeepSeek-V4-Flash / -Pro): architecturally distinct
+            // from DSV3 — mHC residual stream, CSA/HCA hybrid attention,
+            // sqrtsoftplus gate, grouped low-rank O, sliding window,
+            // hash routing on layers 0-2. Would PRODUCE GARBAGE if routed
+            // through DeepseekV3Model. Throw a clear error pointing at
+            // the port plan instead of silently dispatching to DSV3.
+            //
+            // Model weights for DSV4 are also FP4 + FP8 mixed — the
+            // standard safetensors loader doesn't know how to dequant
+            // them, so even a DSV3-shaped fallback would fail at load
+            // time with a less-useful error.
+            //
+            // Swift port plan + status:
+            //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
+            "deepseek_v4": dispatchDeepseekV4,
         ]
     }
 
@@ -180,6 +195,31 @@ public enum LLMTypeRegistry {
     /// three model_type entries in `extendedModels()` share one code
     /// path. Any future DeepSeek-V3-family alias just adds a dict
     /// entry pointing here.
+    /// DSV4 dispatch placeholder. Throws a structured error pointing
+    /// at the port plan until `DeepseekV4.swift` /
+    /// `DeepseekV4JANGTQ.swift` land. Keeping the registration means:
+    ///
+    ///   - osaurus gets a CLEAR error saying DSV4 isn't supported yet
+    ///     instead of a cryptic "bundle silently produced garbage";
+    ///   - model_type reasoning/tool plumbing (which already handles
+    ///     `deepseek*` prefix correctly) keeps working — just the
+    ///     forward pass is gated;
+    ///   - test harness can exercise the `kimi_k25`/`deepseek_v3`
+    ///     paths without triggering DSV4 errors.
+    ///
+    /// Follow `Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md` to finish.
+    private static func dispatchDeepseekV4(data: Data) throws -> any LanguageModel {
+        _ = data
+        // `.unsupportedModelType` is the cleanest error type for this
+        // case even though the model_type itself is registered — we're
+        // signalling that the handler exists but the model isn't yet
+        // supported. The attached string is the full guidance; osaurus
+        // displays the error verbatim.
+        throw ModelFactoryError.unsupportedModelType(
+            "deepseek_v4 (see Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md — DSV4 is architecturally distinct from DSV3 and needs its own model class; routing through DeepseekV3Model would produce garbage output)"
+        )
+    }
+
     private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {
         struct FormatCheck: Codable {
             let weightFormat: String?
