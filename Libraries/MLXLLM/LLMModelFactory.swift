@@ -804,9 +804,18 @@ public final class LLMModelFactory: ModelFactory {
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         if mutableConfiguration.toolCallFormat == nil {
+            // New DSV4-era stamp lives under `chat.tool_calling.parser`
+            // (e.g. `"dsml"` for DeepSeek-V4-Flash). Keep the legacy
+            // `capabilities.tool_parser` path as the second priority
+            // — older bundles use it, and the new schema inherits it
+            // as a fallback. Finally `model_type` infer.
+            let chatStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.chat?.toolCalling?.parser)
             let jangStamped = ToolCallFormat.fromCapabilityName(
                 jangConfig?.capabilities?.toolParser)
-            mutableConfiguration.toolCallFormat = jangStamped
+            mutableConfiguration.toolCallFormat =
+                chatStamped
+                ?? jangStamped
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 

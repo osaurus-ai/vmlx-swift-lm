@@ -102,6 +102,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|python_tag|>{ "name": "func", "parameters": {...} }`
     case llama3
 
+    /// DSML (DeepSeek Markup Language) used by DeepSeek-V4-Flash /
+    /// -Pro per jang/research/DSV-FAMILY-RUNTIME-GUIDE.md §24.
+    /// Example: `<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
+    /// (markers use fullwidth vertical bar U+FF5C, not ASCII `|`).
+    case dsml
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -130,6 +136,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MistralToolCallParser()
         case .llama3:
             return Llama3ToolCallParser()
+        case .dsml:
+            return DSMLToolCallParser()
         }
     }
 
@@ -219,6 +227,19 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .kimiK2
         }
 
+        // DeepSeek-V4 — `DSML` markup format. Per
+        // `jang/research/DSV-FAMILY-RUNTIME-GUIDE.md` §24 the
+        // `jang_config.chat.tool_calling.parser = "dsml"` stamp is
+        // authoritative via `fromCapabilityName` below. This
+        // model_type sniff catches non-JANG DSV4 bundles too.
+        //
+        // NOTE: intentionally narrower than `"deepseek"` prefix —
+        // DSV3 / DSV3.2 / Kimi K2.x use the Kimi/GLM4-style tool
+        // format, not DSML. We only trigger DSML on explicit `_v4`.
+        if type.hasPrefix("deepseek_v4") {
+            return .dsml
+        }
+
         return nil
     }
 
@@ -284,6 +305,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // KimiK2 — `functions.name:0<|tool_call_argument_begin|>{…}`.
         case "kimi", "kimik2", "kimi_k2":
             return .kimiK2
+        // DSV4 DSML — authoritative stamp from
+        // `jang_config.chat.tool_calling.parser`. `deepseek_v4`
+        // alias catches bundles that stamp the model_family rather
+        // than the parser.
+        case "dsml", "deepseek_v4", "deepseekv4":
+            return .dsml
         default:
             return nil
         }

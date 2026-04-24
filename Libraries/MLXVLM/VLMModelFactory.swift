@@ -369,9 +369,15 @@ public final class VLMModelFactory: ModelFactory {
         //   2. JANG `capabilities.tool_parser` stamp — authoritative when set.
         //   3. `ToolCallFormat.infer(from: modelType)` heuristic — last resort.
         if mutableConfiguration.toolCallFormat == nil {
+            // Same priority ladder as LLMModelFactory — DSV4 VLM
+            // bundles will stamp `chat.tool_calling.parser = "dsml"`.
+            let chatStamped = ToolCallFormat.fromCapabilityName(
+                jangConfig?.chat?.toolCalling?.parser)
             let jangStamped = ToolCallFormat.fromCapabilityName(
                 jangConfig?.capabilities?.toolParser)
-            mutableConfiguration.toolCallFormat = jangStamped
+            mutableConfiguration.toolCallFormat =
+                chatStamped
+                ?? jangStamped
                 ?? ToolCallFormat.infer(from: baseConfig.modelType)
         }
 
