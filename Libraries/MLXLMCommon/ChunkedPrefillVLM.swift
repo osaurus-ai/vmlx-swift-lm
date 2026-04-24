@@ -65,7 +65,7 @@ public func chunkedPrefillEmbedding<Result>(
         _ = step(chunk)
         MLX.eval(cache)
         offset = end
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
     }
 
     // Final chunk: keep the result so the caller can sample from it.

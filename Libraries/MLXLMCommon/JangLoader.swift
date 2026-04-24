@@ -266,33 +266,22 @@ public enum ParserResolution {
                 .jangStamped
             )
         }
-        // Heuristic by model_type. We treat most model types as
-        // `<think>`-family and return a parser tuned for that. Gemma 4
-        // uses a different wire format (harmony channel envelope) and
-        // gets a dedicated parser. Gemma 3 / 3n and Mistral have no
-        // reasoning envelope.
-        guard let modelType, !modelType.isEmpty else {
-            return (nil, .none)
+        // Heuristic: delegate to the canonical factory helper so this
+        // stays byte-identical with `LLMModelFactory` / `VLMModelFactory`.
+        // Historical note: this function previously carried its own
+        // reverse-allowlist default that returned a live `ReasoningParser()`
+        // for every non-{gemma,mistral} model_type, which drove the LFM2
+        // "entire answer routed to .reasoning" bug. Never reintroduce a
+        // local default here; `reasoningStampFromModelType` is the sole
+        // source of truth.
+        let stamp = reasoningStampFromModelType(modelType)
+        if stamp == "none" {
+            return (nil, modelType?.isEmpty == false ? .modelTypeHeuristic : .none)
         }
-        let t = modelType.lowercased()
-        if t.hasPrefix("gemma4") {
-            return (
-                ReasoningParser.fromCapabilityName("harmony"),
-                .modelTypeHeuristic
-            )
-        }
-        if t.hasPrefix("mistral") || t.hasPrefix("gemma") {
-            return (nil, .modelTypeHeuristic)
-        }
-        // The `<think>…</think>` family — Qwen 3.5 / 3.6, DeepSeek-R1,
-        // GLM 4.x, Nemotron. The default parser returned here starts in
-        // content mode to preserve byte-for-byte compatibility with the
-        // previous behaviour; Evaluate / BatchEngine resolve the
-        // `think_xml` capability stamp themselves via
-        // `ReasoningParser.fromCapabilityName` (which now returns a
-        // parser with `startInReasoning=true` to handle the Qwen 3.6
-        // enable_thinking=true prefill case).
-        return (ReasoningParser(), .modelTypeHeuristic)
+        return (
+            ReasoningParser.fromCapabilityName(stamp),
+            .modelTypeHeuristic
+        )
     }
 
     /// Resolve a `ToolCallFormat` for a model.
