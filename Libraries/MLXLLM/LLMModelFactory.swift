@@ -70,24 +70,31 @@ public enum LLMTypeRegistry {
             "cohere": create(CohereConfiguration.self, CohereModel.init),
             "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
             "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
-            "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
-            // Kimi K2.6 = DeepseekV3-family MLA + MoE. Upstream writes
-            // `model_type = "kimi_k25"` in config.json (aliased to the
-            // same text backbone as DeepSeek-V3). Pure-text bundles and
-            // the JANGTQ → JANG conversion escape-hatch path described
-            // in jang/research/KIMI-K2.6-VMLX-INTEGRATION.md land here.
-            // VL variants need a separate `KimiVLM` wrapper (MoonViT
-            // + `multi_modal_projector`) in VLMModelFactory — not yet
-            // ported, text path only for now.
+            // DeepSeek-V3 / Kimi K2.6 (kimi_k25, kimi_k2) — all share
+            // the same MLA + MoE text backbone. Factory peeks
+            // `weight_format == "mxtq"` and routes to the JANGTQ
+            // variant (routed experts via TurboQuantSwitchGLU + codebook
+            // Metal kernels) when present; standard affine / fp8
+            // bundles continue to use `DeepseekV3Model`.
             //
-            // NOTE: the current `DeepseekV3Attention` uses prefill-style
-            // K/V materialization on every step (no L==1 absorb branch),
-            // so it does NOT need the MLA fp32-SDPA patch that the
-            // Python runtime requires. ~1.5× decode slowdown vs Python's
-            // absorb path — acceptable correctness-over-speed trade-off
-            // (see section 4 of KIMI-K2.6-IMPLEMENTATION.md).
-            "kimi_k25": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
-            "kimi_k2": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+            // Coverage:
+            //   - model_type = deepseek_v3  : DeepSeek-V3 upstream + JANGTQ
+            //   - model_type = kimi_k25     : Kimi K2.6 REAP-30/50 + JANGTQ
+            //   - model_type = kimi_k2      : pre-K2.6 Kimi naming
+            //
+            // Reference:
+            //   jang/research/KIMI-K2.6-VMLX-INTEGRATION.md §2 (Swift)
+            //   jang/research/KIMI-K2.6-IMPLEMENTATION.md §4.1 (MLA)
+            //
+            // The current `DeepseekV3Attention` uses prefill-style K/V
+            // materialization on every step (no L==1 absorb branch), so
+            // it does NOT need the MLA fp32-SDPA patch the Python
+            // runtime requires. ~1.5× decode slowdown vs Python's
+            // absorb path — deliberate correctness-over-speed
+            // trade-off.
+            "deepseek_v3": dispatchDeepseekV3Family,
+            "kimi_k25": dispatchDeepseekV3Family,
+            "kimi_k2": dispatchDeepseekV3Family,
             "granite": create(GraniteConfiguration.self, GraniteModel.init),
             "granitemoehybrid": create(
                 GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
@@ -161,6 +168,33 @@ public enum LLMTypeRegistry {
             },
             "apertus": create(ApertusConfiguration.self, ApertusModel.init),
         ]
+    }
+
+    /// Dispatcher for the DeepSeek-V3 family (deepseek_v3, kimi_k25,
+    /// kimi_k2). Peeks `weight_format` in config.json — `"mxtq"`
+    /// routes to `DeepseekV3JANGTQModel` (TurboQuantSwitchGLU for
+    /// routed experts + Metal codebook kernels); every other value
+    /// routes to the standard `DeepseekV3Model`.
+    ///
+    /// Keeps as a top-level helper (not an inline closure) so the
+    /// three model_type entries in `extendedModels()` share one code
+    /// path. Any future DeepSeek-V3-family alias just adds a dict
+    /// entry pointing here.
+    private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {
+        struct FormatCheck: Codable {
+            let weightFormat: String?
+            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+        }
+        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+            check.weightFormat == "mxtq"
+        {
+            let config = try JSONDecoder.json5().decode(
+                DeepseekV3JANGTQConfiguration.self, from: data)
+            return DeepseekV3JANGTQModel(config)
+        }
+        let config = try JSONDecoder.json5().decode(
+            DeepseekV3Configuration.self, from: data)
+        return DeepseekV3Model(config)
     }
 
     /// Shared instance with default model types.
