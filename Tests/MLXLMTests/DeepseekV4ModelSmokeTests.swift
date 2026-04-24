@@ -131,11 +131,16 @@ struct DeepseekV4ModelSmokeTests {
 
         // Dropped keys
         #expect(out["mtp.0.weight"] == nil,
-            "MTP keys must be dropped")
-        #expect(out.keys.allSatisfy { !$0.contains("compressor.") },
-            "compressor.* keys must be dropped (not wired in Phase 1b)")
-        #expect(out.keys.allSatisfy { !$0.contains("indexer.") },
-            "indexer.* keys must be dropped (not wired in Phase 1b)")
+            "MTP training-head keys must be dropped")
+
+        // Compressor + Indexer keys KEPT and remapped to
+        // model.layers.L.self_attn.{compressor,indexer}.*
+        #expect(
+            out["model.layers.0.self_attn.compressor.wkv.weight"] != nil,
+            "compressor keys must be KEPT and remapped under self_attn")
+        #expect(
+            out["model.layers.0.self_attn.indexer.wq_b.weight"] != nil,
+            "indexer keys must be KEPT and remapped under self_attn")
     }
 
     @Test("sanitize() stacks per-expert weights into switch_mlp.{proj}.*")

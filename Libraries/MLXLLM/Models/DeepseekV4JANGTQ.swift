@@ -158,6 +158,12 @@ public final class DeepseekV4JANGTQModel:
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0..<config.numHiddenLayers).map { _ in
+            DeepseekV4Cache(slidingWindow: config.slidingWindow)
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         lmHead(model(inputs, cache: cache))
     }

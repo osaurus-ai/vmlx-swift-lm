@@ -123,7 +123,50 @@ Canonical ref: `jang/research/DSV4-RUNTIME-ARCHITECTURE.md`.
       unbiased-for-weighting per §6 bug fix), `yarnInvFreq` with
       `high = min(..., dim-1)` clamp.
 
-### Phase 1b — Minimal text forward (prefill-style, no optimization)
+### Phase 1b — Full forward + Compressor/Indexer (landed 2026-04-24)
+
+- [x] `DeepseekV4.swift` — `DeepseekV4Attention` with corrected
+      numerics: q_norm on qLoraRank (not headDim), per-head fp32
+      variance-rsqrt rescale after wq_b (prevents exponential drift on
+      middle layers), wo_a shape (numHeads*headDim // oGroups →
+      oGroups*oLoraRank) with `einsum bsgd,grd→bsgr` for grouped O,
+      per-layer compress_ratio detection from config.compressRatios
+      (with DSV4-Flash default fallback), per-layer rope_theta
+      (10000 / 160000) + YaRN on compressRatio>0 layers.
+- [x] `DeepseekV4Compressor.swift` — `DeepseekV4Cache` (composite of
+      RotatingKVCache + compressor/indexer buffer + pooled state),
+      `DeepseekV4Compressor` (wkv/wgate projection + APE + window
+      accumulation + overlap transform for ratio=4 + softmax
+      pooling + RMSNorm + partial RoPE), `DeepseekV4Indexer` (per-
+      query top-k over pooled via wq_b + weights_proj + its own
+      inner Compressor).
+- [x] `DeepseekV4Attention` forward wires Compressor/Indexer:
+      compressor state pulled from DeepseekV4Cache or short-prompt
+      fast-path when `L < compress_ratio` without persistent cache;
+      Indexer top-k selected indices gather pooled keys which are
+      concatenated onto local KV for SDPA; mask extended to cover
+      the extra pooled columns.
+- [x] `DeepseekV4Model.newCache` + `DeepseekV4JANGTQModel.newCache`
+      return per-layer `DeepseekV4Cache` so Compressor/Indexer get
+      persistent buffer state across calls.
+- [x] `sanitize` KEEPS `compressor.*` / `indexer.*` keys, remapping
+      under `model.layers.L.self_attn.{compressor,indexer}.*`.
+- [x] Factory dispatch live: `deepseek_v4` → `DeepseekV4Model`;
+      `weight_format=mxtq` → `DeepseekV4JANGTQModel` with
+      `TurboQuantSwitchGLU` for routed experts.
+- [x] All 13 EXHAUSTIVE-VARIABLES-GUIDE §1 bug fixes encoded.
+
+### Phase 2 — JANGTQ refinements (follow-up)
+
+Known approximation in Phase 1b JANGTQ variant: the fused
+`fusedGateUpSwiGLU` kernel applies plain silu(gate)*up without the
+`swiglu_limit=10` clamp. MXTQ codebook's natural boundedness
+regularizes routed experts; shared experts still clamp via
+DeepseekV4MLP. Adding limit support to the fused kernel or switching
+to per-projection gather (3× dispatch cost) is tracked for Phase 2
+if coherence checks fail at Phase 3.
+
+### Phase 1c — Minimal text forward (prefill-style, no optimization)
 1. `DeepseekV4Configuration` — parse all new fields (mHC, attn_sink,
    compress_ratios, hash_layers, sliding_window, o_groups).
 2. `DeepseekV4SwiGLU` with `swiglu_limit=10.0` clamp.

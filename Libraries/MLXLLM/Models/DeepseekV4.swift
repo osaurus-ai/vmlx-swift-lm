@@ -86,19 +86,28 @@ class DeepseekV4RoPE: Module {
 
 class DeepseekV4Attention: Module {
     let config: DeepseekV4Configuration
+    let layerIdx: Int
     let numHeads: Int
     let headDim: Int
     let ropeDim: Int
     let qLoraRank: Int
     let oGroups: Int
     let oLoraRank: Int
+    /// Per-layer compress_ratio ∈ {0, 4, 128}. 0 = no compressor, plain
+    /// sliding-window attention. 4 or 128 = Compressor (+ Indexer at 4)
+    /// augments local KV with pooled global context.
+    let compressRatio: Int
     let scale: Float
 
     @ModuleInfo(key: "wq_a") var wqA: Linear
     @ModuleInfo(key: "wq_b") var wqB: Linear
     @ModuleInfo(key: "wkv") var wkv: Linear
+    // wo_a operates on PER-GROUP features (numHeads*headDim // oGroups),
+    // mapping them to oGroups*oLoraRank via einsum bsgd,grd→bsgr.
+    // Python: Linear(n_heads*head_dim // o_groups, o_groups*o_lora_rank).
     @ModuleInfo(key: "wo_a") var woA: Linear
     @ModuleInfo(key: "wo_b") var woB: Linear
+    /// q_norm is on `q_lora_rank` (1024), NOT head_dim. Applied BEFORE wq_b.
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
     /// Shape (num_heads,) — one learned sink logit per head.
@@ -106,8 +115,16 @@ class DeepseekV4Attention: Module {
 
     let rope: DeepseekV4RoPE
 
+    // Compressor + Indexer (instantiated only when compressRatio > 0).
+    // Swift can't have conditionally-present @ModuleInfo properties
+    // cleanly, so we instantiate always and null the pooled path inside
+    // forward when compressRatio == 0.
+    @ModuleInfo(key: "compressor") var compressor: DeepseekV4Compressor?
+    @ModuleInfo(key: "indexer") var indexer: DeepseekV4Indexer?
+
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
+        self.layerIdx = layerIdx
         self.numHeads = config.numAttentionHeads
         self.headDim = config.headDim
         self.ropeDim = config.qkRopeHeadDim
@@ -116,30 +133,45 @@ class DeepseekV4Attention: Module {
         self.oLoraRank = config.oLoraRank
         self.scale = 1.0 / sqrt(Float(headDim))
 
-        // wq_a: hidden → qLoraRank (low-rank first stage of Q projection)
+        // Resolve per-layer compress_ratio. If config.compressRatios is
+        // populated use it directly; otherwise fall back to the default
+        // DSV4-Flash pattern (layer 0 and last → 0; middle: odd → 4,
+        // even → 128 per layer index after accounting for layer 0).
+        if !config.compressRatios.isEmpty && layerIdx < config.compressRatios.count {
+            self.compressRatio = config.compressRatios[layerIdx]
+        } else {
+            let n = config.numHiddenLayers
+            if layerIdx == 0 || layerIdx == n - 1 {
+                self.compressRatio = 0
+            } else {
+                let i = layerIdx - 1
+                self.compressRatio = (i % 2 == 1) ? 4 : 128
+            }
+        }
+
         self._wqA.wrappedValue = Linear(config.hiddenSize, qLoraRank, bias: false)
-        // wq_b: qLoraRank → numHeads × headDim (second stage)
-        self._wqB.wrappedValue = Linear(
-            qLoraRank, numHeads * headDim, bias: false)
-        // Single latent KV head: hidden → headDim (broadcast to all Q heads)
+        self._wqB.wrappedValue = Linear(qLoraRank, numHeads * headDim, bias: false)
         self._wkv.wrappedValue = Linear(config.hiddenSize, headDim, bias: false)
-        // Grouped low-rank O: numHeads*headDim → oGroups × oLoraRank
-        // (per-group matmul, then concat groups, then wo_b)
+        // wo_a: per-group features (n_heads*head_dim // o_groups) →
+        // o_groups * o_lora_rank. For DSV4-Flash: 4096 → 8192.
         self._woA.wrappedValue = Linear(
-            numHeads * headDim, oGroups * oLoraRank, bias: false)
-        // wo_b: oGroups*oLoraRank → hidden
+            numHeads * headDim / oGroups, oGroups * oLoraRank, bias: false)
         self._woB.wrappedValue = Linear(
             oGroups * oLoraRank, config.hiddenSize, bias: false)
-        self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        self._kvNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        // Initialized to zeros; real weight loaded in sanitize.
+        // q_norm operates on q_lora_rank (1024), not head_dim.
+        self._qNorm.wrappedValue = RMSNorm(
+            dimensions: qLoraRank, eps: config.rmsNormEps)
+        self._kvNorm.wrappedValue = RMSNorm(
+            dimensions: headDim, eps: config.rmsNormEps)
         self._attnSink.wrappedValue = zeros([numHeads])
 
-        let theta = config.ropeTheta(forLayer: layerIdx)
+        // RoPE: compressRatio>0 → compress_rope_theta (160000) + YaRN.
+        // compressRatio==0 → rope_theta (10000), NO YaRN.
+        let theta =
+            compressRatio > 0 ? config.compressRopeTheta : config.ropeTheta
         let factor: Float =
-            config.hasCompressor(layer: layerIdx)
-            ? Float(
-                (config.ropeScaling?["factor"]?.asFloat()) ?? 16.0)
+            compressRatio > 0
+            ? Float((config.ropeScaling?["factor"]?.asFloat()) ?? 16.0)
             : 1.0
         let origMax =
             Int(
@@ -147,69 +179,152 @@ class DeepseekV4Attention: Module {
         self.rope = DeepseekV4RoPE(
             dim: ropeDim, base: theta, factor: factor,
             origMaxPos: origMax, betaFast: 32, betaSlow: 1)
+
+        // Compressor + Indexer are attached ONLY on layers with a
+        // non-zero compress_ratio — matches bundle weight keys.
+        if compressRatio > 0 {
+            self._compressor.wrappedValue = DeepseekV4Compressor(
+                config: config, compressRatio: compressRatio, headDim: headDim)
+            if compressRatio == 4 {
+                self._indexer.wrappedValue = DeepseekV4Indexer(
+                    config: config, compressRatio: compressRatio)
+            }
+        }
     }
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
+        let B = x.dim(0)
+        let L = x.dim(1)
         let offset = cache?.offset ?? 0
 
         // --- Q projection ---
-        // x: (B, L, H) → wq_a(x): (B, L, qLoraRank) → q_norm → wq_b:
-        // (B, L, numHeads*headDim) → (B, L, numHeads, headDim) → (B, numHeads, L, headDim)
-        var q = wqB(qNorm(wqA(x)))
-        q = q.reshaped(B, L, numHeads, headDim).transposed(0, 2, 1, 3)
+        // wq_a(x): (B, L, qLoraRank) → q_norm on qLoraRank → wq_b:
+        // (B, L, numHeads*headDim). Keep the post-qnorm residual — the
+        // Indexer uses it as its own Q source.
+        let qResidual = qNorm(wqA(x))
+        var q = wqB(qResidual)
+        q = q.reshaped(B, L, numHeads, headDim)
+        // Per-head fp32 RMSNorm-like rescale (NOT a learned norm — just
+        // variance normalization). Essential or middle layers drift
+        // exponentially. Python: q * rsqrt((q^2).mean(-1) + eps).
+        let qF32 = q.asType(.float32)
+        let qRescale = rsqrt(
+            (qF32 * qF32).mean(axis: -1, keepDims: true)
+                + MLXArray(config.rmsNormEps))
+        q = (qF32 * qRescale).asType(x.dtype)
+        q = q.transposed(0, 2, 1, 3)
 
         // --- KV projection (single latent head) ---
-        // wkv(x): (B, L, headDim) → kv_norm → (B, 1, L, headDim)
         var kv = kvNorm(wkv(x))
         kv = kv.reshaped(B, L, 1, headDim).transposed(0, 2, 1, 3)
 
         // --- Partial RoPE on last ropeDim dims of Q and K ---
         let (cosT, sinT) = rope.cosSin(offset: offset, length: L)
-        // Broadcast cos/sin over (B, H, L, ropeDim/2) for Q, (B, 1, L, ropeDim/2) for K.
-        let cosQ = cosT.expandedDimensions(axes: [0, 1])  // (1,1,L,ropeDim/2)
+        let cosQ = cosT.expandedDimensions(axes: [0, 1])
         let sinQ = sinT.expandedDimensions(axes: [0, 1])
         q = DeepseekV4Math.applyPartialRoPE(q, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
         kv = DeepseekV4Math.applyPartialRoPE(kv, cos: cosQ, sin: sinQ, ropeDim: ropeDim)
 
-        // --- Cache update ---
-        // DSV4 uses keys==values (single latent head serves both roles).
+        // --- Cache update (sliding-window local) ---
         var keys = kv
         var values = kv
         if let cache = cache {
             (keys, values) = cache.update(keys: kv, values: kv)
         }
+        var fullKV = keys
+
+        // --- Compressor + Indexer global context (compressRatio > 0 layers) ---
+        // Fast path: plain sliding-window cache has no persistent
+        // buffer, so for L < compressRatio the compressor produces an
+        // empty pool and we short-circuit. Saves ~150 matmuls per token
+        // across the 41 compress_ratio>0 layers during short-prompt
+        // decode.
+        if compressRatio > 0 {
+            let v4Cache = cache as? DeepseekV4Cache
+            if v4Cache != nil || L >= compressRatio {
+                if let comp = compressor {
+                    var pooled = comp(x, rope: rope, v4Cache: v4Cache, startPos: offset)
+                    // pooled shape: (B, W, headDim) where W = pooled count.
+                    let W = pooled.dim(1)
+                    if W > 0 {
+                        if compressRatio == 4, let idx = indexer,
+                            let topK = idx(
+                                x, qResidual: qResidual, rope: rope,
+                                positionRope: rope, v4Cache: v4Cache, startPos: offset)
+                        {
+                            // topK shape: (B, L, k). Gather `k` rows from
+                            // `pooled` per query position. For SDPA we
+                            // need keys broadcast to (B, 1, allSelected,
+                            // headDim) — we flatten (L*k) into the
+                            // "time" axis so all queries see all their
+                            // selected pooled keys.
+                            let k = topK.dim(-1)
+                            // pooled: (B, W, D) → (B, 1, 1, W, D)
+                            let expanded = pooled.expandedDimensions(axes: [1, 2])
+                            let pooledBroad = broadcast(
+                                expanded, to: [B, 1, L, W, headDim])
+                            // idx: (B, L, k) → (B, 1, L, k, 1) broadcast over D
+                            let idxExp = topK.expandedDimensions(axes: [1, 4])
+                            let idxBroad = broadcast(
+                                idxExp, to: [B, 1, L, k, headDim])
+                            let gathered = takeAlong(
+                                pooledBroad, idxBroad, axis: 3)
+                            // (B, 1, L*k, D)
+                            pooled = gathered.reshaped(B, 1, L * k, headDim)
+                        } else {
+                            pooled = pooled.expandedDimensions(axis: 1)  // (B, 1, W, D)
+                        }
+                        if pooled.dim(2) > 0 {
+                            fullKV = concatenated([fullKV, pooled], axis: 2)
+                            values = fullKV
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Mask extension for extra pooled keys ---
+        var adjustedMask = mask
+        if case .array(let maskArr) = mask,
+            fullKV.dim(2) > maskArr.dim(-1)
+        {
+            let padShape =
+                Array(maskArr.shape.dropLast()) + [fullKV.dim(2) - maskArr.dim(-1)]
+            let pad = MLXArray.ones(padShape, dtype: maskArr.dtype)
+            adjustedMask = .array(concatenated([maskArr, pad], axis: -1))
+        }
 
         // --- SDPA with attention sinks (fp32 accum for head_dim=512) ---
-        // MLXFast SDPA supports sinks natively. For GQA broadcast,
-        // num_kv_heads=1 → broadcast to numHeads. Scale = 1/√headDim.
         var output = MLXFast.scaledDotProductAttention(
-            queries: q, keys: keys, values: values,
-            scale: scale, mask: mask,
-            sinks: config.useAttnSink ? attnSink : nil)
-        output = output.transposed(0, 2, 1, 3)
+            queries: q, keys: fullKV, values: fullKV,
+            scale: scale, mask: adjustedMask,
+            sinks: config.useAttnSink ? attnSink.asType(q.dtype) : nil)
+        // output shape: (B, numHeads, L, headDim)
+
+        // --- Inverse RoPE on the output's head-major layout ---
+        let cosI = cosT.expandedDimensions(axes: [0, 1])
+        let sinI = sinT.expandedDimensions(axes: [0, 1])
+        output = DeepseekV4Math.applyPartialRoPE(
+            output, cos: cosI, sin: sinI, ropeDim: ropeDim, inverse: true)
+        output = output.transposed(0, 2, 1, 3)  // (B, L, numHeads, headDim)
             .reshaped(B, L, numHeads * headDim)
 
-        // --- Inverse RoPE on the attention output ---
-        // Strip positional info from the output before residual add-back.
-        // This is applied on the last ropeDim contiguous dims of EACH
-        // head's output. For simplicity we reshape to (B, L, numHeads,
-        // headDim), apply inverse on last ropeDim, then flatten.
-        var outputH = output.reshaped(B, L, numHeads, headDim)
-        let cosO = cosT.expandedDimensions(axes: [0, 2])  // (1,L,1,ropeDim/2)
-        let sinO = sinT.expandedDimensions(axes: [0, 2])
-        outputH = DeepseekV4Math.applyPartialRoPE(
-            outputH, cos: cosO, sin: sinO, ropeDim: ropeDim, inverse: true)
-        output = outputH.reshaped(B, L, numHeads * headDim)
-
         // --- Grouped low-rank O projection ---
-        // wo_a splits output into oGroups × oLoraRank: reshape to
-        // (B, L, oGroups, oLoraRank). wo_b flattens and projects to hidden.
-        let oA = woA(output)  // (B, L, oGroups*oLoraRank)
-        let oB = woB(oA)
-        return oB
+        // Reshape to (B, L, oGroups, groupFeat) then wo_a via per-group
+        // matmul, producing (B, L, oGroups, oLoraRank) → concat groups
+        // → wo_b.
+        let groupFeat = (numHeads * headDim) / oGroups
+        let oReshape = output.reshaped(B, L, oGroups, groupFeat)
+        // wo_a.weight has shape (oGroups*oLoraRank, groupFeat). Reshape
+        // to (oGroups, oLoraRank, groupFeat) and einsum bsgd,grd→bsgr.
+        // Since MLX Linear stores weights as (out, in), we reshape
+        // wo_a.weight accordingly for the einsum path.
+        let woaW = woA.weight.reshaped(oGroups, oLoraRank, groupFeat)
+        let oA = einsum("bsgd,grd->bsgr", oReshape, woaW).reshaped(
+            B, L, oGroups * oLoraRank)
+        return woB(oA)
     }
 }
 
@@ -579,6 +694,16 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
+    /// Build per-layer DeepseekV4Cache so the Compressor/Indexer get
+    /// persistent buffer state across turns. Without this, long-context
+    /// (L > sliding_window) would re-pool from scratch each call and
+    /// lose the global-context summary.
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        (0..<config.numHiddenLayers).map { _ in
+            DeepseekV4Cache(slidingWindow: config.slidingWindow)
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
         return lmHead(h)
@@ -602,17 +727,14 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     ///   ffn.experts.{E}.{w1|w2|w3}.*  → mlp.switch_mlp.{gate|down|up}_proj.* (stacked)
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var out: [String: MLXArray] = [:]
-        // First pass: direct rename + drop MTP + drop compressor/indexer.
+        // First pass: direct rename + drop MTP (training head only).
+        // Compressor + Indexer weights are KEPT — they're wired into
+        // DeepseekV4Attention for long-context (L > sliding_window)
+        // attention. Layers with compress_ratio == 0 carry no such
+        // weights; layers with >0 carry `self_attn.compressor.*` and
+        // (for ratio=4) `self_attn.indexer.*`.
         for (rawKey, value) in weights {
-            // Drop keys that aren't wired in Phase 1b.
             if rawKey.contains("mtp.") { continue }
-            if rawKey.contains(".compressor.") || rawKey.contains(".indexer.") {
-                // Compressor + Indexer are optional long-context paths.
-                // Dropping them makes short prompts run correctly; long
-                // prompts (L > sliding_window=128) will fall back to
-                // sliding-window-only attention.
-                continue
-            }
 
             var k = rawKey
 
