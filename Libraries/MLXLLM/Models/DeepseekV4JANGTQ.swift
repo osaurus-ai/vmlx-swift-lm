@@ -163,18 +163,39 @@ public final class DeepseekV4JANGTQModel:
     /// prompts during prefill). `DSV4_LONG_CTX=1` opt-in:
     /// DeepseekV4Cache on compress_ratio>0 layers.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let longCtxEnabled =
-            ProcessInfo.processInfo.environment["DSV4_LONG_CTX"] == "1"
+        let env = ProcessInfo.processInfo.environment
+        let longCtxEnabled = env["DSV4_LONG_CTX"] == "1"
+
+        // Mirror DeepseekV4Model.newCache. Three modes:
+        //   - "sliding" (default): RotatingKVCache, 128-token window.
+        //   - "full":    KVCacheSimple, all tokens kept.
+        //   - "tq":      KVCacheSimple now; BatchQuantize.maybeCompress
+        //                promotes to TurboQuantKVCache once offset > min.
+        //                Caller must also set kvMode=.turboQuant in
+        //                GenerateParameters for the promotion to fire.
+        let envMode = env["DSV4_KV_MODE"]?.lowercased()
+        let callerWantsTQ: Bool = {
+            guard let p = parameters else { return false }
+            if case .turboQuant = p.kvMode { return true }
+            return false
+        }()
+        let mode: String = envMode ?? (callerWantsTQ ? "tq" : "sliding")
+
         return (0..<config.numHiddenLayers).map { layerIdx in
-            if longCtxEnabled {
-                let cr =
-                    config.compressRatios.count > layerIdx
-                    ? config.compressRatios[layerIdx] : 0
-                if cr > 0 {
-                    return DeepseekV4Cache(slidingWindow: config.slidingWindow)
+            switch mode {
+            case "full", "tq":
+                return KVCacheSimple()
+            default:
+                if longCtxEnabled {
+                    let cr =
+                        config.compressRatios.count > layerIdx
+                        ? config.compressRatios[layerIdx] : 0
+                    if cr > 0 {
+                        return DeepseekV4Cache(slidingWindow: config.slidingWindow)
+                    }
                 }
+                return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
             }
-            return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
         }
     }
 
