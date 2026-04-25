@@ -123,6 +123,44 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
             return nil
         }
 
+        // Defer mid-grapheme-cluster emits so streaming output never
+        // splits a multi-codepoint emoji (regional-indicator pairs for
+        // flags, ZWJ sequences for compound emoji, base+variation-
+        // selector pairs). Without this guard, e.g. `🇺🇸` (US flag =
+        // U+1F1FA + U+1F1F8) streams as two separate broken-box
+        // glyphs — confirmed user-visible 2026-04-24 with
+        // MiniMax-M2.7-Small JANGTQ rendering an emitted flag as
+        // `❓国旗` in osaurus.
+        //
+        // Inspect the LAST grapheme cluster of `new` rather than its
+        // last scalar — Swift treats `🇺🇸` as one grapheme even when
+        // the character has two regional-indicator scalars, so a raw
+        // scalar check would defer the completed flag forever.
+        // Triggers:
+        //   • Last grapheme is a single unpaired regional indicator
+        //     (count == 1 within range 0x1F1E6 - 0x1F1FF) → wait for
+        //     the sibling that completes the flag.
+        //   • Last scalar of last grapheme is ZWJ (U+200D) → the
+        //     ZWJ-emoji chain is mid-build; wait for the next codepoint.
+        //   • Trailing high surrogate (rare in Swift String, but
+        //     harmless to defer if it ever appears).
+        if let lastChar = new.last {
+            let scalars = Array(lastChar.unicodeScalars)
+            if let lastScalarValue = scalars.last?.value {
+                let isUnpairedRegionalIndicator =
+                    scalars.count == 1
+                    && (0x1F1E6...0x1F1FF).contains(lastScalarValue)
+                let endsWithZWJ = lastScalarValue == 0x200D
+                let endsWithHighSurrogate =
+                    (0xD800...0xDBFF).contains(lastScalarValue)
+                if isUnpairedRegionalIndicator || endsWithZWJ
+                    || endsWithHighSurrogate
+                {
+                    return nil
+                }
+            }
+        }
+
         if new.hasSuffix("\n") {
             startNewSegment()
         } else {
