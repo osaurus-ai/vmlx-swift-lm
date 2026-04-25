@@ -260,7 +260,42 @@ public enum LLMTypeRegistry {
         // values. Future improvement: peek the safetensors index for
         // `tq_packed` keys when neither stamp nor env is set.
         if isMxtqStamp || forced {
-            let mxtqBits = check?.quantization?.bits ?? 2
+            // mxtqBits sourcing — the routed-MoE codebook lives in
+            // `jangtq_runtime.safetensors` keyed `codebook.{inFeatures}.
+            // {bits}`. The bits THERE are authoritative — the
+            // `config.json` `quantization.bits` field describes the
+            // AFFINE non-routed block (often 8 for JANGTQ_2L) and
+            // doesn't match the codebook bits. Mismatch caused
+            // `TurboQuantSwitchLinear.forward` to fatalError("sidecar
+            // not loaded") when bits=8 was searched against a bits=2
+            // codebook (2026-04-25 reproducer on DSV4-Flash JANGTQ
+            // bundle whose config.json was regenerated with bits=8).
+            //
+            // Resolution priority:
+            //   1. `DSV4_JANGTQ_BITS` env override (4 for JANGTQ4
+            //      bundles, 2 for JANGTQ_2L).
+            //   2. Authoritative `weight_format` stamp:
+            //      `jangtq4` → 4, `jangtq2`/`mxtq` → 2.
+            //   3. Forced path (no stamp, env-only): default to 2 (the
+            //      canonical JANGTQ_2L distribution).
+            //   4. Heuristic — config.json bits, only when in {2, 4}.
+            //      Anything else is the affine non-routed bits and
+            //      doesn't match the codebook.
+            let env = ProcessInfo.processInfo.environment
+            let envBits = (env["DSV4_JANGTQ_BITS"]).flatMap { Int($0) }
+            let stampBits: Int? = {
+                switch weightFormat {
+                case "jangtq4": return 4
+                case "jangtq2", "mxtq": return 2
+                default: return nil
+                }
+            }()
+            let configBits: Int? = {
+                guard let b = check?.quantization?.bits, b == 2 || b == 4
+                else { return nil }
+                return b
+            }()
+            let mxtqBits = envBits ?? stampBits ?? configBits ?? 2
             return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
