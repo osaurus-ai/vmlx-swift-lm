@@ -123,9 +123,16 @@ public func loadWeights(
         // `weight_format: "bf16"` even on quantized variants — the
         // global group_size is in config.json instead).
         let configGS: Int? = quantization?.groupSize
-        effectivePerLayerQuantization = JangLoader.inferPerLayerQuantization(
+        let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             overrideGroupSize: configGS)
+        if !inferred.perLayerQuantization.isEmpty {
+            let b = inferred.quantization?.bits ?? -1
+            let g = inferred.quantization?.groupSize ?? -1
+            FileHandle.standardError.write(
+                Data("[Load] JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
+        }
+        effectivePerLayerQuantization = inferred
     } else if let perLayerQuantization {
         // Remap perLayerQuantization keys to match sanitized weight paths.
         // Config.json uses VLM-prefixed keys like "language_model.model.layers.0..."
@@ -141,6 +148,35 @@ public func loadWeights(
                 remappedPerLayer[stripped] = value
             }
         }
+
+        // Defense-in-depth: cross-check the config-supplied per-layer
+        // overrides against actual safetensors shapes. If a bundle's
+        // config.json was re-stamped (or a converter bug emitted wrong
+        // bits / group_size), the runtime would otherwise silently
+        // corrupt dequant. Shape walk is authoritative — it overrides
+        // disagreeing entries and logs a one-line summary so users can
+        // see when a patch was applied.
+        if let shapeInferred = JangLoader.inferPerLayerQuantizationFromShapes(
+            weights: weights,
+            defaultBits: perLayerQuantization.quantization?.bits,
+            defaultGroupSize: perLayerQuantization.quantization?.groupSize)
+        {
+            var corrections = 0
+            for (path, expected) in shapeInferred.perLayerQuantization {
+                if case .quantize(let q) = expected {
+                    if let configured = remappedPerLayer[path],
+                        case .quantize(let cq) = configured,
+                        cq.bits == q.bits && cq.groupSize == q.groupSize
+                    { continue }
+                    remappedPerLayer[path] = expected
+                    corrections += 1
+                }
+            }
+            if corrections > 0 {
+                FileHandle.standardError.write(
+                    Data("[Load] config per-layer quant disagreed with safetensors shapes — patched \(corrections) layer(s) from shape walk\n".utf8))
+            }
+        }
         effectivePerLayerQuantization = BaseConfiguration.PerLayerQuantization(
             quantization: perLayerQuantization.quantization,
             perLayerQuantization: remappedPerLayer
@@ -153,19 +189,33 @@ public func loadWeights(
         // mixed (8-bit attention + 2-bit routed MoE). The algorithm
         // is idempotent: when the config matches reality the inferred
         // map adds no per-layer overrides.
-        effectivePerLayerQuantization =
+        let inferred =
             JangLoader.inferPerLayerQuantizationFromShapes(
                 weights: weights,
                 defaultBits: quantization.bits,
                 defaultGroupSize: quantization.groupSize)
+        if let inferred, !inferred.perLayerQuantization.isEmpty {
+            let b = inferred.quantization?.bits ?? -1
+            let g = inferred.quantization?.groupSize ?? -1
+            FileHandle.standardError.write(
+                Data("[Load] non-JANG shape walk produced \(inferred.perLayerQuantization.count) per-layer quant override(s) over default (bits=\(b), gs=\(g))\n".utf8))
+        }
+        effectivePerLayerQuantization = inferred
             ?? BaseConfiguration.PerLayerQuantization(
                 quantization: quantization, perLayerQuantization: [:])
     } else {
         // No quantization signal in config.json at all — but the
         // bundle may STILL be quantized (e.g., a stripped config).
         // If `.scales` keys exist, infer fully from shapes.
-        effectivePerLayerQuantization =
+        let inferred =
             JangLoader.inferPerLayerQuantizationFromShapes(weights: weights)
+        if let inferred {
+            let b = inferred.quantization?.bits ?? -1
+            let g = inferred.quantization?.groupSize ?? -1
+            FileHandle.standardError.write(
+                Data("[Load] config has no quant block — shape walk inferred default (bits=\(b), gs=\(g)) plus \(inferred.perLayerQuantization.count) override(s)\n".utf8))
+        }
+        effectivePerLayerQuantization = inferred
     }
 
     // quantize if needed
