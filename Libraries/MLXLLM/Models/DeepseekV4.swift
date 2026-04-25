@@ -556,7 +556,20 @@ class DeepseekV4HyperConnection: Module {
         // Flatten the (hcMult, hidden) tail into one axis.
         let xFlat = h.reshaped(B, L, hcMult * hiddenSize)
         // Variance-only RMS norm with weight = ones.
-        let xNormed = MLXFast.rmsNorm(xFlat, weight: hcRMSOnes.asType(xFlat.dtype), eps: hcEps)
+        //
+        // Force fp32 internals: the reduction `mean(square(x))` runs over
+        // `hcMult * hiddenSize` (≈16384 for DSV4-Flash) elements per row
+        // and bf16 rounding compounds aggressively across that axis. On
+        // M3 Ultra this saturates and the rsqrt produces garbage logits
+        // ("17 plus plus plus" failure mode). M4 happens to keep fp32 in
+        // SIMD lanes for this reduction so MacBook tests pass — but the
+        // bug is real on Mac Studio. Mirrors the Python jang_tools fix
+        // at jang/research/JANGTQ-PROGRESS-LOG-2026-04-25.md §A.1 #50.
+        let xNormed = MLXFast.rmsNorm(
+            xFlat.asType(.float32),
+            weight: hcRMSOnes.asType(.float32),
+            eps: hcEps
+        ).asType(xFlat.dtype)
         // mixes = x_normed @ fn.T  → (B, L, mix_hc)
         let mixes = xNormed.asType(.float32)
             .matmul(fn.asType(.float32).transposed())
