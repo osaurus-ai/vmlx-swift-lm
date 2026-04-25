@@ -740,6 +740,30 @@ public actor BatchEngine {
                         // model forwards either broadcast 2D already
                         // or tolerate the extra leading axis — matches
                         // the sibling `Evaluate.swift:825` fix.
+                        //
+                        // Trim cache offset back to (promptLen - 1) before
+                        // re-feeding the last token. Disk-tier hits restore
+                        // KV for `promptLen + previousDecodeLen` entries
+                        // (storage runs at finishSlot AFTER decode), so
+                        // without trimming the model would re-feed the
+                        // last prompt token at position `promptLen +
+                        // previousDecodeLen` — RoPE then rotates by the
+                        // wrong angle and the resulting logits typically
+                        // sample EOS first-token, yielding 0 generated
+                        // tokens (BENCH_BATCH_DISK_RESTORE 2026-04-24).
+                        // Trim is a no-op for paged-tier hits because
+                        // their `remaining.isEmpty == true` branch is
+                        // only reached when the matched count already
+                        // equals promptLen and offset already equals
+                        // promptLen.
+                        let promptLen = tokenIds.count
+                        let cacheOffset = slot.cache.first?.offset ?? promptLen
+                        let trimNeeded = cacheOffset - (promptLen - 1)
+                        if trimNeeded > 0 {
+                            for layer in slot.cache where layer.isTrimmable {
+                                _ = layer.trim(trimNeeded)
+                            }
+                        }
                         let lastToken = MLXArray([Int32(last)])
                             .expandedDimensions(axis: 0)
                         inputForPrepare = LMInput(
