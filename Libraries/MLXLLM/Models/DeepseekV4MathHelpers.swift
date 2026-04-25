@@ -53,38 +53,49 @@ public enum DeepseekV4Math {
         iters: Int = 20,
         eps: Float = 1e-6
     ) -> (pre: MLXArray, post: MLXArray, comb: MLXArray) {
-        precondition(mixes.shape.last == 3 * hcMult, "mixes last dim must be 3*hcMult")
+        // Match Python `_hc_split_sinkhorn_ops` exactly. Mixes width is
+        // `(2 + hcMult) * hcMult`, not `3 * hcMult`. The first hcMult
+        // elements form `pre`, the next hcMult form `post`, and the
+        // remaining `hcMult * hcMult` are reshaped into the (hc, hc)
+        // doubly-stochastic mixing matrix `comb`.
+        let mh = hcMult
+        let mixHc = (2 + mh) * mh
+        precondition(
+            mixes.shape.last == mixHc,
+            "mixes last dim must be (2+hcMult)*hcMult = \(mixHc), got \(mixes.shape.last ?? -1)")
 
-        // Split mixes into three chunks of width `hcMult`.
-        let slices = split(mixes, parts: 3, axis: -1)
-        let mixPre = slices[0]
-        let mixPost = slices[1]
-        let mixComb = slices[2]
+        // Bring everything to fp32 for numerical stability — the
+        // sinkhorn iterations are sensitive to fp16 underflow on the
+        // post-softmax row/col normalizations.
+        let mixesF = mixes.asType(.float32)
+        let scaleF = scale.asType(.float32)
+        let baseF = base.asType(.float32)
 
-        let basePre = base[0..<hcMult]
-        let basePost = base[hcMult..<(2 * hcMult)]
-        let baseComb = base[(2 * hcMult)..<(3 * hcMult)]
+        let preScale = scaleF[0]
+        let postScale = scaleF[1]
+        let combScale = scaleF[2]
 
-        let pre = sigmoid(mixPre * scale[0] + basePre) + eps
-        let post = 2.0 * sigmoid(mixPost * scale[1] + basePost)
+        let basePre = baseF[0..<mh]
+        let basePost = baseF[mh..<(2 * mh)]
+        let baseComb = baseF[(2 * mh)...]  // length mh*mh
 
-        // `comb` starts as softmax then undergoes Sinkhorn iterations
-        // alternating col-normalize and row-normalize to reach a
-        // doubly-stochastic matrix. The softmax output is (..., hcMult)
-        // — we broadcast it into an (hcMult, hcMult) structure by
-        // treating the softmax as one *row* of the mixing matrix and
-        // replicating. Python replicates via `mx.repeat`.
-        let softmaxed = softmax(mixComb * scale[2] + baseComb, axis: -1) + eps
-        // Expand to (..., hcMult, hcMult) — each row shares the same
-        // softmax output initially; Sinkhorn iterations then mix.
-        let expanded = broadcast(
-            softmaxed.expandedDimensions(axis: -2),
-            to: softmaxed.shape.dropLast() + [hcMult, hcMult])
+        let mixPre = mixesF[.ellipsis, 0..<mh]
+        let mixPost = mixesF[.ellipsis, mh..<(2 * mh)]
+        let mixCombFlat = mixesF[.ellipsis, (2 * mh)...]  // (..., mh*mh)
 
-        var comb = expanded
-        // One initial col-normalize.
+        let pre = sigmoid(mixPre * preScale + basePre) + eps
+        let post = 2.0 * sigmoid(mixPost * postScale + basePost)
+
+        // Reshape last axis (mh*mh) into (mh, mh) and add bias also
+        // reshaped to (mh, mh).
+        let leadShape = Array(mixCombFlat.shape.dropLast())
+        var combRaw = mixCombFlat * combScale
+        combRaw = combRaw.reshaped(leadShape + [mh, mh])
+            + baseComb.reshaped([mh, mh])
+        var comb = softmax(combRaw, axis: -1) + eps
+        // Initial col-normalize, then (iters-1) × {row, col}.
         comb = sinkhornColNormalize(comb, eps: eps)
-        for _ in 0..<(iters - 1) {
+        for _ in 0..<max(iters - 1, 0) {
             comb = sinkhornRowNormalize(comb, eps: eps)
             comb = sinkhornColNormalize(comb, eps: eps)
         }

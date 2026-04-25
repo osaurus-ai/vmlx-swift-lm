@@ -1009,9 +1009,16 @@ public struct JangLoader: Sendable {
     /// `loadWeights()` quantization path can use directly.
     public static func inferPerLayerQuantization(
         weights: [String: MLXArray],
-        jangConfig: JangConfig
+        jangConfig: JangConfig,
+        overrideGroupSize: Int? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
-        let groupSize = jangConfig.quantization.blockSize
+        // Prefer the caller-supplied group_size (typically from
+        // config.json's quantization.group_size) over jangConfig's
+        // default blockSize. Bundles whose jang_config.json doesn't
+        // carry explicit quant metadata (e.g., DSV4-Flash JANG_2L
+        // ships `weight_format: "bf16"`) need the config.json value
+        // to land at the right group_size during shape inference.
+        let groupSize = overrideGroupSize ?? jangConfig.quantization.blockSize
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
 
         // Find the default (most common) bit width from jang_config
@@ -1117,11 +1124,19 @@ public struct JangLoader: Sendable {
         let candidates = bitWidthsUsed.isEmpty
             ? validBits.sorted(by: >)  // [8, 6, 5, 4, 3, 2]
             : bitWidthsUsed.sorted(by: >)
+        // MLX's quantize op only accepts group_size ∈ {32, 64, 128}.
+        // A shape-only fallback search can otherwise return e.g.
+        // (bits=8, gs=8) or (bits=4, gs=16) which then fatal-errors
+        // inside `mlx::quantize`. Filter to the supported set up front
+        // — the next candidate `bits` will pick a valid gs (verified
+        // on DSV4-Flash JANG_2L: bits=2 → inDim=4096 → gs=32 ✓).
+        let mlxValidGroupSizes: Set<Int> = [32, 64, 128]
         for bits in candidates {
             guard bits > 0, (packedDim * 32) % bits == 0 else { continue }
             let inDim = (packedDim * 32) / bits
             guard inDim > 0, inDim % numGroups == 0 else { continue }
             let gs = inDim / numGroups
+            guard mlxValidGroupSizes.contains(gs) else { continue }
             return (bits, gs)
         }
 

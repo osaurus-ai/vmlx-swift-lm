@@ -117,8 +117,15 @@ public func loadWeights(
     // tq_packed expert projections.
     let effectivePerLayerQuantization: BaseConfiguration.PerLayerQuantization?
     if let jangConfig {
+        // Prefer config.json's explicit `quantization.group_size` over
+        // jangConfig.blockSize when the jang_config doesn't carry quant
+        // metadata of its own (e.g., DSV4-Flash bundles ship
+        // `weight_format: "bf16"` even on quantized variants — the
+        // global group_size is in config.json instead).
+        let configGS: Int? = quantization?.groupSize
         effectivePerLayerQuantization = JangLoader.inferPerLayerQuantization(
-            weights: weights, jangConfig: jangConfig)
+            weights: weights, jangConfig: jangConfig,
+            overrideGroupSize: configGS)
     } else if let perLayerQuantization {
         // Remap perLayerQuantization keys to match sanitized weight paths.
         // Config.json uses VLM-prefixed keys like "language_model.model.layers.0..."

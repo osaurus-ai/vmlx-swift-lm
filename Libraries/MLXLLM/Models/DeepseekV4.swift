@@ -312,18 +312,47 @@ class DeepseekV4Attention: Module {
             .reshaped(B, L, numHeads * headDim)
 
         // --- Grouped low-rank O projection ---
-        // Reshape to (B, L, oGroups, groupFeat) then wo_a via per-group
-        // matmul, producing (B, L, oGroups, oLoraRank) → concat groups
-        // → wo_b.
+        // Reshape to (B, L, oGroups, groupFeat) then per-group matmul
+        // through `wo_a`, producing (B, L, oGroups, oLoraRank) → concat
+        // groups → wo_b. Mirrors Python `_grouped_output_projection`
+        // (mlx_model.py:700) — separate dispatch for QuantizedLinear vs
+        // plain Linear because the quantized packed weight cannot be
+        // reshaped element-wise.
         let groupFeat = (numHeads * headDim) / oGroups
         let oReshape = output.reshaped(B, L, oGroups, groupFeat)
-        // wo_a.weight has shape (oGroups*oLoraRank, groupFeat). Reshape
-        // to (oGroups, oLoraRank, groupFeat) and einsum bsgd,grd→bsgr.
-        // Since MLX Linear stores weights as (out, in), we reshape
-        // wo_a.weight accordingly for the einsum path.
-        let woaW = woA.weight.reshaped(oGroups, oLoraRank, groupFeat)
-        let oA = einsum("bsgd,grd->bsgr", oReshape, woaW).reshaped(
-            B, L, oGroups * oLoraRank)
+        let oA: MLXArray
+        if let qwo = woA as? QuantizedLinear {
+            // Python ref:
+            //   out = out.transpose(2, 0, 1, 3)               # (oGroups, B, L, gf)
+            //   weight  = wo_a.weight.reshape(oGroups, oLoraRank, -1)[:, None]
+            //   scales  = wo_a.scales.reshape(oGroups, oLoraRank, -1)[:, None]
+            //   biases  = wo_a.biases.reshape(oGroups, oLoraRank, -1)[:, None]
+            //   out = mx.quantized_matmul(out, weight, scales, biases,
+            //                              transpose=True, group_size, bits, mode)
+            //   out = out.transpose(1, 2, 0, 3).reshape(B, L, oGroups*oLoraRank)
+            let xT = oReshape.transposed(2, 0, 1, 3)
+            // Each per-group weight slab keeps its original packed-in
+            // dim (last axis) — `-1` lets MLX work out 1024 → 128 for
+            // 8-bit g=32 packing.
+            let wPacked = qwo.weight.reshaped(oGroups, oLoraRank, -1)
+                .expandedDimensions(axis: 1)
+            let wScales = qwo.scales.reshaped(oGroups, oLoraRank, -1)
+                .expandedDimensions(axis: 1)
+            let wBiases = qwo.biases?.reshaped(oGroups, oLoraRank, -1)
+                .expandedDimensions(axis: 1)
+            let outQ = MLX.quantizedMatmul(
+                xT, wPacked, scales: wScales, biases: wBiases,
+                transpose: true, groupSize: qwo.groupSize, bits: qwo.bits)
+            oA = outQ.transposed(1, 2, 0, 3).reshaped(
+                B, L, oGroups * oLoraRank)
+        } else {
+            // Non-quantized path: keep the einsum.
+            // wo_a.weight has shape (oGroups*oLoraRank, groupFeat) per
+            // MLX Linear convention (out, in).
+            let woaW = woA.weight.reshaped(oGroups, oLoraRank, groupFeat)
+            oA = einsum("bsgd,grd->bsgr", oReshape, woaW)
+                .reshaped(B, L, oGroups * oLoraRank)
+        }
         return woB(oA)
     }
 }
@@ -357,7 +386,13 @@ class DeepseekV4MoEGate: Module {
         self.isHashLayer = config.isHashLayer(layerIdx)
         self._weight.wrappedValue = zeros([nRoutedExperts, config.hiddenSize])
         self._bias.wrappedValue = zeros([nRoutedExperts])
-        self._tid2eid.wrappedValue = zeros([isHashLayer ? config.vocabSize : 1])
+        // Hash routing table: bundle ships (vocab, topK) — already
+        // pre-stamped with which `topK` experts each token id should
+        // route to, so the gate just gathers without computing scores.
+        // Non-hash layers don't have this tensor, so we still allocate
+        // a placeholder slot.
+        self._tid2eid.wrappedValue =
+            zeros([isHashLayer ? config.vocabSize : 1, isHashLayer ? topK : 1])
     }
 
     /// Returns (indices, weights) where indices has shape (B, L, topK)
@@ -366,13 +401,14 @@ class DeepseekV4MoEGate: Module {
     /// same contract as softmax-routed layers.
     func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> (MLXArray, MLXArray) {
         if isHashLayer, let ids = inputIds {
-            // Hash routing: tid2eid[ids] gives the single expert per token.
-            // Replicate to topK slots with uniform weight so the
-            // SwitchGLU contract (shape (B, L, topK) indices) holds.
+            // Hash routing: tid2eid is (vocab, topK) — pre-stamped at
+            // convert time with which topK experts each token id
+            // routes to. `tid2eid[ids]` for ids shape (B, L) returns
+            // (B, L, topK) directly via fancy index.
             let (B, L) = (x.dim(0), x.dim(1))
-            let chosen = tid2eid[ids]  // (B, L)
-            let indices = broadcast(
-                chosen.expandedDimensions(axis: -1), to: [B, L, topK])
+            let indices = tid2eid[ids]  // (B, L, topK)
+            // Uniform weights — every selected expert contributes
+            // equally, scaled by the routed factor / topK.
             let weights = MLXArray.ones([B, L, topK], dtype: .float32)
                 * (routedScalingFactor / Float(topK))
             return (indices.asType(.uint32), weights)
@@ -475,66 +511,87 @@ class DeepseekV4HyperConnection: Module {
     let hcIters: Int
     let hcEps: Float
     let hiddenSize: Int
-    /// `hc_{attn,ffn}_fn`: (hcMult, 3*hcMult). Maps residual to mix
-    /// coefficients in one matmul.
+    let mixHc: Int  // (2 + hcMult) * hcMult — bundle stores params at this width
+    /// `hc_{attn,ffn}_fn`: shape `((2+hc)*hc, hc*hidden)`. Bundle stores
+    /// `(24, 16384)` for hc=4, hidden=4096.
     @ParameterInfo(key: "fn") var fn: MLXArray
-    /// `hc_{attn,ffn}_scale`: (3,) per-field scalar.
+    /// `hc_{attn,ffn}_scale`: shape `(3,)` per-field scalar.
     @ParameterInfo(key: "scale") var scale: MLXArray
-    /// `hc_{attn,ffn}_base`: (3*hcMult,) bias.
+    /// `hc_{attn,ffn}_base`: shape `((2+hc)*hc,)` per-field bias.
     @ParameterInfo(key: "base") var base: MLXArray
+    /// Constant ones-vector reused as the RMSNorm weight inside the
+    /// per-block collapse (Python sets up `_hc_rms_ones = mx.ones(...)`).
+    let hcRMSOnes: MLXArray
 
     init(config: DeepseekV4Configuration) {
         self.hcMult = config.hcMult
         self.hcIters = config.hcSinkhornIters
         self.hcEps = config.hcEps
         self.hiddenSize = config.hiddenSize
-        self._fn.wrappedValue = zeros([hcMult, 3 * hcMult])
+        self.mixHc = (2 + config.hcMult) * config.hcMult
+        self._fn.wrappedValue = zeros([mixHc, hcMult * hiddenSize])
         self._scale.wrappedValue = zeros([3])
-        self._base.wrappedValue = zeros([3 * hcMult])
+        self._base.wrappedValue = zeros([mixHc])
+        // Match Python `_hc_rms_ones = mx.ones(hc_dim, dtype=mx.float16)`.
+        // This is a constant — not a learned parameter — so we keep it
+        // as a plain stored property (not @ParameterInfo).
+        self.hcRMSOnes = MLXArray.ones([config.hcMult * config.hiddenSize])
     }
 
     /// Collapse: `h` shape (B, L, hcMult, hiddenSize) → collapsed x
     /// (B, L, hiddenSize) plus `post` (B, L, hcMult) and `comb`
     /// (B, L, hcMult, hcMult) for the expand step.
+    ///
+    /// Mirrors Python `DeepseekV4DecoderLayer._hc_pre`:
+    ///   x_flat   = flatten(h, axis=2)              # (B, L, hc*hidden)
+    ///   x_normed = rms_norm(x_flat, ones, eps)
+    ///   mixes    = x_normed @ fn.T                 # (B, L, mix_hc)
+    ///   pre, post, comb = hc_split_sinkhorn(mixes, scale, base, hc, iters, eps)
+    ///   y = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
     func collapse(_ h: MLXArray) -> (x: MLXArray, post: MLXArray, comb: MLXArray) {
+        let dtype = h.dtype
         let B = h.dim(0)
         let L = h.dim(1)
-        // Compute mean across the (hcMult, hiddenSize) flattened axes
-        // for the mixes — using a matmul into `fn`.
-        //   mixes = h_flat @ fn   where h_flat is reshaped to (..., hcMult).
-        // Python reference collapses hcMult dim through rsqrt-normalized
-        // mean. We follow the shape contract: produce `mixes` shape
-        // (..., 3*hcMult) so hcSplitSinkhorn can consume it.
-        let hFp32 = h.asType(.float32)
-        // Reduce over hiddenSize to get per-copy scalar, then matmul with fn.
-        let perCopy = hFp32.mean(axis: -1)  // (B, L, hcMult)
-        let mixes = perCopy.matmul(fn)  // (B, L, 3*hcMult)
+
+        // Flatten the (hcMult, hidden) tail into one axis.
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize)
+        // Variance-only RMS norm with weight = ones.
+        let xNormed = MLXFast.rmsNorm(xFlat, weight: hcRMSOnes.asType(xFlat.dtype), eps: hcEps)
+        // mixes = x_normed @ fn.T  → (B, L, mix_hc)
+        let mixes = xNormed.asType(.float32)
+            .matmul(fn.asType(.float32).transposed())
+
         let (pre, post, comb) = DeepseekV4Math.hcSplitSinkhorn(
             mixes: mixes, scale: scale, base: base,
             hcMult: hcMult, iters: hcIters, eps: hcEps)
-        // x = sum_i pre[i] * h[..., i, :]
-        let preExp = pre.expandedDimensions(axis: -1)  // (B, L, hcMult, 1)
-        let x = (preExp * hFp32).sum(axis: -2)  // (B, L, hiddenSize)
-        return (x: x.asType(h.dtype), post: post, comb: comb)
-        _ = B; _ = L
+
+        // y = sum(pre[..., None] * x_flat.reshape(B, L, hc, D), axis=2)
+        let preCast = pre.asType(dtype)
+        let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
+        let y = (preCast.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
+        return (x: y, post: post, comb: comb)
     }
 
     /// Expand: given attn/ffn output `blockOut` (B, L, hiddenSize),
     /// residual (B, L, hcMult, hiddenSize), and the (post, comb) from
     /// the matching collapse, return new h (B, L, hcMult, hiddenSize).
+    ///
+    /// Mirrors Python `_hc_post`:
+    ///   y = post[..., None] * x[..., None, :] + matmul(comb, residual)
     func expand(
         blockOut: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray
     ) -> MLXArray {
-        // Contract `comb` (B,L,hc,hc) with residual (B,L,hc,D) over the
-        // residual's hc axis: `matmul(comb, residual)` → (B,L,hc,D).
-        let combF = comb.asType(.float32)
-        let residualF = residual.asType(.float32)
-        let combResid = combF.matmul(residualF)
-        // post: (B, L, hc) → (B, L, hc, 1); blockOut: (B, L, D) → (B, L, 1, D).
-        let postExp = post.expandedDimensions(axis: -1)
-        let blockExp = blockOut.asType(.float32).expandedDimensions(axis: -2)
-        let y = postExp * blockExp + combResid
-        return y.asType(blockOut.dtype)
+        let dtype = blockOut.dtype
+        let postCast = post.asType(dtype)
+        let combCast = comb.asType(dtype)
+        // matmul(comb, residual) — comb is (B,L,hc,hc), residual is
+        // (B,L,hc,D); broadcast over leading dims. MLX matmul handles
+        // this directly.
+        let combResid = combCast.matmul(residual)
+        // post: (B,L,hc) → (B,L,hc,1); blockOut: (B,L,D) → (B,L,1,D).
+        let y = postCast.expandedDimensions(axis: -1)
+            * blockOut.expandedDimensions(axis: -2) + combResid
+        return y
     }
 }
 
@@ -543,36 +600,44 @@ class DeepseekV4HyperConnection: Module {
 class DeepseekV4HyperHead: Module {
     let hcMult: Int
     let hiddenSize: Int
+    let hcEps: Float
+    /// Bundle stores `hc_head_fn` at `(hcMult, hcMult*hiddenSize)`.
     @ParameterInfo(key: "hc_head_fn") var fn: MLXArray
     @ParameterInfo(key: "hc_head_base") var base: MLXArray
     @ParameterInfo(key: "hc_head_scale") var scale: MLXArray
+    /// Constant ones-vector for the RMS norm in `_hc_head_reduce`.
+    let hcHeadRMSOnes: MLXArray
 
     init(config: DeepseekV4Configuration) {
         self.hcMult = config.hcMult
         self.hiddenSize = config.hiddenSize
-        // fn shape: (hcMult, hcMult*hiddenSize) per §J bug comment
-        // (vs per-block fn which is (hcMult, 3*hcMult)). This is a
-        // distinct reduction parameter — not used in per-block HC.
+        self.hcEps = config.rmsNormEps
         self._fn.wrappedValue = zeros([hcMult, hcMult * hiddenSize])
         self._base.wrappedValue = zeros([hcMult])
         self._scale.wrappedValue = zeros([1])
+        self.hcHeadRMSOnes = MLXArray.ones([config.hcMult * config.hiddenSize])
     }
 
-    /// Reduce (B, L, hcMult, hiddenSize) → (B, L, hiddenSize) using a
-    /// sigmoid-summed mixing (no Sinkhorn, simpler than per-block HC).
+    /// Reduce (B, L, hcMult, hiddenSize) → (B, L, hiddenSize). Mirrors
+    /// Python `_hc_head_reduce`:
+    ///   x_flat   = flatten(x, axis=2)            # (B, L, hc*hidden)
+    ///   x_normed = rms_norm(x_flat, ones, eps)
+    ///   mixes    = x_normed @ hc_head_fn.T       # (B, L, hc)
+    ///   pre      = sigmoid(mixes * scale + base) + hc_eps
+    ///   y        = sum(pre[..., None] * x_flat.reshape(B,L,hc,D), axis=2)
+    /// NO sum-to-1 normalization — match the Python reference exactly.
     func reduce(_ h: MLXArray) -> MLXArray {
-        // Flatten (hcMult, hiddenSize) → (hcMult*hiddenSize), matmul
-        // with fn^T to get (B, L, hcMult), then sigmoid+sum-to-1.
+        let dtype = h.dtype
         let B = h.dim(0)
         let L = h.dim(1)
-        let flat = h.reshaped(B, L, hcMult * hiddenSize).asType(.float32)
-        let mixes = flat.matmul(fn.asType(.float32).transposed())  // (B, L, hcMult)
-        var weights = sigmoid(mixes * scale + base) + 1e-6
-        let denom = weights.sum(axis: -1, keepDims: true)
-        weights = weights / denom
-        // Weighted sum over hcMult axis.
-        let out = (weights.expandedDimensions(axis: -1) * h.asType(.float32)).sum(axis: -2)
-        return out.asType(h.dtype)
+        let xFlat = h.reshaped(B, L, hcMult * hiddenSize)
+        let xNormed = MLXFast.rmsNorm(
+            xFlat, weight: hcHeadRMSOnes.asType(xFlat.dtype), eps: hcEps)
+        let mixes = xNormed.matmul(fn.transposed())  // (B, L, hcMult)
+        let pre = sigmoid(mixes * scale + base) + MLXArray(hcEps)
+        let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
+        return (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
+            .asType(dtype)
     }
 }
 

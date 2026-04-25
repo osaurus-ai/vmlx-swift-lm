@@ -913,8 +913,13 @@ public final class LLMModelFactory: ModelFactory {
         // When JANG, skip config.json's perLayerQuantization — JANG infers correct
         // per-layer bits from tensor shapes. This avoids creating QuantizedLinear at
         // the wrong bit width (which can't be re-quantized later).
+        // BUT: still pass `quantization` (the global config.json group_size /
+        // bits) so JangLoader.inferPerLayerQuantization gets the correct
+        // `knownGroupSize` even when jang_config.json doesn't carry quant
+        // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
+            quantization: jangConfig != nil ? baseConfig.quantization : nil,
             perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 
