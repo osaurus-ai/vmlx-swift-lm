@@ -300,6 +300,13 @@ Loader robustness (2026-04-25): the per-layer quantization inference walks every
 
 The reasoning parser strips `<think>…</think>` from `.chunk` events automatically when consumers want post-thinking content only — see the reasoning channel section above.
 
+**Multi-turn + reasoning gotcha (live-verified 2026-04-25):** when `enable_thinking=true` and `max_tokens` is too low for the model to close `</think>` before the cap, the truncated mid-reasoning text gets injected verbatim into the next turn's prompt and the model goes off-distribution (gibberish output, leaked `</think>` markers in `.chunk`). Two valid mitigations:
+
+1. **Raise `max_tokens` per turn** to ≥ 4096. DSV4 reasoning traces routinely exceed 1K tokens on non-trivial problems.
+2. **Set `drop_thinking: true` on prior assistant messages** before re-applying the chat template. The bundled DSV4 Jinja honors `message.get('drop_thinking', false)` for non-last messages — passing it strips prior reasoning blocks from the rendered prompt and the model only sees the final answers + the new user turn. This is the production pattern for long agent loops.
+
+Cross-runtime fp32-internal mHC RMSnorm cast is locked at both layers — Python (`jang_tools/dsv4/mlx_model.py:1346-1382`) and Swift (`Libraries/MLXLLM/Models/DeepseekV4.swift:559-572`, commit `5f64495`). Required for M3 Ultra correctness; M4 happens to keep fp32 in SIMD lanes by accident but the cast is mandatory parity guard. **Do NOT remove the `.asType(.float32)` on `xFlat` and `hcRMSOnes` in `collapse()`** — see `research/DSV4-HC-PRE-FP32-CAST-FIX-2026-04-25.md` for the diagnosis trail.
+
 Cache + L2 disk: `CacheCoordinator` paged tier handles cross-turn prefix reuse; `DiskCache` (TQDiskSerializer v2 with `LayerKind.kvSimple` / `.tqCompressed` / `.qkv` / `.mamba` / `.rotating` tags) round-trips all layer types including DSV4's per-layer mix. The 2026-04-24 `BatchEngine.swift:733` trim fix ensures full-cache disk hits don't re-feed the last token at the wrong RoPE position.
 
 ---
