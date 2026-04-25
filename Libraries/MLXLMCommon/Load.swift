@@ -145,8 +145,27 @@ public func loadWeights(
             quantization: perLayerQuantization.quantization,
             perLayerQuantization: remappedPerLayer
         )
+    } else if let quantization {
+        // Bundle has top-level quantization but no per-layer overrides.
+        // Walk every `.scales` key and infer (bits, gs) from shapes.
+        // This catches bundles whose `config.json` says e.g.
+        // `bits: 8` uniformly while individual modules are actually
+        // mixed (8-bit attention + 2-bit routed MoE). The algorithm
+        // is idempotent: when the config matches reality the inferred
+        // map adds no per-layer overrides.
+        effectivePerLayerQuantization =
+            JangLoader.inferPerLayerQuantizationFromShapes(
+                weights: weights,
+                defaultBits: quantization.bits,
+                defaultGroupSize: quantization.groupSize)
+            ?? BaseConfiguration.PerLayerQuantization(
+                quantization: quantization, perLayerQuantization: [:])
     } else {
-        effectivePerLayerQuantization = nil
+        // No quantization signal in config.json at all — but the
+        // bundle may STILL be quantized (e.g., a stripped config).
+        // If `.scales` keys exist, infer fully from shapes.
+        effectivePerLayerQuantization =
+            JangLoader.inferPerLayerQuantizationFromShapes(weights: weights)
     }
 
     // quantize if needed

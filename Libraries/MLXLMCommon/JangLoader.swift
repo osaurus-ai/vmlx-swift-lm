@@ -1007,6 +1007,106 @@ public struct JangLoader: Sendable {
     ///
     /// Returns a `BaseConfiguration.PerLayerQuantization` that the existing
     /// `loadWeights()` quantization path can use directly.
+    /// Universal shape-based inference. Walks every `.scales` key in
+    /// the bundle's weights, derives the actual `(bits, group_size)`
+    /// from the `(weight, scales)` shape pair, and returns a per-layer
+    /// quantization map. Works for any quantized bundle — JANG,
+    /// JANGTQ-native, or stock MLX-quantized — because the math
+    /// `weight.shape[-1] * 32 == bits * in_dim` and `scales.shape[-1] *
+    /// group_size == in_dim` is the same regardless of how the bundle
+    /// was produced.
+    ///
+    /// 2026-04-25: added because bundle `config.json` files can drift
+    /// out of sync with the actual safetensors (e.g., a re-stamped
+    /// `bits: 8` block while the routed-MoE codebook is still bits=2,
+    /// or a converter bug emits the wrong override). Trusting the
+    /// shape always gives a correct dequant; trusting config.json
+    /// produces silent corruption (wrong dequant constants → garbage
+    /// activations) or hard fatal errors (codebook miss).
+    ///
+    /// Resolution priority for the SHARED default (`bits`, `gs`):
+    ///
+    ///   1. Caller-supplied `defaultBits` / `defaultGroupSize`
+    ///      (typically from config.json's top-level `quantization`).
+    ///   2. The MOST FREQUENT (bits, gs) pair across all walked layers.
+    ///   3. Hard-coded `(4, 64)` fallback.
+    ///
+    /// Per-layer entries are emitted only for layers whose
+    /// shape-inferred quant differs from the chosen default. Layers
+    /// whose shapes don't yield a valid `(bits, gs)` (e.g., MXTQ
+    /// codebook entries that don't carry `.scales`) are skipped — they
+    /// were never going to be quantized via this path anyway.
+    public static func inferPerLayerQuantizationFromShapes(
+        weights: [String: MLXArray],
+        defaultBits: Int? = nil,
+        defaultGroupSize: Int? = nil,
+        bitWidthsHint: [Int] = []
+    ) -> BaseConfiguration.PerLayerQuantization? {
+        // Find every base path that has a `.scales` companion.
+        var quantizedLayers = Set<String>()
+        for key in weights.keys where key.hasSuffix(".scales") {
+            quantizedLayers.insert(String(key.dropLast(".scales".count)))
+        }
+        guard !quantizedLayers.isEmpty else { return nil }
+
+        // Walk shapes. The `bitWidthsHint` (if present) constrains the
+        // ambiguous fallback search. If the caller didn't pass one,
+        // prefer high-bit candidates first since the converter classify
+        // rule puts attention/embed/lm_head/shared at the highest
+        // available bits — matches "(8,32) first" pref order from the
+        // jang_tools runtime fix design.
+        let hintToUse: [Int] =
+            bitWidthsHint.isEmpty ? [8, 6, 5, 4, 3, 2] : bitWidthsHint
+
+        var inferred = [String: (bits: Int, groupSize: Int)]()
+        for basePath in quantizedLayers {
+            guard let weightArray = weights[basePath + ".weight"],
+                let scalesArray = weights[basePath + ".scales"]
+            else { continue }
+            let (bits, gs) = inferBitWidthAndGroupSize(
+                weight: weightArray, scales: scalesArray,
+                knownGroupSize: defaultGroupSize,
+                bitWidthsUsed: hintToUse)
+            inferred[basePath] = (bits, gs)
+        }
+        guard !inferred.isEmpty else { return nil }
+
+        // Pick the shared default. Caller's hint wins when present;
+        // otherwise we use the most frequent (bits, gs) pair.
+        let chosenDefault: (bits: Int, groupSize: Int)
+        if let b = defaultBits, let gs = defaultGroupSize {
+            chosenDefault = (b, gs)
+        } else {
+            var counts = [String: (count: Int, bits: Int, gs: Int)]()
+            for (_, t) in inferred {
+                let k = "\(t.bits)/\(t.groupSize)"
+                let prev = counts[k] ?? (0, t.bits, t.groupSize)
+                counts[k] = (prev.count + 1, prev.bits, prev.gs)
+            }
+            if let top = counts.values.max(by: { $0.count < $1.count }) {
+                chosenDefault = (top.bits, top.gs)
+            } else {
+                chosenDefault = (4, 64)
+            }
+        }
+
+        var perLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (path, t) in inferred {
+            if t.bits != chosenDefault.bits
+                || t.groupSize != chosenDefault.groupSize
+            {
+                perLayer[path] = .quantize(
+                    BaseConfiguration.Quantization(
+                        groupSize: t.groupSize, bits: t.bits))
+            }
+        }
+        return BaseConfiguration.PerLayerQuantization(
+            quantization: BaseConfiguration.Quantization(
+                groupSize: chosenDefault.groupSize, bits: chosenDefault.bits),
+            perLayerQuantization: perLayer
+        )
+    }
+
     public static func inferPerLayerQuantization(
         weights: [String: MLXArray],
         jangConfig: JangConfig,
@@ -1112,25 +1212,62 @@ public struct JangLoader: Sendable {
             }
         }
 
-        // Fallback: the provided knownGroupSize is wrong for this tensor (e.g.,
-        // MoE gates use a different group_size than body layers). Search for
-        // (bits, groupSize) pairs that produce an exact round-trip. Prefer
-        // higher bits first to favor CRITICAL tier layers (which JANG stores
-        // at the highest available bit width).
+        // Fallback: the provided knownGroupSize is wrong for this tensor
+        // (e.g., MoE gates / attention with a different group_size than
+        // body layers). Search a fixed `(bits, gs)` preference order
+        // and pick the first valid hit:
         //
-        // For any candidate `bits`, the implied group size must be an integer:
-        //   in_dim = (packedDim * 32) / bits    (must be exact)
-        //   gs     = in_dim / numGroups         (must be exact)
+        //     (8,32), (8,64), (8,128),
+        //     (4,32), (4,64), (4,128),
+        //     (2,32), (2,64), (2,128),
+        //     (3,32), (6,32)
+        //
+        // Why this order is empirically correct for JANG/JANGTQ
+        // bundles:
+        //
+        //   - The converter classify rules put attention / embed /
+        //     lm_head / shared at the highest available bit width
+        //     (8 affine, gs=32 or 64) and routed experts at low bits
+        //     (2 / 3 / 4) with the same gs.
+        //   - When two `(bits, gs)` pairs share `bits * gs` (and thus
+        //     the same `packedDim / numGroups` ratio — e.g.
+        //     (8,32) ≡ (4,64) ≡ (2,128)) the converter ALWAYS chose
+        //     the high-bit variant for attention layers, never the
+        //     low-bit variant. Trying (8,32) first picks the right
+        //     answer for those layers; routed experts (which actually
+        //     are 4-bit or 2-bit) fail the (8,*) ratio check and fall
+        //     through to (4,*) or (2,*).
+        //
+        // This also fixes the `bitWidthsUsed=[2,4,6]` regression on
+        // re-stamped MiniMax/Qwen JANGTQ bundles whose attention
+        // layers are actually 8-bit — the old code excluded 8 from
+        // the candidate list and silently returned `(4, 32)`, which
+        // produced wrong dequant constants and a mid-decode rms_norm
+        // shape trap (2026-04-25 reproducer).
+        let mlxValidGroupSizes = [32, 64, 128]
+        let preferOrder: [(bits: Int, gs: Int)] = [
+            (8, 32), (8, 64), (8, 128),
+            (4, 32), (4, 64), (4, 128),
+            (2, 32), (2, 64), (2, 128),
+            (3, 32), (6, 32),
+        ]
+        for cand in preferOrder {
+            let bits = cand.bits
+            let gs = cand.gs
+            // Match: bits * gs * numGroups must equal packedDim * 32.
+            if bits * gs * numGroups == packedDim * 32,
+                mlxValidGroupSizes.contains(gs)
+            {
+                return (bits, gs)
+            }
+        }
+
+        // Last-resort: prior search by `bitWidthsUsed` first (preserves
+        // legacy behaviour for bundles whose actual bit width isn't in
+        // the preference order — e.g., a 5-bit layer).
         let candidates = bitWidthsUsed.isEmpty
-            ? validBits.sorted(by: >)  // [8, 6, 5, 4, 3, 2]
+            ? validBits.sorted(by: >)
             : bitWidthsUsed.sorted(by: >)
-        // MLX's quantize op only accepts group_size ∈ {32, 64, 128}.
-        // A shape-only fallback search can otherwise return e.g.
-        // (bits=8, gs=8) or (bits=4, gs=16) which then fatal-errors
-        // inside `mlx::quantize`. Filter to the supported set up front
-        // — the next candidate `bits` will pick a valid gs (verified
-        // on DSV4-Flash JANG_2L: bits=2 → inDim=4096 → gs=32 ✓).
-        let mlxValidGroupSizes: Set<Int> = [32, 64, 128]
         for bits in candidates {
             guard bits > 0, (packedDim * 32) % bits == 0 else { continue }
             let inDim = (packedDim * 32) / bits
