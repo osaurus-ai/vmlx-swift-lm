@@ -243,6 +243,50 @@ public enum ChatTemplateFallbacks {
 {%- endif %}
 """#
 
+    /// DeepSeek-V4 minimal template. DSV4-Flash bundles ship NO
+    /// `chat_template` field in `tokenizer_config.json` — the stock
+    /// distribution carries an external `encoding/encoding_dsv4.py`
+    /// instead. This jinja renders the same wire format the Python
+    /// encoder produces (BOS / `<｜User｜>` / `<｜Assistant｜>` /
+    /// closed `</think>` chat-mode tail / open `<think>` thinking-
+    /// mode tail / DSML tool calls / `reasoning_effort=max` preface).
+    /// Selected via the DSV4 BOS sniff in the tokenizer bridge.
+    public static let dsv4Minimal: String = #"""
+{%- set bos = '<｜begin▁of▁sentence｜>' -%}
+{%- set eos = '<｜end▁of▁sentence｜>' -%}
+{%- set user_token = '<｜User｜>' -%}
+{%- set asst_token = '<｜Assistant｜>' -%}
+{%- set think_open = '<think>' -%}
+{%- set think_close = '</think>' -%}
+{%- set dsml = '｜DSML｜' -%}
+{{- bos -}}
+{%- if reasoning_effort == 'max' -%}
+{{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{- message['content'] -}}
+{%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
+{{- user_token -}}{{- message['content'] -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- asst_token -}}
+{%- if message.get('reasoning_content') -%}
+{{- message['reasoning_content'] -}}{{- think_close -}}
+{%- endif -%}
+{{- message['content'] or '' -}}
+{{- eos -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- asst_token -}}
+{%- if enable_thinking -%}
+{{- think_open -}}
+{%- else -%}
+{{- think_close -}}
+{%- endif -%}
+{%- endif -%}
+"""#
+
     /// Ordered list of (label, template) fallbacks used when the
     /// model's native template throws. Order matters: `gemma4WithTools`
     /// comes first because (a) it subsumes `gemma4Minimal` when no
@@ -252,5 +296,6 @@ public enum ChatTemplateFallbacks {
         ("Gemma4WithTools", gemma4WithTools),
         ("Gemma4Minimal",   gemma4Minimal),
         ("NemotronMinimal", nemotronMinimal),
+        ("DSV4Minimal",     dsv4Minimal),
     ]
 }

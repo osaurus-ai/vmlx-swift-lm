@@ -136,6 +136,31 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: additionalContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            // DSV4-Flash family: bundles ship NO chat_template
+                            // (the stock distribution carries an external
+                            // `encoding/encoding_dsv4.py` instead). Detect via
+                            // the curly-quote BOS marker (U+FF5C fullwidth
+                            // vertical bar around `begin` U+2581 `of` U+2581
+                            // `sentence`) and apply the in-process DSV4Minimal
+                            // template. VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1
+                            // opts out.
+                            let dsv4Bos =
+                                "<" + String(UnicodeScalar(0xFF5C)!)
+                                + "begin" + String(UnicodeScalar(0x2581)!) + "of"
+                                + String(UnicodeScalar(0x2581)!) + "sentence"
+                                + String(UnicodeScalar(0xFF5C)!) + ">"
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1",
+                               upstream.bosToken == dsv4Bos {
+                                if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                    FileHandle.standardError.write(
+                                        "[vmlx] chat-template missing -> DSV4Minimal fallback engaged\\n"
+                                            .data(using: .utf8)!)
+                                }
+                                return try upstream.applyChatTemplate(
+                                    messages: messages,
+                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal))
+                            }
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         } catch {
                             // Upstream threw on a template the swift-jinja runtime

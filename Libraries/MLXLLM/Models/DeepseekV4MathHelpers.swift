@@ -141,21 +141,34 @@ public enum DeepseekV4Math {
         return concatenated([nope, rotated], axis: -1)
     }
 
-    /// Apply the standard "rotate half" RoPE transform to a fully-rope
-    /// tensor. `cos`/`sin` must broadcast over the leading shape and
-    /// match the last axis (ropeDim). `inverse=true` uses conj(sin).
+    /// Apply traditional/interleaved RoPE — DSV4 uses
+    /// `traditional=True` (mx.fast.rope) which rotates ADJACENT pairs:
+    /// `(x[…,0], x[…,1])`, `(x[…,2], x[…,3])`, etc. NOT split-half
+    /// `(x[…,:D/2], x[…,D/2:])`. Mirror Python `_call_manual` in
+    /// jang_tools/dsv4/mlx_model.py:DeepseekV4RoPE — using the wrong
+    /// convention scrambles positional information across the head
+    /// dim and the model decodes a repeating-token loop (verified
+    /// 2026-04-24).
+    ///
+    /// `cos`/`sin` shape must broadcast over the leading axes and
+    /// match `(L, ropeDim/2)`. `inverse=true` flips sin sign
+    /// (equivalent to multiplying by conjugate of the rotation).
     private static func rotateHalf(
         _ x: MLXArray, cos: MLXArray, sin: MLXArray, inverse: Bool
     ) -> MLXArray {
-        let half = x.shape.last! / 2
-        let x1 = x[.ellipsis, 0..<half]
-        let x2 = x[.ellipsis, half...]
-        // Standard form: [x1*c - x2*s, x1*s + x2*c].
-        // Inverse form: swap sign of s terms (equivalent to conj(freqs)).
+        let lastDim = x.shape.last!
+        let halfDim = lastDim / 2
+        // Reshape last axis from D to (D/2, 2) so the trailing pair
+        // is the (real, imag) tuple of each rotation.
+        let xPaired = x.reshaped(x.shape.dropLast() + [halfDim, 2])
+        let x0 = xPaired[.ellipsis, 0]  // (..., D/2)
+        let x1 = xPaired[.ellipsis, 1]  // (..., D/2)
         let s = inverse ? -sin : sin
-        let rot1 = x1 * cos - x2 * s
-        let rot2 = x1 * s + x2 * cos
-        return concatenated([rot1, rot2], axis: -1)
+        let r0 = x0 * cos - x1 * s
+        let r1 = x0 * s + x1 * cos
+        // Stack along a new last axis (D/2, 2) then collapse → D.
+        let stacked = stacked([r0, r1], axis: -1)
+        return stacked.reshaped(x.shape)
     }
 
     // MARK: - DSV4 SwiGLU activation with `limit`

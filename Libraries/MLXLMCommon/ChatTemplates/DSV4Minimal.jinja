@@ -1,0 +1,90 @@
+{# DSV4-Flash minimal chat template — Swift fallback when the bundle
+   ships no `chat_template` field in `tokenizer_config.json` (the
+   stock distribution ships an external `encoding/encoding_dsv4.py`
+   instead). Mirrors the Python encoder's `chat`-mode default
+   (closed empty `</think>` tail, no thinking block) plus tools +
+   reasoning-effort `max` preface support so prompts that opt into
+   the thinking branch get the right preamble.
+
+   Special tokens (curly-quote U+FF5C, NOT ASCII `|`):
+     bos: `<｜begin▁of▁sentence｜>`
+     eos: `<｜end▁of▁sentence｜>`
+     user: `<｜User｜>`
+     assistant: `<｜Assistant｜>`
+     dsml: `<｜DSML｜>`
+
+   Render flow (matches `jang/jang-tools/jang_tools/dsv4_prune/
+   encoding/encoding_dsv4.py`):
+     - BOS at the very start (no prior context).
+     - System message content first (no role marker — DSV4 system is
+       just preface text).
+     - Tools schema rendered after system content if `tools` set.
+     - Per turn: `<｜User｜>{content}` for user / developer, or
+       `<｜Assistant｜>{reasoning?}{content}{tool_calls?}<eos>` for
+       assistant.
+     - When `add_generation_prompt` is true the tail is
+       `<｜Assistant｜>` followed by `</think>` (chat mode, default)
+       OR `<think>` if `enable_thinking == true` was passed in
+       additional_context.
+     - `reasoning_effort == "max"` prepends the verbatim
+       REASONING_EFFORT_MAX preface from the Python encoder.
+#}
+{%- set bos = '<｜begin▁of▁sentence｜>' -%}
+{%- set eos = '<｜end▁of▁sentence｜>' -%}
+{%- set user_token = '<｜User｜>' -%}
+{%- set asst_token = '<｜Assistant｜>' -%}
+{%- set think_open = '<think>' -%}
+{%- set think_close = '</think>' -%}
+{%- set dsml = '｜DSML｜' -%}
+{{- bos -}}
+{%- if reasoning_effort == 'max' -%}
+{{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{- message['content'] -}}
+{%- if tools -%}
+{{- '\n\n## Tools\n\nYou have access to a set of tools to help answer the user\'s question. Invoke a tool by writing a "<' ~ dsml ~ 'tool_calls>" block:\n\n<' ~ dsml ~ 'tool_calls>\n<' ~ dsml ~ 'invoke name="$TOOL_NAME">\n<' ~ dsml ~ 'parameter name="$NAME" string="true|false">$VALUE</' ~ dsml ~ 'parameter>\n</' ~ dsml ~ 'invoke>\n</' ~ dsml ~ 'tool_calls>\n\nString parameters use string="true". Numbers/bools/arrays/objects use string="false" with a JSON-encoded value.\n\n### Available Tool Schemas\n\n' -}}
+{%- for tool in tools -%}
+{{- tool.function | tojson -}}{{ '\n' }}
+{%- endfor -%}
+{{- '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.' -}}
+{%- endif -%}
+{%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
+{{- user_token -}}{{- message['content'] -}}
+{%- elif message['role'] == 'assistant' -%}
+{{- asst_token -}}
+{%- if message.get('reasoning_content') and (message.get('drop_thinking', false) == false or loop.last) -%}
+{{- message['reasoning_content'] -}}{{- think_close -}}
+{%- endif -%}
+{{- message['content'] or '' -}}
+{%- if message.get('tool_calls') -%}
+{{- '\n\n<' ~ dsml ~ 'tool_calls>\n' -}}
+{%- for tc in message['tool_calls'] -%}
+{{- '<' ~ dsml ~ 'invoke name="' ~ tc.function.name ~ '">\n' -}}
+{%- set args = tc.function.arguments -%}
+{%- if args is string -%}
+{%- set args = args | fromjson -%}
+{%- endif -%}
+{%- for k, v in args.items() -%}
+{%- if v is string -%}
+{{- '<' ~ dsml ~ 'parameter name="' ~ k ~ '" string="true">' ~ v ~ '</' ~ dsml ~ 'parameter>\n' -}}
+{%- else -%}
+{{- '<' ~ dsml ~ 'parameter name="' ~ k ~ '" string="false">' ~ (v | tojson) ~ '</' ~ dsml ~ 'parameter>\n' -}}
+{%- endif -%}
+{%- endfor -%}
+{{- '</' ~ dsml ~ 'invoke>\n' -}}
+{%- endfor -%}
+{{- '</' ~ dsml ~ 'tool_calls>' -}}
+{%- endif -%}
+{{- eos -}}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- asst_token -}}
+{%- if enable_thinking -%}
+{{- think_open -}}
+{%- else -%}
+{{- think_close -}}
+{%- endif -%}
+{%- endif -%}
