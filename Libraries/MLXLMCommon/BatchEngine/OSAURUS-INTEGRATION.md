@@ -288,6 +288,18 @@ Bundle dispatch / quantization knobs:
 
 Loader robustness (2026-04-25): the per-layer quantization inference walks every `.scales` key in the bundle and chooses `(bits, group_size)` from a fixed empirical preference order — `(8,32) (8,64) (8,128) (4,32) (4,64) (4,128) (2,32) (2,64) (2,128) (3,32) (6,32)`. This is shape-authoritative: bundles whose `config.json` got re-stamped with mismatched per-layer overrides (or uniform `bits: 8` while routed experts are actually `bits: 2`) load correctly without manual config patching. Idempotent — clean configs add zero overrides.
 
+**Prompt-mode guidance (live-tested 2026-04-25 on DSV4-Flash JANGTQ):**
+
+| Caller mode | Result |
+|---|---|
+| `applyChatTemplate(...additionalContext: ["enable_thinking": false])` | Clean & correct. Short questions complete in `<10` tokens with proper EOS. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true])` + `max_tokens >= 1024` | Correct. Model emits `<think>…</think>` then the answer. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true, "reasoning_effort": "max"])` + `max_tokens >= 4096` | Canonical config for hard reasoning / HumanEval-style benchmarks. T=1.0 top_p=1.0 per the DeepSeek paper. |
+| `applyChatTemplate(...additionalContext: ["enable_thinking": true])` + `max_tokens < 512` | ⚠ Mid-think truncation. Model gets cut off before closing `</think>`. Cap higher or use `enable_thinking=false` for short-output workloads. |
+| Raw FIM (no chat template) | ⚠ **Avoid for general chat.** No stop signal → model loops the answer then degenerates into character-level slop on long outputs. Only safe when the prompt itself constrains the continuation (function signature → body). |
+
+The reasoning parser strips `<think>…</think>` from `.chunk` events automatically when consumers want post-thinking content only — see the reasoning channel section above.
+
 Cache + L2 disk: `CacheCoordinator` paged tier handles cross-turn prefix reuse; `DiskCache` (TQDiskSerializer v2 with `LayerKind.kvSimple` / `.tqCompressed` / `.qkv` / `.mamba` / `.rotating` tags) round-trips all layer types including DSV4's per-layer mix. The 2026-04-24 `BatchEngine.swift:733` trim fix ensures full-cache disk hits don't re-feed the last token at the wrong RoPE position.
 
 ---
