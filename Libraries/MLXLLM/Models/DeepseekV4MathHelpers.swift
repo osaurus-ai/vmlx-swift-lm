@@ -289,4 +289,109 @@ public enum DeepseekV4Math {
         return scaled * (MLXArray(1.0) - smooth) + invFreqArr * smooth
         _ = maxPos  // reserved for future extrapolation logic
     }
+
+    // MARK: - Compressor + Indexer attention masks (PR #1195 port)
+    //
+    // The DSV4 paper §9-13 attention path is a hybrid of:
+    //   1. A LOCAL sliding-window over the last `window` raw tokens
+    //      (kept in a RotatingKVCache).
+    //   2. A GLOBAL pooled context over compressor chunks (kept as
+    //      a single (B, P, head_dim) tensor in an ArraysCache slot).
+    //
+    // Visibility from query at raw position `q` to a key:
+    //
+    //   - Window key at raw position `r`:
+    //       q - window < r <= q
+    //
+    //   - Compressed key at chunk index `k` covering raw range
+    //     [k*ratio, (k+1)*ratio):
+    //       (k + 1) * ratio <= q + 1
+    //
+    // For compress_ratio==4 layers the Indexer adds a top-k
+    // selection — only the K compressed chunks the indexer scored
+    // highest are visible, ANDed with the causal staircase above.
+    //
+    // Both helpers return 4D bool arrays of shape (B, 1, S, L_kv)
+    // that broadcast onto SDPA attention scores (B, H, S, L_kv).
+    // Building 4D directly avoids the SDPA broadcast bugs the
+    // previous staircase attempts hit.
+
+    /// Per-query visibility into the local sliding-window cache.
+    ///
+    /// `windowLen` is the number of slots currently filled in the
+    /// RotatingKVCache (== window once the buffer wraps). The
+    /// trailing `windowLen` raw positions in the cache map to raw
+    /// token indices `(offset + S) - windowLen + i` for slot `i`.
+    /// Returns shape `(B, 1, S, windowLen)`.
+    public static func buildWindowMask(
+        batch B: Int, queryLen S: Int,
+        offset: Int, window: Int, windowLen: Int
+    ) -> MLXArray {
+        // q_pos: (B, S) — broadcasted absolute raw positions of each
+        // query slot. The PR #1195 Python builds (B, S) by broadcasting
+        // (1, S) to (B, S); we do the same.
+        let qPos =
+            MLXArray(Int32(offset)..<Int32(offset + S))
+            .expandedDimensions(axis: 0)        // (1, S)
+            .reshaped(1, S)
+        // raw_pos_at_k: (windowLen,) → (1, 1, windowLen)
+        let cacheK = MLXArray(Int32(0)..<Int32(windowLen))
+        let rawPosAtK = MLXArray(Int32((offset + S) - windowLen)) + cacheK
+        // qPos: (1, S) → (1, S, 1) then broadcast against (1, 1, windowLen)
+        let qPos3 = qPos.expandedDimensions(axis: -1)
+        let raw3 = rawPosAtK.expandedDimensions(axes: [0, 1])
+        let lower = raw3 .> (qPos3 - MLXArray(Int32(window)))
+        let upper = raw3 .<= qPos3
+        let visible = MLX.logicalAnd(lower, upper)
+        // (1, S, windowLen) → broadcast to (B, 1, S, windowLen)
+        let v4 = visible.expandedDimensions(axis: 1)
+        let bArr = MLX.broadcast(v4, to: [B, 1, S, windowLen])
+        return bArr
+    }
+
+    /// Per-query causal visibility into the compressor's pooled
+    /// chunks. Chunk `k` covers raw positions `[k*ratio, (k+1)*ratio)`
+    /// and is visible to query `q` once that whole chunk has been
+    /// observed: `(k+1)*ratio <= q+1`.
+    /// Returns shape `(B, 1, S, compressedLen)`.
+    public static func compressedVisibility(
+        batch B: Int, queryLen S: Int,
+        offset: Int, compressedLen: Int, ratio: Int
+    ) -> MLXArray {
+        let qPos =
+            MLXArray(Int32(offset)..<Int32(offset + S))
+            .expandedDimensions(axis: 0)
+            .reshaped(1, S)
+        let k = MLXArray(Int32(0)..<Int32(compressedLen))
+        // (k+1) * ratio <= (qPos + 1)
+        let lhs =
+            (k + MLXArray(Int32(1))) * MLXArray(Int32(ratio))
+        let rhs = qPos + MLXArray(Int32(1))
+        // lhs: (compressedLen,) → (1, 1, compressedLen)
+        let lhs3 = lhs.expandedDimensions(axes: [0, 1])
+        // rhs: (1, S) → (1, S, 1)
+        let rhs3 = rhs.expandedDimensions(axis: -1)
+        let visible = lhs3 .<= rhs3
+        let v4 = visible.expandedDimensions(axis: 1)
+        return MLX.broadcast(v4, to: [B, 1, S, compressedLen])
+    }
+
+    /// AND the per-query indexer top-k selection onto a compressed
+    /// visibility mask. `topk` is the indexer's `(B, S, K)` int array
+    /// of selected chunk indices; returns `(B, 1, S, compressedLen)`
+    /// bool — true only when chunk index `c` appears in `topk[b, s, :]`.
+    public static func indexerSelectionMask(
+        topk: MLXArray, compressedLen: Int
+    ) -> MLXArray {
+        // topk: (B, S, K) → (B, S, K, 1)
+        let topk4 = topk.expandedDimensions(axis: -1)
+        // k_range: (compressedLen,) → (1, 1, 1, compressedLen)
+        let kRange =
+            MLXArray(Int32(0)..<Int32(compressedLen))
+            .expandedDimensions(axes: [0, 1, 2])
+        // (B, S, K, compressedLen) → (B, S, compressedLen) via any over K
+        let eq = topk4 .== kRange
+        let selected = eq.any(axis: -2)  // (B, S, compressedLen)
+        return selected.expandedDimensions(axis: 1)  // (B, 1, S, compressedLen)
+    }
 }
