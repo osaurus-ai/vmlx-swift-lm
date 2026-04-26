@@ -254,11 +254,14 @@ public enum LLMTypeRegistry {
         let isMxtqStamp =
             weightFormat == "mxtq" || weightFormat == "jangtq2"
             || weightFormat == "jangtq4"
-        // Heuristic match: need explicit force OR explicit mxtq stamp
-        // — purely heuristic dispatch on bits=2/4 alone is unsafe
-        // because JANG_2L (uniform affine 2-bit) shares those config
-        // values. Future improvement: peek the safetensors index for
-        // `tq_packed` keys when neither stamp nor env is set.
+
+        // 2026-04-26: bundles with mislabeled `weight_format: "bf16"`
+        // but real JANGTQ codebook tensors are auto-corrected by
+        // `_load`'s merge step BEFORE this dispatcher fires — when a
+        // valid `jangtq_runtime.safetensors` sidecar is present, the
+        // merge forces `weight_format = "mxtq"`. By the time we
+        // reach this point the stamp is authoritative, so the
+        // existing `isMxtqStamp` check is sufficient.
         if isMxtqStamp || forced {
             // mxtqBits sourcing — the routed-MoE codebook lives in
             // `jangtq_runtime.safetensors` keyed `codebook.{inFeatures}.
@@ -818,12 +821,40 @@ public final class LLMModelFactory: ModelFactory {
             {
                 configDict["mxtq_bits"] = routed
             }
-            if configDict["mxtq_bits"] == nil {
-                let sidecarURL = modelDirectory.appending(
-                    component: "jangtq_runtime.safetensors")
-                if let sniffed = JANGTQRuntimeCache.sniffCodebookBits(
-                    at: sidecarURL)
-                {
+            // Sidecar sniff — the conclusive "is this JANGTQ?" signal.
+            // A non-empty codebook in `jangtq_runtime.safetensors`
+            // means routed-MoE experts use the TurboQuant codebook
+            // path, regardless of what the bundle's `weight_format`
+            // stamp says. Some bundles in the wild ship
+            // `weight_format: "bf16"` (mislabeled — the bundle is
+            // actually JANGTQ); without this auto-correction the
+            // dispatch would route to the plain affine class and
+            // fail with "Unhandled keys ['tq_norms', 'tq_packed']"
+            // 60+ shards into the weight load.
+            //
+            // When detected, force `weight_format = "mxtq"` so the
+            // existing dispatch logic routes to JANGTQ via its
+            // normal stamp path — no new convention, no implicit
+            // fields, just patching the bundle metadata in-memory
+            // to match the actual on-disk reality. Logs a one-line
+            // diagnostic so operators can see when the override
+            // fired (a hint to repair the bundle's stamp at source).
+            let sidecarURL = modelDirectory.appending(
+                component: "jangtq_runtime.safetensors")
+            if let sniffed = JANGTQRuntimeCache.sniffCodebookBits(
+                at: sidecarURL)
+            {
+                let priorFormat =
+                    (configDict["weight_format"] as? String) ?? "(unset)"
+                let isMxtqStampAlready = (priorFormat.lowercased() == "mxtq")
+                    || (priorFormat.lowercased() == "jangtq2")
+                    || (priorFormat.lowercased() == "jangtq4")
+                if !isMxtqStampAlready {
+                    configDict["weight_format"] = "mxtq"
+                    FileHandle.standardError.write(
+                        Data("[Load] sidecar codebook present (\(sniffed)-bit) — forced weight_format \"mxtq\" (was: \"\(priorFormat)\"); fix the bundle's jang_config.json\n".utf8))
+                }
+                if configDict["mxtq_bits"] == nil {
                     configDict["mxtq_bits"] = sniffed
                 }
             }
