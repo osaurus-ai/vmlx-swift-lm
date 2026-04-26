@@ -848,13 +848,24 @@ public final class LLMModelFactory: ModelFactory {
             // VL-wrapped configs (Qwen3.5-VL, Qwen3.6-VL) put the LLM fields
             // inside `text_config`. The Qwen35JANGTQ decoder tries the
             // top-level first then falls back to decoding from `text_config`,
-            // so mxtq_bits / mxtq_seed must ALSO be mirrored into
-            // `text_config` for the nested decode path to see them.
-            // Without this, JANGTQ4 would silently fall back to the default
-            // bits=2 and crash at first forward with "JANGTQ runtime sidecar
-            // not loaded" (it can't find codebook.*.2 because only .*.4 shipped).
+            // so the routed-bits resolution we just performed must ALSO be
+            // mirrored into `text_config` for the nested decode path to
+            // see it. Includes `routed_expert_bits` (DSV4-VL family
+            // convention) so both decoder shapes work without a separate
+            // injection pass.
+            //
+            // Mirror is unconditional fill-when-missing — never overwrite
+            // a value the bundle's text_config already explicitly set.
+            // This deliberately differs from a "skip if values match"
+            // guard which could fall through and leave text_config nil
+            // when top-level was just resolved by our cascade above
+            // (see vmlx-swift §421/§425 — that bug class is closed here
+            // by always running the mirror, not by adding a guard).
             if var textConfig = configDict["text_config"] as? [String: Any] {
-                for key in ["weight_format", "mxtq_seed", "mxtq_bits"] {
+                for key in [
+                    "weight_format", "mxtq_seed", "mxtq_bits",
+                    "routed_expert_bits",
+                ] {
                     if textConfig[key] == nil, let v = configDict[key] {
                         textConfig[key] = v
                     }
