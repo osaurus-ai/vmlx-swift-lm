@@ -336,29 +336,6 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
         return codebookByKey["codebook.\(inFeatures).\(bits)"]
     }
 
-    /// Side-channel set by the model loader (`LLMModelFactory.load` /
-    /// `Load.swift`) BEFORE the factory dispatch decodes the model
-    /// configuration. Lets a bundle's actual codebook bits — sniffed
-    /// from the sidecar's `codebook.{inFeatures}.{bits}` keys — flow
-    /// into config decoders that would otherwise fall back to
-    /// `quantization.bits` (the affine non-routed setting, often 8)
-    /// or to a default of 2.
-    ///
-    /// Decoders consume this via `routedBitsHint` and never via
-    /// reading the property directly. Always cleared after the
-    /// dispatch returns.
-    private var _routedBitsHint: Int? = nil
-
-    public func setRoutedBitsHint(_ bits: Int?) {
-        lock.lock(); defer { lock.unlock() }
-        _routedBitsHint = bits
-    }
-
-    public var routedBitsHint: Int? {
-        lock.lock(); defer { lock.unlock() }
-        return _routedBitsHint
-    }
-
     /// Sniff the routed-MoE codebook bits directly from a sidecar
     /// safetensors file WITHOUT fully loading it into the runtime
     /// cache. Uses the `codebook.{inFeatures}.{bits}` key naming
