@@ -278,6 +278,69 @@ struct ReasoningParserTests {
         #expect(content == "tail")
     }
 
+    @Test("Stray </think> in content mode is stripped (interleaved-thinking leak)")
+    func streamStrayCloserStrippedInContent() {
+        // 2026-04-25 osaurus repro: MiniMax-Small JANGTQ chat where the
+        // model emitted `</think>` THREE times across one assistant
+        // turn after the first `</think>` had already flipped state to
+        // content. Old parser only looked for `<think>` when in content
+        // mode, so the stray `</think>` markers leaked into `.chunk`.
+        // With stripStrayTags=true (default for think_xml family) the
+        // strays are consumed silently.
+        var parser = ReasoningParser(startInReasoning: true)
+        let input =
+            "first reasoning</think>"        // legitimate close → content
+            + "first content</think>"        // STRAY — must not leak
+            + "more content</think>"         // STRAY — must not leak
+            + "tail"
+        var reasoning = ""
+        var content = ""
+        for seg in parser.feed(input) {
+            switch seg {
+            case .reasoning(let r): reasoning.append(r)
+            case .content(let c): content.append(c)
+            }
+        }
+        for seg in parser.flush() {
+            switch seg {
+            case .reasoning(let r): reasoning.append(r)
+            case .content(let c): content.append(c)
+            }
+        }
+        #expect(reasoning == "first reasoning")
+        #expect(content == "first contentmore contenttail")
+        #expect(!content.contains("</think>"),
+            "stray </think> markers must not leak into the visible chunk stream")
+    }
+
+    @Test("Stray <think> in reasoning mode is stripped (symmetric)")
+    func streamStrayOpenerStrippedInReasoning() {
+        // Symmetric: model emits `<think>` while parser is already in
+        // reasoning. Should be stripped without flipping state.
+        var parser = ReasoningParser(startInReasoning: true)
+        let input =
+            "outer <think>nested opener</think>"  // STRAY <think>, real </think>
+            + "tail"
+        var reasoning = ""
+        var content = ""
+        for seg in parser.feed(input) {
+            switch seg {
+            case .reasoning(let r): reasoning.append(r)
+            case .content(let c): content.append(c)
+            }
+        }
+        for seg in parser.flush() {
+            switch seg {
+            case .reasoning(let r): reasoning.append(r)
+            case .content(let c): content.append(c)
+            }
+        }
+        #expect(reasoning == "outer nested opener")
+        #expect(content == "tail")
+        #expect(!reasoning.contains("<think>"),
+            "stray <think> markers must not leak into reasoning text")
+    }
+
     @Test func streamFlushDrainsBufferedPartial() {
         // Stream ends mid-pretag — flush must still emit the buffered text
         // as content rather than dropping it.
@@ -518,7 +581,11 @@ struct HarmonyParserStreamingTests {
         ReasoningParser(
             startTag: "<|channel>",
             endTag: "<channel|>",
-            startInReasoning: false)
+            startInReasoning: false,
+            // Match the production harmony factory in
+            // ReasoningParser.fromCapabilityName(_:) — A2/A3 expect
+            // stray markers to pass through as literal content.
+            stripStrayTags: false)
     }
 
     @Test("full harmony block (thought channel) in a single feed")

@@ -67,6 +67,23 @@ public struct ReasoningParser: Sendable {
     /// The tag that ends a reasoning block. Default `</think>`.
     public let endTag: String
 
+    /// When true, the drain loop strips stray markers regardless of
+    /// state — a `</think>` while in content mode is consumed as a
+    /// model artifact (state stays in content), and a `<think>` while
+    /// in reasoning mode is consumed similarly. Required for the
+    /// `<think>`/`</think>` family because models occasionally emit
+    /// duplicate or unmatched markers in interleaved-thinking decode
+    /// (verified 2026-04-25 on MiniMax-Small JANGTQ where `</think>`
+    /// leaked into the user-visible chunk stream three times across
+    /// one assistant turn).
+    ///
+    /// When false, the drain loop only looks for whichever tag
+    /// matches the current mode; the other tag passes through as
+    /// literal content. Required for the harmony channel format
+    /// where stray-tag leaks are the documented intent (legacy
+    /// Gemma-4 channel parser behaviour — A2/A3 tests).
+    public let stripStrayTags: Bool
+
     // MARK: State
 
     /// Text not yet emitted because it might be a partial tag prefix.
@@ -88,14 +105,19 @@ public struct ReasoningParser: Sendable {
     ///     byte is already reasoning, so starting in `.content` mode
     ///     would leak the entire CoT into the visible answer until the
     ///     first `</think>` flips state.
+    ///   - stripStrayTags: see property doc. Defaults to `true` (correct
+    ///     for the `<think>`/`</think>` family). The harmony parser
+    ///     factory in `fromCapabilityName(_:)` overrides this to `false`.
     public init(
         startTag: String = "<think>",
         endTag: String = "</think>",
-        startInReasoning: Bool = false
+        startInReasoning: Bool = false,
+        stripStrayTags: Bool = true
     ) {
         self.startTag = startTag
         self.endTag = endTag
         self.insideReasoning = startInReasoning
+        self.stripStrayTags = stripStrayTags
     }
 
     // MARK: Streaming API
@@ -127,22 +149,69 @@ public struct ReasoningParser: Sendable {
     /// `allowPartialTagAtEnd` keeps a tail of up to `max(startTag, endTag).count - 1`
     /// characters in the buffer when streaming, so a tag split across
     /// chunks isn't mistakenly emitted as content.
+    ///
+    /// Tag handling is symmetric — the loop scans for whichever of
+    /// `startTag` / `endTag` appears EARLIEST in the buffer and sets state
+    /// explicitly based on which one was found (open → reasoning, close →
+    /// content). This makes the parser robust to interleaved-thinking
+    /// pathologies where the model emits a stray `</think>` while already
+    /// in content mode (or a stray `<think>` while already in reasoning).
+    /// In the legacy "lookFor only one tag based on current state" design
+    /// those stray markers leaked into the visible stream verbatim
+    /// (reproduced 2026-04-25 on a MiniMax-Small JANGTQ chat where the
+    /// model emitted three `</think>` markers across one assistant turn).
     private mutating func drain(allowPartialTagAtEnd: Bool = true)
         -> [ReasoningSegment]
     {
         var out: [ReasoningSegment] = []
 
         while !buffer.isEmpty {
-            let lookFor = insideReasoning ? endTag : startTag
-            if let range = buffer.range(of: lookFor) {
+            // Tag-search dispatch: stripStrayTags=true scans for both
+            // and resolves to whichever appears first; stripStrayTags=
+            // false (legacy harmony) only scans for the tag matching
+            // the current mode.
+            let firstTagRange: Range<String.Index>?
+            let firstTagIsOpener: Bool
+            if stripStrayTags {
+                let openRange = buffer.range(of: startTag)
+                let closeRange = buffer.range(of: endTag)
+                switch (openRange, closeRange) {
+                case (let o?, let c?):
+                    if o.lowerBound <= c.lowerBound {
+                        firstTagRange = o
+                        firstTagIsOpener = true
+                    } else {
+                        firstTagRange = c
+                        firstTagIsOpener = false
+                    }
+                case (let o?, nil):
+                    firstTagRange = o
+                    firstTagIsOpener = true
+                case (nil, let c?):
+                    firstTagRange = c
+                    firstTagIsOpener = false
+                case (nil, nil):
+                    firstTagRange = nil
+                    firstTagIsOpener = false
+                }
+            } else {
+                let lookFor = insideReasoning ? endTag : startTag
+                firstTagRange = buffer.range(of: lookFor)
+                firstTagIsOpener = !insideReasoning
+            }
+            if let range = firstTagRange {
                 // Emit everything before the tag in the current mode.
                 let before = String(buffer[..<range.lowerBound])
                 if !before.isEmpty {
                     out.append(insideReasoning ? .reasoning(before) : .content(before))
                 }
-                // Consume the tag itself (don't emit it).
+                // Consume the tag itself (never emit it). Set state
+                // explicitly per tag identity — open tag → reasoning,
+                // close tag → content. With stripStrayTags=true the
+                // already-in-state branch is a no-op state-wise but
+                // the tag is still consumed.
                 buffer.removeSubrange(buffer.startIndex..<range.upperBound)
-                insideReasoning.toggle()
+                insideReasoning = firstTagIsOpener
                 continue
             }
 
@@ -237,7 +306,12 @@ extension ReasoningParser {
             return ReasoningParser(
                 startTag: "<|channel>",
                 endTag: "<channel|>",
-                startInReasoning: false)
+                startInReasoning: false,
+                // Harmony format: stray-tag leaks treated as literal
+                // content per the legacy A2/A3 contract. The bare
+                // `<channel|>` close marker is rare enough mid-content
+                // that we don't want to silently strip it.
+                stripStrayTags: false)
         case "none", "off", "disabled", "mistral", "gemma":
             return nil
         default:
@@ -314,7 +388,12 @@ extension ReasoningParser {
         return ReasoningParser(
             startTag: startTag,
             endTag: endTag,
-            startInReasoning: startInReasoning)
+            startInReasoning: startInReasoning,
+            // Preserve the family's stray-tag policy from `base` —
+            // think_xml family keeps `stripStrayTags: true`, harmony
+            // keeps `false`. Without this carry-over, harmony lost
+            // its A2/A3 contract whenever `forPrompt(...)` was used.
+            stripStrayTags: base.stripStrayTags)
     }
 }
 
