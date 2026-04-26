@@ -92,6 +92,16 @@ public struct ReasoningParser: Sendable {
     /// Whether we're currently inside a reasoning block.
     private var insideReasoning: Bool = false
 
+    /// Read-only access to the current parser state — true when the
+    /// stream is currently inside a `<think>…</think>` block (or the
+    /// family-specific equivalent). Useful at end-of-stream to detect
+    /// the "model emitted EOS while still inside reasoning" pathology
+    /// (a.k.a. "trapped thinking") that some reasoning-trained models
+    /// exhibit on validation-style prompts.
+    public var isInsideReasoning: Bool {
+        insideReasoning
+    }
+
     // MARK: Init
 
     /// - Parameters:

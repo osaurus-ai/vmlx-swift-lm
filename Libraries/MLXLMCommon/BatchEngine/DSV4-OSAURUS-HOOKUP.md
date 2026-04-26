@@ -224,19 +224,58 @@ parser doc-comment for the trade-off).
 
 ### 8a. Short-prompt thinking with `enable_thinking=true` may inline the answer
 
-DSV4 sometimes generates the answer INSIDE the `<think>` block on trivial
-questions ("Hi", "What is 7+5?") and emits EOS without ever closing
+DSV4 (and Qwen3.6-A3B fine-tunes) sometimes generates the answer INSIDE
+the `<think>` block on validation-style prompts ("Give me a 20-digit
+number", "Hi", "What is 7+5?") and emits EOS without ever closing
 `</think>`. The streaming pipeline routes everything to `.reasoning`,
 `.chunk` is empty, `finish: stop`. UIs that only render `.chunk` see
 an empty bubble while the answer lives in the thinking pane.
 
-**Recommended handling** (osaurus-side):
-- Maintain a per-model `AutoThinkingProfile` defaulting DSV4 to
-  `enable_thinking: false` for chat workloads. Flip on for explicit
+**Diagnostic signal — `GenerateCompletionInfo.unclosedReasoning`:**
+The library detects this case automatically. Inspect `info.unclosedReasoning`
+on the `.info(GenerateCompletionInfo)` event — `true` means the parser
+was still inside reasoning when the stream ended (model never emitted
+`</think>`). Use this to drive the UI fallback without re-instrumenting
+the parser yourself:
+
+```swift
+case .info(let info):
+    if info.unclosedReasoning {
+        // model got trapped — surface a banner or auto-mirror the
+        // last sentence of the accumulated `.reasoning` text into
+        // the content bubble.
+        ui.showTrappedThinkingFallback(reasoningBuffer)
+    }
+```
+
+This is a 2026-04-26 addition; check that your vmlx-swift-lm pin is
+≥ 510fe47 (search the binary for the `unclosedReasoning` symbol via
+`nm` if in doubt).
+
+**Other recommended handling** (osaurus-side):
+- Maintain a per-model `AutoThinkingProfile` defaulting DSV4 / Qwen3.6
+  to `enable_thinking: false` for chat workloads. Flip on for explicit
   reasoning intents (a "Reasoning" toggle, an `:explain`-prefixed
-  command, etc.).
-- Or, as a UI-level fallback, mirror `.reasoning` to the content
-  bubble when `.chunk` is empty + `finish: stop`.
+  command, etc.). This stops the loop before it starts.
+- Cap `max_tokens` lower for chat (e.g. 512) so trapped reasoning
+  terminates earlier with `finish: length` + `unclosedReasoning: true`,
+  letting the UI fallback fire quickly.
+
+**A/B-verified diagnostic data (M4 Max, this session):**
+
+```
+prompt: "Give me a random 20-digit number. Only return the number itself."
+
+  Qwen3.6-A3B-JANGTQ-CRACK (bits=2)  enable_thinking=true   → LOOPS, unclosedReasoning=true
+  Holo3-A3B-JANGTQ4 (bits=4)         enable_thinking=true   → OK, content="78901234567890123456"
+  Qwen3.6-A3B-JANGTQ-CRACK (bits=2)  enable_thinking=false  → OK, content="384729105638472910"
+```
+
+The loop is NOT a quantization-bits issue (bits=2 loops, bits=4 doesn't on
+the same architecture). It's a fine-tune-specific training pattern in the
+Qwen3.6-A3B family that activates on validation-shaped prompts. The fix
+is at the prompt-construction layer (`enable_thinking: false`), not at
+the runtime layer.
 
 ### 8b. Multi-turn truncation cascade with low max_tokens
 

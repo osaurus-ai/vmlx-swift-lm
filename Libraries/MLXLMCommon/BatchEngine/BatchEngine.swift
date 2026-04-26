@@ -373,19 +373,35 @@ public actor BatchEngine {
                         await engineRef.cancel(requestId)
                     }
                 case .info(let info):
+                    // Snapshot reasoning state BEFORE flush — `flush()`
+                    // resets `insideReasoning` to false as part of
+                    // draining the buffer. The pre-flush value is what
+                    // the consumer wants: "was the LAST CONSUMED TOKEN
+                    // inside a reasoning block?" If yes, the model
+                    // ended without ever emitting `</think>`.
+                    let unclosed = reasoningParser?.isInsideReasoning ?? false
                     flush()
                     detokenizer.startNewSegment()
-                    let finalInfo: GenerateCompletionInfo
+                    // Detect "trapped thinking": stream ended while the
+                    // reasoning parser was still inside a `<think>…</think>`
+                    // block (no close tag ever observed). Surface it on
+                    // the .info event so consumers can implement a UI
+                    // fallback (mirror last sentence of .reasoning to
+                    // .chunk, show "answer trapped in thinking" banner,
+                    // etc.) without instrumenting the parser themselves.
+                    let finalStop: GenerateStopReason
                     if stopMatched {
-                        finalInfo = GenerateCompletionInfo(
-                            promptTokenCount: info.promptTokenCount,
-                            generationTokenCount: info.generationTokenCount,
-                            promptTime: info.promptTime,
-                            generationTime: info.generateTime,
-                            stopReason: .stop)
+                        finalStop = .stop
                     } else {
-                        finalInfo = info
+                        finalStop = info.stopReason
                     }
+                    let finalInfo = GenerateCompletionInfo(
+                        promptTokenCount: info.promptTokenCount,
+                        generationTokenCount: info.generationTokenCount,
+                        promptTime: info.promptTime,
+                        generationTime: info.generateTime,
+                        stopReason: finalStop,
+                        unclosedReasoning: unclosed)
                     continuation.yield(.info(finalInfo))
                 }
             }

@@ -2238,6 +2238,27 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
+    /// True when the stream ended with the reasoning parser still in
+    /// REASONING state — i.e. the model never emitted `</think>` (or
+    /// the family-specific close tag) before EOS or `max_tokens`.
+    ///
+    /// Indicates the model got "trapped" in chain-of-thought without
+    /// producing a final answer in the visible content stream.
+    /// `Generation.chunk` events for this turn are typically empty
+    /// while `Generation.reasoning` carries the entire output.
+    ///
+    /// Reasoning-trained models (Qwen3.6-A3B fine-tunes, some DeepSeek-V4
+    /// variants) exhibit this on validation-style prompts ("give me a
+    /// 20-digit number") because their training data extends thought
+    /// through arbitrary self-verification. The fix is at the prompt
+    /// layer (use `enable_thinking: false` for chat workloads, or
+    /// implement a UI-level "answer trapped in thinking" fallback that
+    /// surfaces the last sentence of `Generation.reasoning`).
+    ///
+    /// `false` for any caller that didn't wire a reasoning parser
+    /// (no behavior change on non-reasoning workloads).
+    public let unclosedReasoning: Bool
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2253,13 +2274,15 @@ public struct GenerateCompletionInfo: Sendable {
         generationTokenCount: Int,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
-        stopReason: GenerateStopReason = .stop
+        stopReason: GenerateStopReason = .stop,
+        unclosedReasoning: Bool = false
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.unclosedReasoning = unclosedReasoning
     }
 
     public func summary() -> String {
