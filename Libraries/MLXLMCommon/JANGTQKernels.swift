@@ -146,8 +146,19 @@ private let kFusedSwiGLUSource = """
             }
         }
 
-        #pragma unroll
-        for (uint k = 0; k < 16; k++) {
+        // 2026-04-26: loop bound MUST be `vals_per_u32` (= 32 / bits)
+        // not the hardcoded 16. Correct for bits=2 (vals_per_u32=16)
+        // by coincidence but for bits=4 (vals_per_u32=8) the old
+        // hardcoded 16 walked PAST the end of each packed uint32 by
+        // 8 iterations: shifts 32-60 are out-of-range for uint32
+        // right-shift (Metal undefined behaviour), AND `i = i_base + k`
+        // for k=8..15 reads input values that belong to the NEXT
+        // pack_idx — corrupting both accumulators. Reproduces as
+        // garbage multilingual gibberish on Holo3-35B-A3B-JANGTQ4 and
+        // Qwen3.6-35B-A3B-JANGTQ4 with suspiciously fast decode rates
+        // (compute is short-circuited / corrupted, not skipped).
+        // See research/QWEN36-A3B-JANGTQ4-COHERENCE-BUG-2026-04-25.md.
+        for (uint k = 0; k < vals_per_u32; k++) {
             uint i = i_base + k;
             if (i >= in_features) break;
             float xv = static_cast<float>(x_rot[x_off + i]);
@@ -223,8 +234,11 @@ private let kGatherTQSource = """
         for (uint o = 0; o < 20; o++) {
             pv[o] = (o < n_outs) ? packed[expert_base + (out_idx_0 + o) * packed_cols + pack_idx] : 0u;
         }
-        #pragma unroll
-        for (uint k = 0; k < 16; k++) {
+        // Symmetric fix to the gate/up kernel: loop bound MUST be
+        // vals_per_u32 (= 32 / bits), not the hardcoded 16. See the
+        // comment in jangtq_fused_gate_up_swiglu_matmul above for the
+        // full diagnosis.
+        for (uint k = 0; k < vals_per_u32; k++) {
             uint i = i_base + k;
             if (i >= in_features) break;
             float xv = static_cast<float>(x_rot[x_offset + i]);
