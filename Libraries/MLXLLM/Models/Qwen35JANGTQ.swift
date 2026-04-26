@@ -210,7 +210,36 @@ public struct Qwen35JANGTQTextConfiguration: Codable, Sendable {
 
         self.weightFormat =
             try container.decodeIfPresent(String.self, forKey: .weightFormat) ?? "mxtq"
-        self.mxtqBits = try container.decodeIfPresent(Int.self, forKey: .mxtqBits) ?? 2
+
+        // §418 (port from vmlx/swift 755f138) — robust mxtqBits resolution.
+        //
+        // Bundles vary in how they stamp the routed-MoE codebook bits:
+        //   1. Flat `mxtq_bits: Int` (older converters, our default).
+        //   2. Per-role dict `{routed_expert: 2, attention: 8, ...}`
+        //      (§346 T6 — Qwen3.6 family bundles).
+        //   3. ABSENT entirely — bundle ships only top-level
+        //      `quantization.bits` (Qwen3.6-35B-A3B-JANGTQ4 ships
+        //      `quantization.bits=4` only). With the previous `?? 2`
+        //      fallback the TurboQuant routed experts loaded with a
+        //      2-bit (4-entry) codebook against on-disk 4-bit
+        //      packing → empty / degenerate output.
+        //
+        // Bundle naming convention (`JANGTQ4` = 4-bit routed) guarantees
+        // the top-level affine bits match the routed bits when no
+        // dedicated routed-bits field is present.
+        if let flat = try? container.decodeIfPresent(Int.self, forKey: .mxtqBits) {
+            self.mxtqBits = flat
+        } else if let dict = try? container.decodeIfPresent(
+            [String: Int].self, forKey: .mxtqBits),
+            let routed = dict["routed_expert"] ?? dict["routed"]
+                ?? dict.values.first
+        {
+            self.mxtqBits = routed
+        } else if let qBits = Self._peekQuantizationBits(decoder) {
+            self.mxtqBits = qBits
+        } else {
+            self.mxtqBits = 2
+        }
         self.mxtqSeed = try container.decodeIfPresent(Int.self, forKey: .mxtqSeed) ?? 42
 
         let defaultRopeParameters: [String: StringOrNumber] = [
@@ -267,6 +296,31 @@ public struct Qwen35JANGTQTextConfiguration: Codable, Sendable {
             fatalError(
                 "Qwen35JANGTQTextConfiguration.asAffine encode/decode failed: \(error)")
         }
+    }
+}
+
+extension Qwen35JANGTQTextConfiguration {
+    /// §418 (port from vmlx/swift 755f138) — peek at top-level
+    /// `quantization.bits` for the `mxtq_bits` fallback. Some bundles
+    /// (e.g. Qwen3.6-A3B-JANGTQ4) ship `quantization.bits=4` only,
+    /// omitting the dedicated `mxtq_bits` field. Without this fallback
+    /// the routed-expert TurboQuant kernel loaded with the default
+    /// 2-bit codebook, producing empty output.
+    fileprivate enum QuantPeekKey: String, CodingKey { case quantization }
+    fileprivate struct QuantPeek: Decodable {
+        let bits: Int?
+        let groupSize: Int?
+        enum CodingKeys: String, CodingKey {
+            case bits, groupSize = "group_size"
+        }
+    }
+    fileprivate static func _peekQuantizationBits(_ decoder: Decoder) -> Int? {
+        guard let outer = try? decoder.container(keyedBy: QuantPeekKey.self) else {
+            return nil
+        }
+        guard let q = try? outer.decodeIfPresent(QuantPeek.self, forKey: .quantization)
+        else { return nil }
+        return q.bits
     }
 }
 

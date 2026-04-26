@@ -192,6 +192,14 @@ final class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "norm") var norm: Qwen3NextRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
+    // Pre-computed scaled-norm weights — q uses (1/sqrt(headDim))^2, k uses (1/sqrt(headDim)).
+    // Replaces `scalar * MLXFast.rmsNorm(x, weight: nil)` (2 ops) with one
+    // `MLXFast.rmsNorm(x, weight: precomputed)` (1 op) by baking the scale into
+    // the rms_norm weight vector. Computed lazily on first use because we need
+    // the parameter dtype which isn't known at init.
+    private var qScaleWeight: MLXArray?
+    private var kScaleWeight: MLXArray?
+
     init(_ args: Qwen35TextConfiguration) {
         self.hiddenSize = args.hiddenSize
         self.numVHeads = args.linearNumValueHeads
@@ -271,13 +279,19 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         var state = cache?[1]
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2), dtype: q.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale, dtype: k.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        // Fused scaled rms_norm: bake the per-head-dim scale into the rms_norm
+        // weight vector so MLXFast.rmsNorm does (scale * normed) in one Metal
+        // dispatch instead of two (rms_norm + scalar multiply). Saves ~2 ops
+        // per linear layer per token (~60 ops/token for 30 linear layers).
+        if qScaleWeight == nil || qScaleWeight!.dtype != q.dtype {
+            let invScale = pow(Float(headKDim), -0.5)
+            qScaleWeight = MLXArray.full(
+                [headKDim], values: MLXArray(pow(invScale, 2)), dtype: q.dtype)
+            kScaleWeight = MLXArray.full(
+                [headKDim], values: MLXArray(invScale), dtype: k.dtype)
+        }
+        let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight!, eps: 1e-6)
+        let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight!, eps: 1e-6)
 
         var out: MLXArray
 
