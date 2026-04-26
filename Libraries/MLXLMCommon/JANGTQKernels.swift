@@ -335,6 +335,78 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return codebookByKey["codebook.\(inFeatures).\(bits)"]
     }
+
+    /// Side-channel set by the model loader (`LLMModelFactory.load` /
+    /// `Load.swift`) BEFORE the factory dispatch decodes the model
+    /// configuration. Lets a bundle's actual codebook bits — sniffed
+    /// from the sidecar's `codebook.{inFeatures}.{bits}` keys — flow
+    /// into config decoders that would otherwise fall back to
+    /// `quantization.bits` (the affine non-routed setting, often 8)
+    /// or to a default of 2.
+    ///
+    /// Decoders consume this via `routedBitsHint` and never via
+    /// reading the property directly. Always cleared after the
+    /// dispatch returns.
+    private var _routedBitsHint: Int? = nil
+
+    public func setRoutedBitsHint(_ bits: Int?) {
+        lock.lock(); defer { lock.unlock() }
+        _routedBitsHint = bits
+    }
+
+    public var routedBitsHint: Int? {
+        lock.lock(); defer { lock.unlock() }
+        return _routedBitsHint
+    }
+
+    /// Sniff the routed-MoE codebook bits directly from a sidecar
+    /// safetensors file WITHOUT fully loading it into the runtime
+    /// cache. Uses the `codebook.{inFeatures}.{bits}` key naming
+    /// convention to read the actual bit width that was used at
+    /// quantization time.
+    ///
+    /// This is the most reliable signal when the bundle's
+    /// `jang_config.json` is missing the routed-expert bits field
+    /// (e.g. some Qwen3.6-A3B-JANGTQ4 / Kimi-K2.6 bundles ship only
+    /// `quantization.bits=8`, which is the affine non-routed setting,
+    /// not the codebook bits). Returns the most-frequent `bits` value
+    /// among the codebook keys, or `nil` if the file has no codebook
+    /// entries (or doesn't exist).
+    public static func sniffCodebookBits(at sidecarPath: URL) -> Int? {
+        guard FileManager.default.fileExists(atPath: sidecarPath.path),
+              let arrays = try? MLX.loadArrays(url: sidecarPath)
+        else { return nil }
+        var counts = [Int: Int]()
+        for name in arrays.keys where name.hasPrefix("codebook.") {
+            // Format: `codebook.{inFeatures}.{bits}`
+            let parts = name.split(separator: ".")
+            guard parts.count == 3, let bits = Int(parts[2]) else { continue }
+            counts[bits, default: 0] += 1
+        }
+        return counts.max(by: { $0.value < $1.value })?.key
+    }
+}
+
+/// Detect routed-MoE codebook bits from a JANG bundle's `profile`
+/// string field (`JANGTQ4` → 4, `JANGTQ2`/`JANGTQ`/`MXTQ` → 2).
+/// Bundle naming convention is empirically reliable: every JANG /
+/// JANGTQ converter pre-2026-04 stamped the profile this way.
+/// Returns `nil` for unrecognized strings so the caller falls back
+/// to the next signal in the resolution chain.
+public func jangtqBitsFromProfile(_ profile: String?) -> Int? {
+    guard let profile, !profile.isEmpty else { return nil }
+    let p = profile.lowercased()
+    if p.contains("jangtq4") || p.contains("jangtq_4") || p.contains("jangtq-4") {
+        return 4
+    }
+    if p.contains("jangtq2") || p.contains("jangtq_2") || p.contains("jangtq-2") {
+        return 2
+    }
+    // Bare "jangtq" / "mxtq" historically meant 2-bit.
+    if p == "jangtq" || p == "mxtq" {
+        return 2
+    }
+    return nil
 }
 
 // MARK: - High-level kernel wrappers (mirror Python `make_*_decode` factories)

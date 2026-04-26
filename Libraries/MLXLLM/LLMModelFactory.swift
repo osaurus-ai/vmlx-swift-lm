@@ -295,7 +295,18 @@ public enum LLMTypeRegistry {
                 else { return nil }
                 return b
             }()
-            let mxtqBits = envBits ?? stampBits ?? configBits ?? 2
+            // Side-channel hint set by `_load` BEFORE this dispatch fires —
+            // the loader has already cascaded through routed_expert_bits,
+            // sidecar codebook sniff, and profile-name pattern. When
+            // present, prefer it over `configBits` (which can be the
+            // affine non-routed bits = 8, useless for routed-MoE).
+            let hintBits: Int? = {
+                guard let h = JANGTQRuntimeCache.shared.routedBitsHint,
+                      h == 2 || h == 4
+                else { return nil }
+                return h
+            }()
+            let mxtqBits = envBits ?? stampBits ?? hintBits ?? configBits ?? 2
             return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
@@ -782,6 +793,49 @@ public final class LLMModelFactory: ModelFactory {
             {
                 configDict["mxtq_bits"] = routed
             }
+            // 2026-04-26 robustness: bundles in the wild ship inconsistent
+            // routed-bits fields (some have `mxtq_bits` Int, some
+            // `routed_expert_bits` top-level, some only the nested dict
+            // above, some nothing at all). Cascade through the remaining
+            // signals so the runtime never silently picks the wrong
+            // codebook bits and produces garbage:
+            //
+            //   1. `routed_expert_bits` Int at jang_config top-level
+            //   2. Sniff actual codebook bits from the sidecar's
+            //      `codebook.{inFeatures}.{bits}` keys (most reliable —
+            //      determined at quantization time, can't drift)
+            //   3. `profile` string convention ("JANGTQ4" → 4, etc.)
+            //   4. Fall through to the per-config decoder default
+            if configDict["mxtq_bits"] == nil,
+                let routed = jangDict["routed_expert_bits"] as? Int
+            {
+                configDict["mxtq_bits"] = routed
+            }
+            if configDict["mxtq_bits"] == nil {
+                let sidecarURL = modelDirectory.appending(
+                    component: "jangtq_runtime.safetensors")
+                if let sniffed = JANGTQRuntimeCache.sniffCodebookBits(
+                    at: sidecarURL)
+                {
+                    configDict["mxtq_bits"] = sniffed
+                }
+            }
+            if configDict["mxtq_bits"] == nil,
+                let profile = jangDict["profile"] as? String,
+                let pBits = jangtqBitsFromProfile(profile)
+            {
+                configDict["mxtq_bits"] = pBits
+            }
+            // Stash whatever we resolved into the `JANGTQRuntimeCache.
+            // routedBitsHint` side-channel for downstream dispatchers
+            // (e.g. `dispatchDeepseekV4`) that don't share the same
+            // config shape but still need the routed-MoE bits before
+            // model construction. Cleared at the end of `_load`.
+            if let resolved = configDict["mxtq_bits"] as? Int {
+                JANGTQRuntimeCache.shared.setRoutedBitsHint(resolved)
+            } else {
+                JANGTQRuntimeCache.shared.setRoutedBitsHint(nil)
+            }
             // VL-wrapped configs (Qwen3.5-VL, Qwen3.6-VL) put the LLM fields
             // inside `text_config`. The Qwen35JANGTQ decoder tries the
             // top-level first then falls back to decoding from `text_config`,
@@ -957,6 +1011,13 @@ public final class LLMModelFactory: ModelFactory {
             quantization: jangConfig != nil ? baseConfig.quantization : nil,
             perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
+
+        // Clear the routed-bits side-channel after the dispatch +
+        // weight load have consumed it — the hint was only meaningful
+        // for THIS load. Leaving it set would leak into the next
+        // model loaded in the same process if that one's resolution
+        // chain reached the hint stage.
+        JANGTQRuntimeCache.shared.setRoutedBitsHint(nil)
 
         let tokenizer = try await tokenizerTask
 
