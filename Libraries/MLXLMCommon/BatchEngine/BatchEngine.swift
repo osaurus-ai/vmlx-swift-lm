@@ -702,6 +702,26 @@ public actor BatchEngine {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: slot.cache)
                         }
+                        // 2026-04-27 fix: materialize restored cache state
+                        // in its own command buffer BEFORE prefill builds
+                        // its forward graph. Disk restore produces lazy
+                        // MLXArrays (asType conversions, TQ component
+                        // deserialization, mamba state copies). Without
+                        // an explicit eval here, the next prefill forward
+                        // builds a single command buffer containing both
+                        // the cache materialization AND the model's
+                        // custom kernel dispatches — combined allocation
+                        // pressure can trigger `mlx::core::metal::Device::
+                        // clear_library` mid-encode, evicting a kernel
+                        // pipeline that's still referenced by the
+                        // in-flight buffer →
+                        // `notifyExternalReferencesNonZeroOnDealloc`
+                        // assertion (osaurus repro 2026-04-27 on Qwen-3.6
+                        // 35B A3B MXFP4 with warm disk-tier KV cache).
+                        // Eager eval forces the cache state into GPU
+                        // memory in a SEPARATE command buffer that
+                        // commits before prefill encoding starts.
+                        MLX.eval(slot.cache)
                         restored = true
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit for slot \(slot.id): restored \(diskRestored) tokens from disk, prefilling \(remaining.count) remaining"
