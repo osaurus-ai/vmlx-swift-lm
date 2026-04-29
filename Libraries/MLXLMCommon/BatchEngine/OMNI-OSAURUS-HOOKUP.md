@@ -602,43 +602,72 @@ events. No app-layer parsing required.
 
 ## 10. BatchEngine — what works at B>1, what doesn't
 
-Omni in BatchEngine is supported but with the same heterogeneous-cache
-caveats as Qwen 3.5 hybrid:
+Updated 2026-04-29 with actual `BENCH_OMNI_BATCH=1` results on real
+JANGTQ2 bundle. **Honest current state, not aspirational.**
 
 | Surface | Status |
 |---|---|
-| Multi-slot admission | ✅ works. `BatchEngine.admitPendingRequests` auto-flips coordinator hybrid. |
-| Mamba slot handling | ✅ via `BatchArraysCache` (subclass of `MambaCache`). Per-slot SSM states are merged on admit, written back on detach. |
-| KV slot quantization | ✅ TQ on the 6 attention layers (`BatchQuantize.maybeCompress`). |
+| Multi-slot admission (text-only B>1) | ⚠️ **BROKEN today**. `BatchEngine` calls `model.prepare(_:)` correctly and the omni `.logits` text-only path runs cleanly to first token, but the produced output stream is empty — root cause TBD. Reproducible by `BENCH_OMNI_BATCH=1` rows B1/B2. |
+| Mamba slot handling code | ✅ in place. `BatchArraysCache` (subclass of `MambaCache`) merges per-slot SSM states at admit and writes back at detach. Code path is wired; runtime correctness blocked on the empty-stream issue above. |
+| KV slot TQ quantization | ✅ in place. `BatchQuantize.maybeCompress` promotes the 6 attention `KVCacheSimple` slots to `TurboQuantKVCache` at admission. Mamba slots correctly preserved unchanged. |
 | Compiled decode promotion | ❌ **NOT** taken — heterogeneous topology classifies as `.heterogeneous`, falls to uncompiled (`BatchCompile.swift:85`). Correct-by-design; Mamba trace grouping is `Stage 4 pending`. |
 | Disk cache (multi-slot) | ✅ each slot's per-token store after generation goes to `DiskCache.store` under the per-slot lock (iter 61 fix). Hybrid slots also store SSM companion state. |
-| Multimodal embed splice (per-slot) | ⚠️ **OPEN**. Today the BatchEngine prefill path takes raw token IDs, not pre-spliced `inputsEmbeds`. Multimodal works through `Evaluate` but **not** through `BatchEngine` for the omni image/video/audio splice. See §10.1. |
-| Reasoning + tool events at B>1 | ✅ same as text-only — per-slot streams. |
+| Multimodal embed splice (per-slot) | ⚠️ **OPEN** — same root cause as text-only. `model.prepare(_:)` is invoked; multimodal `.logits` path runs; output stream still empty. Can't validate splice independently until B1 lands. |
+| Reasoning + tool events at B>1 | ⚠️ untested for omni. Validated for text-only LLMs (Qwen / Gemma) — should carry to omni once admission/decode lands. |
 
-### 10.1 BatchEngine + multimodal splice — open seam
+### 10.1 What `BENCH_OMNI_BATCH=1` actually showed
 
-`BatchEngine.admitPendingRequests` currently expects each slot to provide
-text tokens; the prefill loop calls `model(inputs:cache:)` not
-`model.callAsFunction(inputsEmbeds:cache:)`. For omni, this means an image
-or video request submitted to BatchEngine **would forward the literal
-placeholder tokens with no replacement** — not a crash, but the model
-produces nonsense.
+Verified at HEAD (post `a5c02a0`):
 
-**Workaround for now** (osaurus-side): **do not admit omni multimodal
-turns through BatchEngine**. Route them through `Evaluate.generate()`
-which already calls `model.prepare(_:cache:windowSize:)`, which is the
-overridden path that does the splice. Text-only omni turns can go through
-BatchEngine without restriction.
+```
+[FAIL] B1. BatchEngine text B=1                    "empty output stream"
+[FAIL] B2. BatchEngine text B=2 concurrent         "one slot empty (s0=0 s1=0)"
+[FAIL] B3. BatchEngine image B=1                   "empty output stream"
+[FAIL] B4. BatchEngine audio B=1                   "empty output stream"
+```
 
-**Fix path** (vmlx-side, future):
-- Either extend `BatchEngine`'s admit/prefill to call `model.prepare(...)`
-  for VL models (mirror of Evaluate's path).
-- Or expose a `inputsEmbeds`-aware admission API on BatchEngine.
+A first-pass fix made `model.prepare(_:)` for text-only return `.logits`
+(running prefill ourselves) instead of `.tokens(input.text)`, mirroring
+`Gemma3.prepare` and `FastVLM.prepare`. Without that fix the prefill
+trapped at `[concatenate] dims 3 vs 4` inside Mamba2 conv state merge,
+because `BatchEngine.stepPrefill` adds an extra axis via
+`remainingText[text: .newAxis]` to already-2D processor tokens.
 
-This is a non-trivial change because it affects every VLM, not just omni.
-File issue if osaurus needs this prioritized; the current Evaluate fallback
-for VL turns is the sane default and matches what every other VLM in the
-repo does today.
+After the `.logits` fix the trap is gone — but the resulting decode
+stream is still empty. Root cause is downstream of the prefill (likely
+in the `firstToken` extraction or sampler interaction with hybrid
+cache). **This is real work** to land cleanly; not a comment fix.
+
+### 10.2 What this means for osaurus today
+
+- **`mlxBatchEngine` should remain default OFF for omni bundles** until
+  B1/B2 land. PR #967 already defaults it off, so this is no regression.
+- **All omni traffic should route through `Evaluate.generate()`**
+  (i.e., the `TokenIterator` path). Verified end-to-end across all
+  three quants — that's the 13-row × 3-quant matrix in `BENCH_OMNI=1`
+  including reasoning toggle, mixed modality, media-salt isolation,
+  hybrid SSM warm-pass parity. Production-ready on this path.
+- **Don't preemptively flip the BatchEngine default for omni**, even
+  if the dashboard shows non-omni models doing fine on it. Hybrid +
+  multimodal is its own surface; it's not validated yet.
+
+### 10.3 Path forward (vmlx-side work)
+
+- **Reproduce B1 isolated** (text-only, single slot, JANGTQ2 — fastest
+  iteration). The current empty-output-stream is happening despite the
+  forward returning logits — probably the stream-dispatch or
+  finishSlot logic doesn't relay events correctly when prepare returns
+  `.logits` for a text-only LLM-shape input.
+- **Audit `stepPrefill` + `firstToken` extraction** for the
+  `.logits` text-only path. The shape contract is `logits[0..<1, -1, 0...]`;
+  verify omni hybrid attn cache after `inputsEmbeds`-style prefill is
+  consistent with what the sampler expects.
+- **Don't extend BatchEngine multimodal until text-only B>1 works** —
+  fixing both at once means you can't bisect.
+
+The Python upstream has had this seam closed for a while; the vmlx
+port hasn't caught up yet. If a customer/use-case needs omni at B>1
+specifically, file the ask and this is the next focused work-item.
 
 ---
 

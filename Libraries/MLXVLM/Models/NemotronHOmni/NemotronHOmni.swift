@@ -190,8 +190,20 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let convertedCache = cache.compactMap { $0 as KVCache }
 
         if input.image == nil && input.video == nil && input.audio == nil {
-            // Text-only fast path.
-            return .tokens(input.text)
+            // Text-only path. We deliberately return `.logits` (run the
+            // prefill ourselves) rather than `.tokens(input.text)` because
+            // `BatchEngine.stepPrefill` calls
+            //     context.model(remainingText[text: .newAxis], ...)
+            // for the `.tokens` branch, adding an extra axis on top of
+            // the already-2D `[1, T]` token tensor that processors emit.
+            // For omni's hybrid Mamba layers a 3D token input cascades
+            // into a 4-vs-3-dim concat trap inside `applyConv` —
+            // observed crash on the BatchEngine omni text-only path.
+            // Mirroring `Gemma3.prepare(...)` and `FastVLM.prepare(...)`
+            // which take the same `.logits` route for text-only.
+            let logits = languageModel.callAsFunction(
+                input.text.tokens, cache: convertedCache)
+            return .logits(LMOutput(logits: logits))
         }
 
         // Build embeddings for tokens + splice multimodal at placeholder tokens.
