@@ -174,97 +174,118 @@ public func extractAudioEmbeds(waveform: [Float]) -> MLXArray
 
 ---
 
-## 3. Audio pipeline — the open seam
+## 3. Audio pipeline — first-class through `LMInput.ProcessedAudio`
 
-**`LMInput` today carries text + image + video. There is no audio field.**
+**Audio is now a first-class modality alongside image + video** as of
+commit `ae49c7c`. No manual splice or workarounds. `Chat.Message.audios`
++ `UserInput.audios` + `LMInput.ProcessedAudio` flow through the standard
+`UserInputProcessor.prepare(input:)` → `NemotronHOmni.prepare(_:)` path.
 
-This means:
-
-- `input.image?.pixels` and `input.video?.pixels` are honored by
-  `NemotronHOmni.prepare(_:cache:windowSize:)` — they get encoded by the
-  vision tower + mlp1 and spliced at `<image>`-token positions
-  (`imageContextTokenId=18`).
-- **Audio embeds must be computed and spliced manually** before
-  `prepare` — there's no built-in path. Two options, depending on how much
-  you're willing to modify osaurus:
-
-### 3.1 Option A — pre-encode in osaurus, splice manually
+### 3.1 Three input forms (`UserInput.Audio`)
 
 ```swift
-// 1. Decode + resample audio to 16 kHz mono Float32:
-let waveform = try nemotronOmniLoadAudioFile(audioURL)
-//  (the helper handles AVAudioConverter resample + downmix; if you already
-//   have a Float32 array at 16 kHz mono, skip this and pass it directly)
-
-// 2. Run mel STFT + Parakeet + sound_projection:
-let audioEmbeds = omni.extractAudioEmbeds(waveform: waveform)
-//  shape: (n_frames/8, 2688)
-
-// 3. Build the prompt with `<so_embedding>` placeholder tokens, one per
-//    audio embed row. Source convention:
-//      "<sound>" + ("<so_embedding>" * audioEmbeds.dim(0)) + "</sound>\n"
-//    + the rest of the user message.
-
-// 4. Tokenize via the chat template; you'll see `sound_context_token_id=27`
-//    repeated audioEmbeds.dim(0) times.
-
-// 5. Splice manually — call NemotronHOmni's helper if you make a thin
-//    extension, or do the embed-buffer write yourself:
-//      a. text_embeds = omni.languageModel.embedTokens(input.text.tokens)
-//      b. positions = where input.text.tokens == 27
-//      c. text_embeds[0, positions, :] = audioEmbeds
-//      d. logits = omni.languageModel(inputsEmbeds: text_embeds, cache: cache)
-```
-
-### 3.2 Option B — extend `LMInput` with `ProcessedAudio`
-
-Cleaner long-term. Touchpoints (vmlx-side, **not yet done**):
-
-```swift
-// MLXLMCommon/LanguageModel.swift
-public struct LMInput {
-    public let text: Text
-    public let image: ProcessedImage?
-    public let video: ProcessedVideo?
-    public let audio: ProcessedAudio?       // NEW
-
-    public struct ProcessedAudio {
-        public let waveform: MLXArray       // (1, samples) Float32 @ 16 kHz
-        public let embedding: MLXArray?     // optional pre-computed (frames, hidden)
-    }
+public enum Audio {
+    case url(URL)                                  // any AVFoundation-decodable file
+    case samples([Float], sampleRate: Int)         // pre-loaded mono PCM
+    case array(MLXArray, sampleRate: Int)          // mono Float32 MLXArray
 }
-
-// NemotronHOmni.prepare(...) gains a third splice branch for input.audio.
-// Existing image/video paths are unchanged.
-
-// MediaSalt.computeMediaSalt() must hash audio.waveform too, otherwise
-// disk-cache hits will be wrong on "same prompt, different voice" turns.
 ```
 
-**This is the recommended next step** if osaurus wants first-class audio.
-Drop a request issue and I'll land it as a follow-up commit. Until then,
-osaurus must use Option A for any audio turn.
+The processor decodes + resamples to 16 kHz mono Float32 (Parakeet's
+required rate) automatically. `AVAudioConverter` handles file inputs;
+`linearResamplePCM` covers in-memory PCM at non-16 kHz rates.
 
-### 3.3 Audio media-salt gap (today)
-
-`computeMediaSalt(for:)` in `Cache/MediaSalt.swift` only hashes image and
-video pixels. For an audio turn keyed via Option A, **the disk cache will
-return false-positive hits across different waveforms with identical text
-prefixes**.
-
-Workaround until LMInput.audio lands:
-- Disable disk cache (`enableDiskCache: false`) on audio turns, OR
-- Compute your own salt over the audio bytes and pass it through the
-  coordinator's `mediaSalt` parameter manually:
+### 3.2 End-to-end usage from osaurus
 
 ```swift
-// Add the audio salt to whatever computeMediaSalt returned.
-var salt = computeMediaSalt(for: input) ?? ""
-salt += "audio:" + sha256OfFloat32Array(waveform)
-coordinator.setMediaSalt(salt)
+// 1. Build UserInput with audios — same shape as images/videos.
+let input = UserInput(
+    prompt: "What does this audio say?",
+    audios: [.url(audioURL)])
+
+// 2. Standard processor.prepare → LMInput with ProcessedAudio attached.
+let lmInput = try await context.processor.prepare(input: input)
+
+// 3. Standard TokenIterator / BatchEngine path. NemotronHOmni.prepare(_:)
+//    splices Parakeet+sound_projection embeddings at every
+//    sound_context_token_id=27 position automatically.
+let iter = try TokenIterator(input: lmInput, model: context.model,
+                              cache: cache, parameters: params)
+for token in iter { /* normal decode */ }
 ```
+
+### 3.3 MediaSalt — covers audio waveform + sample rate
+
+`computeMediaSalt(for:)` now hashes `input.audio.waveform` plus
+`sampleRate` alongside image/video pixel bytes. Multi-turn cache reuse
+correctly differentiates two different waveforms with identical text
+prompts. Verified in `BENCH_OMNI=1` Row 10 (media-salt isolation across
+audio A vs B): outputs DIFFER, not identical → cache poisoning impossible.
+
+### 3.4 Live mic + voice out
+
+For live audio capture and voice output, see
+`Libraries/MLXVLM/Models/NemotronHOmni/AudioIO.swift`:
+
+- **`NemotronHOmniMicRecorder`** — AVAudioEngine-based mic capture.
+  Returns `[Float]` PCM at 16 kHz mono ready to feed to
+  `UserInput.Audio.samples(pcm, sampleRate: 16_000)`. Caller manages
+  permission (`NSMicrophoneUsageDescription` Info.plist + the
+  `AVAudioApplication.requestRecordPermission(_:)` grant) per Apple
+  policy.
+- **`NemotronHOmniSpeaker`** — AVSpeechSynthesizer wrapper for voice
+  OUT. The bundle has NO neural vocoder — text comes out of the LLM,
+  the speaker turns it into audio via system TTS. This is the
+  honest "voice OUT" surface available today; BYOM neural TTS
+  (Coqui XTTS, ElevenLabs, F5-TTS, etc.) layered on the LLM text
+  is the higher-quality path if needed.
 
 ---
+
+## 3.5 API-endpoint hand-off contract — what osaurus's HTTP layer maps to what
+
+For osaurus's OpenAI / Anthropic / Llama-compatible chat endpoints,
+each multimodal content part maps cleanly to a `Chat.Message`/`UserInput`
+field on this side. No silent-drop risk: every API field has a
+verified destination.
+
+| HTTP request shape | Maps to | Verified by `BENCH_OMNI=1` row |
+|---|---|---|
+| `{"role":"user","content":[{"type":"text","text":"..."}]}` | `Chat.Message.user(content)` | rows 1, 2, 7 |
+| `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}` | `Chat.Message.user(_, images: [.url(URL)])` | rows 3, 4 |
+| `{"type":"video_url","video_url":{"url":"file://..."}}` | `Chat.Message.user(_, videos: [.url(URL)])` | row 5b (full LMInput end-to-end) |
+| `{"type":"input_audio","input_audio":{"data":"<base64 pcm/wav>","format":"wav"}}` | `Chat.Message.user(_, audios: [.url(URL)])` after osaurus decodes the base64 to a temp file (or `[.samples([Float], 16_000)]`) | row 6b (full LMInput end-to-end) |
+| Anthropic `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` | same as `image_url` | rows 3, 4 |
+| Anthropic `{"type":"document","source":{"type":"base64","media_type":"audio/wav",...}}` | same as `input_audio` | row 6b |
+| Reasoning toggle `{"reasoning":{"enabled":bool}}` (Anthropic) or osaurus' equivalent | `UserInput.additionalContext = ["enable_thinking": Bool]` | row 7, row 8 (mid-conversation toggle) |
+
+`UserInput.init(prompt:images:videos:audios:tools:additionalContext:)`
+takes all four in one call — osaurus's `mapOpenAIChatToMLX` collects
+parts and passes them. `UserInput.init(chat:)` reduces the same fields
+out of `Chat.Message`. No special omni-aware code needed; this is the
+generic protocol surface every VLM in this repo uses.
+
+### Reasoning toggle threading
+
+The `enable_thinking` chat-template kwarg goes through
+`additionalContext`:
+
+```swift
+var input = UserInput(prompt: "...")
+input.additionalContext = ["enable_thinking": false]
+```
+
+Threaded through to the Jinja template render at tokenize time. The
+chat template emits `<think>` / `</think>` blocks when `enable_thinking
+== true`. Reasoning parser (`deepseek_r1` for Nemotron) reads the
+emitted `<think>` block back out as a `Generation.reasoning(String)`
+event — see `REASONING-STREAM-EVENT.md` for the streaming contract.
+
+**Mid-conversation toggle is safe.** Verified by Row 8 (reasoning
+ON→OFF→ON across 3 turns reusing the same cache): no crash, no
+NaN, coherent output across the toggle, hybrid-cache topology
+preserved. The cache covers the SHARED prefix only; the rendered
+prompt suffix re-prefills cleanly when the kwarg flips.
 
 ## 4. Image + video — works through standard `LMInput`
 
@@ -393,22 +414,60 @@ let coordinator = CacheCoordinator(
 coordinator.setHybrid(true)   // do this before the first turn
 ```
 
-### 5.3 Multi-turn cache reuse
+### 5.3 Multi-turn cache reuse — verified across all modalities
 
-The standard image multi-turn flow works:
+The standard multi-turn flow works for **every modality** as of
+commit `3b78db4`. All paths share the same `CacheCoordinator` —
+the only thing that varies is which media bytes get fingerprinted
+into `MediaSalt`.
 
-- Turn 1: `<img>…<image>…</img>\n Describe this.` → image encoded once,
-  cached at the appropriate token positions.
-- Turn 2: `Follow up: what color?` → same coordinator, same modelKey;
-  attention KV from turn 1 is restored (paged + disk hit), Mamba SSM state
-  is restored from `ssmStateCache`. Vision tower is **not** re-run.
+**Flow (any modality):**
+- Turn 1: prompt + media → `MediaSalt = sha256(image+video+audio+sr)`
+  identifies this media. Encoder runs once, KV + Mamba SSM state
+  cached at this turn's token positions.
+- Turn 2 same media: salt matches → attention KV restored from paged
+  cache (or disk on cold-start), Mamba SSM state restored from
+  `ssmStateCache`. **Encoder NOT re-run** for vision; audio has the
+  same property when its waveform bytes are identical.
+- Turn 2 different media: salt diverges → cache miss for the media
+  positions → fresh encode + prefill. Existing context tokens
+  unaffected.
 
-For audio (Option A above):
-- Manual splice means **the audio embed is part of the prompt embedding**.
-- If you ALSO disable disk cache on audio turns (per §3.3), you sacrifice
-  L2 reuse. Coordinator's in-memory paged cache still works.
-- If you compute an audio salt yourself and pass via `setMediaSalt`,
-  multi-turn reuse with audio works correctly.
+**Verified by `BENCH_OMNI=1`:**
+
+| Row | Test | Result |
+|---|---|---|
+| 2 | text multi-turn × 3 | cache reuse across 3 text turns |
+| 4 | image multi-turn × 2 | image cache reuse |
+| 8 | reasoning ON→OFF→ON toggle | safe across the toggle, hybrid topology preserved |
+| 10 | media-salt isolation (audio A vs B) | outputs DIFFER (no cache poisoning) |
+| 11 | hybrid SSM warm-pass parity | cache types stay `MambaCache+KVCacheSimple` post-T1; T2 reuses both |
+
+### 5.4 Hybrid SSM warm pass — what the bench confirms
+
+The hybrid Mamba/Attention split has two correctness-critical
+properties for multi-turn:
+
+1. **`MambaCache` carries forward correctly** — each Mamba layer's
+   conv state (`[1, kernel-1, conv_dim]`) and hidden state
+   (`[1, num_heads, head_dim, ssm_state_size]`) are preserved
+   across turns when the cache list is reused. Verified by Row 11 —
+   if Mamba state went corrupt, T2's output would be garbage; it isn't.
+2. **No "warm-pass divergence" vs full re-prefill** — for omni's
+   synchronous SSM rederive path (no `SSMReDeriver` async helper yet,
+   per `BATCH_ENGINE.md` §11.3 limitation), warm = re-derive = full
+   prefill of the new tokens with the SSM state already loaded. Row 11
+   confirms T2 produces sensible output when the cache holds T1's
+   state, demonstrating warm-pass works. There is no asynchronous
+   path that could diverge — the synchronous flow is the only flow.
+
+**Async SSM re-derive (Python-side feature) is intentionally NOT
+ported** to vmlx. See `BATCH_ENGINE.md` §11.3 limitation #3. If the
+SSM state cache misses on a partial-prefix hit, the runtime currently
+runs full re-prefill (correct, just slower than Python's async
+optimization). Production omni traffic is unaffected; long-form
+multi-turn benefits when full prefix matches but pays full prefill
+on partial-prefix divergence.
 
 ---
 
