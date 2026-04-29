@@ -639,54 +639,94 @@ Use this as a PR checklist when wiring omni support into the osaurus runtime:
 
 ---
 
-## 12.5 Real-bundle state — what actually loads + runs (2026-04-28 bench results)
+## 12.5 Real-bundle state — what actually loads + runs (2026-04-28)
 
-`BENCH_OMNI=1` against the three local bundles surfaced two real bugs that
-override the optimistic claims made earlier in this doc. **Trust this
-section over §7 when there's a conflict.**
+Updated after `BENCH_OMNI=1` against the local bundles + the JANG
+quant-inference fix in `ae526a3`.
 
-| Bundle | Loads? | First forward? | Bug |
+| Bundle | Load | E2E multi-turn | Notes |
 |---|---|---|---|
-| `Nemotron-3-Nano-Omni-30B-A3B-MXFP4` (21 GB) | **YES** (3.2 s) | **NO** | crashes on row 1 (text-only single-turn) at `[rms_norm] (*weight) must have the same size as the last dimension of x but has 2688 elements`. Most likely cause: the JANG per-layer-quantization overrides (`backbone.layers.X.mixer.switch_mlp.fc1`) don't match the wrapper's `language_model.backbone.…` paths, so quantized experts are loaded as plain Linear with mismatched shapes. Fix: prefix-aware override application in `loadWeights`, or unwrap-then-rewrap of the LLM in the omni constructor. |
-| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ4` (19 GB) | **NO** | n/a | Same as JANGTQ2 — see below. |
-| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ2` (12 GB) | **NO** | n/a | `unhandledKeys: experts` at every E (MoE) layer. Bundle ships per-expert `experts.{e}.{up,down}_proj.{tq_packed, tq_norms, tq_bits}` keys — `NemotronHModel.sanitize` only stacks `experts.{e}.{up,down}_proj.weight` (plain affine), so the TQ-packed expert tensors propagate through unchanged and the model rejects them. Fix: write `NemotronHJANGTQ.swift` (mirror `DeepseekV3JANGTQ.swift` pattern — ~300 LOC) that stacks TQ tensors and swaps in `TurboQuantSwitchLinear` for the routed-expert switch. |
+| `Nemotron-3-Nano-Omni-30B-A3B-MXFP4` (21 GB) | ✅ 1.1 s | ✅ **7/7 PASS** | text single + multi-turn cache reuse, image single + multi-turn (MediaSalt), video encoder smoke (T=2 channel-stack), audio encoder smoke (Parakeet + sound_projection), reasoning OFF parity. Decode 79–121 tok/s @ B=1 / M3 Max. **Production-ready.** |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ4` (19 GB) | ❌ | n/a | needs `NemotronHJANGTQ.swift` — see below |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ2` (12 GB) | ❌ | n/a | needs `NemotronHJANGTQ.swift` — see below |
 
-**What this means for osaurus today**:
+### What `ae526a3` fixed
 
-- ✅ `OmniBench` (env-gated `BENCH_OMNI=1`) is committed and runs the
-  full multi-turn matrix — but the first row already fails.
-- ✅ The factory dispatch + `NemotronHOmni` wrapper module structure +
-  multimodal sanitize routing all work (load completes, dispatch
-  resolves to the right type/processor).
-- ❌ **No omni bundle currently runs end-to-end inference in Swift.**
-- ❌ The §7 claim "the same Swift type loads all three quant variants"
-  is **wrong as of `b4eec09`**. JANGTQ specifically needs its own
-  wrapper class.
+The original `[rms_norm] (*weight) must have the same size as the last
+dimension of x but has 2688 elements` trap — first hit by tpae's
+osaurus run on Cascade-2 JANG_4M, then independently caught by
+`BENCH_OMNI=1` on Nemotron-Omni MXFP4 — was a JANG quant-inference
+shape-ambiguity bug, NOT an omni-wrapper bug.
 
-**Fix priority (vmlx-side)**:
+Root cause: `(bits=8, gs=32)` and `(bits=4, gs=64)` produce the SAME
+packed tensor shape for any `numGroups`. The primary path of
+`inferBitWidthAndGroupSize` accepts whichever matches the prior
+`gs`; for bundles with mixed-gs layers + a single prior, the wrong
+half got loaded with double-bits / half-gs and dequant reconstructed
+wrong row vectors. Trap fired mid-prefill.
 
-1. **MXFP4 forward crash** — diagnose whether it's quant-override path
-   matching, or a different shape bug somewhere in the splice/forward
-   path. This is the closest win since the bundle already loads.
-2. **`NemotronHJANGTQ.swift`** — straight port of the
-   `DeepseekV3JANGTQ.swift` pattern: subclass that handles per-expert
-   `tq_packed`/`tq_norms`/`tq_bits` → stacked `switch_mlp.fc1/fc2.{tq_*}`
-   and substitutes `TurboQuantSwitchLinear` for the MoE routed path
-   under `language_model.backbone.layers.{l}.mixer.switch_mlp`.
+Three plumbing fixes in `ae526a3`:
+1. `JangLoader.inferPerLayerQuantization` — prefer
+   `jangConfig.blockSize` (authoritative) over `overrideGroupSize`
+   when `bit_widths_used` is non-empty (real JANG conversion signal).
+2. `VLMModelFactory._load` — pass `baseConfig.quantization` through
+   to `loadWeights` so omni / VL bundles' top-level
+   `quantization.group_size` lands as the prior. (LLM factory already
+   did this; VLM was missing it.)
+3. Both factories — pass `perLayerQuantization` through even when
+   JANG; `loadWeights` retains shape walk for the JANG path but the
+   plumbing is now uniform.
 
-Until both land, the recommended osaurus posture is:
+Affected bundles: anything with a JANG-converted `bit_widths_used:
+[…, …]` and mixed gs across layers (Cascade-2 JANG_4M, Nemotron-Omni
+MXFP4). Unaffected: JANG_2L bundles whose prior gs matches every
+layer (Cascade-2 JANG_2L unchanged at 125 tok/s).
 
-- **Don't ship omni bundle support yet.** The four-tower wrapper, the
-  factory dispatch, the documentation, the smoke tests, and the bench
-  harness are all in. Real inference is not.
-- **Keep tracking `b4eec09` + this hookup doc** for when fixes land.
-- The BatchEngine + cache + reasoning / tool plumbing is unaffected —
-  those contracts remain valid; they just don't have a working bundle
-  to validate against today.
+### Still open: NemotronHJANGTQ wrapper for omni JANGTQ2 / JANGTQ4
 
-This was caught by running `BENCH_OMNI=1 BENCH_MODEL=…` — the first
-real-bundle run any of this code has seen. Smoke tests on toy tensor
-shapes (`NemotronHOmniSmokeTests`) all still pass.
+JANGTQ omni still fails at `unhandledKeys: experts`. Bundle ships
+per-expert TurboQuant tensors:
+
+```
+backbone.layers.{l}.mixer.experts.{e}.{up,down}_proj.{tq_packed,
+                                                      tq_norms,
+                                                      tq_bits}
+```
+
+`NemotronHModel.sanitize` only stacks `experts.{e}.{up,down}_proj.weight`
+(plain affine), so the TQ tensors propagate through and the model
+rejects with `unhandledKeys: experts`.
+
+Fix path: write `NemotronHJANGTQ.swift` mirroring the
+`DeepseekV3JANGTQ.swift` pattern — ~300 LOC subclass that:
+- Stacks per-expert TQ tensors into
+  `switch_mlp.{fc1,fc2}.{tq_packed, tq_norms, tq_bits}`
+- Substitutes `TurboQuantSwitchLinear` for the MoE routed-expert
+  switch under `backbone.layers.{l}.mixer.switch_mlp`
+- Wires JANGTQ runtime cache (signs / codebook) for the routed
+  experts at first forward
+
+Tracked in §13 below as a HIGH-severity gap. Until it lands, JANGTQ
+omni doesn't load; MXFP4 omni serves as the production path.
+
+### Osaurus posture (revised, 2026-04-28)
+
+- **Ship MXFP4 omni now.** All seven bench rows pass on real bundle.
+  The factory + processor + cache + reasoning + tool plumbing are
+  validated. No known gaps for MXFP4.
+- **Don't ship JANGTQ omni yet** — wait for `NemotronHJANGTQ.swift`.
+- **All non-omni paths unaffected** by either change. Cascade-2 JANG_2L
+  + JANG_4M text-only also benefit from the `ae526a3` fix.
+
+Reproduce locally:
+
+```bash
+BENCH_OMNI=1 \
+  BENCH_MODEL=~/.mlxstudio/models/JANGQ-AI/Nemotron-3-Nano-Omni-30B-A3B-MXFP4 \
+  BENCH_MAX_TOKENS=24 \
+  swift run -c release RunBench
+# Expected: "7 passed, 0 failed | load 1.11s"
+```
 
 ---
 
@@ -694,8 +734,8 @@ shapes (`NemotronHOmniSmokeTests`) all still pass.
 
 | Gap | Severity | Owner | Tracking |
 |---|---|---|---|
-| **MXFP4 omni first-forward crash** (rms_norm 2688) | **HIGH** | vmlx-side | §12.5 row 1; blocks all omni serving |
-| **`NemotronHJANGTQ.swift` missing** | **HIGH** | vmlx-side | §12.5 rows 2–3; blocks JANGTQ omni serving |
+| ~~MXFP4 omni first-forward crash (rms_norm 2688)~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED in `ae526a3`** — see §12.5 |
+| **`NemotronHJANGTQ.swift` missing** | **HIGH** | vmlx-side | §12.5 — blocks JANGTQ4 / JANGTQ2 omni serving; MXFP4 unaffected |
 | `LMInput` has no audio field | medium | vmlx-side | this doc §3.2; unblock once osaurus signals demand |
 | `MediaSalt` skips audio | medium | vmlx-side | this doc §3.3; trivial fix once §3.2 lands |
 | BatchEngine prefill uses tokens, not inputsEmbeds | medium | vmlx-side | this doc §10.1; affects ALL VLMs not just omni |
