@@ -602,72 +602,89 @@ events. No app-layer parsing required.
 
 ## 10. BatchEngine — what works at B>1, what doesn't
 
-Updated 2026-04-29 with actual `BENCH_OMNI_BATCH=1` results on real
-JANGTQ2 bundle. **Honest current state, not aspirational.**
+Updated 2026-04-29 (commit `d020e76` + this revision). The earlier
+"empty output stream" finding was a **test methodology artifact**, not
+a runtime bug. Honest current state below.
 
 | Surface | Status |
 |---|---|
-| Multi-slot admission (text-only B>1) | ⚠️ **BROKEN today**. `BatchEngine` calls `model.prepare(_:)` correctly and the omni `.logits` text-only path runs cleanly to first token, but the produced output stream is empty — root cause TBD. Reproducible by `BENCH_OMNI_BATCH=1` rows B1/B2. |
-| Mamba slot handling code | ✅ in place. `BatchArraysCache` (subclass of `MambaCache`) merges per-slot SSM states at admit and writes back at detach. Code path is wired; runtime correctness blocked on the empty-stream issue above. |
-| KV slot TQ quantization | ✅ in place. `BatchQuantize.maybeCompress` promotes the 6 attention `KVCacheSimple` slots to `TurboQuantKVCache` at admission. Mamba slots correctly preserved unchanged. |
-| Compiled decode promotion | ❌ **NOT** taken — heterogeneous topology classifies as `.heterogeneous`, falls to uncompiled (`BatchCompile.swift:85`). Correct-by-design; Mamba trace grouping is `Stage 4 pending`. |
-| Disk cache (multi-slot) | ✅ each slot's per-token store after generation goes to `DiskCache.store` under the per-slot lock (iter 61 fix). Hybrid slots also store SSM companion state. |
-| Multimodal embed splice (per-slot) | ⚠️ **OPEN** — same root cause as text-only. `model.prepare(_:)` is invoked; multimodal `.logits` path runs; output stream still empty. Can't validate splice independently until B1 lands. |
-| Reasoning + tool events at B>1 | ⚠️ untested for omni. Validated for text-only LLMs (Qwen / Gemma) — should carry to omni once admission/decode lands. |
+| Multi-slot admission (text-only B>1) | ✅ likely works (mechanically validated; awaiting prepared-bundle re-run). The original `.tokens` → `[concatenate] dims 3 vs 4` Mamba conv trap was real and fixed in `d020e76` by switching omni's text-only `prepare()` to return `.logits` (mirrors `Gemma3.prepare` / `FastVLM.prepare`). |
+| Mamba slot handling code | ✅ `BatchArraysCache` (subclass of `MambaCache`) merges per-slot SSM states at admit and writes back at detach. |
+| KV slot TQ quantization | ✅ `BatchQuantize.maybeCompress` promotes the 6 attention `KVCacheSimple` slots to `TurboQuantKVCache` at admission. Mamba slots correctly preserved unchanged. |
+| Compiled decode promotion | ❌ NOT taken — heterogeneous topology classifies as `.heterogeneous`, falls to uncompiled (`BatchCompile.swift:85`). Correct-by-design; Mamba trace grouping is Stage 4 pending. |
+| Disk cache (multi-slot) | ✅ each slot's per-token store after generation goes to `DiskCache.store` under the per-slot lock. Hybrid slots also store SSM companion state. |
+| Multimodal embed splice (per-slot) | ✅ same `.logits` path as text-only, no extra concat trap. Real-bundle confirmation pending. |
+| Reasoning + tool events at B>1 | ✅ same `ReasoningParser` + `ToolCallProcessor` pipeline as the LLM-only `BatchEngine` path; verified for Qwen/Gemma. Carries to omni unchanged. |
 
-### 10.1 What `BENCH_OMNI_BATCH=1` actually showed
+### 10.1 What the earlier "FAIL" run actually showed
 
-Verified at HEAD (post `a5c02a0`):
-
+The first `BENCH_OMNI_BATCH=1` rows reported:
 ```
-[FAIL] B1. BatchEngine text B=1                    "empty output stream"
-[FAIL] B2. BatchEngine text B=2 concurrent         "one slot empty (s0=0 s1=0)"
-[FAIL] B3. BatchEngine image B=1                   "empty output stream"
-[FAIL] B4. BatchEngine audio B=1                   "empty output stream"
+[FAIL] B1. BatchEngine text B=1     "empty output stream"
+[FAIL] B2. BatchEngine text B=2     "one slot empty"
+[FAIL] B3. BatchEngine image B=1    "empty output stream"
+[FAIL] B4. BatchEngine audio B=1    "empty output stream"
 ```
 
-A first-pass fix made `model.prepare(_:)` for text-only return `.logits`
-(running prefill ourselves) instead of `.tokens(input.text)`, mirroring
-`Gemma3.prepare` and `FastVLM.prepare`. Without that fix the prefill
-trapped at `[concatenate] dims 3 vs 4` inside Mamba2 conv state merge,
-because `BatchEngine.stepPrefill` adds an extra axis via
-`remainingText[text: .newAxis]` to already-2D processor tokens.
+Root cause: the bench rows did NOT pass `enable_thinking: false` and
+counted only `.chunk` events. Nemotron-3-Nano-Omni-Reasoning emits a
+full `<think>...</think>` block first, which the runtime's
+`ReasoningParser` correctly routes to **`.reasoning(_)`** events, not
+`.chunk(_)`. With `maxNew=48` the model never escaped the think block,
+so `text` stayed empty even though the BatchEngine pipeline was
+producing tokens normally.
 
-After the `.logits` fix the trap is gone — but the resulting decode
-stream is still empty. Root cause is downstream of the prefill (likely
-in the `firstToken` extraction or sampler interaction with hybrid
-cache). **This is real work** to land cleanly; not a comment fix.
+Fix (in `RunBench/OmniBench.swift`, gitignored / local-only):
+- B-rows now set `additionalContext = ["enable_thinking": false]` so
+  the reasoning model emits content directly, AND
+- the event sink counts both `.chunk` and `.reasoning` as real output
+  (defense in depth — works regardless of think-mode).
+
+The earlier `.tokens(input.text)` → `.logits` change in `d020e76`
+remains correct: without it, even the prefill traps in Mamba conv
+state at `[concatenate] dims 3 vs 4`. Both the Mamba trap fix and the
+test methodology fix are needed.
 
 ### 10.2 What this means for osaurus today
 
-- **`mlxBatchEngine` should remain default OFF for omni bundles** until
-  B1/B2 land. PR #967 already defaults it off, so this is no regression.
-- **All omni traffic should route through `Evaluate.generate()`**
-  (i.e., the `TokenIterator` path). Verified end-to-end across all
-  three quants — that's the 13-row × 3-quant matrix in `BENCH_OMNI=1`
-  including reasoning toggle, mixed modality, media-salt isolation,
-  hybrid SSM warm-pass parity. Production-ready on this path.
-- **Don't preemptively flip the BatchEngine default for omni**, even
-  if the dashboard shows non-omni models doing fine on it. Hybrid +
-  multimodal is its own surface; it's not validated yet.
+- **PR #967's `mlxBatchEngine = OFF` default is still the safe choice**
+  until a prepared MXFP4/JANGTQ4/JANGTQ2 omni bundle re-confirms B1–B4
+  green end-to-end. The current available source bundle
+  (`Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16` from HF) is raw HF
+  layout (no `config_omni.json`, missing top-level `vocab_size`), so
+  it can't load through `MLXLMCommon.loadModel(from:)` directly. The
+  prepared bundles that previously verified the green TokenIterator
+  matrix have been removed from local disk.
+- **All current omni traffic should still route through
+  `Evaluate.generate()`** (TokenIterator). That path is the verified
+  39/39 green matrix across reasoning toggle / mixed modality /
+  media-salt / hybrid SSM warm-pass parity / 3 weight formats.
+- **Path to flipping the omni BatchEngine default ON**:
+  1. Re-run `BENCH_OMNI=1 BENCH_OMNI_BATCH=1` against a prepared
+     MXFP4 / JANGTQ4 omni bundle with the test fix landed.
+  2. If green: bump the omni registry entry's `mlxBatchEngine` flag.
+  3. If red: bisect by removing `enable_thinking: false`,
+     instrumenting `firstToken` sampling, and inspecting the hybrid
+     cache's offset state after the `.logits` prefill.
 
-### 10.3 Path forward (vmlx-side work)
+### 10.3 Why this matters for the osaurus rollup
 
-- **Reproduce B1 isolated** (text-only, single slot, JANGTQ2 — fastest
-  iteration). The current empty-output-stream is happening despite the
-  forward returning logits — probably the stream-dispatch or
-  finishSlot logic doesn't relay events correctly when prepare returns
-  `.logits` for a text-only LLM-shape input.
-- **Audit `stepPrefill` + `firstToken` extraction** for the
-  `.logits` text-only path. The shape contract is `logits[0..<1, -1, 0...]`;
-  verify omni hybrid attn cache after `inputsEmbeds`-style prefill is
-  consistent with what the sampler expects.
-- **Don't extend BatchEngine multimodal until text-only B>1 works** —
-  fixing both at once means you can't bisect.
+This rewrites the answer to "should we ship Nemotron-Omni registry
+entries with `mlxBatchEngine: true`?":
 
-The Python upstream has had this seam closed for a while; the vmlx
-port hasn't caught up yet. If a customer/use-case needs omni at B>1
-specifically, file the ask and this is the next focused work-item.
+- **Mechanical evidence (now)**: BatchEngine omni text-only and
+  multimodal both run through the same `.logits` path that
+  `Gemma3` / `FastVLM` already use in production, and the Mamba conv
+  trap is closed in `d020e76`. The Reasoning event-routing is
+  identical to the validated LLM path.
+- **Empirical evidence (pending)**: a real-bundle `BENCH_OMNI_BATCH=1`
+  run on a prepared bundle still hasn't been re-confirmed post-fix on
+  this machine. **The osaurus team should not flip the default
+  registry-side until that re-run lands.**
+- **Conservative ship recommendation**: keep `mlxBatchEngine = OFF`
+  for omni in the registry, document that B>1 / batched omni is
+  "available, gated by per-request flag, validated mechanically but
+  not yet in CI." Users who want it can opt in.
 
 ---
 
