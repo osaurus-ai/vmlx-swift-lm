@@ -48,6 +48,19 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
     public let videoContextTokenId: Int
     public let soundContextTokenId: Int
 
+    /// Non-nil when the bundle is JANGTQ-quantized — opts the LLM
+    /// backbone's routed-expert switch_mlp into TurboQuantSwitchLinear
+    /// instead of the affine SwitchLinear. Resolved at decode time
+    /// from `weight_format` + `mxtq_bits` injected into config.json by
+    /// the factory layer (see `VLMModelFactory._load` jang merge).
+    public let jangtqContext: NemotronHJANGTQContext?
+
+    enum JANGTQCodingKeys: String, CodingKey {
+        case weightFormat = "weight_format"
+        case mxtqBits = "mxtq_bits"
+        case mxtqSeed = "mxtq_seed"
+    }
+
     public init(from decoder: Decoder) throws {
         // The bundle's config.json is the LLM config directly. Decode it as
         // NemotronHConfiguration; multimodal dims are fixed defaults.
@@ -77,6 +90,20 @@ public struct NemotronHOmniConfiguration: Codable, Sendable {
         self.imageContextTokenId = 18
         self.videoContextTokenId = 131_081
         self.soundContextTokenId = 27
+
+        // Detect JANGTQ from the merged config.json (the factory layer
+        // injects `weight_format` + `mxtq_bits` from `jang_config.json`
+        // into the config.json data before decode — see
+        // `VLMModelFactory._load`'s JANG merge).
+        let c = try? decoder.container(keyedBy: JANGTQCodingKeys.self)
+        let weightFormat = (try? c?.decodeIfPresent(String.self, forKey: .weightFormat)) ?? nil
+        if weightFormat == "mxtq" {
+            let bits = (try? c?.decodeIfPresent(Int.self, forKey: .mxtqBits)) ?? 2
+            let seed = (try? c?.decodeIfPresent(Int.self, forKey: .mxtqSeed)) ?? 42
+            self.jangtqContext = NemotronHJANGTQContext(bits: bits ?? 2, mxtqSeed: seed ?? 42)
+        } else {
+            self.jangtqContext = nil
+        }
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -110,7 +137,12 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
     public init(_ config: NemotronHOmniConfiguration) {
         self.config = config
 
-        self._languageModel.wrappedValue = NemotronHModel(config.llmConfig)
+        if let jangtq = config.jangtqContext {
+            self._languageModel.wrappedValue = NemotronHModel(
+                jangtqContext: jangtq, configuration: config.llmConfig)
+        } else {
+            self._languageModel.wrappedValue = NemotronHModel(config.llmConfig)
+        }
         self._radioModel.wrappedValue = NemotronHRADIOVisionModel(
             embedDim: config.vitHiddenSize,
             numBlocks: config.visionNumBlocks,

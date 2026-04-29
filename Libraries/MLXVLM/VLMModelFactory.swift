@@ -359,10 +359,57 @@ public final class VLMModelFactory: ModelFactory {
             dispatchModelType = "NemotronH_Nano_Omni_Reasoning_V3"
         }
 
+        // 2026-04-29: merge jang_config.json fields into the config.json
+        // dictionary BEFORE decoding so omni `NemotronHOmniConfiguration`
+        // sees `weight_format` + `mxtq_bits` + `mxtq_seed` and can opt
+        // its inner `NemotronHModel` into the JANGTQ codebook MoE path.
+        // Mirrors what `LLMModelFactory` does for non-omni JANGTQ
+        // bundles (Cascade-2 / DSV3 / Qwen3.5 MoE). Idempotent: bundles
+        // without `jang_config.json` skip this entirely.
+        var mergedConfigData = configData
+        let jangConfigURL = modelDirectory.appending(component: "jang_config.json")
+        if FileManager.default.fileExists(atPath: jangConfigURL.path),
+            let jangData = try? Data(contentsOf: jangConfigURL),
+            let jangJSON = try? JSONSerialization.jsonObject(with: jangData)
+                as? [String: Any],
+            var configDict = try? JSONSerialization.jsonObject(with: configData)
+                as? [String: Any]
+        {
+            // weight_format lives at top-level in jang_config.json
+            if let wf = jangJSON["weight_format"] as? String {
+                configDict["weight_format"] = wf
+            }
+            // mxtq_bits comes from the converter's bit_widths_used list
+            // (lowest bit width) or an explicit `mxtq_bits` key if present.
+            if let qDict = jangJSON["quantization"] as? [String: Any] {
+                if configDict["mxtq_bits"] == nil,
+                    let bits = qDict["bit_widths_used"] as? [Int],
+                    let minBits = bits.min()
+                {
+                    configDict["mxtq_bits"] = minBits
+                }
+                // Profile fallback: JANGTQ4 → 4 bits, JANGTQ2 → 2 bits.
+                if configDict["mxtq_bits"] == nil,
+                    let profile = qDict["profile"] as? String
+                {
+                    if profile.contains("4") { configDict["mxtq_bits"] = 4 }
+                    else if profile.contains("2") { configDict["mxtq_bits"] = 2 }
+                }
+                if configDict["mxtq_seed"] == nil,
+                    let seed = qDict["mxtq_seed"] as? Int
+                {
+                    configDict["mxtq_seed"] = seed
+                }
+            }
+            if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
+                mergedConfigData = merged
+            }
+        }
+
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: configData, modelType: dispatchModelType)
+                configuration: mergedConfigData, modelType: dispatchModelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)

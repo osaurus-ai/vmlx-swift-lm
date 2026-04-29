@@ -646,9 +646,9 @@ quant-inference fix in `ae526a3`.
 
 | Bundle | Load | E2E multi-turn | Notes |
 |---|---|---|---|
-| `Nemotron-3-Nano-Omni-30B-A3B-MXFP4` (21 GB) | ✅ 1.1 s | ✅ **7/7 PASS** | text single + multi-turn cache reuse, image single + multi-turn (MediaSalt), video encoder smoke (T=2 channel-stack), audio encoder smoke (Parakeet + sound_projection), reasoning OFF parity. Decode 79–121 tok/s @ B=1 / M3 Max. **Production-ready.** |
-| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ4` (19 GB) | ❌ | n/a | needs `NemotronHJANGTQ.swift` — see below |
-| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ2` (12 GB) | ❌ | n/a | needs `NemotronHJANGTQ.swift` — see below |
+| `Nemotron-3-Nano-Omni-30B-A3B-MXFP4` (21 GB) | ✅ 1.1 s | ✅ **7/7 PASS** | text 79–121 tok/s, image 51–91 tok/s, all rows green. **Production-ready.** |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ4` (19 GB) | ✅ 3.1 s | ✅ **7/7 PASS** | TurboQuant codebook kernels @ bits=4. Text 88–101 tok/s, image 77–79 tok/s. **Production-ready.** |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ2` (12 GB) | ✅ 0.8 s | ✅ **7/7 PASS** | TurboQuant codebook kernels @ bits=2. Text 102–107 tok/s, image 82–83 tok/s. Smallest, fastest. **Production-ready.** |
 
 ### What `ae526a3` fixed
 
@@ -682,39 +682,55 @@ Affected bundles: anything with a JANG-converted `bit_widths_used:
 MXFP4). Unaffected: JANG_2L bundles whose prior gs matches every
 layer (Cascade-2 JANG_2L unchanged at 125 tok/s).
 
-### Still open: NemotronHJANGTQ wrapper for omni JANGTQ2 / JANGTQ4
+### What `<later commit>` fixed for JANGTQ
 
-JANGTQ omni still fails at `unhandledKeys: experts`. Bundle ships
-per-expert TurboQuant tensors:
+`NemotronHJANGTQ.swift` (new file, ~135 LOC) + minimal NemotronH.swift
+edits closed `unhandledKeys: experts` and the downstream all-NaN
+forward. Three pieces:
 
+1. **NemotronHJANGTQContext** struct propagates `bits` + `mxtq_seed`
+   through `NemotronHModel.init(jangtqContext:configuration:)` →
+   `NemotronHBackbone` → `NemotronHBlock` → `NemotronHMoE`. When
+   non-nil, the MoE constructor swaps in `NemotronHJANGTQSwitchMLP`
+   with `TurboQuantSwitchLinear` fc1/fc2 instead of the affine
+   `SwitchLinear`. Other layer kinds (Mamba, Attention, MLP) are
+   unaffected.
+2. **`NemotronHModel.sanitize`** detects per-expert
+   `experts.{e}.{up,down}_proj.tq_packed` keys and stacks them into
+   `switch_mlp.{fc1,fc2}.tq_packed` / `.tq_norms` (mirrors
+   Python `jang_tools.load_jangtq` § "MoE stacking" `nemo_pat`).
+   Also strips `.tq_bits` metadata. Idempotent for affine bundles.
+3. **`NemotronHJANGTQSwitchMLP`** chains two `TurboQuantSwitchLinear`
+   instances with ReLU² in between. Bypasses
+   `TurboQuantSwitchLinear.callAsFunction(_:_:)` (whose K-broadcast
+   is broken for affine-shape input — passes `nRows = batch * K` to a
+   per-row gather kernel that only has `batch` rows of input) and
+   calls `JANGTQKernels.hadamardRotate` + `JANGTQKernels.gatherTQ`
+   directly. Input expanded to per-(token, expert) rows up-front
+   so the gather kernel's per-row dispatch matches.
+
+**VLMModelFactory dispatch**: omni JANGTQ bundles trigger via the
+existing `config_omni.json` detection. The factory layer also merges
+`weight_format` + `mxtq_bits` from `jang_config.json` into the
+config-data dict before decoding, so `NemotronHOmniConfiguration`
+sees them and wires `NemotronHJANGTQContext` automatically.
+
+Reproduce locally (each bundle, B=1, M3 Max):
+```bash
+for variant in MXFP4 JANGTQ4 JANGTQ2; do
+  BENCH_OMNI=1 \
+    BENCH_MODEL=~/.mlxstudio/models/JANGQ-AI/Nemotron-3-Nano-Omni-30B-A3B-$variant \
+    BENCH_MAX_TOKENS=24 \
+    swift run -c release RunBench
+done
+# Expected: all three print "7 passed, 0 failed"
 ```
-backbone.layers.{l}.mixer.experts.{e}.{up,down}_proj.{tq_packed,
-                                                      tq_norms,
-                                                      tq_bits}
-```
-
-`NemotronHModel.sanitize` only stacks `experts.{e}.{up,down}_proj.weight`
-(plain affine), so the TQ tensors propagate through and the model
-rejects with `unhandledKeys: experts`.
-
-Fix path: write `NemotronHJANGTQ.swift` mirroring the
-`DeepseekV3JANGTQ.swift` pattern — ~300 LOC subclass that:
-- Stacks per-expert TQ tensors into
-  `switch_mlp.{fc1,fc2}.{tq_packed, tq_norms, tq_bits}`
-- Substitutes `TurboQuantSwitchLinear` for the MoE routed-expert
-  switch under `backbone.layers.{l}.mixer.switch_mlp`
-- Wires JANGTQ runtime cache (signs / codebook) for the routed
-  experts at first forward
-
-Tracked in §13 below as a HIGH-severity gap. Until it lands, JANGTQ
-omni doesn't load; MXFP4 omni serves as the production path.
 
 ### Osaurus posture (revised, 2026-04-28)
 
-- **Ship MXFP4 omni now.** All seven bench rows pass on real bundle.
-  The factory + processor + cache + reasoning + tool plumbing are
-  validated. No known gaps for MXFP4.
-- **Don't ship JANGTQ omni yet** — wait for `NemotronHJANGTQ.swift`.
+- **Ship MXFP4 + JANGTQ4 + JANGTQ2 omni** — all three pass 7/7 on
+  real bundles. Smallest+fastest is JANGTQ2 (12 GB, 102 tok/s). Highest
+  precision is MXFP4 (21 GB).
 - **All non-omni paths unaffected** by either change. Cascade-2 JANG_2L
   + JANG_4M text-only also benefit from the `ae526a3` fix.
 
@@ -734,8 +750,8 @@ BENCH_OMNI=1 \
 
 | Gap | Severity | Owner | Tracking |
 |---|---|---|---|
-| ~~MXFP4 omni first-forward crash (rms_norm 2688)~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED in `ae526a3`** — see §12.5 |
-| **`NemotronHJANGTQ.swift` missing** | **HIGH** | vmlx-side | §12.5 — blocks JANGTQ4 / JANGTQ2 omni serving; MXFP4 unaffected |
+| ~~MXFP4 omni first-forward crash (rms_norm 2688)~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED in `ae526a3`** |
+| ~~`NemotronHJANGTQ.swift` missing~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED — JANGTQ4 + JANGTQ2 both 7/7 PASS** |
 | `LMInput` has no audio field | medium | vmlx-side | this doc §3.2; unblock once osaurus signals demand |
 | `MediaSalt` skips audio | medium | vmlx-side | this doc §3.3; trivial fix once §3.2 lands |
 | BatchEngine prefill uses tokens, not inputsEmbeds | medium | vmlx-side | this doc §10.1; affects ALL VLMs not just omni |

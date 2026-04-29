@@ -9,9 +9,25 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - JANGTQ context
+
+/// Propagated through ``NemotronHBackbone`` / ``NemotronHBlock`` /
+/// ``NemotronHMoE`` to opt the routed-expert MoE projections into the
+/// JANGTQ codebook kernels (``TurboQuantSwitchLinear``) instead of the
+/// affine ``SwitchLinear``. Set non-nil at ``NemotronHModel`` init for
+/// JANGTQ bundles (Cascade-2 JANG_2L variants, Nemotron-Omni JANGTQ4 / JANGTQ2).
+public struct NemotronHJANGTQContext: Sendable {
+    public let bits: Int
+    public let mxtqSeed: Int
+    public init(bits: Int = 2, mxtqSeed: Int = 42) {
+        self.bits = bits
+        self.mxtqSeed = mxtqSeed
+    }
+}
+
 // MARK: - Block Type
 
-private enum NemotronHBlockType {
+internal enum NemotronHBlockType {
     case mamba  // "M"
     case attention  // "*"
     case mlp  // "-"
@@ -31,7 +47,7 @@ private enum NemotronHBlockType {
 // MARK: - Mixer Protocol
 
 /// Protocol for all mixer types in NemotronH blocks
-private protocol NemotronHMixer: Module {
+internal protocol NemotronHMixer: Module {
     func callAsFunction(
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -40,17 +56,25 @@ private protocol NemotronHMixer: Module {
     ) -> MLXArray
 }
 
+/// Type-erased switch-MLP forward used by both ``NemotronHSwitchMLP``
+/// (affine `SwitchLinear`) and ``NemotronHJANGTQSwitchMLP``
+/// (TurboQuant codebook). Lets ``NemotronHMoE`` hold its switch_mlp
+/// as a generic `Module` and dispatch via this protocol at forward time.
+internal protocol NemotronHSwitchMLPLayer: Module {
+    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+}
+
 // MARK: - Activations
 
 /// Squared ReLU activation: relu(x)^2
-private func relu2(_ x: MLXArray) -> MLXArray {
+internal func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
     return y * y
 }
 
 // MARK: - MambaRMSNormGated
 
-private class NemotronHRMSNormGated: Module {
+internal class NemotronHRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
     let groupSize: Int
@@ -90,7 +114,7 @@ private class NemotronHRMSNormGated: Module {
 
 // MARK: - Mamba2Mixer
 
-private class NemotronHMamba2Mixer: Module, NemotronHMixer {
+internal class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
     let ssmStateSize: Int
@@ -250,7 +274,7 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
 // MARK: - Attention
 
-private class NemotronHAttention: Module, NemotronHMixer {
+internal class NemotronHAttention: Module, NemotronHMixer {
     let args: NemotronHConfiguration
     let scale: Float
     let numHeads: Int
@@ -325,7 +349,7 @@ private class NemotronHAttention: Module, NemotronHMixer {
 
 // MARK: - MLP
 
-private class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
+internal class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
@@ -353,7 +377,7 @@ private class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - MoE Gate
 
-private func groupExpertSelect(
+internal func groupExpertSelect(
     gates: MLXArray,
     eSCB: MLXArray,  // e_score_correction_bias
     topK: Int,
@@ -408,7 +432,7 @@ private func groupExpertSelect(
     return (inds, finalScores)
 }
 
-private class NemotronHMoEGate: Module {
+internal class NemotronHMoEGate: Module {
     let topK: Int
     let nGroup: Int
     let topkGroup: Int
@@ -447,7 +471,7 @@ private class NemotronHMoEGate: Module {
 
 // MARK: - SwitchMLP for NemotronH (uses relu2 instead of silu/glu)
 
-private class NemotronHSwitchMLP: Module {
+internal class NemotronHSwitchMLP: Module, NemotronHSwitchMLPLayer {
     @ModuleInfo(key: "fc1") var fc1: SwitchLinear
     @ModuleInfo(key: "fc2") var fc2: SwitchLinear
 
@@ -494,24 +518,38 @@ private class NemotronHSwitchMLP: Module {
 
 // MARK: - MoE
 
-private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
+internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     let numExpertsPerTok: Int
     let hasSharedExperts: Bool
 
     @ModuleInfo(key: "gate") var gate: NemotronHMoEGate
-    @ModuleInfo(key: "switch_mlp") var switchMLP: NemotronHSwitchMLP
+    /// `switch_mlp` is type-erased so that JANGTQ bundles can swap in
+    /// `NemotronHJANGTQSwitchMLP` (TurboQuant-backed fc1/fc2) without
+    /// duplicating the surrounding MoE plumbing. Both variants implement
+    /// `callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray`.
+    @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
-    init(_ args: NemotronHConfiguration) {
+    init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil) {
         self.numExpertsPerTok = args.numExpertsPerTok
         self.hasSharedExperts = args.nSharedExperts != nil && args.nSharedExperts! > 0
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
-        self._switchMLP.wrappedValue = NemotronHSwitchMLP(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: args.nRoutedExperts
-        )
+        if let jangtq {
+            self._switchMLP.wrappedValue = NemotronHJANGTQSwitchMLP(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.nRoutedExperts,
+                bits: jangtq.bits,
+                mxtqSeed: jangtq.mxtqSeed
+            )
+        } else {
+            self._switchMLP.wrappedValue = NemotronHSwitchMLP(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.nRoutedExperts
+            )
+        }
 
         if hasSharedExperts {
             self._sharedExperts.wrappedValue = NemotronHMLP(
@@ -525,7 +563,13 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
+        // Dispatch through the type-erased protocol — both
+        // `NemotronHSwitchMLP` (affine) and `NemotronHJANGTQSwitchMLP`
+        // (TurboQuant) implement `callAsFunction(_:_:)`.
+        guard let layer = switchMLP as? NemotronHSwitchMLPLayer else {
+            fatalError("NemotronHMoE.switch_mlp must conform to NemotronHSwitchMLPLayer (got \(type(of: switchMLP)))")
+        }
+        var y = layer(x, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
 
         if let sharedExperts {
@@ -548,7 +592,7 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - Decoder Block
 
-private class NemotronHBlock: Module {
+internal class NemotronHBlock: Module {
     let blockType: NemotronHBlockType
 
     @ModuleInfo(key: "norm") var norm: RMSNorm
@@ -557,12 +601,18 @@ private class NemotronHBlock: Module {
     // This pattern is used by Jamba for feedForward: Module
     @ModuleInfo(key: "mixer") var mixer: Module
 
-    init(_ args: NemotronHConfiguration, blockType: Character) {
+    init(
+        _ args: NemotronHConfiguration,
+        blockType: Character,
+        jangtq: NemotronHJANGTQContext? = nil
+    ) {
         self.blockType = NemotronHBlockType(from: blockType)
 
         self._norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
 
-        // Assign the appropriate concrete mixer type
+        // Assign the appropriate concrete mixer type. The MoE branch
+        // optionally swaps in JANGTQ-flavored switch projections; every
+        // other layer kind is unaffected by the quant choice.
         switch self.blockType {
         case .mamba:
             _mixer.wrappedValue = NemotronHMamba2Mixer(args)
@@ -571,7 +621,7 @@ private class NemotronHBlock: Module {
         case .mlp:
             _mixer.wrappedValue = NemotronHMLP(args)
         case .moe:
-            _mixer.wrappedValue = NemotronHMoE(args)
+            _mixer.wrappedValue = NemotronHMoE(args, jangtq: jangtq)
         }
 
         super.init()
@@ -595,7 +645,7 @@ private class NemotronHBlock: Module {
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
 
-private class NemotronHBackbone: Module {
+internal class NemotronHBackbone: Module {
     let args: NemotronHConfiguration
 
     @ModuleInfo(key: "embeddings") var embeddings: Embedding
@@ -608,7 +658,7 @@ private class NemotronHBackbone: Module {
     let firstAttentionCacheIndex: Int?
     let firstMambaCacheIndex: Int?
 
-    init(_ args: NemotronHConfiguration) {
+    init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil) {
         self.args = args
         precondition(args.vocabSize > 0)
 
@@ -616,7 +666,9 @@ private class NemotronHBackbone: Module {
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
 
         let pattern = Array(args.hybridOverridePattern)
-        self._layers.wrappedValue = pattern.map { NemotronHBlock(args, blockType: $0) }
+        self._layers.wrappedValue = pattern.map {
+            NemotronHBlock(args, blockType: $0, jangtq: jangtq)
+        }
 
         self._normF.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
 
@@ -726,8 +778,30 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             return nil
         }
 
-        self._backbone.wrappedValue = NemotronHBackbone(args)
+        self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: nil)
 
+        if !args.tieWordEmbeddings {
+            self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+        }
+    }
+
+    /// JANGTQ-flavored init — replaces routed-expert `SwitchLinear` fc1/fc2
+    /// inside every MoE layer with `TurboQuantSwitchLinear` so the codebook
+    /// kernels run instead of `gather_qmm`. Use for Cascade-2 / Nemotron-Omni
+    /// JANGTQ bundles. The factory layer detects the bundle via
+    /// `jang_config.weight_format == "mxtq"` and dispatches here.
+    public init(jangtqContext: NemotronHJANGTQContext, configuration args: NemotronHConfiguration) {
+        self.configuration = args
+        self.vocabularySize = args.vocabSize
+        let pattern = Array(args.hybridOverridePattern)
+        self.kvHeads = pattern.compactMap { char -> Int? in
+            let blockType = NemotronHBlockType(from: char)
+            if blockType == .mamba || blockType == .attention {
+                return blockType == .attention ? args.numKeyValueHeads : 0
+            }
+            return nil
+        }
+        self._backbone.wrappedValue = NemotronHBackbone(args, jangtq: jangtqContext)
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
         }
@@ -821,6 +895,49 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 }
             }
         }
+
+        // JANGTQ per-expert TurboQuant tensors:
+        //   backbone.layers.{l}.mixer.experts.{e}.{up,down}_proj.{tq_packed,tq_norms,tq_bits}
+        // → backbone.layers.{l}.mixer.switch_mlp.{fc1,fc2}.{tq_packed,tq_norms}
+        // (tq_bits is metadata — dropped)
+        // Mirrors `jang_tools.load_jangtq` § "MoE stacking" (nemo_pat).
+        // Pre-stacked variants (MLX-native conversions where converter
+        // already produced the stacked layout) skip the loop because
+        // `experts.0.up_proj.tq_packed` won't exist; the keys go through
+        // unchanged via the early loop above.
+        let tqMap: [(String, String)] = [("up_proj", "fc1"), ("down_proj", "fc2")]
+        var tqStackedCount = 0
+        for l in 0 ..< configuration.numHiddenLayers {
+            let prefix = "backbone.layers.\(l).mixer"
+            for (proj, fc) in tqMap {
+                let probe = "\(prefix).experts.0.\(proj).tq_packed"
+                guard sanitized[probe] != nil else { continue }
+                for kind in ["tq_packed", "tq_norms"] {
+                    let stacked: [MLXArray] = (0 ..< configuration.nRoutedExperts).compactMap { e in
+                        sanitized.removeValue(
+                            forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
+                    }
+                    if !stacked.isEmpty {
+                        sanitized["\(prefix).switch_mlp.\(fc).\(kind)"] = MLX.stacked(stacked)
+                        tqStackedCount += 1
+                    }
+                }
+                // Drop the per-expert tq_bits metadata.
+                for e in 0 ..< configuration.nRoutedExperts {
+                    sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(proj).tq_bits")
+                }
+            }
+        }
+        // Strip any remaining `.tq_bits` keys anywhere in the tree.
+        for key in Array(sanitized.keys) where key.hasSuffix(".tq_bits") {
+            sanitized.removeValue(forKey: key)
+        }
+
+        if tqStackedCount > 0 {
+            FileHandle.standardError.write(
+                Data("[NemotronH.sanitize] stacked \(tqStackedCount) JANGTQ tensor groups (per-expert tq_packed/tq_norms → switch_mlp.{fc1,fc2}.{tq_*})\n".utf8))
+        }
+        _ = tqStackedCount  // silence unused warning when log is gated
 
         return sanitized
     }
