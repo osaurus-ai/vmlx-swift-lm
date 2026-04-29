@@ -168,12 +168,15 @@ public struct UserInput {
                 // no action
                 break
             case .chat(let messages):
-                // rebuild images & videos
+                // rebuild images, videos, audios
                 self.images = messages.reduce(into: []) { result, message in
                     result.append(contentsOf: message.images)
                 }
                 self.videos = messages.reduce(into: []) { result, message in
                     result.append(contentsOf: message.videos)
+                }
+                self.audios = messages.reduce(into: []) { result, message in
+                    result.append(contentsOf: message.audios)
                 }
             }
         }
@@ -319,6 +322,9 @@ public struct UserInput {
         }
         self.videos = chat.reduce(into: []) { result, message in
             result.append(contentsOf: message.videos)
+        }
+        self.audios = chat.reduce(into: []) { result, message in
+            result.append(contentsOf: message.audios)
         }
 
         self.processing = processing

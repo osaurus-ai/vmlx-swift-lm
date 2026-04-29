@@ -478,15 +478,54 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         return out
     }
 
+    /// Decode video resources to the (groups, T*3, 512, 512) channel-stack
+    /// tensor that NemotronH RADIO's `video_embedder` consumes.
+    public func preprocess(videos: [UserInput.Video]) async throws -> (MLXArray, Int) {
+        // Concatenate all video pixel-tensors into a single (totalGroups,
+        // T*3, H, W) tensor and return the total post-pixel-shuffle token
+        // count for placeholder budgeting (256 tokens per group × N groups).
+        var groupTensors: [MLXArray] = []
+        var totalGroups = 0
+        for v in videos {
+            let url: URL
+            switch v {
+            case .url(let u): url = u
+            case .avAsset, .frames:
+                throw NSError(
+                    domain: "NemotronHOmniProcessor", code: -20,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "video must be .url(URL); .avAsset / .frames not yet supported"])
+            }
+            let pixels = try await nemotronOmniPreprocessVideo(
+                url: url,
+                imageSize: config.imageSize,
+                targetFrames: 32,
+                videoTemporalPatchDim: 2)
+            // pixels shape: (groups, T*3, H, W). Flatten group axis so we
+            // can stack across multiple videos.
+            groupTensors.append(pixels)
+            totalGroups += pixels.dim(0)
+        }
+        let pixelValues = groupTensors.count == 1
+            ? groupTensors[0]
+            : MLX.concatenated(groupTensors, axis: 0)
+        return (pixelValues, totalGroups)
+    }
+
     public func prepare(input: UserInput) async throws -> LMInput {
         // Build prompt with NVLM 1-D placeholders. After tile selection we
         // know N total tiles → expand 256 image tokens per tile (post pixel
         // shuffle 32×32 → 16×16). Audio takes a parallel placeholder
         // path with `<so_embedding>` tokens — one per Parakeet output
-        // frame.
+        // frame. Video uses the SAME `<image>` placeholder (per Python
+        // model.py: `img_context_token_id` is reused for video frames;
+        // the model distinguishes them only by which embedding tower
+        // produced the values).
         var processedImage: LMInput.ProcessedImage?
+        var processedVideo: LMInput.ProcessedVideo?
         var processedAudio: LMInput.ProcessedAudio?
         var totalImageTokens = 0
+        var totalVideoTokens = 0
         var totalAudioTokens = 0
         let tokensPerTile = 256
 
@@ -498,6 +537,20 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
                 frames: counts.map { THW($0, config.imageSize, config.imageSize) })
             let totalTiles = counts.reduce(0, +)
             totalImageTokens = totalTiles * tokensPerTile
+        }
+
+        if !input.videos.isEmpty {
+            let (pixels, groups) = try await preprocess(videos: input.videos)
+            processedVideo = LMInput.ProcessedVideo(
+                pixels: pixels,
+                frames: [THW(groups, config.imageSize, config.imageSize)])
+            // Each group emits 256 post-pixel-shuffle tokens, exactly the
+            // same as one image tile (32×32 → 16×16 → 256). EVS pruning
+            // happens at the embedding level inside extractImageEmbeds —
+            // we don't subtract here; the placeholder count matches the
+            // pre-pruning embed count, and the splice path tolerates
+            // them being equal.
+            totalVideoTokens = groups * tokensPerTile
         }
 
         if !input.audios.isEmpty {
@@ -548,6 +601,16 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             media += String(repeating: "<image>", count: totalImageTokens)
             media += "</img>\n"
         }
+        if totalVideoTokens > 0 {
+            // Video reuses `<image>` placeholders per Python convention
+            // (model.py § comment on img_context_token_id reuse). The
+            // model's prepare() runs the video tower and splices into
+            // the same token positions; image+video in one prompt
+            // serialize image-first then video-second by construction.
+            media += "<img>"
+            media += String(repeating: "<image>", count: totalVideoTokens)
+            media += "</img>\n"
+        }
         if totalAudioTokens > 0 {
             media += "<sound>"
             media += String(repeating: "<so_embedding>", count: totalAudioTokens)
@@ -578,6 +641,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage,
+            video: processedVideo,
             audio: processedAudio)
     }
 }

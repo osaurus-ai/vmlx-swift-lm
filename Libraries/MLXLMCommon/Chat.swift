@@ -14,6 +14,14 @@ public enum Chat {
         /// Array of video data associated with the message.
         public var videos: [UserInput.Video]
 
+        /// Array of audio data associated with the message. Used by
+        /// speech-aware models (Nemotron-3-Nano-Omni Parakeet path).
+        /// Stays empty for text/image-only models. The osaurus
+        /// `MessageContentPart.audioInput` → `mapOpenAIChatToMLX`
+        /// path populates this field; downstream
+        /// ``UserInput.init(chat:)`` copies it into ``UserInput/audios``.
+        public var audios: [UserInput.Audio]
+
         /// Structured tool calls issued by this message (assistant role
         /// only). `nil` on messages that did not issue tool calls.
         ///
@@ -48,6 +56,7 @@ public enum Chat {
         public init(
             role: Role, content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
+            audios: [UserInput.Audio] = [],
             toolCalls: [ToolCall]? = nil,
             toolCallId: String? = nil
         ) {
@@ -55,21 +64,26 @@ public enum Chat {
             self.content = content
             self.images = images
             self.videos = videos
+            self.audios = audios
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
         }
 
         public static func system(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String, images: [UserInput.Image] = [],
+            videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .system, content: content, images: images, videos: videos)
+            Self(role: .system, content: content,
+                 images: images, videos: videos, audios: audios)
         }
 
         /// Build an assistant message with plain text content.
         public static func assistant(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String, images: [UserInput.Image] = [],
+            videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .assistant, content: content, images: images, videos: videos)
+            Self(role: .assistant, content: content,
+                 images: images, videos: videos, audios: audios)
         }
 
         /// Build an assistant message that issued one or more tool
@@ -80,19 +94,22 @@ public enum Chat {
             _ content: String,
             toolCalls: [ToolCall],
             images: [UserInput.Image] = [],
-            videos: [UserInput.Video] = []
+            videos: [UserInput.Video] = [],
+            audios: [UserInput.Audio] = []
         ) -> Self {
             Self(
                 role: .assistant, content: content,
-                images: images, videos: videos,
+                images: images, videos: videos, audios: audios,
                 toolCalls: toolCalls
             )
         }
 
         public static func user(
-            _ content: String, images: [UserInput.Image] = [], videos: [UserInput.Video] = []
+            _ content: String, images: [UserInput.Image] = [],
+            videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .user, content: content, images: images, videos: videos)
+            Self(role: .user, content: content,
+                 images: images, videos: videos, audios: audios)
         }
 
         /// Build a tool-role message carrying the result of a tool call.
