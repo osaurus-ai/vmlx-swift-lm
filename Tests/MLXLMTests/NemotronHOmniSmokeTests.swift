@@ -119,10 +119,11 @@ final class NemotronHOmniSmokeTests: XCTestCase {
             "irrelevant.weight": MLXArray.zeros([1]),
         ]
         let out = remapMlp1Weights(raw)
-        XCTAssertEqual(out["vision_mlp.layer_norm.weight"]?.shape, [5120])
-        XCTAssertEqual(out["vision_mlp.layer_norm.bias"]?.shape, [5120])
-        XCTAssertEqual(out["vision_mlp.fc1.weight"]?.shape, [20_480, 5120])
-        XCTAssertEqual(out["vision_mlp.fc2.weight"]?.shape, [2688, 20_480])
+        // remap returns unprefixed keys — wrapper sanitize prefixes with mlp1.
+        XCTAssertEqual(out["layer_norm.weight"]?.shape, [5120])
+        XCTAssertEqual(out["layer_norm.bias"]?.shape, [5120])
+        XCTAssertEqual(out["fc1.weight"]?.shape, [20_480, 5120])
+        XCTAssertEqual(out["fc2.weight"]?.shape, [2688, 20_480])
         XCTAssertNil(out["irrelevant.weight"])
     }
 
@@ -135,33 +136,32 @@ final class NemotronHOmniSmokeTests: XCTestCase {
             "skip.me": MLXArray.zeros([1]),
         ]
         let out = remapSoundProjectionWeights(raw)
-        XCTAssertEqual(out["sound_projection.norm.weight"]?.shape, [1024])
-        XCTAssertEqual(out["sound_projection.linear1.weight"]?.shape, [4096, 1024])
-        XCTAssertEqual(out["sound_projection.linear2.weight"]?.shape, [2688, 4096])
+        // remap returns unprefixed keys — wrapper sanitize prefixes with sound_projection.
+        XCTAssertEqual(out["norm.weight"]?.shape, [1024])
+        XCTAssertEqual(out["linear1.weight"]?.shape, [4096, 1024])
+        XCTAssertEqual(out["linear2.weight"]?.shape, [2688, 4096])
         XCTAssertNil(out["skip.me"])
     }
 
     func testParakeetSubsamplingConv2dTranspose() throws {
         // Source PyTorch shape (256, 1, 3, 3) should map to MLX channels-last
-        // (256, 3, 3, 1).
+        // (256, 3, 3, 1). remap returns unprefixed keys.
         let raw: [String: MLXArray] = [
             "sound_encoder.encoder.subsampling.layers.0.weight": MLXArray.zeros([256, 1, 3, 3]),
             "sound_encoder.encoder.subsampling.layers.0.bias": MLXArray.zeros([256]),
         ]
         let out = remapParakeetWeights(raw)
-        XCTAssertEqual(
-            out["sound_encoder.subsampling.layers_0.weight"]?.shape, [256, 3, 3, 1])
+        XCTAssertEqual(out["subsampling.layers_0.weight"]?.shape, [256, 3, 3, 1])
     }
 
     func testParakeetPointwiseConv1dTranspose() throws {
-        // Source (2048, 1024, 1) → MLX (2048, 1, 1024)
+        // Source (2048, 1024, 1) → MLX (2048, 1, 1024). remap unprefixed.
         let raw: [String: MLXArray] = [
             "sound_encoder.encoder.layers.0.conv.pointwise_conv1.weight":
                 MLXArray.zeros([2048, 1024, 1])
         ]
         let out = remapParakeetWeights(raw)
-        XCTAssertEqual(
-            out["sound_encoder.layers.0.conv.pointwise_conv1.weight"]?.shape,
+        XCTAssertEqual(out["layers.0.conv.pointwise_conv1.weight"]?.shape,
             [2048, 1, 1024])
     }
 }

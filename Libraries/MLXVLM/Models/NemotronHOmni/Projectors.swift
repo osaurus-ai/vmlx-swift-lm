@@ -65,15 +65,16 @@ public class NemotronHSoundProjector: Module, UnaryLayer {
     }
 }
 
-/// Maps on-disk `mlp1.{0,1,3}.*` keys to module attribute names.
+/// Maps on-disk `mlp1.{0,1,3}.*` keys to NemotronHVisionMLPProjector
+/// attribute names (single-segment, no leading prefix).
 public func remapMlp1Weights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     let rename: [String: String] = [
-        "mlp1.0.weight": "vision_mlp.layer_norm.weight",
-        "mlp1.0.bias": "vision_mlp.layer_norm.bias",
-        "mlp1.1.weight": "vision_mlp.fc1.weight",
-        "mlp1.1.bias": "vision_mlp.fc1.bias",
-        "mlp1.3.weight": "vision_mlp.fc2.weight",
-        "mlp1.3.bias": "vision_mlp.fc2.bias",
+        "mlp1.0.weight": "layer_norm.weight",
+        "mlp1.0.bias": "layer_norm.bias",
+        "mlp1.1.weight": "fc1.weight",
+        "mlp1.1.bias": "fc1.bias",
+        "mlp1.3.weight": "fc2.weight",
+        "mlp1.3.bias": "fc2.bias",
     ]
     var out = [String: MLXArray]()
     for (oldKey, v) in weights {
@@ -84,13 +85,14 @@ public func remapMlp1Weights(_ weights: [String: MLXArray]) -> [String: MLXArray
     return out
 }
 
-/// Maps on-disk `sound_projection.*` keys to module attribute names.
+/// Maps on-disk `sound_projection.*` keys to NemotronHSoundProjector
+/// attribute names (single-segment, no leading prefix).
 public func remapSoundProjectionWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     var out = [String: MLXArray]()
     for (oldKey, v) in weights {
         guard oldKey.hasPrefix("sound_projection.") else { continue }
         let suffix = String(oldKey.dropFirst("sound_projection.".count))
-        out["sound_projection.\(suffix)"] = v
+        out[suffix] = v
     }
     return out
 }

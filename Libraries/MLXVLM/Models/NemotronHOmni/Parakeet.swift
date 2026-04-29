@@ -397,7 +397,7 @@ public func remapParakeetWeights(_ weights: [String: MLXArray]) -> [String: MLXA
             v = v.transposed(0, 2, 1)
         }
 
-        out["sound_encoder.\(suffix)"] = v
+        out[suffix] = v
     }
     return out
 }

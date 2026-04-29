@@ -639,10 +639,63 @@ Use this as a PR checklist when wiring omni support into the osaurus runtime:
 
 ---
 
+## 12.5 Real-bundle state — what actually loads + runs (2026-04-28 bench results)
+
+`BENCH_OMNI=1` against the three local bundles surfaced two real bugs that
+override the optimistic claims made earlier in this doc. **Trust this
+section over §7 when there's a conflict.**
+
+| Bundle | Loads? | First forward? | Bug |
+|---|---|---|---|
+| `Nemotron-3-Nano-Omni-30B-A3B-MXFP4` (21 GB) | **YES** (3.2 s) | **NO** | crashes on row 1 (text-only single-turn) at `[rms_norm] (*weight) must have the same size as the last dimension of x but has 2688 elements`. Most likely cause: the JANG per-layer-quantization overrides (`backbone.layers.X.mixer.switch_mlp.fc1`) don't match the wrapper's `language_model.backbone.…` paths, so quantized experts are loaded as plain Linear with mismatched shapes. Fix: prefix-aware override application in `loadWeights`, or unwrap-then-rewrap of the LLM in the omni constructor. |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ4` (19 GB) | **NO** | n/a | Same as JANGTQ2 — see below. |
+| `Nemotron-3-Nano-Omni-30B-A3B-JANGTQ2` (12 GB) | **NO** | n/a | `unhandledKeys: experts` at every E (MoE) layer. Bundle ships per-expert `experts.{e}.{up,down}_proj.{tq_packed, tq_norms, tq_bits}` keys — `NemotronHModel.sanitize` only stacks `experts.{e}.{up,down}_proj.weight` (plain affine), so the TQ-packed expert tensors propagate through unchanged and the model rejects them. Fix: write `NemotronHJANGTQ.swift` (mirror `DeepseekV3JANGTQ.swift` pattern — ~300 LOC) that stacks TQ tensors and swaps in `TurboQuantSwitchLinear` for the routed-expert switch. |
+
+**What this means for osaurus today**:
+
+- ✅ `OmniBench` (env-gated `BENCH_OMNI=1`) is committed and runs the
+  full multi-turn matrix — but the first row already fails.
+- ✅ The factory dispatch + `NemotronHOmni` wrapper module structure +
+  multimodal sanitize routing all work (load completes, dispatch
+  resolves to the right type/processor).
+- ❌ **No omni bundle currently runs end-to-end inference in Swift.**
+- ❌ The §7 claim "the same Swift type loads all three quant variants"
+  is **wrong as of `b4eec09`**. JANGTQ specifically needs its own
+  wrapper class.
+
+**Fix priority (vmlx-side)**:
+
+1. **MXFP4 forward crash** — diagnose whether it's quant-override path
+   matching, or a different shape bug somewhere in the splice/forward
+   path. This is the closest win since the bundle already loads.
+2. **`NemotronHJANGTQ.swift`** — straight port of the
+   `DeepseekV3JANGTQ.swift` pattern: subclass that handles per-expert
+   `tq_packed`/`tq_norms`/`tq_bits` → stacked `switch_mlp.fc1/fc2.{tq_*}`
+   and substitutes `TurboQuantSwitchLinear` for the MoE routed path
+   under `language_model.backbone.layers.{l}.mixer.switch_mlp`.
+
+Until both land, the recommended osaurus posture is:
+
+- **Don't ship omni bundle support yet.** The four-tower wrapper, the
+  factory dispatch, the documentation, the smoke tests, and the bench
+  harness are all in. Real inference is not.
+- **Keep tracking `b4eec09` + this hookup doc** for when fixes land.
+- The BatchEngine + cache + reasoning / tool plumbing is unaffected —
+  those contracts remain valid; they just don't have a working bundle
+  to validate against today.
+
+This was caught by running `BENCH_OMNI=1 BENCH_MODEL=…` — the first
+real-bundle run any of this code has seen. Smoke tests on toy tensor
+shapes (`NemotronHOmniSmokeTests`) all still pass.
+
+---
+
 ## 13. Known gaps + tracking
 
 | Gap | Severity | Owner | Tracking |
 |---|---|---|---|
+| **MXFP4 omni first-forward crash** (rms_norm 2688) | **HIGH** | vmlx-side | §12.5 row 1; blocks all omni serving |
+| **`NemotronHJANGTQ.swift` missing** | **HIGH** | vmlx-side | §12.5 rows 2–3; blocks JANGTQ omni serving |
 | `LMInput` has no audio field | medium | vmlx-side | this doc §3.2; unblock once osaurus signals demand |
 | `MediaSalt` skips audio | medium | vmlx-side | this doc §3.3; trivial fix once §3.2 lands |
 | BatchEngine prefill uses tokens, not inputsEmbeds | medium | vmlx-side | this doc §10.1; affects ALL VLMs not just omni |

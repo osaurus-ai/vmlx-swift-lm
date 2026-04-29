@@ -92,8 +92,12 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
 
     // Tower modules. The on-disk weights for these are fp16/bf16 (NOT
     // quantized); sanitize() routes them through the remap helpers.
-    @ModuleInfo(key: "vision_model.radio_model") private var radioModel: NemotronHRADIOVisionModel
-    @ModuleInfo(key: "mlp1.vision_mlp") private var visionMLP: NemotronHVisionMLPProjector
+    //
+    // NOTE: @ModuleInfo keys must be single-segment (no dots). Multi-level
+    // namespaces from the bundle's safetensors keys are flattened by
+    // sanitize() into one-segment paths that match these keys directly.
+    @ModuleInfo(key: "vision_model") private var radioModel: NemotronHRADIOVisionModel
+    @ModuleInfo(key: "mlp1") private var visionMLP: NemotronHVisionMLPProjector
     @ModuleInfo(key: "sound_encoder") private var soundEncoder: NemotronHParakeetEncoder
     @ModuleInfo(key: "sound_projection") private var soundProjection: NemotronHSoundProjector
 
@@ -304,18 +308,20 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         let mlp1Remapped = remapMlp1Weights(mlp1Keys)
         let soundProjRemapped = remapSoundProjectionWeights(soundProjKeys)
 
-        // Combine under namespaced prefixes that match @ModuleInfo keys:
-        //   "language_model.*"     → NemotronHModel root
-        //   "vision_model.radio_model.*" → NemotronHRADIOVisionModel root
-        //   "mlp1.vision_mlp.*"    → vision_mlp inside mlp1 wrapper
-        //   "sound_encoder.*"      → already namespaced inside the parakeet remap
-        //   "sound_projection.*"   → SoundProjector root
+        // Combine under @ModuleInfo single-segment prefixes:
+        //   "language_model.*"   → NemotronHModel root
+        //   "vision_model.*"     → NemotronHRADIOVisionModel root (RADIO ViT body)
+        //   "mlp1.*"             → NemotronHVisionMLPProjector root
+        //   "sound_encoder.*"    → NemotronHParakeetEncoder root
+        //   "sound_projection.*" → NemotronHSoundProjector root
+        // The remap helpers return unprefixed paths; we add the single
+        // top-level segment here.
         var out = [String: MLXArray]()
         for (k, v) in llmSanitized { out["language_model.\(k)"] = v }
         for (k, v) in visionRemapped { out["vision_model.\(k)"] = v }
-        for (k, v) in soundRemapped { out[k] = v } // already prefixed sound_encoder.*
+        for (k, v) in soundRemapped { out["sound_encoder.\(k)"] = v }
         for (k, v) in mlp1Remapped { out["mlp1.\(k)"] = v }
-        for (k, v) in soundProjRemapped { out[k] = v } // already prefixed sound_projection.*
+        for (k, v) in soundProjRemapped { out["sound_projection.\(k)"] = v }
 
         return out
     }

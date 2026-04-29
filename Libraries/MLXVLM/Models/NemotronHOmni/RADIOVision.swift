@@ -291,7 +291,8 @@ public class NemotronHRADIOVisionModel: Module {
     }
 }
 
-/// Maps on-disk `vision_model.radio_model.*` keys to module attribute names.
+/// Maps on-disk `vision_model.radio_model.*` keys to NemotronHRADIOVisionModel
+/// attribute names (single-segment, no leading prefix).
 public func remapRadioWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     var out = [String: MLXArray]()
     let prefix = "vision_model.radio_model."
@@ -304,13 +305,13 @@ public func remapRadioWeights(_ weights: [String: MLXArray]) -> [String: MLXArra
             continue
         }
         if suffix.hasPrefix("model.patch_generator.cls_token.token") {
-            out["radio_model.patch_generator.cls_token"] = v
+            out["patch_generator.cls_token"] = v
         } else if suffix.hasPrefix("model.patch_generator.") {
             let inner = String(suffix.dropFirst("model.patch_generator.".count))
-            out["radio_model.patch_generator.\(inner)"] = v
+            out["patch_generator.\(inner)"] = v
         } else if suffix.hasPrefix("model.blocks.") {
             let inner = String(suffix.dropFirst("model.".count)) // "blocks.N.…"
-            out["radio_model.\(inner)"] = v
+            out[inner] = v
         } else if suffix == "summary_idxs" {
             // Adaptor head selection buffer — not used.
             continue
