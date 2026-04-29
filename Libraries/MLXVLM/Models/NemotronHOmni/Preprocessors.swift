@@ -541,9 +541,13 @@ public func nemotronOmniLoadAudioFile(
 
 // MARK: - Video preprocessing (frame extraction + EVS)
 
-/// Extract uniformly-spaced frames from a video file.
+/// Extract uniformly-spaced frames from a video file using the same async
+/// `AVAssetImageGenerator.images(for:)` API as Qwen 2/2.5/3/3.5/3.6 VL.
+/// Reuses `MediaProcessing.asCIImageSequence` so the frame-decode pipeline
+/// is shared across every VLM in vmlx-swift-lm.
+///
 /// Returns up to `targetFrames` frames. Frames are full-resolution CIImages
-/// (caller will tile-preprocess them through the image pipeline).
+/// (caller post-processes them via `nemotronOmniPreprocessVideo`).
 public func nemotronOmniExtractVideoFrames(
     _ url: URL,
     targetFrames: Int = 32
@@ -556,25 +560,116 @@ public func nemotronOmniExtractVideoFrames(
             domain: "NemotronHOmni", code: -10,
             userInfo: [NSLocalizedDescriptionKey: "Invalid video duration"])
     }
+    // Translate target frame count into samplesPerSecond. The shared
+    // `asCIImageSequence` uses linspace(0, durationValue, count: fps*duration)
+    // — we invert: samplesPerSecond = targetFrames / duration.
+    let samplesPerSecond = max(1, Int(round(Double(targetFrames) / durationSeconds)))
+    return try await MediaProcessing.asCIImageSequence(
+        asset, samplesPerSecond: samplesPerSecond,
+    )
+}
 
-    let gen = AVAssetImageGenerator(asset: asset)
-    gen.appliesPreferredTrackTransform = true
-    gen.requestedTimeToleranceBefore = .zero
-    gen.requestedTimeToleranceAfter = .zero
+/// Native Swift video preprocessor — full Nemotron-3-Nano-Omni pipeline:
+///   1. Frame extraction (uniform sample via `MediaProcessing.asCIImageSequence`)
+///   2. Pad N to a multiple of `videoTemporalPatchDim=2` by repeating last frame
+///   3. Bicubic resize each frame to (imageSize, imageSize) via CIImage transform
+///   4. RGB Float32 extraction via vImage
+///   5. CLIP normalize per channel
+///   6. Stack T frames into channel dim → (N/T, T*3, H, W) MLXArray
+///
+/// Returns the MLXArray that can be fed directly to `RADIOVisionModel(x, video: true)`.
+///
+/// - Parameters:
+///   - url: video file URL
+///   - imageSize: per-frame target size (default 512, matches force_image_size)
+///   - targetFrames: how many frames to sample (default 32)
+///   - videoTemporalPatchDim: T (default 2 — RADIO video_embedder accepts T*3*P*P input)
+public func nemotronOmniPreprocessVideo(
+    url: URL,
+    imageSize: Int = 512,
+    targetFrames: Int = 32,
+    videoTemporalPatchDim: Int = 2
+) async throws -> MLXArray {
+    var frames = try await nemotronOmniExtractVideoFrames(
+        url, targetFrames: targetFrames,
+    )
+    if frames.isEmpty {
+        throw NSError(
+            domain: "NemotronHOmni", code: -11,
+            userInfo: [NSLocalizedDescriptionKey: "No frames decoded from video"])
+    }
 
-    var frames: [CIImage] = []
-    for i in 0 ..< targetFrames {
-        let t = Double(i) * durationSeconds / Double(max(1, targetFrames))
-        let cm = CMTime(seconds: t, preferredTimescale: 600)
-        do {
-            let cg = try gen.copyCGImage(at: cm, actualTime: nil)
-            frames.append(CIImage(cgImage: cg))
-        } catch {
-            // Skip frames that fail
-            continue
+    // Pad to a multiple of T by repeating the last frame
+    while frames.count % videoTemporalPatchDim != 0 {
+        frames.append(frames.last!)
+    }
+    let nFrames = frames.count
+    let nGroups = nFrames / videoTemporalPatchDim
+    let H = imageSize
+    let W = imageSize
+
+    // Resize + normalize each frame to a (3, H, W) Float32 array.
+    // Layout: per-frame (3, H, W) row-major — same as PyTorch convention.
+    var stacked = [Float](repeating: 0, count: nFrames * 3 * H * W)
+    let perFrame = 3 * H * W
+    for (i, frame) in frames.enumerated() {
+        let resized = nemotronOmniResizeAndNormalize(frame, target: imageSize)
+        for j in 0 ..< perFrame {
+            stacked[i * perFrame + j] = resized[j]
         }
     }
-    return frames
+
+    // Build (N, 3, H, W) MLXArray, then reshape to (N/T, T*3, H, W).
+    let pixelValues = MLXArray(stacked, [nFrames, 3, H, W])
+    return pixelValues.reshaped([nGroups, videoTemporalPatchDim * 3, H, W])
+}
+
+/// Bicubic resize a CIImage to (target, target) and normalize via CLIP
+/// mean/std → returns a contiguous (3*target*target,) Float32 buffer in
+/// (3, H, W) order.
+private func nemotronOmniResizeAndNormalize(_ image: CIImage, target: Int) -> [Float] {
+    // Resize via CIImage affine transform with Lanczos interpolation
+    // (closest match to PyTorch BICUBIC for our use-case).
+    let extent = image.extent
+    let scaleX = CGFloat(target) / extent.width
+    let scaleY = CGFloat(target) / extent.height
+    let resized = image
+        .transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        .cropped(to: CGRect(x: 0, y: 0, width: target, height: target))
+
+    // Render to RGBA8 via CIContext, then strip alpha + normalize
+    let ctx = imagePreprocessContext
+    let bitsPerComponent = 8
+    let bytesPerRow = 4 * target
+    var buffer = [UInt8](repeating: 0, count: 4 * target * target)
+    let cgContext = CGContext(
+        data: &buffer, width: target, height: target,
+        bitsPerComponent: bitsPerComponent, bytesPerRow: bytesPerRow,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
+    )!
+    if let cg = ctx.createCGImage(resized, from: CGRect(x: 0, y: 0, width: target, height: target)) {
+        cgContext.draw(cg, in: CGRect(x: 0, y: 0, width: target, height: target))
+    }
+
+    // Convert (H, W, 4) RGBA8 → (3, H, W) Float32 with CLIP normalization
+    let mean: [Float] = NEMOTRON_OMNI_CLIP_MEAN
+    let std: [Float] = NEMOTRON_OMNI_CLIP_STD
+    var out = [Float](repeating: 0, count: 3 * target * target)
+    let plane = target * target
+    for y in 0 ..< target {
+        for x in 0 ..< target {
+            let i = (y * target + x) * 4
+            let r = Float(buffer[i]) / 255.0
+            let g = Float(buffer[i + 1]) / 255.0
+            let b = Float(buffer[i + 2]) / 255.0
+            let pix = y * target + x
+            out[0 * plane + pix] = (r - mean[0]) / std[0]
+            out[1 * plane + pix] = (g - mean[1]) / std[1]
+            out[2 * plane + pix] = (b - mean[2]) / std[2]
+        }
+    }
+    return out
 }
 
 /// Apply Efficient Video Sampling (EVS) at the *embedding* level.
