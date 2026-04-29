@@ -57,7 +57,8 @@ import MLX
 public func computeMediaSalt(for input: LMInput) -> String? {
     let hasImage = input.image != nil
     let hasVideo = input.video != nil
-    guard hasImage || hasVideo else { return nil }
+    let hasAudio = input.audio != nil
+    guard hasImage || hasVideo || hasAudio else { return nil }
 
     var hasher = SHA256()
 
@@ -68,6 +69,17 @@ public func computeMediaSalt(for input: LMInput) -> String? {
     if let video = input.video {
         hasher.update(data: Data("video:".utf8))
         hashMLXArray(video.pixels, into: &hasher)
+    }
+    if let audio = input.audio {
+        // Same shape+dtype+bytes treatment as image/video. Hash the
+        // waveform — NOT the (optional) pre-encoded embedding — so
+        // logically-identical inputs produced via different encoder
+        // paths still cache-collide correctly. SR is mixed in too:
+        // identical bytes at different SR are different inputs.
+        hasher.update(data: Data("audio:".utf8))
+        var sr = Int64(audio.sampleRate)
+        withUnsafeBytes(of: &sr) { hasher.update(bufferPointer: $0) }
+        hashMLXArray(audio.waveform, into: &hasher)
     }
 
     let digest = hasher.finalize()

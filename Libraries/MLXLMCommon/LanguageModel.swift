@@ -36,6 +36,7 @@ public struct LMInput {
     public let text: Text
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
+    public let audio: ProcessedAudio?
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -95,17 +96,55 @@ public struct LMInput {
         }
     }
 
+    /// Representation of prepared input audio for speech-aware models
+    /// (Nemotron-3-Nano-Omni Parakeet path, future ASR-conditioned VLMs).
+    ///
+    /// ``waveform`` is a Float32 mono PCM tensor at ``sampleRate`` Hz —
+    /// the model encodes it via its own mel STFT + audio encoder during
+    /// `prepare(_:cache:windowSize:)`. The tensor format is intentionally
+    /// minimal so different audio-encoder front-ends (Parakeet,
+    /// Whisper-style log-mel, raw waveform encoders) can each consume
+    /// the same `LMInput.audio` field.
+    public struct ProcessedAudio {
+
+        /// Mono Float32 PCM samples. Shape `[1, samples]` or `[samples]`.
+        public let waveform: MLXArray
+
+        /// Sampling rate of `waveform` in Hz. Models may resample
+        /// internally if their encoder requires a different rate.
+        public let sampleRate: Int
+
+        /// Optional pre-encoded embedding `[frames, hidden]`. When
+        /// supplied the model SHOULD skip its mel/encoder pipeline and
+        /// splice these embeds directly. Used for the
+        /// `extractAudioEmbeds` → manual splice workflow that
+        /// non-omni-aware code can fall back to without paying the
+        /// re-encode cost on every turn.
+        public let preEncodedEmbedding: MLXArray?
+
+        public init(
+            waveform: MLXArray, sampleRate: Int = 16_000,
+            preEncodedEmbedding: MLXArray? = nil
+        ) {
+            self.waveform = waveform
+            self.sampleRate = sampleRate
+            self.preEncodedEmbedding = preEncodedEmbedding
+        }
+    }
+
     public init(tokens: MLXArray, mask: MLXArray? = nil) {
         self.init(text: .init(tokens: tokens, mask: mask))
     }
 
     public init(
         text: LMInput.Text, image: LMInput.ProcessedImage? = nil,
-        video: LMInput.ProcessedVideo? = nil
+        video: LMInput.ProcessedVideo? = nil,
+        audio: LMInput.ProcessedAudio? = nil
     ) {
         self.text = text
         self.image = image
         self.video = video
+        self.audio = audio
     }
 }
 

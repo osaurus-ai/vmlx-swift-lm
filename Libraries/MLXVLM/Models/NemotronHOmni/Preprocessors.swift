@@ -539,6 +539,32 @@ public func nemotronOmniLoadAudioFile(
     return Array(UnsafeBufferPointer(start: chData[0], count: n))
 }
 
+// MARK: - Audio resampling
+
+/// Linear interpolation resampler — cheap, good enough for 16 kHz
+/// targets (Parakeet's input rate). Use AVAudioConverter via
+/// `nemotronOmniLoadAudioFile` for file inputs (it does sinc-quality
+/// resampling); this helper covers the in-memory PCM path where
+/// AVAudioConverter would be overkill.
+@available(macOS 14.0, *)
+public func linearResamplePCM(_ pcm: [Float], fromRate: Int, toRate: Int) -> [Float] {
+    guard fromRate > 0, toRate > 0, !pcm.isEmpty else { return pcm }
+    if fromRate == toRate { return pcm }
+    let ratio = Double(toRate) / Double(fromRate)
+    let outCount = Int((Double(pcm.count) * ratio).rounded(.down))
+    guard outCount > 0 else { return [] }
+    var out = [Float](repeating: 0, count: outCount)
+    let step = Double(fromRate) / Double(toRate)
+    for i in 0 ..< outCount {
+        let srcIdx = Double(i) * step
+        let i0 = Int(srcIdx.rounded(.down))
+        let frac = Float(srcIdx - Double(i0))
+        let i1 = min(i0 + 1, pcm.count - 1)
+        out[i] = pcm[i0] * (1 - frac) + pcm[i1] * frac
+    }
+    return out
+}
+
 // MARK: - Video preprocessing (frame extraction + EVS)
 
 /// Extract uniformly-spaced frames from a video file using the same async

@@ -180,21 +180,22 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         languageModel.callAsFunction(inputs, cache: cache)
     }
 
-    /// VLM prepare — accepts LMInput with text + optional image. Audio /
-    /// video must be passed via the higher-level `chat` API.
+    /// VLM prepare — accepts LMInput with text + optional image / video /
+    /// audio. Each non-text modality gets encoded by its tower and
+    /// spliced into the token-embedding sequence at its placeholder
+    /// positions before the LLM forward pass.
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
         let convertedCache = cache.compactMap { $0 as KVCache }
 
-        if input.image == nil && input.video == nil {
+        if input.image == nil && input.video == nil && input.audio == nil {
             // Text-only fast path.
             return .tokens(input.text)
         }
 
         // Build embeddings for tokens + splice multimodal at placeholder tokens.
         let textEmbeds = languageModel.embedTokens(input.text.tokens)
-        // Vision-only path (image OR video tiles in `input.image.pixels`).
         var spliced = textEmbeds
         if let pixelValues = input.image?.pixels {
             let imageEmbeds = extractImageEmbeds(pixelValues: pixelValues)
@@ -211,6 +212,19 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
                 inputsEmbeds: spliced,
                 replacement: videoEmbeds,
                 tokenId: config.imageContextTokenId)
+        }
+        if let audio = input.audio {
+            // Use the pre-encoded embedding when the processor already
+            // ran Parakeet (avoids re-encoding the same audio across
+            // turns); otherwise encode the raw waveform now.
+            let audioEmbeds: MLXArray = audio.preEncodedEmbedding
+                ?? extractAudioEmbeds(waveformArray: audio.waveform,
+                                      sampleRate: audio.sampleRate)
+            spliced = spliceAtToken(
+                tokens: input.text.tokens,
+                inputsEmbeds: spliced,
+                replacement: audioEmbeds,
+                tokenId: config.soundContextTokenId)
         }
 
         let logits = languageModel.callAsFunction(
@@ -244,6 +258,28 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         feats = visionMLP(feats)
         // Flatten to (N*tokens, llm_hidden)
         return feats.reshaped([N * tokens, feats.dim(-1)])
+    }
+
+    /// Run STFT + Parakeet + sound_projection on a mono waveform stored
+    /// as an `MLXArray` (any rate; resampled to 16 kHz internally if
+    /// necessary). Convenience wrapper around the [Float] form for
+    /// `LMInput.ProcessedAudio` consumers.
+    public func extractAudioEmbeds(waveformArray: MLXArray, sampleRate: Int = 16_000) -> MLXArray {
+        // Flatten to mono Float32 array. ProcessedAudio.waveform is
+        // typically shape `[1, samples]` or `[samples]`; both flatten
+        // to `[samples]`.
+        let flat = waveformArray.reshaped([-1]).asType(.float32)
+        let pcm = flat.asArray(Float.self)
+        // If sample rate differs from the model's required rate the
+        // raw mel STFT will be off — but ProcessedAudio is documented
+        // as "model handles resampling". Linear resample to 16 kHz
+        // when needed (cheap; AVAudioConverter is the file path that
+        // already gets us 16 kHz, but in-memory PCM may arrive at any
+        // rate).
+        let pcm16k: [Float] =
+            sampleRate == config.soundSampleRate
+            ? pcm : linearResamplePCM(pcm, fromRate: sampleRate, toRate: config.soundSampleRate)
+        return extractAudioEmbeds(waveform: pcm16k)
     }
 
     /// Run STFT + Parakeet + sound_projection on a 16 kHz mono waveform.
@@ -414,12 +450,44 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
         return (pixels, counts)
     }
 
+    /// Decode + resample audio resources into 16 kHz mono Float32 PCM
+    /// (Parakeet's required input rate per `config_omni.json`).
+    public func preprocess(audios: [UserInput.Audio]) throws -> [[Float]] {
+        var out: [[Float]] = []
+        for a in audios {
+            switch a {
+            case .url(let url):
+                out.append(
+                    try nemotronOmniLoadAudioFile(
+                        url, targetSampleRate: 16_000))
+            case .samples(let pcm, let sr):
+                if sr == 16_000 {
+                    out.append(pcm)
+                } else {
+                    out.append(
+                        linearResamplePCM(pcm, fromRate: sr, toRate: 16_000))
+                }
+            case .array(let arr, let sr):
+                let pcm = arr.reshaped([-1]).asType(.float32).asArray(Float.self)
+                out.append(
+                    sr == 16_000
+                        ? pcm
+                        : linearResamplePCM(pcm, fromRate: sr, toRate: 16_000))
+            }
+        }
+        return out
+    }
+
     public func prepare(input: UserInput) async throws -> LMInput {
         // Build prompt with NVLM 1-D placeholders. After tile selection we
         // know N total tiles → expand 256 image tokens per tile (post pixel
-        // shuffle 32×32 → 16×16).
+        // shuffle 32×32 → 16×16). Audio takes a parallel placeholder
+        // path with `<so_embedding>` tokens — one per Parakeet output
+        // frame.
         var processedImage: LMInput.ProcessedImage?
+        var processedAudio: LMInput.ProcessedAudio?
         var totalImageTokens = 0
+        var totalAudioTokens = 0
         let tokensPerTile = 256
 
         if !input.images.isEmpty {
@@ -432,13 +500,58 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             totalImageTokens = totalTiles * tokensPerTile
         }
 
+        if !input.audios.isEmpty {
+            // Concat all audio waveforms into one stream — multiple
+            // audio inputs serialize into the prompt in order, with a
+            // single contiguous run of `<so_embedding>` placeholders.
+            // Mirrors Python jang_tools.nemotron_omni: audio embeds
+            // are flat (frames, hidden) per turn; the model doesn't
+            // care about per-clip boundaries beyond positional order.
+            let waveforms = try preprocess(audios: input.audios)
+            let combined = waveforms.flatMap { $0 }
+            // Pre-encode here so repeated turns over the same audio
+            // don't re-run mel STFT + Parakeet. The result rides on
+            // ProcessedAudio.preEncodedEmbedding — `prepare(_:)` on
+            // the model side picks it up directly.
+            // We need the model instance for this; the processor
+            // doesn't have one. Instead, we ship the raw waveform
+            // and let `NemotronHOmni.prepare` invoke the encoder.
+            // (Pre-encoding here would require coupling processor to
+            // model, which UserInputProcessor's contract avoids.)
+            let waveArray = MLXArray(combined).reshaped([1, combined.count])
+            processedAudio = LMInput.ProcessedAudio(
+                waveform: waveArray,
+                sampleRate: 16_000,
+                preEncodedEmbedding: nil)
+            // Audio token count = expected Parakeet output frames.
+            // Mel STFT: nFrames ≈ 1 + (samples + 2*pad - nFFT)/hop
+            // with pad=nFFT/2=256, nFFT=512, hop=160. Parakeet
+            // subsamples by 8 → audio_tokens ≈ nFrames / 8.
+            let nFFT = 512, hop = 160, pad = nFFT / 2
+            let melFrames = max(0, 1 + (combined.count + 2 * pad - nFFT) / hop)
+            // Subsampling factor 8 with stride-2 conv stack (3 levels).
+            // Each level: ceil(T_in / 2). For melFrames=101 → 51 → 26
+            // → 13. Compute exactly the same way to avoid placeholder
+            // count drift between processor and encoder.
+            var t = melFrames
+            for _ in 0 ..< 3 { t = (t + 1) / 2 }
+            totalAudioTokens = t
+        }
+
         // Insert media placeholders into the user message before tokenization.
-        // Source convention (Python `model.py`): "<img>" + N×"<image>" + "</img>\n"
+        // Source convention (Python `model.py`):
+        //   "<img>" + N×"<image>" + "</img>\n"
+        //   "<sound>" + N×"<so_embedding>" + "</sound>\n"
         var media = ""
         if totalImageTokens > 0 {
             media += "<img>"
             media += String(repeating: "<image>", count: totalImageTokens)
             media += "</img>\n"
+        }
+        if totalAudioTokens > 0 {
+            media += "<sound>"
+            media += String(repeating: "<so_embedding>", count: totalAudioTokens)
+            media += "</sound>\n"
         }
 
         // Build messages with media prepended to the LAST user message.
@@ -464,6 +577,7 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
-            image: processedImage)
+            image: processedImage,
+            audio: processedAudio)
     }
 }

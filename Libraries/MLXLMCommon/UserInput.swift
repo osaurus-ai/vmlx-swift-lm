@@ -137,6 +137,20 @@ public struct UserInput {
         }
     }
 
+    /// Representation of an audio resource (mono PCM, model handles
+    /// resampling to its required rate). Used by speech-aware models
+    /// like Nemotron-3-Nano-Omni's Parakeet path.
+    public enum Audio {
+        /// File on disk — any format AVFoundation can decode (.wav, .m4a,
+        /// .mp3, .aac, .mov audio track, etc.). Resampled to the model's
+        /// required rate during `prepare`.
+        case url(URL)
+        /// Pre-loaded Float32 PCM samples + sample rate.
+        case samples([Float], sampleRate: Int)
+        /// Pre-loaded waveform as MLXArray (mono, Float32).
+        case array(MLXArray, sampleRate: Int)
+    }
+
     /// Representation of processing to apply to media.
     public struct Processing: Sendable {
         public var resize: CGSize?
@@ -177,6 +191,13 @@ public struct UserInput {
     /// collect the videos from the chat messages, otherwise these are the stored videos with the ``UserInput``.
     public var videos = [Video]()
 
+    /// The audio resources associated with the `UserInput`. Used by
+    /// speech-aware models (Nemotron-3-Nano-Omni Parakeet path).
+    /// Stays empty for non-audio models — the per-model
+    /// ``UserInputProcessor`` is responsible for decoding into
+    /// ``LMInput/ProcessedAudio`` when applicable.
+    public var audios = [Audio]()
+
     public var tools: [ToolSpec]?
 
     /// Additional values provided for the chat template rendering context
@@ -196,6 +217,7 @@ public struct UserInput {
     /// - ``init(chat:tools:additionalContext:)``
     public init(
         prompt: String, images: [Image] = [Image](), videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
@@ -212,6 +234,7 @@ public struct UserInput {
         // without these assignments. Matches what the `didSet` clause does.
         self.images = images
         self.videos = videos
+        self.audios = audios
     }
 
     /// Initialize the `UserInput` with model specific mesage structures.
