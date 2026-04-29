@@ -47,6 +47,19 @@ public struct BaseProcessorConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Optional: bundles like Nemotron-Omni use `image_processor_type` and
+        // have no `processor_class`. Default to empty so the model_type
+        // override path can pick a processor; this is a no-op for bundles
+        // that ship a real `processor_class`.
+        self.processorClass = try c.decodeIfPresent(String.self, forKey: .processorClass) ?? ""
+    }
+
+    public init(processorClass: String) {
+        self.processorClass = processorClass
+    }
 }
 
 /// Creates a function that loads a configuration file and instantiates a model with the proper configuration
@@ -122,6 +135,9 @@ public enum VLMTypeRegistry {
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
+        "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
+        "NemotronH_Nano_Omni_Reasoning_V3":
+            create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
     ]
 }
 
@@ -155,6 +171,8 @@ public enum VLMProcessorTypeRegistry {
             GlmOcrProcessorConfiguration.self, GlmOcrProcessor.init),
         "Gemma4Processor": create(
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
+        "NemotronHOmniProcessor": create(
+            NemotronHOmniProcessorConfiguration.self, NemotronHOmniProcessor.init),
     ])
 }
 
@@ -331,10 +349,20 @@ public final class VLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        // Detect Nemotron-Omni bundles by presence of config_omni.json. The
+        // bundle's config.json reports `model_type: nemotron_h` (LLM only),
+        // so we override the dispatch model_type here so the VLM factory
+        // routes to NemotronHOmni instead of failing or hitting the LLM path.
+        var dispatchModelType = baseConfig.modelType
+        let configOmniURL = modelDirectory.appending(component: "config_omni.json")
+        if FileManager.default.fileExists(atPath: configOmniURL.path) {
+            dispatchModelType = "NemotronH_Nano_Omni_Reasoning_V3"
+        }
+
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
-                configuration: configData, modelType: baseConfig.modelType)
+                configuration: configData, modelType: dispatchModelType)
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
@@ -435,12 +463,16 @@ public final class VLMModelFactory: ModelFactory {
 
         // Override processor type based on model type for models that need special handling
         // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
-        // to handle spatial merging correctly
+        // to handle spatial merging correctly. Nemotron-Omni bundles use a custom
+        // image_processor_type that doesn't map to processor_class — force the
+        // NemotronHOmniProcessor when we've detected the omni bundle.
         let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor"
+            "mistral3": "Mistral3Processor",
+            "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
+            "nemotron_h_omni": "NemotronHOmniProcessor",
         ]
         let processorType =
-            processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
+            processorTypeOverrides[dispatchModelType] ?? baseProcessorConfig.processorClass
 
         let processor = try await processorRegistry.createModel(
             configuration: processorConfigData,

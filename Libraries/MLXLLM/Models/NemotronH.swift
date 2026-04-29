@@ -651,7 +651,13 @@ private class NemotronHBackbone: Module {
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        var hidden = embeddings(inputs)
+        let hidden = embeddings(inputs)
+        return forwardFromEmbeddings(hidden, cache: cache)
+    }
+
+    /// Forward starting from a pre-computed embedding tensor (for multimodal splice).
+    func forwardFromEmbeddings(_ inputsEmbeds: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        var hidden = inputsEmbeds
 
         // Create attention mask using the first attention layer's cache
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
@@ -698,7 +704,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public let kvHeads: [Int]
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
-    let configuration: NemotronHConfiguration
+    public let configuration: NemotronHConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -729,6 +735,23 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone(inputs, cache: cache)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = backbone.embeddings.asLinear(out)
+        }
+        return out
+    }
+
+    /// Look up text token embeddings (used for multimodal splice).
+    public func embedTokens(_ tokens: MLXArray) -> MLXArray {
+        backbone.embeddings(tokens)
+    }
+
+    /// Forward starting from pre-computed embeddings (for multimodal splice).
+    /// Returns logits in the same shape as ``callAsFunction(_:cache:)``.
+    public func callAsFunction(inputsEmbeds: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var out = backbone.forwardFromEmbeddings(inputsEmbeds, cache: cache)
         if let lmHead {
             out = lmHead(out)
         } else {
