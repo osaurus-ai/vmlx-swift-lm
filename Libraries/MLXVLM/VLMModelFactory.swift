@@ -444,7 +444,15 @@ public final class VLMModelFactory: ModelFactory {
 
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
+            // 2026-04-28: pass top-level `quantization` through too, matching
+            // the LLM factory. Omni / VL bundles whose `config.json` carries
+            // `quantization.group_size` need that prior to land at
+            // `inferPerLayerQuantization` so the shape walk uses the right
+            // gs. Without it, MXFP4 omni fell back to `jangConfig.blockSize`'s
+            // default 64 instead of the actual gs=32, mis-inferring layers
+            // and causing mid-prefill rmsNorm shape traps.
+            quantization: jangConfig != nil ? baseConfig.quantization : nil,
+            perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 
         let tokenizer = try await tokenizerTask

@@ -122,10 +122,22 @@ public func loadWeights(
         // metadata of its own (e.g., DSV4-Flash bundles ship
         // `weight_format: "bf16"` even on quantized variants — the
         // global group_size is in config.json instead).
+        //
+        // 2026-04-28: when jangConfig has explicit `bit_widths_used`
+        // (signals real JANG conversion), `inferPerLayerQuantization`
+        // ignores `overrideGroupSize` and uses jangConfig.blockSize as
+        // the authoritative prior — see `JangLoader.swift` for the
+        // root-cause writeup of the (8, 32) ≡ (4, 64) shape ambiguity
+        // that crashed Cascade-2 JANG_4M / Nemotron-Omni MXFP4 with
+        // mid-prefill rmsNorm. We do NOT merge config.json's per-layer
+        // dict here because that dict can be HF-tooling-stale (claims
+        // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
+        // bits=4)`) and would re-introduce the wrong values.
         let configGS: Int? = quantization?.groupSize
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
             overrideGroupSize: configGS)
+
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1
             let g = inferred.quantization?.groupSize ?? -1

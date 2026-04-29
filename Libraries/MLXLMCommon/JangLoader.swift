@@ -1118,7 +1118,30 @@ public struct JangLoader: Sendable {
         // carry explicit quant metadata (e.g., DSV4-Flash JANG_2L
         // ships `weight_format: "bf16"`) need the config.json value
         // to land at the right group_size during shape inference.
-        let groupSize = overrideGroupSize ?? jangConfig.quantization.blockSize
+        //
+        // 2026-04-28 EXCEPTION: when jangConfig has explicit
+        // `bit_widths_used` (signal that this is a real JANG-converted
+        // bundle), the converter's chosen `block_size` is authoritative
+        // and we must IGNORE config.json's `group_size`. Reason:
+        // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 ship `config.json`
+        // with `quantization.group_size = 32` (HF-tooling default)
+        // even though the JANG converter actually packed at gs=64.
+        // The (8, 32) and (4, 64) `(bits, gs)` pairs share the same
+        // packed shape, so the primary path silently picks (8, 32)
+        // and the dequant reconstructs wrong row vectors. Mid-prefill
+        // rmsNorm shape trap follows on the first forward.
+        //
+        // The signal `!bit_widths_used.isEmpty` distinguishes a real
+        // JANG-converted bundle from a non-JANG bundle that just
+        // happens to ship a jang_config.json shell — only the former
+        // carries an authoritative blockSize stamp.
+        let isAuthoritativeJang = !jangConfig.quantization.bitWidthsUsed.isEmpty
+        let groupSize: Int
+        if isAuthoritativeJang {
+            groupSize = jangConfig.quantization.blockSize
+        } else {
+            groupSize = overrideGroupSize ?? jangConfig.quantization.blockSize
+        }
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
 
         // Find the default (most common) bit width from jang_config

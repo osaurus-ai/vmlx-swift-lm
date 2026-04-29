@@ -1060,7 +1060,12 @@ public final class LLMModelFactory: ModelFactory {
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
             quantization: jangConfig != nil ? baseConfig.quantization : nil,
-            perLayerQuantization: jangConfig != nil ? nil : baseConfig.perLayerQuantization,
+            // 2026-04-28: pass perLayerQuantization through even when JANG;
+            // loadWeights merges config.json's explicit per-layer dict on
+            // top of the shape walk to fix mis-inference of (bits, gs) pairs
+            // that share a packed shape (e.g., (4,64) ≡ (8,32)). Closes
+            // Cascade-2 JANG_4M / Nemotron-Omni MXFP4 first-prefill rmsNorm.
+            perLayerQuantization: baseConfig.perLayerQuantization,
             jangConfig: jangConfig)
 
         let tokenizer = try await tokenizerTask
