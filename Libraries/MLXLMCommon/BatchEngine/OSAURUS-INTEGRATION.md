@@ -15,6 +15,7 @@
 | `GEMMA4-SLIDING-WINDOW-CRASH.md` | 2026-04-20 fix for tpae's `broadcast_shapes` crash on Gemma-4 at prompts past `sliding_window=1024`. Real-model verification matrix included. |
 | `REASONING-STREAM-EVENT.md` | 2026-04-20 `Generation.reasoning(String)` library-level streaming channel. Closes tpae's "thinking parsers should be handled at library level". Updated 2026-04-20 PM with harmony (Gemma-4) + `startInReasoning` (Qwen 3.x enable_thinking prefill) support. |
 | `STOP-SEQUENCES-CONTRACT.md` | 2026-04-20 `GenerateParameters.extraStopStrings` field + `StopStringMatcher`. Closes tpae's "what should happen to text-level stop sequences". |
+| **`OMNI-OSAURUS-HOOKUP.md`** | **2026-04-28 Nemotron-3-Nano-Omni multimodal integration guide.** Bundle detection, four-tower wrapper (LLM + RADIO + Parakeet + projectors), image/video/audio splice contracts, hybrid Mamba/Attn cache topology, TQ KV interaction, EVS pruning, JANGTQ × all-three-quants routing, cross-VLM `VLMVideoUtils.swift` shared library, the `LMInput.audio` open seam + workaround, BatchEngine multimodal-prefill open seam + workaround, full migration checklist. Read this if osaurus is wiring any omni bundle. |
 | `FORK-SYNC-PROCESS.md` | 2026-04-20 upstream-sync procedure (`ml-explore/mlx-swift-lm` → `osaurus-ai/vmlx-swift-lm`). **Note:** `osaurus-ai/mlx-swift-lm` is deprecated — osaurus consumes vmlx directly. Closes tpae's "are we keeping this up to date". |
 | `BATCH_ENGINE.md` (next to these) | Internal iter log — architecture decisions, per-iter rationale, the ~2100-line deep dive. |
 
