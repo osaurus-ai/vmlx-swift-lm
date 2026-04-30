@@ -1,6 +1,6 @@
 # Osaurus release hand-off — vmlx-swift-lm 1c62d21+
 
-Audience: tpae + osaurus team. Read this before bumping the vmlx pin.
+Audience: osaurus host team. Read this before bumping the vmlx pin.
 Companion to `OSAURUS-INTEGRATION.md` (LLM tier) and `OMNI-OSAURUS-HOOKUP.md`
 (multimodal). This file consolidates only the deltas relevant to the
 upcoming release.
@@ -61,7 +61,7 @@ let output = try await batchEngine.generate(
 
 ### A. `notifyExternalReferencesNonZeroOnDealloc` (Bug 1)
 
-**Reproduced**: tpae 2026-04-30 on M4 Pro with Qwen-3.6 35B A3B MXFP4
+**Reported**: 2026-04-30 host-side triage on M4 Pro with Qwen-3.6 35B A3B MXFP4
 hybrid + warm KV disk cache. Two identical prompts, second crashes.
 
 **What we tried that didn't fix it**: vmlx-swift-lm `98289d9` added
@@ -91,7 +91,7 @@ specialised pipeline per unique source string). Reverter env:
 
 ### Bug 2 — `[metal::malloc] 154 GB allocation` on hybrid + over-cap prompt
 
-**Reported**: tpae 2026-04-30 on hybrid Qwen-3.6-27B-MXFP4 with a
+**Reported**: 2026-04-30 host-side triage on hybrid Qwen-3.6-27B-MXFP4 with a
 56,797-token prompt and `defaultMaxKVSize=8192`. Process fataled with
 `Attempting to allocate 154843162032 bytes which is greater than the
 maximum allowed buffer size of 30150672384 bytes`.
@@ -137,7 +137,7 @@ Two layers, both in this PR's investigation/ folder:
 - L1 — `Tests/MLXLMStressTests/StressMatrix.swift` (vmlx side, swift test)
 - L2 — `osaurus-staging/investigation/repros/stress_extras.py` (HTTP)
 
-The L2 suites are drop-in companions to tpae's
+The L2 suites are drop-in companions to the host-side
 `scripts/eval_http_stability.py`. Run order:
 
 ```bash
@@ -146,7 +146,7 @@ export OSAURUS_STRESS_HYBRID_MODEL=/Volumes/EricsLLMDrive/jangq-ai/Nemotron-3-Na
 swift test --filter MLXLMStressTests
 
 # L2 (osaurus, server already running)
-python3 scripts/eval_http_stability.py                              # tpae's S1-S6
+python3 scripts/eval_http_stability.py                              # host-side S1-S6 stability suites
 python3 investigation/repros/stress_extras.py --only S7             # Bug 1 repro
 python3 investigation/repros/stress_extras.py --only S8             # Bug 2 repro
 python3 investigation/repros/stress_extras.py --only S9             # 20-turn agent loop
@@ -162,9 +162,9 @@ All cells must be green before the pin bump.
 - No changes to BatchEngine semantics. (The Bug 2 hybrid clamp was
   considered then deferred — see "NOT in this PR" above.)
 - No new dependency. The mlx-swift fork patch is a leaf C++ change.
-- No HTTP-layer changes. tpae's `bugfix/http-model-runtime-fix` owns
+- No HTTP-layer changes. the host-side `bugfix/http-model-runtime-fix` branch owns
   HTTP cancellation; vmlx-side just makes the hot path crash-free.
-- No UI work. tpae owns the chat-window file-import paths.
+- No UI work. host UI ownership covers the chat-window file-import paths.
 
 ## Open questions (need a decision before merge)
 

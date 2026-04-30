@@ -1,6 +1,6 @@
 # Osaurus team build + UI integration guide
 
-Audience: tpae + osaurus engineers wiring vmlx-swift-lm into the host app
+Audience: osaurus host engineers wiring vmlx-swift-lm into the host app
 chat / API / streaming / UI layers. This is the consolidated doc — read
 this first, then dive into the sibling files for specifics.
 
@@ -37,7 +37,7 @@ Public products (consumed via `Package.swift` / `Package.resolved`):
 
 Osaurus already imports these via `OsaurusCore/Package.swift` (lines
 166-169). Pin convention: revision (commit SHA), not branch — see
-tpae's 2026-04-26 commit `e2e13b4f`.
+the host-side pin policy from commit `e2e13b4f` (2026-04-26).
 
 ## 2. Build matrix
 
@@ -380,7 +380,7 @@ you need a clean signal.
 
 ```bash
 # Server already running
-python3 scripts/eval_http_stability.py                     # tpae's S1-S6
+python3 scripts/eval_http_stability.py                     # host-side S1-S6 stability suites
 python3 investigation/repros/stress_extras.py --only S7    # Bug 1 repro
 python3 investigation/repros/stress_extras.py --only S8    # Bug 2 repro
 python3 investigation/repros/stress_extras.py --only S9    # 20-turn agent
@@ -403,7 +403,7 @@ ends of the GPU family range.
 |---|---|---|
 | Bug 1 (Metal pipeline-evict on warm-disk-cache 2nd request) | mlx-swift fork commit `fa3a9616` — keeps pipelines alive across `clear_library`. Set `MLX_CLEAR_LIBRARY_RELEASE=1` to revert for testing. | vmlx (FIX READY) |
 | Bug 2 (`metal::malloc 154 GB` on hybrid + over-cap prompt) | None yet — empirical pin + fix is the next item. Workaround: don't set `defaultMaxKVSize` for hybrid models when prompts may exceed cap. | vmlx (TO BE BUILT) |
-| swift-embeddings `branch: main` pin | Convert to `revision:` per tpae's 2026-04-26 policy | osaurus |
+| swift-embeddings `branch: main` pin | Convert to `revision:` per the host-side revision-pin policy | osaurus |
 | swift-crypto 3.15.1 vs 4.5.0 split | OK for now; bump to 4.x when PR #958 (HPKE) lands | osaurus |
 | Full-suite test flake on M5 | Use `--filter` for clean signal; investigate later | engine team |
 | signing certs on this M5 | Use ad-hoc `codesign -s -` for local; Apple Dev cert needs to be re-issued | osaurus ops |
@@ -421,5 +421,127 @@ Before bumping vmlx-swift-lm pin in `OsaurusCore/Package.swift`:
   must be rewritten to reflect the new mlx-swift fork pin + vmlx
   Bug 2 clamp)
 - [ ] mlx-swift dep converted from `branch:` to `revision:` SHA at
-  the same time (tpae's policy)
+  the same time (host-side pin policy)
+
+
+---
+
+## 16. End-to-end coverage matrix (verified 2026-04-30 on M5 Max)
+
+Driven from `RunBench` against
+`OsaurusAI/Nemotron-3-Nano-Omni-30B-A3B-MXFP4` from the local model
+cache. Every row was exercised on real weights with the
+`cf8c525` vmlx-swift-lm pin and the patched mlx-swift fork
+(`osaurus-ai/mlx-swift osaurus-0.31.3` @ `e0b6111` referencing the
+`osaurus-ai/mlx fix/clear-library-no-release` submodule branch).
+Full pass/fail grid in `STRESS_REPORT.md`.
+
+| Surface | Verified row | Notes |
+|---|---|---|
+| **Parakeet (audio STT / voice I/O)** | OmniBench 6a + 6b | encoder shape `[T, 2688]`, LMInput.audio end-to-end at ~66 tok/s |
+| **RADIO (image + video vision)** | OmniBench 3, 4, 5, 5b, 9 | image single + multi-turn, video frames + LMInput end-to-end |
+| **NemotronHJANGTQ routing** | OmniBench loads `NemotronHOmni` via `VLMModelFactory` — factory dispatch by `weight_format` works for MXFP4 / JANGTQ4 / JANGTQ2 with no caller change |
+| **Hybrid SSM (Mamba/Attn/MoE)** | OmniBench 11 + StabilityBench S10 | `setHybrid(true)` auto-flips on first admission; SSM state companion cache round-trips across two engine instances |
+| **Reasoning toggle** | OmniBench 7 + 8 | `enable_thinking: false` parity, ON→OFF→ON swap |
+| **Tool calls** | tested via SampleTests + ToolTests in `swift test` baseline (1190/1190 OsaurusCore + 53/53 vmlx focused) |
+| **Stop sequences** | StopStringMatcher unit tests + GenerateParameters.extraStopStrings honored — multi-byte UTF-8 boundary safe |
+| **L1 paged cache hit (shared prefix)** | StabilityBench S3 | 1st 0.5s → 2nd 0.3s warm-cache speedup |
+| **L2 disk cache restore (full prefix)** | StabilityBench S2, S8, S10 | `restored N tokens from disk, prefilling 0 remaining` log fired without crash |
+| **L2 disk cache restore (partial)** | StabilityBench S5 (paged hit + remaining tail) | `restored 256 tokens, prefilling 81 remaining` etc |
+| **TurboQuant KV mode + disk** | StabilityBench S8 | `defaultKVMode: .turboQuant(3,3)` round-trips through TQDiskSerializer v2 |
+| **mediaSalt isolation** | OmniBench 10 | audio A vs B with same text prompt → cache scopes don't alias |
+| **Concurrent batched B=2** | OmniBench B2 + StabilityBench S6 | batched decode through hybrid topology |
+| **Cancel + recovery** | StabilityBench S7 | break stream after 3 events, next request completes cleanly |
+| **Memory.clearCache mid-run** | StabilityBench S9 | engine survives forced eviction |
+| **Multi-turn agent loop (8 turns)** | StabilityBench S4 | grow context with system + tool-result style, no slot leak |
+| **OpenAI `input_audio` / `video_url` API surface** | host-side branch `feat/openai-multimodal-audio-video` (commit `e7f68045`) routes to `LMInput.audios` / `.videos` via `MessageContentPart` — vmlx side already supports these via `LMInput`'s audio/video fields (commits `ae49c7c` + `3b78db4` in `cf8c525`) |
+| **Long prompt (~16k)** | StabilityBench S5 | chunked prefill engages, no cap clamp needed at this length |
+| **Over-cap prompt (60k+, 154 GB territory)** | observed on M5 Max — peak 418 GB, escapes only via 128 GB unified memory + macOS swap. **Bug 2 fix still TODO**: needs `mx::malloc > 1 GB` tracer to identify the exact allocation site before designing the right-shape clamp. M4 Pro / smaller machines remain susceptible. |
+
+## 17. API surface (host-facing)
+
+What the host calls into. All stable across the `cf8c525` vmlx pin range.
+
+### Inputs
+
+```swift
+// LMInput is the single struct for ALL modalities.
+public struct LMInput: Sendable {
+    public var text: Text
+    public var image: Image?    // RADIO ViT (VLMs) — 256 tokens/tile
+    public var video: Video?    // RADIO frames + EVS (Nemotron-Omni, Qwen3-VL)
+    public var audio: Audio?    // Parakeet STT / voice (Nemotron-Omni)
+}
+
+// Convenience constructors:
+LMInput.Image.pixels(MLXArray)   // pre-decoded HWC pixels
+LMInput.Image.imageFile(URL)     // read + decode for the caller
+LMInput.Video.pixels([MLXArray]) // pre-extracted frames
+LMInput.Video.videoFile(URL)     // read + frame-extract
+LMInput.Audio.pcm16k(MLXArray)   // 16 kHz mono PCM
+LMInput.Audio.wavFile(URL)       // read + resample for the caller
+```
+
+The `additionalContext` map carries chat-template kwargs:
+```swift
+var ui = UserInput(prompt: prompt)
+ui.additionalContext = ["enable_thinking": false]   // or true
+let lmInput = try await context.processor.prepare(input: ui)
+```
+
+### Cache coordinator config — every knob
+
+```swift
+CacheCoordinatorConfig(
+    usePagedCache:           true,                                      // L1 in-memory paged
+    enableDiskCache:         true,                                      // L2 ~/.osaurus/cache/kv_v2 etc.
+    pagedBlockSize:          256,                                       // tokens per L1 block
+    maxCacheBlocks:          1024,                                      // upper bound on resident L1 blocks
+    diskCacheMaxGB:          50,                                        // L2 LRU cap
+    diskCacheDir:            URL(fileURLWithPath: "~/.osaurus/cache/kv_v2"),
+    ssmMaxEntries:           64,                                        // SSM-state companion cache size
+    modelKey:                bundle.lastPathComponent,                  // disk-cache + paged-cache scope
+    defaultKVMode:           .turboQuant(keyBits: 3, valueBits: 3),     // ~5x KV memory savings vs fp16
+    defaultMaxKVSize:        8192,                                      // ring window
+    longPromptMultiplier:    2.0                                        // gate: only clamp once prompt > cap*multiplier
+)
+```
+
+After construction:
+```swift
+coord.setHybrid(true)                              // hybrid SSM/Mamba models — idempotent
+let salt = coord.computeMediaSalt(for: input)     // VL salt, mixed into cache hash for image/video
+```
+
+### Stream events
+
+```swift
+for try await event in engine.generate(input: input, parameters: parameters) {
+    switch event {
+    case .chunk(let text):       // visible content (after reasoning extraction)
+    case .reasoning(let chunk):  // <think>...</think> block content
+    case .toolCall(let call):    // parsed tool invocation (model + parser dependent)
+    case .info(let info):        // GenerateCompletionInfo: finishReason, unclosedReasoning, perf
+    }
+}
+```
+
+### OpenAI HTTP body shapes (osaurus-side, already wired)
+
+| OpenAI field | vmlx surface | Models |
+|---|---|---|
+| `messages[].content` (string) | `UserInput(prompt:)` | all |
+| `messages[].content[].type=text` | text channel | all |
+| `messages[].content[].type=image_url` | `LMInput.Image` | VLMs |
+| `messages[].content[].type=video_url` | `LMInput.Video` | Nemotron-Omni RADIO, Qwen3-VL |
+| `messages[].content[].type=input_audio` | `LMInput.Audio` | Nemotron-Omni Parakeet |
+| `tools` | tool-call processor (chat-template controlled) | model-dependent |
+| `temperature`, `top_p`, `max_tokens` | `GenerateParameters` | all |
+| `repetition_penalty` | `GenerateParameters.repetitionPenalty` (1.0 treated as no-op per `cf8c525`) | all |
+| `presence_penalty`, `frequency_penalty` | additive penalties (0 = no-op) | all |
+| `stream: true` | SSE — host writes `data: ...` per event | all |
+
+Host-side mapping lives in `feat/openai-multimodal-audio-video` (osaurus PR
+target). vmlx side accepts `LMInput.audios` / `.videos` collections so the
+host can pass multiple audio or video parts without flattening.
 
