@@ -154,6 +154,56 @@ public class SampleTests: XCTestCase {
         )
     }
 
+    /// 2026-04-30 (Bug 3a): `repetition_penalty: 1.0` is the HuggingFace
+    /// idiom for "no penalty" — multiplying / dividing logits by 1.0 is
+    /// a no-op. Models like Nemotron-3-Nano-Omni ship `1.0` as a default
+    /// in their `generation_config.json`. The processor should treat
+    /// this as if no penalty were configured (returning nil), which
+    /// also avoids exposing a latent mlx-swift indexing panic on first
+    /// decode.
+    func testRepetitionPenaltyOneIsTreatedAsNoOp() {
+        // The no-op cases — all should produce no processor.
+        XCTAssertNil(GenerateParameters(repetitionPenalty: 1.0).processor())
+        XCTAssertNil(GenerateParameters(repetitionPenalty: 0.0).processor())
+        XCTAssertNil(GenerateParameters(repetitionPenalty: nil).processor())
+
+        // Non-no-op penalties must still produce a processor.
+        XCTAssertNotNil(GenerateParameters(repetitionPenalty: 1.05).processor())
+        XCTAssertNotNil(GenerateParameters(repetitionPenalty: 0.99).processor())
+        XCTAssertNotNil(GenerateParameters(repetitionPenalty: 2.0).processor())
+
+        // Boundary values just outside the no-op equality must still build
+        // a processor (we do an exact `!= 1.0` comparison, not approximate).
+        XCTAssertNotNil(
+            GenerateParameters(repetitionPenalty: Float(1.0).nextUp).processor()
+        )
+        XCTAssertNotNil(
+            GenerateParameters(repetitionPenalty: Float(1.0).nextDown).processor()
+        )
+
+        // Combination: 1.0 rep penalty but non-zero presence still produces
+        // a processor (driven by presence; rep contribution is correctly nil).
+        XCTAssertNotNil(
+            GenerateParameters(repetitionPenalty: 1.0, presencePenalty: 0.5).processor()
+        )
+        // Symmetric: 1.0 rep + non-zero frequency → processor exists.
+        XCTAssertNotNil(
+            GenerateParameters(repetitionPenalty: 1.0, frequencyPenalty: 0.5).processor()
+        )
+
+        // Sanity: presence/frequency keep their additive-no-op semantics
+        // (penalty == 0 → no processor); 1.0 is NOT a no-op for them.
+        XCTAssertNil(GenerateParameters(presencePenalty: 0.0).processor())
+        XCTAssertNotNil(GenerateParameters(presencePenalty: 1.0).processor())
+        XCTAssertNil(GenerateParameters(frequencyPenalty: 0.0).processor())
+        XCTAssertNotNil(GenerateParameters(frequencyPenalty: 1.0).processor())
+
+        // contextSize=0 also short-circuits regardless of penalty value.
+        XCTAssertNil(
+            GenerateParameters(repetitionPenalty: 1.5, repetitionContextSize: 0).processor()
+        )
+    }
+
     func testPresencePenaltyContextPenalizesUniqueSeenTokens() {
         var processor = PresencePenaltyContext(presencePenalty: 0.5, presenceContextSize: 5)
         processor.prompt(MLXArray([0, 0, 0, 1, 1]))

@@ -276,7 +276,20 @@ public struct GenerateParameters: Sendable {
 
     public func processor() -> LogitProcessor? {
         let repetitionContext: RepetitionContext?
-        if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
+        // 2026-04-30 fix (Bug 3a): also skip the no-op case where
+        // `repetitionPenalty == 1.0` — that's the HuggingFace idiom for
+        // "no penalty," shipped in many `generation_config.json` files
+        // (notably Nemotron-3-Nano-Omni). Multiplying / dividing logits
+        // by 1.0 is a mathematical no-op, so building a RepetitionContext
+        // for it is wasted work AND, when it happens, exposes a latent
+        // bounds-check panic in mlx-swift's `MLXArray[range].subscript`
+        // that kills the process on first decode (osaurus crash report
+        // 2026-04-30-141326.ips). Treating 1.0 as nil here is the
+        // correct semantic AND the safe runtime choice.
+        if let repetitionPenalty,
+           repetitionPenalty != 0,
+           repetitionPenalty != 1.0,
+           repetitionContextSize > 0 {
             repetitionContext = RepetitionContext(
                 repetitionPenalty: repetitionPenalty,
                 repetitionContextSize: repetitionContextSize
