@@ -136,7 +136,35 @@ public enum LLMTypeRegistry {
             // shared. See `Models/Laguna.swift`. JANGTQ variant (paired
             // JANGTQDenseLinear port) follows the Mistral 3 family
             // pattern in a follow-up.
-            "laguna": create(LagunaConfiguration.self, LagunaModel.init),
+            "laguna": { data in
+                // 2026-04-30: peek `weight_format` and route mxtq →
+                // LagunaJANGTQModel. mxtqBits / mxtqSeed merged into
+                // config.json by the factory pre-decode (same pattern
+                // as MiniMax / Mistral 3 family).
+                struct WFCheck: Codable {
+                    let weightFormat: String?
+                    let mxtqBits: Int?
+                    let mxtqSeed: Int?
+                    enum CodingKeys: String, CodingKey {
+                        case weightFormat = "weight_format"
+                        case mxtqBits = "mxtq_bits"
+                        case mxtqSeed = "mxtq_seed"
+                    }
+                }
+                if let probe = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
+                    probe.weightFormat?.lowercased() == "mxtq"
+                {
+                    let cfg = try JSONDecoder.json5().decode(
+                        LagunaConfiguration.self, from: data)
+                    return LagunaJANGTQModel(
+                        cfg,
+                        bits: probe.mxtqBits ?? 2,
+                        seed: probe.mxtqSeed ?? 42)
+                }
+                let cfg = try JSONDecoder.json5().decode(
+                    LagunaConfiguration.self, from: data)
+                return LagunaModel(cfg)
+            },
         ]
     }
 
