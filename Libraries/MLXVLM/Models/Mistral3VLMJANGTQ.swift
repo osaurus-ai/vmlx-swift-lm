@@ -513,6 +513,19 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // Drop JANGTQ per-tensor `.tq_bits` scalars. The bits-width is
+            // consumed from `mxtq_bits` / `quantization.profile` at config
+            // time (passed into Mistral3VLMJANGTQ's init via the bits arg);
+            // the per-tensor scalar in the safetensors is redundant and
+            // JANGTQDenseLinear's @ParameterInfo schema doesn't accept it.
+            // Without this drop, every Mistral 3 / 3.5 VLM JANGTQ bundle
+            // throws `Unhandled keys [tq_bits]` at first weight load. Same
+            // pattern as LagunaJANGTQ.sanitize / Mistral3TextJANGTQ.sanitize
+            // / DeepseekV4JANGTQ.sanitize / NemotronHJANGTQ.sanitize.
+            if newKey.hasSuffix(".tq_bits") {
+                continue
+            }
+
             if newKey.contains("weight_scale_inv") {
                 let scaleInv = value
                 let weightKey = newKey.replacingOccurrences(of: "_scale_inv", with: "")
