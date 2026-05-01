@@ -1,0 +1,427 @@
+# vmlx-swift-lm Integration Guide for osaurus
+
+**Date:** 2026-05-01
+**Pin:** `origin/main` HEAD `71065ca` (or later)
+**Audience:** osaurus model-loading + chat-engine agents
+
+This is the authoritative integration document. It supersedes
+`MODEL-LOADING-STATUS-2026-05-01.md` and absorbs the per-model status,
+cache topology, VL/audio/video pipeline details, EOS handling, chat
+template fallbacks, and ALL structural fixes landed in main as of
+2026-05-01.
+
+---
+
+## TL;DR — what changed since the last pin bump
+
+7 commits land structural fixes that affect EVERY JANGTQ / MXFP4 /
+hybrid-SSM model. Bump past `71065ca` and you get all of them.
+
+| Commit | Subsystem | What it fixes |
+|---|---|---|
+| `1135950` | Laguna model | softplus (not sigmoid) g_proj gate; un-biased weights for routed-MoE; YaRN scaling on full-attention layers |
+| `576916b` | Laguna MoE | `TurboQuantSwitchGLU` (was 256 individual modules) + sanitize splits fused `gate_up_proj` |
+| `babbe34` | Mistral 3.5 VLM | strips `model.` prefix on `vision_tower.…` keys |
+| `0fab91c` | Mistral 3.5 VLM | strips `model.` prefix on `multi_modal_projector.…` keys |
+| `1173822` | Cache (cross-cutting) | (A) TurboQuant paged-cache compounding-quantization fix; (B) hybrid models honor `defaultMaxKVSize` |
+| `3f8a5e9` | Cache + sanitize | Qwen35JANGTQ also honors `maxKVSize`; tied-embeddings hardenings (Mistral3VLM, NemotronH, Mistral3VLMJANGTQ) |
+| `0d85e9d` | EOS detection | BatchEngine probes 7 common end-of-turn special tokens against the tokenizer vocab (defensive widening) |
+| `0756dc0` | Disk-tier cache | closes the trim+seed Metal lifecycle crash on full disk-cache hit (`notifyExternalReferencesNonZeroOnDealloc` repro) |
+| `71065ca` | Chat templates | Laguna minimal fallback + bridge sniff (covers swift-jinja `{% generation %}` block-tag throw) |
+
+**Osaurus can re-enable the L2 disk cache** (`enableDiskCache = true`)
+after this pin bump — `0756dc0` closes the repro.
+
+---
+
+## Verified-coherent bundles (real load + decode this session)
+
+All loaded from `/Volumes/EricsLLMDrive/`. Bench harness:
+- `BENCH_SIMPLE=1` — synthetic prompt, raw token decode
+- `BENCH_COHERENT=1` — 3-turn ChatSession with real tokenizer
+- `BENCH_BATCH_CHAT=1` — 3-turn BatchEngine with cache reuse
+
+| Bundle | Quant | Test | Result |
+|---|---|---|---|
+| Laguna-XS.2-JANGTQ | mixed (codebook MoE + 8-bit affine dense) | BENCH_SIMPLE → tokenizer decode | `Okay, so I need to figure out how / <think> / Okay, let's see. The` — coherent reasoning |
+| Mistral-Medium-3.5-128B-JANGTQ | all-codebook decoder + fp16 vision/projector/lm_head | BENCH_SIMPLE → tokenizer decode | Loads in 13s, valid multilingual tokens (English + French) |
+| Nemotron-3-Nano-Omni-30B-JANGTQ | omni JANGTQ | BENCH_OMNI 11-row matrix | All pass: text + image + video + audio + reasoning toggle + mixed |
+| Qwen3.6-27B-MXFP4 | MXFP4 dense | BENCH_BATCH_CHAT 3-turn | Turn 2 says "Blue." (cache reuse). No `<\|im_end\|>` leak |
+| Qwen3.6-35B-A3B-JANGTQ4 | hybrid SSM + codebook MoE | BENCH_COHERENT 3-turn | "Blue is a wonderful choice!" → "Your favorite color is blue." → "Blue is considered a cool color." |
+| MiniMax-M2.7-Small-JANGTQ | MoE JANGTQ | BENCH_COHERENT 3-turn | "Blue is a great choice—it's calming, …" → "Your favorite color is blue." → "Blue is a cool color." |
+
+---
+
+## Dispatch + sanitize per family
+
+### Mistral 3 / Mistral 3.5 (LLM)
+
+**Outer model_type:** `mistral3` OR `ministral3` (text-only Mistral 3.5 LLM
+bundles can use either spelling). Both registered to `dispatchMistral3LLM`
+(`Libraries/MLXLLM/LLMModelFactory.swift:186, :193`).
+
+**Logic chain:**
+1. `vision_config` present → throw `unsupportedModelType("…route via VLMModelFactory")` — osaurus should auto-redispatch.
+2. `text_config.model_type == "mistral4"` → `Mistral4Model` (3.5 wrapper around 4 architecture).
+3. `weight_format == "mxtq"` → `Mistral3TextJANGTQModel` (entire decoder JANGTQ-quantized).
+4. Otherwise → `Mistral3TextModel`.
+
+**Reasoning / tool stamps:** `none` reasoning (no `<think>`); `mistral` tool format.
+
+### Mistral 3 / Mistral 3.5 (VLM)
+
+**Outer model_type:** `mistral3` OR `ministral3` — both registered to
+`dispatchMistral3VLM` (`VLMModelFactory.swift:115, :119`).
+
+**Logic chain:**
+1. `weight_format == "mxtq"` → `Mistral3VLMJANGTQ` (JANGTQ inner LM, fp16 Pixtral vision tower).
+2. `text_config.model_type == "mistral4"` → `Mistral4VLM`.
+3. Otherwise → `Mistral3VLM`.
+
+**Processor override:** `processorTypeOverrides` map at
+`VLMModelFactory.swift:554` covers BOTH `mistral3` and `ministral3` →
+`Mistral3Processor` (the Pixtral processor in `preprocessor_config.json`
+loses spatial-merge handling).
+
+**Sanitize key remaps (verified against real bundle):**
+- `model.language_model.…` → `language_model.model.…`
+- `model.vision_tower.…` → `vision_tower.vision_model.…` (strips `model.` prefix; commit `babbe34`)
+- `model.multi_modal_projector.…` → `multi_modal_projector.…` (commit `0fab91c`)
+- `lm_head.weight` (root) → `language_model.lm_head.weight`
+- `model.<llm-key>` (LLM-shape without wrapper) → `language_model.model.<llm-key>` (fallback)
+- Tied embeddings: drop redundant `language_model.lm_head.{weight,scales,biases}`
+- Drop `.tq_bits` per-tensor scalars and `self_attn.rotary_emb.inv_freq`
+
+### Laguna (Poolside)
+
+**Outer model_type:** `laguna`. Routes through `LagunaModel` always
+(LagunaJANGTQModel was deleted in commit `576916b` — it modeled the
+wrong scheme).
+
+**Architecture (mixed-quant):**
+- Layer 0 dense MLP, layers 1..39 sparse MoE (40 layers total)
+- Per-layer attention head count via `num_attention_heads_per_layer` (48 full / 64 SWA)
+- Dual RoPE per `rope_parameters[layer_type]` (full = YaRN factor=32, SWA = default base=10000)
+- `q_norm` / `k_norm` per-head RMSNorm BEFORE rope
+- `g_proj` per-head **softplus** gating (NOT sigmoid — see commit `1135950`)
+- Routed experts: 256 stacked codebook tensors at `experts.gate_up_proj.{tq_packed,tq_norms}` + `experts.down_proj.{tq_packed,tq_norms}`. Bundle ships gate+up FUSED on out-dim axis.
+- Shared expert: vanilla `LagunaDenseMLP` (8-bit affine quant via MLX auto-quant)
+- Sigmoid + bias router; bias ONLY for top-k selection, weights are un-biased sigmoid scores
+
+**Sanitize:**
+- `model.<x>` → `<x>`
+- `mlp.experts.e_score_correction_bias` → `mlp.e_score_correction_bias`
+- `mlp.experts.gate_up_proj.{tq_packed,tq_norms}` → split into `mlp.experts.{gate_proj,up_proj}.{…}` halves
+- Drop `self_attn.rotary_emb.inv_freq`, `.tq_bits`, tied `lm_head.weight`
+
+**bits / seed:** read `mxtq_bits` (dict) and `mxtq_seed` from `jang_config.json`. Routed-expert bits = 2 (codebook); attention/dense/shared/embed/lm_head = 8 (affine).
+
+**Cache topology:** per-layer mixed `RotatingKVCache` (sliding) + `KVCacheSimple` (full) — bounded by `parameters.maxKVSize` since `1173822`.
+
+**Reasoning / tool stamps:** `think_xml` reasoning (Laguna emits `<think>`); `glm4` tool format.
+
+**Chat template:** native uses `{% generation %}` HF block tags swift-jinja can't parse. Bridge sniff (`bos_token == "〈|EOS|〉"`) routes directly to `LagunaMinimal` fallback — see `ChatTemplateFallbacks.swift`.
+
+### NemotronH Omni (Cascade-2 Nano-Omni)
+
+**Auto-detect:** `VLMModelFactory.swift:387` — when `config_omni.json` exists, override `baseConfig.modelType` to `"NemotronH_Nano_Omni_Reasoning_V3"`. The bundle's own `config.json` reports `model_type: nemotron_h` (LLM-only schema).
+
+**Components:**
+- LM: `NemotronHModel` (or `NemotronHModel(jangtqContext:)` for JANGTQ omni)
+- Vision: RADIO ViT (`NemotronHRADIOVisionModel`) + pixel-shuffle + `NemotronHVisionMLPProjector` (`mlp1`)
+- Audio: Parakeet conformer encoder + mel STFT + sound projector
+- All 4 sub-modules at root with single-segment `@ModuleInfo` keys
+
+**Multi-modal placeholder splice:**
+- Image AND video share `<image>` placeholder (`imageContextTokenId`); the model's `prepare()` concatenates image + video embeds (image-first matching processor placeholder order) and splices in ONE pass — fixed in commit prior to this pin
+- Audio uses `<so_embedding>` placeholder (`soundContextTokenId`)
+
+**Long-prompt safety:** `prepare()` chunks text-only prefill at `windowSize ?? 512` tokens to bound the SSM segsum O(L²) memory cost (avoids the 158GB allocation OOM osaurus team reported on long contexts).
+
+**Reasoning / tool stamps:** `think_xml` reasoning; `xmlFunction` tool format.
+
+### Qwen 3.5 / 3.6
+
+**Outer model_types:** `qwen3_5`, `qwen3_5_moe`, `qwen3_5_text`, `qwen3_vl` (in VLM).
+
+**Hybrid pattern:**
+- `layer.isLinear == true` → SSM Mamba layer → `MambaCache()`
+- `layer.isLinear == false` → attention layer → `RotatingKVCache(maxSize: maxKVSize, keep: 4)` when `parameters.maxKVSize` set (commit `1173822`); else `KVCacheSimple()`
+- Both `Qwen35Model` AND `Qwen35JANGTQModel` honor maxKVSize as of `3f8a5e9`
+
+**JANGTQ4 routed-MoE:** pre-stacked at `mlp.switch_mlp.{gate_proj,up_proj,down_proj}.{tq_packed,tq_norms}` (already split in the bundle, not fused). `Qwen35JANGTQTextModel.sanitize` correctly skips its own stacking branch when keys are already in switch_mlp form.
+
+**MXFP4 dense (e.g. Qwen3.6 27B):** standard MLX affine quant, vanilla `Linear` modules, MLX auto-quant from `config.json`'s `quantization` field.
+
+**Reasoning / tool stamps:** `think_xml` reasoning (Qwen3.5/3.6 native `<think>` chat template); `xmlFunction` tool format.
+
+### MiniMax M2 / M2.7
+
+**Outer model_types:** `minimax`, `minimax_m2`, `minimax_m3`.
+
+**Sanitize:** drops tied `lm_head.weight` correctly (also covers `.scales` / `.biases` after commit `3f8a5e9` — forward-compat for tied+quantized lm_head).
+
+**Reasoning / tool stamps:** `minimaxM2` tool format (special XML envelope per Python `minimax_m2/encoding.py`); reasoning per JANG `tool_parser=minimax` capability stamp.
+
+### DeepSeek-V4 Flash
+
+**Outer model_type:** `deepseek_v4`. Dispatched via `dispatchDeepseekV4` which reads `weight_format=="mxtq"` / `jangtq2` / `jangtq4` (or env override `DSV4_FORCE_JANGTQ=1`) → `DeepseekV4JANGTQModel`; otherwise `DeepseekV4Model`.
+
+**Architecture distinct from DSV3:** mHC residual stream, CSA/HCA hybrid attention, sqrtsoftplus + hash-routing on layers 0-2, grouped low-rank O. The factory throws a structured error rather than dispatching to DSV3 (which would silently produce garbage).
+
+**Routed MoE:** `TurboQuantSwitchGLU` keyed at `switch_mlp` (different from Laguna's `experts` key — bundle layout convention).
+
+**Chat template:** DSV4 ships NO `chat_template` field. Bridge sniff (`bos_token == "<\|begin▁of▁sentence\|>"` with curly-quote U+FF5C) auto-engages `DSV4Minimal.jinja` fallback. `VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` opts out.
+
+**Note (open issue):** `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
+
+---
+
+## Cache topology — fully specified
+
+### Per-layer cache types
+
+| Cache class | Purpose | When created |
+|---|---|---|
+| `KVCacheSimple` | Full attention, unbounded | `newCache` when no `maxKVSize` set |
+| `RotatingKVCache(maxSize:, keep:)` | Sliding-window OR `maxKVSize`-bounded full attention | `newCache` when `maxKVSize` is set, OR for SWA layers with `slidingWindow` |
+| `MambaCache` | SSM hidden + conv state | Hybrid models on Mamba layers |
+| `ArraysCache` | Generic state slots | Some Cascade variants |
+| `CacheList` | Composite (e.g. SSM + KV in one layer) | Models with co-located SSM and attention |
+| `TurboQuantKVCache` | Codebook-quantized KV | Wrapped on top of `KVCacheSimple` by `maybeQuantizeKVCache` when `kvMode == .turboQuant(k,v)` and offset > threshold |
+| `QuantizedKVCache` | Standard MLX affine-quantized KV | Alternative to TurboQuant |
+
+### `defaultMaxKVSize` contract (osaurus → vmlx)
+
+`CacheCoordinatorConfig.defaultMaxKVSize` writes the bound into
+`parameters.maxKVSize` at admission. Models honor it as follows
+(verified post-`3f8a5e9`):
+
+| Model | Honors `maxKVSize`? |
+|---|---|
+| Llama, Mistral (vanilla) | ✅ via `KVCache.makePromptCacheWithLayerCount` |
+| Mistral 3 / 3.5 (LLM + VLM) | ✅ via `RotatingKVCache` for SWA layers, KVCacheSimple for full |
+| Laguna | ✅ per-layer mixed (sliding bounded by `slidingWindow`, full bounded by `maxKVSize`) |
+| Qwen3.5 / 3.6 (vanilla) | ✅ since `1173822` |
+| Qwen3.5 / 3.6 JANGTQ | ✅ since `3f8a5e9` |
+| Qwen3Next | ✅ since `1173822` |
+| NemotronH / NemotronH Omni | ✅ since `1173822` (per-block via `hybridOverridePattern`) |
+| Mamba layers (any hybrid) | ⚠️ ignore by design — SSM hidden state is fixed-size |
+
+### TurboQuant KV — paged-cache restore (commit `1173822`)
+
+`TurboQuantKVCache.restoreFromDecodedKV(keys:values:sourceOffset:)` is
+the **correct** entry point for paged-tier restore. Seats decoded
+float as the `.compressed` phase prefix WITHOUT re-encoding, leaving
+`compressedKeys`/`compressedValues` nil (paged tier doesn't carry them
+— only the disk tier does via `restoreCompressed`).
+
+**Why this matters:** the previous `tq.state = [keys, values]` path
+transitioned the cache back to `.fill` phase with already-lossy float
+as the new prefill. Subsequent compression at the next threshold
+cross re-quantized the lossy float — **compounding quantization error
+per turn**. This is the exact "first turn fine, later turns garbage"
+symptom osaurus observed across every JANGTQ/MXFP4 multi-turn path.
+
+**3-bit KV verdict:** Now safe to re-enable (`defaultKVMode =
+.turboQuant(3, 3)` works post-`1173822`). The per-bit packing is
+sound; the bug was in the cross-turn handoff. Conservative
+`.turboQuant(4, 4)` still recommended as the default — 3-bit is most
+sensitive to error amplification and gains less compression benefit.
+
+### Disk-tier cache — re-enable now (commit `0756dc0`)
+
+The `notifyExternalReferencesNonZeroOnDealloc` crash is closed.
+`enableDiskCache = true` is safe to re-enable in osaurus
+`ModelRuntime.swift`. The fix forces materialization of trim mutations
+in a SEPARATE command buffer before the seed-token forward encodes,
+avoiding the Metal library-cache eviction race.
+
+### Hybrid SSM seed-on-restore
+
+Inline synchronous seed at `BatchEngine.swift:911` (post-prefill).
+SSMReDeriver was reverted (Metal race). Current path:
+1. `extractSSMStates` walks per-layer cache pulling Mamba conv+hidden
+2. Stored in `coordinator.ssmStateCache` keyed by promptTokens hash
+3. On restore: `restoreSSMStates` overwrites a fresh cache
+4. Safety net: if hybrid SSM detected AND remaining > 0, full re-prefill
+   (partial cache hits never benefit hybrid SSM models — by design)
+
+---
+
+## EOS detection — fully wired (commits `0d85e9d` + factory chain)
+
+### Sources cascaded into `BatchEngine.stopTokenIDs`
+
+1. `config.json` `eos_token_id` (int or array via `IntOrIntArray`)
+2. `generation_config.json` `eos_token_id` (overrides config.json per Python mlx-lm convention)
+3. `tokenizer.eosTokenId` (tokenizer_config.json `eos_token` → vocab ID)
+4. `tokenizer.unknownTokenId`
+5. `ModelConfiguration.extraEOSTokens` (caller-supplied)
+6. **Defensive widening** (commit `0d85e9d`) — probes 7 common end-of-turn special tokens against the tokenizer vocab:
+   - `<|im_end|>` (Qwen / Mistral 3 / NemotronH-Omni / many)
+   - `<|endoftext|>` (Qwen2/3, GPT-style)
+   - `<|eot_id|>` (Llama 3.x)
+   - `<|end_of_text|>` (Llama 3.x alt)
+   - `<|end|>` (Phi 3, Phi 4)
+   - `<|end_of_turn|>` (Gemma family)
+   - `<end_of_turn>` (Gemma 2/3 alt spelling)
+
+`convertTokenToId` returns nil for non-vocab strings — plain content
+bytes that happen to spell these tokens do NOT match. Only genuine
+special tokens do.
+
+---
+
+## Chat template fallbacks — bridge dispatch flow
+
+Bridge: `Libraries/MLXHuggingFaceMacros/HuggingFaceIntegrationMacros.swift:111-228`.
+
+Order of attempts:
+1. `VMLX_CHAT_TEMPLATE_OVERRIDE=/path/to/template.jinja` — explicit override.
+2. The model's shipped `chat_template.jinja` via swift-jinja.
+3. On `missingChatTemplate` throw: DSV4 BOS sniff (`<\|begin▁of▁sentence\|>` curly-quote) → `DSV4Minimal`.
+4. On any other `swift-jinja` throw:
+   - **Laguna sniff** (`bos_token == "〈|EOS|〉"`): `LagunaMinimal` only (commit `71065ca`).
+   - **Gemma family sniff** (`bos_token == "<bos>"` OR `convertTokenToId("<|turn>") != nil`): full `orderedFallbacks`.
+   - Otherwise: `[NemotronMinimal, Gemma4WithTools, Gemma4Minimal]`.
+5. Re-throw if no fallback parses.
+
+`VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` opts out of step 3 + 4 entirely.
+`VMLX_CHAT_TEMPLATE_FALLBACK_LOG=1` logs which fallback engaged to stderr.
+
+### Known native templates that work
+
+- Gemma-4 / Gemma-4n (E2B/E4B/26B-A4B/31B JANG) — works post swift-transformers 1.3.0 bump; fallback auto-engages on regression
+- Nemotron-Cascade-2 30B-A3B — works post 1.3.0 bump
+- Qwen3.6 27B + 35B — verified end-to-end multi-turn this session
+- MiniMax-M2.7 Small — verified multi-turn
+- Mistral 3.5 LLM + VLM — verified load+decode
+
+### Known native templates with workarounds
+
+- **Laguna** — `{% generation %}` block tag → bridge auto-routes to `LagunaMinimal`
+- **DSV4** — no `chat_template` shipped → bridge auto-routes to `DSV4Minimal`
+
+### Known unresolved gaps (caller workarounds available)
+
+If any family's swift-jinja rendering breaks at HEAD:
+- Set `VMLX_CHAT_TEMPLATE_OVERRIDE=/abs/path/to/your.jinja` to bypass
+- File issue with the family + repro
+
+---
+
+## Reasoning + tool format dispatch
+
+### Reasoning stamp resolution priority (highest first)
+
+1. JANG `chat.reasoning_parser` stamp from `jang_config.json`
+2. JANG `capabilities.reasoning_parser` stamp
+3. `reasoningStampFromModelType(model_type)` heuristic — explicit allowlist:
+   - `gemma4*` → `harmony` (channel envelope)
+   - `qwen3*`, `deepseek*`, `glm4_moe*`, `glm5*`, `minimax*`, `kimi*`, `nemotron_h*`, `holo*`, `laguna*` → `think_xml`
+   - Everything else → `none`
+
+### Tool format resolution priority
+
+1. Caller-supplied `configuration.toolCallFormat`
+2. JANG `chat.tool_calling.parser` stamp (DSV4-era; e.g. `"dsml"`)
+3. JANG `capabilities.tool_parser` stamp
+4. `ToolCallFormat.infer(from: model_type)` heuristic
+
+### Sentinel encoding (osaurus-side responsibility)
+
+The streaming pipeline emits typed events via sentinel-prefixed strings:
+- `\u{FFFE}reasoning:…` → OpenAI `delta.reasoning_content`
+- `\u{FFFE}tool:…` → OpenAI `tool_calls`
+- `\u{FFFE}stats:…` → `usage`
+
+osaurus's `StreamingReasoningHint` / `StreamingToolHint` /
+`StreamingStatsHint` are responsible for decoding these.
+
+### Multi-turn history filter (osaurus-side)
+
+Filter to `t.role == .user` only when re-templating prior turns.
+Prevents `<think>` content from previous assistant turns from leaking
+into the new prompt. (Confirmed correct in `ChatView.swift:1288-1291`
+per osaurus audit.)
+
+---
+
+## VL pipeline — per-family considerations
+
+### Mistral 3.5 VLM (Pixtral vision tower)
+
+- Use `Mistral3Processor` (not `PixtralProcessor`) — spatial-merge handling
+- Vision feature dim flows through `multi_modal_projector.{linear_1, norm, linear_2, patch_merger.merging_layer}` — all fp16 passthrough
+- JANGTQ inner LM, fp16 vision tower (per `mxtq_bits.vision_tower=passthrough_fp16`)
+
+### NemotronH Omni — image / video / audio in one model
+
+- Image: tile-pipeline → RADIO ViT → pixel-shuffle → `mlp1` projector
+- Video: `nemotronOmniPreprocessVideo` → group-stack 32-frame → 256 tokens per group
+- Audio: mel STFT → Parakeet conformer → sound projector → 1 audio token per 8 mel frames
+- Image and video SHARE `<image>` placeholder; processor concatenates embeds in image-first-then-video order; model's `prepare()` splices in ONE pass
+- Audio has its own `<so_embedding>` placeholder; supports `preEncodedEmbedding` fast-path to skip mel+Parakeet on repeat turns
+
+### Qwen 3.5 / 3.6 VLM
+
+- Native video pipeline via Qwen3VL.swift (separate from omni pipeline)
+- 3D rotary position via `Qwen3VLLanguage.applyMultimodalRotary` — image/video tokens use the multimodal rope branch
+
+### Capability matcher (osaurus side)
+
+`ModelMediaCapabilities.from(modelId:)` → `omni` / `imageVideo` /
+`imageOnly` / `textOnly`. Refines via post-load `vision_config` +
+`config_omni.json` sidecar. Matcher logic verified correct in osaurus
+audit.
+
+---
+
+## Pre-flight before testing
+
+Per memory notes (model + GPU):
+
+```bash
+# Run model tests ONE AT A TIME — never parallel (GPU RAM)
+# Kill any lingering inference / test processes first
+pkill -f xctest
+pkill -f RunBench
+pkill -f mlx_lm
+pkill -f ollama
+pkill -f lms
+
+# Verify nothing's holding the GPU
+ps -A | grep -E "xctest|RunBench|mlx" | grep -v grep
+```
+
+xctest zombies hold 27+GB and cut decode throughput in half.
+
+---
+
+## Bench harness
+
+Single binary: `swift build -c release` → `.build/release/RunBench`.
+
+Modes:
+- `BENCH_SIMPLE=1` — synthetic-prompt decode, prints raw token IDs
+- `BENCH_COHERENT=1` — 3-turn ChatSession (compile OFF + ON) — empty `text` for reasoning-heavy turns is normal
+- `BENCH_BATCH_CHAT=1` — 3-turn BatchEngine multi-turn with cache reuse + full HF tokenizer
+- `BENCH_BATCH_CACHE_HIT=1` — exercises CacheCoordinator cross-turn prefix reuse
+- `BENCH_OMNI=1 BENCH_MODEL=...` — 11-row Nemotron Omni matrix (text/image/video/audio/reasoning toggle/mixed)
+- `BENCH_VL=1 BENCH_MODEL=... BENCH_VIDEO=...` — VL video smoke
+- `BENCH_CROSS_VALIDATE=1` — TokenIterator vs BatchEngine byte-parity assertion (temp=0)
+
+Per-bench env knobs documented in `Bench.swift`.
+
+---
+
+## Surface area for osaurus
+
+Public APIs — see `OSAURUS-API-SURFACE.md` for the full list. Highlights:
+
+- `MLXLMCommon.loadModel(from:URL, using: tokenizerLoader)` — high-level dispatch (LLM vs VLM auto-detected)
+- `BatchEngine(context:maxBatchSize:cacheCoordinator:)` — admit `BatchRequest` → typed event stream
+- `ToolCallFormat.fromCapabilityName(_:)` — JANG short-name → enum (accepts `qwen`, `qwen3_6`, `minimax`, `glm47`, `deepseek`, `nemotron`, `gemma4`, `mistral`, `lfm2`, `kimi_k2`)
+- `ReasoningParser.fromCapabilityName(_:)` — same for reasoning stamps
+- `CacheCoordinatorConfig.defaultMaxKVSize` / `defaultKVMode` — coordinator-owned KV sizing (now honored by all hybrid families)
