@@ -472,17 +472,24 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         //   - `model.layers.N.mlp.experts.e_score_correction_bias` →
         //     `layers.N.mlp.e_score_correction_bias` (drop `experts.` segment;
         //     the Python reference notes this remap explicitly)
+        // Plus drops keys other vmlx model classes also drop (audit 2026-04-30):
+        //   - `self_attn.rotary_emb.inv_freq`     (precomputed rope freqs)
+        //   - `.tq_bits` per-tensor scalars       (read from config, not weights)
+        //   - `lm_head.weight`                    (when tieWordEmbeddings)
         var out: [String: MLXArray] = [:]
         for (key, value) in weights {
             var k = key
             if k.hasPrefix("model.") {
                 k = String(k.dropFirst("model.".count))
             }
-            // e_score_correction_bias remap.
             k = k.replacingOccurrences(
                 of: ".mlp.experts.e_score_correction_bias",
                 with: ".mlp.e_score_correction_bias"
             )
+            // Drop unused / config-only keys.
+            if k.contains("self_attn.rotary_emb.inv_freq") { continue }
+            if k.hasSuffix(".tq_bits") { continue }
+            if cfg.tieWordEmbeddings && k == "lm_head.weight" { continue }
             out[k] = value
         }
         return out

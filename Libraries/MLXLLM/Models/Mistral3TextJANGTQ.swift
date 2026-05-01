@@ -311,6 +311,55 @@ public class Mistral3TextJANGTQModel: Module, LLMModel, KVCacheDimensionProvider
             }
         }
     }
+
+    /// 2026-04-30 audit fix: mirror Mistral3TextModel.sanitize so JANGTQ
+    /// bundles handle the same HF-shipped weight quirks the vanilla
+    /// path handles. Without this, bundles carrying
+    /// `self_attn.rotary_emb.inv_freq` (precomputed rope frequencies,
+    /// common in HF safetensors) trigger "Unhandled keys" at load
+    /// time. Also handles tied embeddings + the `tq_bits` per-tensor
+    /// scalar that some early JANGTQ converters emit (vmlx ignores it
+    /// — bits live in the model class config from jang_config.json).
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var processedWeights = weights
+
+        // VLM-converted bundles bury weights under a `language_model.`
+        // top-level. Unwrap to top-level for the LLM path.
+        let unflattened = ModuleParameters.unflattened(weights)
+        if let lm = unflattened["language_model"] {
+            processedWeights = Dictionary(uniqueKeysWithValues: lm.flattened())
+        }
+
+        // Drop unused precomputed rope freqs and JANGTQ per-tensor
+        // bit-width scalars (mxtq_bits is read from config, not weights).
+        var sanitizedWeights = processedWeights.filter {
+            !$0.key.contains("self_attn.rotary_emb.inv_freq")
+                && !$0.key.hasSuffix(".tq_bits")
+        }
+
+        // Tied embeddings: drop lm_head.weight; embed_tokens.asLinear
+        // shares the input embedding matrix.
+        if args.tieWordEmbeddings {
+            sanitizedWeights["lm_head.weight"] = nil
+        }
+
+        // FP8 weight_scale_inv handling (matches vanilla Mistral3TextModel).
+        var newWeights: [String: MLXArray] = [:]
+        for (key, value) in sanitizedWeights {
+            if key.contains("weight_scale_inv") {
+                let scaleInv = value
+                let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
+                if let weight = sanitizedWeights[weightKey] {
+                    newWeights[weightKey] = weight * scaleInv
+                }
+            } else if key.contains("activation_scale") {
+                continue
+            } else if newWeights[key] == nil {
+                newWeights[key] = value
+            }
+        }
+        return newWeights
+    }
 }
 
 // LoRA conformance: JANGTQ Linear is not LoRA-quantizable today
