@@ -39,7 +39,16 @@ private let kHadamardMultiblockSource = """
     uint total_d = meta[0];
     uint n_blocks = meta[1];
 
-    threadgroup float shmem[4096];
+    // 8192 floats = 32 KB = max threadgroup memory on Apple Silicon. The
+    // largest single power-of-2 block we ever decompose into is 8192
+    // (e.g., Mistral-Medium-3.5 hidden=12288 → [8192, 4096]). Was [4096]
+    // → silently corrupted block 0 of any non-pow2 dim > 4096 (notably
+    // hidden=12288 above, GLM-5.1 hidden=6144 = 4096+2048, etc.).
+    // Diagnosis: per-layer L2 probe on Mistral 3.5 JANGTQ vs mxfp4 showed
+    // residual stream stops growing after layer 0 (stays near input
+    // magnitudes instead of saturating ~555). Raised to 8192 to match the
+    // Python reference (hadamard_kernel.py).
+    threadgroup float shmem[8192];
 
     for (uint i = tid; i < total_d; i += threads_per_tg) {
         shmem[i] = static_cast<float>(x[batch_idx * total_d + i]) * signs[i];
@@ -58,7 +67,12 @@ private let kHadamardMultiblockSource = """
             uint h = 1u << stage;
             uint two_h = 2u * h;
 
-            float newv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // Stack buffer per thread for butterfly-stage values. For the
+            // 8192 block + 1024 threads-per-tg this needs ≥ 8 entries; for
+            // smaller threads_per_tg it grows. Python reference uses 64
+            // for safety — match it here so nothing silently overruns.
+            float newv[64];
+            for (uint k = 0; k < 64; k++) newv[k] = 0.0f;
             for (uint k = 0; k < ept; k++) {
                 uint i_local = tid * ept + k;
                 if (i_local < d_b) {

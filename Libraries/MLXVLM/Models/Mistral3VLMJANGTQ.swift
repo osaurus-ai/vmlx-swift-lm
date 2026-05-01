@@ -76,13 +76,41 @@ internal final class Mistral3JANGTQAttention: Module {
         _ x: MLXArray,
         attentionScale: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?
+        cache: KVCache?,
+        layerIndex: Int? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
+
+        let projProbe =
+            ProcessInfo.processInfo.environment["VMLX_MISTRAL3_PROJ_PROBE"] == "1"
+            && (layerIndex.map { $0 < 3 } ?? false)
+        if projProbe, let li = layerIndex {
+            let xL2 = sqrt((x.asType(.float32) * x.asType(.float32)).sum())
+                .item(Float.self)
+            // Also probe the loaded weight params so we can correlate
+            // wq/wk/wv/wo runtime norms with their on-disk values.
+            let qNormsL2 = sqrt((wq.norms.asType(.float32) * wq.norms.asType(.float32)).sum()).item(Float.self)
+            let kNormsL2 = sqrt((wk.norms.asType(.float32) * wk.norms.asType(.float32)).sum()).item(Float.self)
+            let vNormsL2 = sqrt((wv.norms.asType(.float32) * wv.norms.asType(.float32)).sum()).item(Float.self)
+            let oNormsL2 = sqrt((wo.norms.asType(.float32) * wo.norms.asType(.float32)).sum()).item(Float.self)
+            FileHandle.standardError.write(
+                Data("[mistral3-proj-jangtq] layer=\(li) input.L2=\(xL2) tqN(q=\(qNormsL2) k=\(kNormsL2) v=\(vNormsL2) o=\(oNormsL2))\n".utf8))
+        }
 
         var queries = wq(x)
         var keys = wk(x)
         var values = wv(x)
+
+        if projProbe, let li = layerIndex {
+            let qL2 = sqrt((queries.asType(.float32) * queries.asType(.float32)).sum())
+                .item(Float.self)
+            let kL2 = sqrt((keys.asType(.float32) * keys.asType(.float32)).sum())
+                .item(Float.self)
+            let vL2 = sqrt((values.asType(.float32) * values.asType(.float32)).sum())
+                .item(Float.self)
+            FileHandle.standardError.write(
+                Data("[mistral3-proj-jangtq] layer=\(li) q.L2=\(qL2) k.L2=\(kL2) v.L2=\(vL2)\n".utf8))
+        }
 
         queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
         keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
@@ -99,7 +127,21 @@ internal final class Mistral3JANGTQAttention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
-        return wo(output)
+        if projProbe, let li = layerIndex {
+            let attL2 = sqrt((output.asType(.float32) * output.asType(.float32)).sum())
+                .item(Float.self)
+            FileHandle.standardError.write(
+                Data("[mistral3-proj-jangtq] layer=\(li) attn-out.L2=\(attL2)\n".utf8))
+        }
+
+        let result = wo(output)
+        if projProbe, let li = layerIndex {
+            let oL2 = sqrt((result.asType(.float32) * result.asType(.float32)).sum())
+                .item(Float.self)
+            FileHandle.standardError.write(
+                Data("[mistral3-proj-jangtq] layer=\(li) o.L2=\(oL2)\n".utf8))
+        }
+        return result
     }
 }
 
@@ -159,11 +201,12 @@ internal final class Mistral3JANGTQTransformerBlock: Module {
         _ x: MLXArray,
         attentionScale: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?
+        cache: KVCache?,
+        layerIndex: Int? = nil
     ) -> MLXArray {
         var r = attention(
             inputLayerNorm(x), attentionScale: attentionScale,
-            mask: mask, cache: cache)
+            mask: mask, cache: cache, layerIndex: layerIndex)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         return h + r
@@ -267,7 +310,8 @@ internal final class Mistral3JANGTQModelInner: Module {
             let mask = layer.useSliding ? swaMask : faMask
             h = layer(
                 h, attentionScale: attentionScale, mask: mask,
-                cache: cache.isEmpty ? nil : cache[i])
+                cache: cache.isEmpty ? nil : cache[i],
+                layerIndex: i)
             if probe {
                 let l2 = sqrt((h.asType(.float32) * h.asType(.float32)).sum()).item(Float.self)
                 FileHandle.standardError.write(
