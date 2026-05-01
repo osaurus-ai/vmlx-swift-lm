@@ -148,6 +148,34 @@ public enum LLMTypeRegistry {
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
             "mistral3": { data in
+                // 2026-04-30: fail-fast guard for JANGTQ-quantized Mistral 3
+                // family bundles. The current Mistral3TextModel /
+                // Mistral3VLM classes use vanilla MLXNN.Linear, which
+                // reads a flat `weight` tensor. JANGTQ bundles ship
+                // `.tq_packed` + `.scales` tensors that need a
+                // JANGTQ-aware Linear shim (see
+                // MiniMaxJANGTQModel / NemotronHJANGTQModel for the
+                // pattern). Without that shim, loading an mxtq Mistral
+                // 3.x bundle either crashes on weight-shape mismatch
+                // OR silently uses raw codebook bytes as weights. Fail
+                // fast with a clear error pointing at the porting work.
+                struct WFCheck: Codable {
+                    let weightFormat: String?
+                    enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+                }
+                if let wf = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
+                    wf.weightFormat?.lowercased() == "mxtq"
+                {
+                    throw NSError(
+                        domain: "vmlx-swift-lm.LLMModelFactory",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "JANGTQ-quantized Mistral 3 family bundles are not yet supported."
+                            + " The Mistral3TextModel uses vanilla nn.Linear; loading mxtq weights"
+                            + " requires a paired JANGTQ-aware Linear shim that has not been ported."
+                            + " Use the MXFP4 quant tier instead, or wait for the JANGTQ port."]
+                    )
+                }
                 // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
                 struct TextConfigCheck: Codable {
                     let textConfig: TextModelType?

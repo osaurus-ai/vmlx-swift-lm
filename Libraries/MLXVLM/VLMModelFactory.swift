@@ -113,6 +113,29 @@ public enum VLMTypeRegistry {
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
         "mistral3": { data in
+            // 2026-04-30: fail-fast guard for JANGTQ-quantized Mistral 3
+            // family bundles — same rationale as the LLM factory's
+            // mistral3 closure. Without a JANGTQ-aware Linear shim
+            // ported into Mistral3VLM, mxtq weights would either crash
+            // on shape mismatch or silently load garbage. Fail fast
+            // with a clear error pointing at the porting work.
+            struct WFCheck: Codable {
+                let weightFormat: String?
+                enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+            }
+            if let wf = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
+                wf.weightFormat?.lowercased() == "mxtq"
+            {
+                throw NSError(
+                    domain: "vmlx-swift-lm.VLMModelFactory",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "JANGTQ-quantized Mistral 3 family VLM bundles are not yet supported."
+                        + " The Mistral3VLM language model uses vanilla nn.Linear; loading"
+                        + " mxtq weights requires a paired JANGTQ-aware Linear shim that has not"
+                        + " been ported. Use the MXFP4 quant tier instead."]
+                )
+            }
             // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
             struct TextCheck: Codable {
                 let textConfig: TextType?
