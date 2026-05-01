@@ -247,8 +247,15 @@ internal final class LagunaAttention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
     @ModuleInfo(key: "g_proj") var gProj: Linear?
 
-    let ropeFull: RoPE
-    let ropePartial: RoPE?
+    // 2026-05-01: Use the dispatching `RoPELayer` so YaRN-scaled
+    // full-attention layers get their factor=32 / mscale stretch
+    // applied. Plain `RoPE` for full_attention destroyed long-context
+    // accuracy on prompts > 4096 tokens (Laguna's
+    // original_max_position_embeddings) — same class of bug as the
+    // softplus / un-biased-weights pair fixed alongside this. The
+    // sliding-attention layers still use plain RoPE because their
+    // rope_parameters entry is `rope_type: "default"`.
+    let rope: RoPELayer
 
     init(_ cfg: LagunaConfiguration, layerIndex: Int) {
         self.layerIndex = layerIndex
@@ -274,26 +281,46 @@ internal final class LagunaAttention: Module {
             self._gProj.wrappedValue = Linear(h, nHeads, bias: false)
         }
 
-        // Construct two RoPE instances: one for the full head_dim path,
-        // one for the partial-rotary path. Pick the right one per
-        // forward based on `ropeDim == headDim`.
-        self.ropeFull = RoPE(dimensions: headDim, traditional: false, base: ropeBase)
-        if ropeDim != headDim {
-            self.ropePartial = RoPE(dimensions: ropeDim, traditional: false, base: ropeBase)
-        } else {
-            self.ropePartial = nil
+        // Build the per-layer-type scaling config dict for `initializeRope`.
+        // Mirrors the Python remap (jang_tools/laguna/model.py:76-87):
+        // pull this layer's entry from `rope_parameters[layer_type]`,
+        // and rename `attention_factor` → `mscale` (HF YaRN nomenclature
+        // → mlx-swift YarnRoPE expected key). For SWA layers whose
+        // `rope_type == "default"`, `initializeRope` returns plain RoPE.
+        var scalingCfg: [String: StringOrNumber]? = nil
+        if let entry = cfg.ropeParameters[layerType] {
+            let ropeType = entry["rope_type"].flatMap { v -> String? in
+                if case .string(let s) = v { return s }
+                return nil
+            } ?? "default"
+            if ropeType != "default" {
+                var dict = entry
+                if let af = dict["attention_factor"], dict["mscale"] == nil {
+                    dict["mscale"] = af
+                    dict["attention_factor"] = nil
+                }
+                // Drop the nil we just inserted.
+                dict = dict.compactMapValues { $0 }
+                scalingCfg = dict
+            }
         }
+        self.rope = initializeRope(
+            dims: ropeDim,
+            base: ropeBase,
+            traditional: false,
+            scalingConfig: scalingCfg,
+            maxPositionEmbeddings: cfg.maxPositionEmbeddings)
     }
 
     private func applyPartialRope(_ t: MLXArray, offset: Int) -> MLXArray {
-        if let ropePartial {
-            // Rotate first ropeDim, keep tail.
-            let rot = t[.ellipsis, ..<ropeDim]
-            let keep = t[.ellipsis, ropeDim...]
-            let rotated = ropePartial(rot, offset: offset)
-            return MLX.concatenated([rotated, keep], axis: -1)
+        if ropeDim == headDim {
+            return rope(t, offset: offset)
         }
-        return ropeFull(t, offset: offset)
+        // Partial-rotary: rotate the first `ropeDim` channels, keep tail.
+        let rot = t[.ellipsis, ..<ropeDim]
+        let keep = t[.ellipsis, ropeDim...]
+        let rotated = rope(rot, offset: offset)
+        return MLX.concatenated([rotated, keep], axis: -1)
     }
 
     func callAsFunction(
@@ -320,10 +347,17 @@ internal final class LagunaAttention: Module {
 
         var result = out
         if let g = gProj {
-            // Per-head sigmoid gating: gate the SDPA output element-wise
-            // per head. gate shape: (B, T, nHeads) → broadcast to
-            // (B, T, nHeads, headDim) before flattening back.
-            let gate = sigmoid(g(x))
+            // Per-head softplus gating. Python `jang_tools/laguna/model.py`
+            // line 158 + the comment block above it explicitly notes that
+            // sigmoid (the obvious choice for an attention gate) drives
+            // residual stream blow-up over 30+ layers — std grows from
+            // 0.29 → 11, max → 616, output saturates into garbage tokens.
+            // The HF reference uses softplus to AMPLIFY (unbounded
+            // monotonic) rather than DAMP (sigmoid bounds [0,1]) the
+            // attention output. Match exactly: cast to fp32 before
+            // softplus to avoid fp16 overflow on long-tail logits, then
+            // back to result dtype for the broadcast.
+            let gate = softplus(g(x).asType(.float32)).asType(result.dtype)
             let gated = result.reshaped(B, T, nHeads, headDim) * gate.expandedDimensions(axis: -1)
             result = gated.reshaped(B, T, nHeads * headDim)
         }
@@ -410,23 +444,41 @@ internal final class LagunaMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // x: (B, T, H). Routing operates on (B, T, num_experts).
+        //
+        // CRITICAL ordering — copied from `jang_tools/laguna/model.py:209`
+        // (LagunaMoE.__call__) and the HF `modeling_laguna.py`
+        // LagunaTopKRouter / LagunaSparseMoeBlock reference:
+        //
+        //     scores               = sigmoid(logits)                     # un-biased
+        //     scores_for_selection = scores + e_score_correction_bias    # biased ONLY for top-k pick
+        //     inds                 = argpartition(-scores_for_selection)[..., :k]
+        //     topk_scores          = take_along(scores, inds, axis=-1)   # un-biased!
+        //     topk_scores         /= sum(topk_scores, axis=-1, keepdims=True)
+        //
+        // The bias is used ONLY to decide WHICH experts are selected; the
+        // gating weights themselves are the un-biased sigmoid scores.
+        // Adding the bias to the weights drives residual stream blow-up
+        // (Python comment quotes std growth 0.29 → 11 across 30 layers,
+        // max=616 → garbage saturation). The previous Swift impl folded
+        // the bias into the sigmoid input, reproducing exactly that bug.
         let logits = gate(x).asType(.float32)
-        let scoresFull = sigmoid(logits + eScoreCorrectionBias.asType(.float32))
+        let scores = sigmoid(logits)                                  // un-biased
+        let scoresForSelection = scores + eScoreCorrectionBias.asType(.float32)
 
-        // Top-K selection (descending) along the experts axis.
         let topK = cfg.numExpertsPerTok
-        let sortedIdx = MLX.argSort(-scoresFull, axis: -1)
-        let topkIdx = sortedIdx[.ellipsis, ..<topK]               // (B, T, K)
-        var topkW = MLX.takeAlong(scoresFull, topkIdx, axis: -1)  // (B, T, K)
+        let sortedIdx = MLX.argSort(-scoresForSelection, axis: -1)
+        let topkIdx = sortedIdx[.ellipsis, ..<topK]                   // (B, T, K)
+        var topkW = MLX.takeAlong(scores, topkIdx, axis: -1)          // (B, T, K) — un-biased!
         let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
-        topkW = (topkW / normSum) * cfg.moeRoutedScalingFactor
+        topkW = topkW / normSum
 
         // SwitchGLU dispatch: returns (B, T, K, H).
         let yK = experts(x, topkIdx)
         // Weight by router scores and sum over the K dim → (B, T, H).
         var y = (yK * topkW.expandedDimensions(axis: -1).asType(yK.dtype)).sum(axis: -2)
-        // Add shared expert path.
-        y = y + sharedExpert(x)
+        // Routed scaling factor applies to the routed contribution only.
+        // Shared expert is NOT scaled — matches HF order (model.py:243).
+        y = y * cfg.moeRoutedScalingFactor + sharedExpert(x)
         return y.asType(x.dtype)
     }
 }
