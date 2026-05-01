@@ -15,7 +15,10 @@ import MLXNN
 ///   - beta: Scaling factor (llama_4_scaling_beta)
 ///   - maxPositionEmbeddings: Original max position embeddings
 /// - Returns: Scaling tensor of shape [stop - start, 1]
-private func getLlama4AttentionScale(
+// 2026-04-30: was `private`; promoted to internal so the JANGTQ variant
+// (Mistral3TextJANGTQModelInner) can reuse the same scaling math
+// without copy-paste drift.
+internal func getLlama4AttentionScale(
     start: Int, stop: Int, beta: Float, maxPositionEmbeddings: Int
 ) -> MLXArray {
     let positions = MLXArray(Int32(start) ..< Int32(stop))

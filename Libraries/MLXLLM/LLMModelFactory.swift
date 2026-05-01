@@ -148,34 +148,6 @@ public enum LLMTypeRegistry {
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
             "mistral3": { data in
-                // 2026-04-30: fail-fast guard for JANGTQ-quantized Mistral 3
-                // family bundles. The current Mistral3TextModel /
-                // Mistral3VLM classes use vanilla MLXNN.Linear, which
-                // reads a flat `weight` tensor. JANGTQ bundles ship
-                // `.tq_packed` + `.scales` tensors that need a
-                // JANGTQ-aware Linear shim (see
-                // MiniMaxJANGTQModel / NemotronHJANGTQModel for the
-                // pattern). Without that shim, loading an mxtq Mistral
-                // 3.x bundle either crashes on weight-shape mismatch
-                // OR silently uses raw codebook bytes as weights. Fail
-                // fast with a clear error pointing at the porting work.
-                struct WFCheck: Codable {
-                    let weightFormat: String?
-                    enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
-                }
-                if let wf = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
-                    wf.weightFormat?.lowercased() == "mxtq"
-                {
-                    throw NSError(
-                        domain: "vmlx-swift-lm.LLMModelFactory",
-                        code: 1,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "JANGTQ-quantized Mistral 3 family bundles are not yet supported."
-                            + " The Mistral3TextModel uses vanilla nn.Linear; loading mxtq weights"
-                            + " requires a paired JANGTQ-aware Linear shim that has not been ported."
-                            + " Use the MXFP4 quant tier instead, or wait for the JANGTQ port."]
-                    )
-                }
                 // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
                 struct TextConfigCheck: Codable {
                     let textConfig: TextModelType?
@@ -190,6 +162,36 @@ public enum LLMTypeRegistry {
                 {
                     let config = try JSONDecoder.json5().decode(Mistral4Configuration.self, from: data)
                     return Mistral4Model(config)
+                }
+                // 2026-04-30: JANGTQ dispatch. `weight_format == "mxtq"`
+                // routes to `Mistral3TextJANGTQModel` which uses
+                // `JANGTQDenseLinear` for attention Q/K/V/O + MLP
+                // gate/up/down — consuming `.tq_packed` + `.tq_norms`
+                // safetensors instead of a flat `.weight`. Reads bits +
+                // seed from the merged `mxtq_bits` / `mxtq_seed` fields
+                // (jang_config.json values were merged into config.json
+                // earlier in the factory dispatch path — same pattern
+                // as MiniMaxJANGTQ).
+                struct JANGTQProbe: Codable {
+                    let weightFormat: String?
+                    let mxtqBits: Int?
+                    let mxtqSeed: Int?
+                    enum CodingKeys: String, CodingKey {
+                        case weightFormat = "weight_format"
+                        case mxtqBits = "mxtq_bits"
+                        case mxtqSeed = "mxtq_seed"
+                    }
+                }
+                if let probe = try? JSONDecoder.json5().decode(JANGTQProbe.self, from: data),
+                    probe.weightFormat?.lowercased() == "mxtq"
+                {
+                    let config = try JSONDecoder.json5().decode(
+                        Mistral3TextConfiguration.self, from: data)
+                    return Mistral3TextJANGTQModel(
+                        config,
+                        bits: probe.mxtqBits ?? 2,
+                        seed: probe.mxtqSeed ?? 42
+                    )
                 }
                 let config = try JSONDecoder.json5().decode(Mistral3TextConfiguration.self, from: data)
                 return Mistral3TextModel(config)

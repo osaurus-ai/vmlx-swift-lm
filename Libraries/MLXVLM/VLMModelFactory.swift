@@ -113,12 +113,12 @@ public enum VLMTypeRegistry {
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
         "mistral3": { data in
-            // 2026-04-30: fail-fast guard for JANGTQ-quantized Mistral 3
-            // family bundles — same rationale as the LLM factory's
-            // mistral3 closure. Without a JANGTQ-aware Linear shim
-            // ported into Mistral3VLM, mxtq weights would either crash
-            // on shape mismatch or silently load garbage. Fail fast
-            // with a clear error pointing at the porting work.
+            // 2026-04-30: VLM JANGTQ for Mistral 3 family is in-flight.
+            // The LLM-side port (Mistral3TextJANGTQModel for text-only
+            // bundles) is complete; the VLM port additionally needs the
+            // parallel JANGTQ inner LM wired into Mistral3VLM. Until
+            // that lands, fail fast with a clear error so users get a
+            // remediation message instead of a weight-load crash.
             struct WFCheck: Codable {
                 let weightFormat: String?
                 enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
@@ -130,10 +130,12 @@ public enum VLMTypeRegistry {
                     domain: "vmlx-swift-lm.VLMModelFactory",
                     code: 1,
                     userInfo: [NSLocalizedDescriptionKey:
-                        "JANGTQ-quantized Mistral 3 family VLM bundles are not yet supported."
-                        + " The Mistral3VLM language model uses vanilla nn.Linear; loading"
-                        + " mxtq weights requires a paired JANGTQ-aware Linear shim that has not"
-                        + " been ported. Use the MXFP4 quant tier instead."]
+                        "JANGTQ-quantized Mistral 3 family VLM bundles (with Pixtral vision)"
+                        + " are not yet supported — the VLM-side JANGTQ port is in-flight."
+                        + " Text-only Mistral 3 / 3.5 JANGTQ bundles (no vision_config) DO"
+                        + " load via the LLM factory's Mistral3TextJANGTQModel path. For"
+                        + " vision-enabled bundles, use the MXFP4 quant tier (Mistral-Medium-"
+                        + "3.5-128B-mxfp4) until the VLM JANGTQ port lands."]
                 )
             }
             // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
