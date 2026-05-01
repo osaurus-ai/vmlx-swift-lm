@@ -184,6 +184,24 @@ public enum LLMTypeRegistry {
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
             "mistral3": { data in
+                // Mistral3 with `vision_config` is a VLM bundle — refuse here so
+                // the factory iterator falls through to VLMModelFactory's
+                // `mistral3` route. Without this, JANGTQ Mistral 3.5 VLM
+                // bundles loaded under the LLM factory throw
+                // `Unhandled keys ["language_model", "multi_modal_projector",
+                // "vision_tower"]` because Mistral3TextJANGTQModel only knows
+                // how to load text-only weights.
+                struct VisionGate: Codable {
+                    let visionConfig: AnyDecodable?
+                    enum CodingKeys: String, CodingKey { case visionConfig = "vision_config" }
+                }
+                struct AnyDecodable: Codable {}
+                if let gate = try? JSONDecoder.json5().decode(VisionGate.self, from: data),
+                    gate.visionConfig != nil
+                {
+                    throw ModelFactoryError.unsupportedModelType(
+                        "mistral3 (has vision_config — route via VLMModelFactory)")
+                }
                 // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
                 struct TextConfigCheck: Codable {
                     let textConfig: TextModelType?
