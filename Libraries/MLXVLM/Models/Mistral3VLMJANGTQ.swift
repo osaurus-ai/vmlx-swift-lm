@@ -521,6 +521,15 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
             } else if key.contains("model.vision_projection") {
                 newKey = key.replacingOccurrences(
                     of: "model.vision_projection", with: "multi_modal_projector")
+            } else if key.hasPrefix("model.multi_modal_projector.") {
+                // 2026-05-01: real Mistral 3.5 VLM JANGTQ bundles ship
+                // projector keys at `model.multi_modal_projector.…`
+                // (linear_1, linear_2, norm, patch_merger.merging_layer).
+                // The wrapper class declares the projector at root via
+                // `@ModuleInfo(key: "multi_modal_projector")`. Strip the
+                // `model.` prefix so keys land at the root path.
+                // Verified on Mistral-Medium-3.5-128B-JANGTQ.
+                newKey = String(key.dropFirst("model.".count))
             }
 
             if newKey.contains("self_attn.rotary_emb.inv_freq") {

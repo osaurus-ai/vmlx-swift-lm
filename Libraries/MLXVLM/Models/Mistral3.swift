@@ -818,6 +818,11 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             } else if key.contains("model.vision_projection") {
                 newKey = key.replacingOccurrences(
                     of: "model.vision_projection", with: "multi_modal_projector")
+            } else if key.hasPrefix("model.multi_modal_projector.") {
+                // Real Mistral 3.5 VLM bundles ship projector keys as
+                // `model.multi_modal_projector.…`; the wrapper class
+                // wraps it at the root, so strip the `model.` prefix.
+                newKey = String(key.dropFirst("model.".count))
             }
 
             // Skip rotary embeddings
