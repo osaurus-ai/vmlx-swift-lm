@@ -539,6 +539,34 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // 2026-05-01: Robust fallback for LLM-shape keys.
+            //
+            // Some Mistral 3 family VLM JANGTQ bundles (especially
+            // Mistral 3.5 with `ministral3` outer model_type) ship the
+            // language-model weights without the `language_model.`
+            // wrapper — i.e. plain `model.embed_tokens.*`,
+            // `model.norm.*`, `model.layers.<i>.<...>` rather than
+            // `model.language_model.<...>` or `language_model.model.<...>`.
+            //
+            // None of the existing elif rules match those, so they
+            // pass through unchanged and the loader reports
+            // `Unhandled keys ["model"]` (deduped to the top segment).
+            //
+            // Re-prefix any leftover `model.<llm-key>` with
+            // `language_model.` so they land at
+            // `language_model.model.<llm-key>` — the path the wrapper
+            // class expects. Vision-tower / projector keys were
+            // already transformed by the rules above and start with
+            // `vision_tower.` or `multi_modal_projector.`, so this
+            // fallback is safe.
+            if newKey.hasPrefix("model.")
+                && !newKey.hasPrefix("model.vision_")
+                && !newKey.contains("language_model")
+                && !newKey.contains("multi_modal_projector")
+            {
+                newKey = "language_model." + newKey
+            }
+
             if newKey.contains("weight_scale_inv") {
                 let scaleInv = value
                 let weightKey = newKey.replacingOccurrences(of: "_scale_inv", with: "")

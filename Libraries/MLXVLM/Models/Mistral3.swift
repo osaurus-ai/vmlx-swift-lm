@@ -818,6 +818,19 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // 2026-05-01: Robust fallback for plain `model.<llm-key>` keys
+            // (Mistral 3.5 / `ministral3` outer bundles often ship LM
+            // weights without the `language_model.` wrapper). Re-prefix
+            // so they land at `language_model.model.<llm-key>`. See
+            // Mistral3VLMJANGTQ.sanitize for the full rationale.
+            if newKey.hasPrefix("model.")
+                && !newKey.hasPrefix("model.vision_")
+                && !newKey.contains("language_model")
+                && !newKey.contains("multi_modal_projector")
+            {
+                newKey = "language_model." + newKey
+            }
+
             // Handle weight scale patterns
             if newKey.contains("weight_scale_inv") {
                 let scaleInv = value

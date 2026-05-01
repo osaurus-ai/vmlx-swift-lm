@@ -244,20 +244,32 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
         // Build embeddings for tokens + splice multimodal at placeholder tokens.
         let textEmbeds = languageModel.embedTokens(input.text.tokens)
         var spliced = textEmbeds
+        // Image and video share the same `<image>` placeholder per Python
+        // model.py (img_context_token_id is reused for both — the
+        // distinguishing factor is which tower produced the embedding).
+        // The processor emits placeholders in image-first-then-video order
+        // and `mask == imageContextTokenId` matches BOTH groups in one
+        // sweep — so splicing image and video separately would either
+        // (a) trip the placeholder-count precondition (mask matches
+        // image+video tokens but replacement only has image rows), or
+        // (b) silently overwrite image embeddings with video embeddings.
+        // Concatenate image and video embeds (in the same order the
+        // processor wrote their placeholders) and splice in one pass.
+        var visualEmbeds: MLXArray? = nil
         if let pixelValues = input.image?.pixels {
-            let imageEmbeds = extractImageEmbeds(pixelValues: pixelValues)
-            spliced = spliceAtToken(
-                tokens: input.text.tokens,
-                inputsEmbeds: spliced,
-                replacement: imageEmbeds,
-                tokenId: config.imageContextTokenId)
+            visualEmbeds = extractImageEmbeds(pixelValues: pixelValues)
         }
         if let videoPixels = input.video?.pixels {
             let videoEmbeds = extractImageEmbeds(pixelValues: videoPixels, video: true)
+            visualEmbeds = visualEmbeds.map {
+                MLX.concatenated([$0, videoEmbeds], axis: 0)
+            } ?? videoEmbeds
+        }
+        if let visualEmbeds {
             spliced = spliceAtToken(
                 tokens: input.text.tokens,
                 inputsEmbeds: spliced,
-                replacement: videoEmbeds,
+                replacement: visualEmbeds,
                 tokenId: config.imageContextTokenId)
         }
         if let audio = input.audio {

@@ -137,32 +137,49 @@ public enum LLMTypeRegistry {
             // JANGTQDenseLinear port) follows the Mistral 3 family
             // pattern in a follow-up.
             "laguna": { data in
-                // 2026-04-30: peek `weight_format` and route mxtq →
-                // LagunaJANGTQModel. mxtqBits / mxtqSeed merged into
-                // config.json by the factory pre-decode (same pattern
-                // as MiniMax / Mistral 3 family).
-                struct WFCheck: Codable {
-                    let weightFormat: String?
-                    let mxtqBits: Int?
-                    let mxtqSeed: Int?
-                    enum CodingKeys: String, CodingKey {
-                        case weightFormat = "weight_format"
-                        case mxtqBits = "mxtq_bits"
-                        case mxtqSeed = "mxtq_seed"
-                    }
-                }
-                if let probe = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
-                    probe.weightFormat?.lowercased() == "mxtq"
-                {
-                    let cfg = try JSONDecoder.json5().decode(
-                        LagunaConfiguration.self, from: data)
-                    return LagunaJANGTQModel(
-                        cfg,
-                        bits: probe.mxtqBits ?? 2,
-                        seed: probe.mxtqSeed ?? 42)
-                }
+                // 2026-05-01: Laguna mxtq bundles in the wild ship MIXED
+                // quantization — dense paths (attention Q/K/V/O, dense
+                // MLP gate/up/down, shared expert) are MLX standard
+                // affine quant (`weight` packed uint32 + `scales` +
+                // `biases` of shape [out, in/group_size]); only the
+                // routed-MoE experts MAY be codebook. `LagunaJANGTQModel`
+                // wraps every Linear in `JANGTQDenseLinear` (codebook
+                // schema: `tq_packed` + `tq_norms`), so loading throws
+                // at e.g. `layers.0.mlp.down_proj.biases [2048, 128]`
+                // because that 2D affine-bias tensor has no place in
+                // the codebook schema.
+                //
+                // Until a codebook-aware SwitchGLU port for Laguna's
+                // 256-expert MoE lands, route mxtq bundles to vanilla
+                // `LagunaModel`. The MLX loader sees `quantization:
+                // { bits, group_size }` in config.json and
+                // auto-substitutes `QuantizedLinear` for every dense
+                // `Linear` — which matches the bundle's affine-quant
+                // dense paths. Routed-expert codebook tensors (if
+                // present) will still fail to load and surface a
+                // clear `Unhandled keys` error pointing at the MoE
+                // path, so the next failure is informative.
+                //
+                // Set LAGUNA_FORCE_JANGTQ=1 in the environment to opt
+                // back into `LagunaJANGTQModel` for genuine all-codebook
+                // bundles (none in production today; future Mistral-3-
+                // family-style Laguna distributions).
                 let cfg = try JSONDecoder.json5().decode(
                     LagunaConfiguration.self, from: data)
+                if ProcessInfo.processInfo.environment["LAGUNA_FORCE_JANGTQ"] == "1" {
+                    struct WFProbe: Codable {
+                        let mxtqBits: Int?
+                        let mxtqSeed: Int?
+                        enum CodingKeys: String, CodingKey {
+                            case mxtqBits = "mxtq_bits"
+                            case mxtqSeed = "mxtq_seed"
+                        }
+                    }
+                    let probe = try? JSONDecoder.json5().decode(WFProbe.self, from: data)
+                    return LagunaJANGTQModel(
+                        cfg, bits: probe?.mxtqBits ?? 2,
+                        seed: probe?.mxtqSeed ?? 42)
+                }
                 return LagunaModel(cfg)
             },
         ]

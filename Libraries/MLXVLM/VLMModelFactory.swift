@@ -553,6 +553,14 @@ public final class VLMModelFactory: ModelFactory {
         // NemotronHOmniProcessor when we've detected the omni bundle.
         let processorTypeOverrides: [String: String] = [
             "mistral3": "Mistral3Processor",
+            // Mistral 3.5 VLM bundles can carry the outer model_type
+            // `ministral3` (the inner text decoder spelling promoted to
+            // the outer level). Their preprocessor_config.json still
+            // ships `processor_class: "PixtralProcessor"`, which loses
+            // Mistral3's spatial-merge handling. Force the spatial-merge
+            // processor here for both spellings — same dispatch as
+            // VLMTypeRegistry.dispatchMistral3VLM.
+            "ministral3": "Mistral3Processor",
             "NemotronH_Nano_Omni_Reasoning_V3": "NemotronHOmniProcessor",
             "nemotron_h_omni": "NemotronHOmniProcessor",
         ]
