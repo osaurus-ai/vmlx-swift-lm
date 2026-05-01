@@ -378,19 +378,39 @@ public func loadModelContainer(
 
 private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
     let factories = ModelFactoryRegistry.shared.modelFactories()
-    var lastError: Error?
+    // Track all failures across factories. When multiple factories fail, the
+    // most informative error wins: a real load/decode/weight failure is
+    // strictly more useful than `unsupportedModelType` (which just means
+    // "wrong factory"). Without this preference rule, a route like the
+    // mistral3 LLM-side vision_config gate (which exists to defer to the
+    // VLM factory) would mask the actual VLM-side failure that the user
+    // needs to see.
+    var realError: Error?
+    var unsupportedError: Error?
     for factory in factories {
         do {
             let model = try await loader(factory)
             return model
+        } catch let error as ModelFactoryError {
+            print("[ModelFactory] \(type(of: factory)) failed: \(error)")
+            switch error {
+            case .unsupportedModelType, .unsupportedProcessorType:
+                if unsupportedError == nil { unsupportedError = error }
+            default:
+                // configurationFileError / configurationDecodingError /
+                // anything else — these are real failures.
+                if realError == nil { realError = error }
+            }
         } catch {
             print("[ModelFactory] \(type(of: factory)) failed: \(error)")
-            lastError = error
+            if realError == nil { realError = error }
         }
     }
 
-    if let lastError {
-        throw lastError
+    if let realError {
+        throw realError
+    } else if let unsupportedError {
+        throw unsupportedError
     } else {
         throw ModelFactoryError.noModelFactoryAvailable
     }
