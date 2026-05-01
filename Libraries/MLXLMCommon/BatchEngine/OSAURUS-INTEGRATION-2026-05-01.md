@@ -179,6 +179,15 @@ wrong scheme).
 1. `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
 2. **DSV4 model forward has a separate reshape bug at HEAD** — verified 2026-05-01 against `DeepSeek-V4-Flash-JANGTQ` bundle on disk. `BENCH_SIMPLE` with a 10-token synthetic prompt fails with `[reshape] Cannot reshape array of size 163840 into shape (1,5,16384)` — the model produces 2× the expected positions on axis-1. Factor-of-2 suggests an mHC residual-stream split or a multi-token-prediction artifact not being reduced before reshape. Reproducible with `BENCH_SIMPLE` AND `BENCH_COHERENT`. Pre-existing; not introduced by this pin's commits. Out of scope for the current osaurus integration push — flag for the DSV4 author to investigate. **DO NOT ship DSV4 in osaurus until this is fixed.**
 
+**Mistral 3 / 3.5 VLM — open architectural bug (NOT chat template):**
+- Verified 2026-05-01 against both `Mistral-Medium-3.5-128B-JANGTQ` AND `Mistral-Medium-3.5-128B-mxfp4` bundles on `/Volumes/EricsLLMDrive`.
+- JANGTQ bundle: model loads and produces token salad ("ติ Jeparroll rele Maradecydmai Électionsixarag…") on real chat prompts. TTFT grows pathologically per turn (34s → 81s → 113s).
+- mxfp4 bundle: model loads, then `BENCH_SIMPLE` throws `[rms_norm] (*weight) must have the same size as the last dimension of x but has 12288 elements` — a hidden-size RMSNorm being applied to a wrong-shape tensor.
+- **The mxfp4 throw proves the bug is in the `Mistral3VLM` Swift forward itself — NOT in the JANGTQ codebook path, NOT in the chat template (which now renders correctly post-jinja-fork-pin).**
+- The Python reference at `~/jang/jang-tools/jang_tools/mistral3/model.py` uses plain RoPE at base=1e6 (the YaRN code at line 36-52 is dead) — but Swift uses `initializeRope` which routes via YarnRoPE because `rope_type="yarn"` is in the config. This may be one source of the discrepancy.
+- Code path to investigate: `Libraries/MLXVLM/Models/Mistral3.swift` Language.LanguageModel + Ministral3ModelInner forward; trace which RMSNorm receives a wrong-shape tensor.
+- **DO NOT ship Mistral 3.5 in osaurus until the forward bug is traced and fixed.** Other Mistral 3 family bundles (smaller / older) may also be affected — needs separate verification.
+
 ---
 
 ## Cache topology — fully specified
