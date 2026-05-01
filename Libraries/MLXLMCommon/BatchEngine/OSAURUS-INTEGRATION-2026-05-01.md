@@ -346,6 +346,47 @@ the bug went undetected on the previously-tested coherent models.
 Probe infra is gated behind `VMLX_MISTRAL3_LAYER_PROBE=1` and
 `VMLX_MISTRAL3_PROJ_PROBE=1` — no overhead in production builds.
 
+### Mistral 3.5 VLM patch_conv layout fix (commit `890e3ed` 2026-05-01)
+
+`Mistral3VLM.sanitize` and `Mistral3VLMJANGTQ.sanitize` fully owned weight
+key rewriting and never delegated to `PixtralVisionModel.sanitize`, where
+the patch_conv `(out, in, kh, kw) → (out, kh, kw, in)` transpose lives.
+Result: every Mistral 3.5 VLM with an image input crashed at
+`PixtralVisionModelInner.callAsFunction` with `[conv] input: (1,224,224,3)
+vs weight: (1664,3,14,14)`.
+
+Inlined the same idempotent transpose (gated on `checkArrayShape`) into
+both Mistral3VLM and Mistral3VLMJANGTQ sanitize paths.
+
+**Verified end-to-end:** `BENCH_VL` on Mistral 3.5 mxfp4 with synthetic
+red→purple gradient image:
+- Turn 1: "The image displays a gradient transitioning from red at the
+  top to purple at the bottom."
+- Turn 2 (cache reuse): "The color that dominates the top edge of the
+  image is red."
+
+Both turns describe the gradient accurately. JANGTQ no longer crashes
+on the image-prep path either (still text-degenerates due to 2-bit
+codebook precision — separate issue).
+
+### Laguna mxfp4 expert-format mismatch (open, 2026-05-01)
+
+`/Volumes/EricsLLMDrive/jangq-ai/OsaurusAI/Laguna-XS.2-mxfp4` ships
+routed-expert weights as MLX standard affine quant (`.weight`/`.scales`
+/`.biases`). `LagunaModel`/`LagunaMoE` hardcodes `TurboQuantSwitchGLU`
+(codebook MoE), so the bundle fails to load with
+`unhandledKeys [biases, scales, weight] modules [TurboQuantSwitchLinear]`.
+
+The JANGTQ Laguna bundle works (mxtq codebook on routed experts +
+affine quant on dense paths is the supported "mixed-quant" topology;
+see `LLMModelFactory.swift:139` comment).
+
+**Recommendation:** ship Laguna JANGTQ in osaurus, mark Laguna-XS.2-
+mxfp4 unsupported until/unless we add a `LagunaMoEAffine` variant
+that uses `SwitchLinear` instead of `TurboQuantSwitchGLU`. Pattern to
+follow: `NemotronHOmni.swift::jangtqContext` resolves codebook-vs-affine
+expert primitive at decode time from `weight_format` in config.json.
+
 ### Perf optimizations landed in this session
 
 | Lever | Description | Status |
