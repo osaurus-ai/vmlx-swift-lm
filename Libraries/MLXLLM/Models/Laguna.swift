@@ -350,69 +350,84 @@ internal final class LagunaDenseMLP: Module, UnaryLayer {
 }
 
 // MARK: - MoE Block
+//
+// 2026-05-01: rewritten to match real Laguna bundle layout.
+//
+// On-disk routed-expert tensors at `layers.<i>.mlp.experts.*`:
+//
+//   experts.gate_up_proj.tq_packed : (n_exp, 2 × moe_inter, packed_in_hidden)
+//   experts.gate_up_proj.tq_norms  : (n_exp, 2 × moe_inter)
+//   experts.down_proj.tq_packed    : (n_exp, hidden,         packed_in_moe_inter)
+//   experts.down_proj.tq_norms     : (n_exp, hidden)
+//
+// i.e. all 256 experts are packed into a single stacked tensor (NOT 256
+// individual modules), gate and up are FUSED on the out-dim axis (concat
+// gate then up), and the projection is JANGTQ-codebook-quantized
+// (`tq_packed` + `tq_norms`).
+//
+// Dense paths (attention Q/K/V/O, layer-0 dense MLP gate/up/down, the
+// shared expert, and the router gate) are MLX standard affine quant
+// (`weight` packed uint32 + `scales` + `biases` of shape [out, in/gs]).
+// Those load through vanilla `Linear` because the MLX loader auto-
+// substitutes `QuantizedLinear` based on the top-level `quantization`
+// field in `config.json`.
+//
+// The previous implementation declared `experts: [LagunaDenseMLP]` —
+// 256 individual modules — and iterated them with `.item()` syncs. That
+// shape is incompatible with the bundle's stacked tensors and causes a
+// hard load failure ("Unable to set layers.1.mlp.experts: 256 modules
+// not compatible with [down_proj: tq_norms[256, 2048]…]").
+//
+// The new wiring uses `TurboQuantSwitchGLU` (the same codebook MoE
+// primitive DeepSeek-V4 / Mistral 4 / NemotronH JANGTQ already use) and
+// splits the fused `gate_up_proj` tensor at sanitize time into the
+// `gate_proj` / `up_proj` halves the primitive expects.
 
 internal final class LagunaMoE: Module, UnaryLayer {
     let cfg: LagunaConfiguration
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    // 2026-05-01: Module-array fields must be wrapped in @ModuleInfo
-    // and declared `var` so mlx-swift's parameter loader can both
-    // discover them via reflection AND update their per-expert weights.
-    // Without the wrapper + var, weight load fails with
-    // 'Unable to set layers.1.mlp.experts on LagunaModel.LagunaLayer.LagunaMoE'
-    // because the loader can't write into a `let` array of Module.
-    @ModuleInfo(key: "experts") var experts: [LagunaDenseMLP]
+    @ModuleInfo(key: "experts") var experts: TurboQuantSwitchGLU
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
-    init(_ cfg: LagunaConfiguration) {
+    init(_ cfg: LagunaConfiguration, bits: Int, seed: Int) {
         self.cfg = cfg
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
-        self._experts.wrappedValue = (0..<cfg.numExperts).map { _ in
-            LagunaDenseMLP(hidden: cfg.hiddenSize, intermediate: cfg.moeIntermediateSize)
-        }
+        // Routed experts: codebook MoE via TurboQuantSwitchGLU.
+        // inputDims == hiddenSize (gate/up in_dim == down out_dim);
+        // hiddenDims == moeIntermediateSize (gate/up out_dim == down in_dim).
+        self._experts.wrappedValue = TurboQuantSwitchGLU(
+            inputDims: cfg.hiddenSize,
+            hiddenDims: cfg.moeIntermediateSize,
+            numExperts: cfg.numExperts,
+            bits: bits, seed: seed)
+        // Shared expert is affine-quant Linear (NOT codebook).
         self._sharedExpert.wrappedValue = LagunaDenseMLP(
             hidden: cfg.hiddenSize, intermediate: cfg.sharedExpertIntermediateSize)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (B, T, H) = (x.dim(0), x.dim(1), x.dim(2))
-        let flat = x.reshaped(B * T, H)
-        // Bias-corrected sigmoid routing per DeepSeek-V3 recipe.
-        let logits = gate(flat).asType(.float32)
-        let scores = sigmoid(logits + eScoreCorrectionBias.asType(.float32))
+        // x: (B, T, H). Routing operates on (B, T, num_experts).
+        let logits = gate(x).asType(.float32)
+        let scoresFull = sigmoid(logits + eScoreCorrectionBias.asType(.float32))
 
-        // Top-K selection: argsort descending, take first K. MLX
-        // doesn't expose negative-axis argsort directly; sort positive
-        // axis 1.
+        // Top-K selection (descending) along the experts axis.
         let topK = cfg.numExpertsPerTok
-        let sortedIdx = MLX.argSort(-scores, axis: 1)
-        let topkIdx = sortedIdx[0..., ..<topK]
-        var topkW = MLX.takeAlong(scores, topkIdx, axis: 1)
-        let normSum = topkW.sum(axis: 1, keepDims: true) + 1e-20
+        let sortedIdx = MLX.argSort(-scoresFull, axis: -1)
+        let topkIdx = sortedIdx[.ellipsis, ..<topK]               // (B, T, K)
+        var topkW = MLX.takeAlong(scoresFull, topkIdx, axis: -1)  // (B, T, K)
+        let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
         topkW = (topkW / normSum) * cfg.moeRoutedScalingFactor
 
-        // Dispatch each token's selected experts. The reference does a
-        // gather + scatter loop over experts; mirror that here. With
-        // 256 experts and most rows hitting only 8, the inner
-        // `mx.any(mask).item()` Bool check skips experts cheaply.
-        var out = MLXArray.zeros(flat.shape, dtype: topkW.dtype)
-        for e in 0..<cfg.numExperts {
-            let mask = (topkIdx .== MLXArray(Int32(e)))
-            // Per-row weight contribution from this expert:
-            // sum( where(mask, topkW, 0), axis=-1 )
-            let zeros = MLXArray.zeros(topkW.shape, dtype: topkW.dtype)
-            let weighted = MLX.which(mask, topkW, zeros)
-            let perRowWeight = weighted.sum(axis: 1, keepDims: false)
-            // Skip if all rows have zero weight on this expert.
-            let totalWeight = perRowWeight.sum().item(Float.self)
-            if totalWeight == 0 { continue }
-            let y = experts[e](flat)
-            out = out + y * perRowWeight.expandedDimensions(axis: -1).asType(out.dtype)
-        }
-        out = out + sharedExpert(flat)
-        return out.reshaped(B, T, H).asType(x.dtype)
+        // SwitchGLU dispatch: returns (B, T, K, H).
+        let yK = experts(x, topkIdx)
+        // Weight by router scores and sum over the K dim → (B, T, H).
+        var y = (yK * topkW.expandedDimensions(axis: -1).asType(yK.dtype)).sum(axis: -2)
+        // Add shared expert path.
+        y = y + sharedExpert(x)
+        return y.asType(x.dtype)
     }
 }
 
@@ -426,7 +441,7 @@ internal final class LagunaLayer: Module {
     let layerType: String
     let useSliding: Bool
 
-    init(_ cfg: LagunaConfiguration, layerIndex: Int) {
+    init(_ cfg: LagunaConfiguration, layerIndex: Int, bits: Int, seed: Int) {
         self._inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -436,7 +451,7 @@ internal final class LagunaLayer: Module {
             self.mlp = LagunaDenseMLP(
                 hidden: cfg.hiddenSize, intermediate: cfg.intermediateSize)
         } else {
-            self.mlp = LagunaMoE(cfg)
+            self.mlp = LagunaMoE(cfg, bits: bits, seed: seed)
         }
         self.layerType = cfg.layerTypes[layerIndex]
         self.useSliding = layerType == "sliding_attention"
@@ -469,7 +484,13 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let faIdx: Int
     fileprivate let swaIdx: Int?
 
-    public init(_ cfg: LagunaConfiguration) {
+    /// `bits` and `seed` are forwarded to the `TurboQuantSwitchGLU` codebook
+    /// MoE used for routed experts. They default to JANGTQ-2L (`bits=2`,
+    /// `seed=42`), the canonical Laguna distribution. Real bundles report
+    /// `mxtq_bits` / `mxtq_seed` in `jang_config.json`; the `LLMModelFactory`
+    /// merges those into `config.json` before this init runs and threads
+    /// the resolved values via the explicit args.
+    public init(_ cfg: LagunaConfiguration, bits: Int = 2, seed: Int = 42) {
         self.cfg = cfg
         self.vocabularySize = cfg.vocabularySize
         self.kvHeads = (0..<cfg.numHiddenLayers).map { _ in cfg.numKeyValueHeads }
@@ -477,7 +498,7 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: cfg.vocabularySize, dimensions: cfg.hiddenSize)
         self.layers = (0..<cfg.numHiddenLayers).map {
-            LagunaLayer(cfg, layerIndex: $0)
+            LagunaLayer(cfg, layerIndex: $0, bits: bits, seed: seed)
         }
         self.norm = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
         if !cfg.tieWordEmbeddings {
@@ -534,11 +555,20 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         //   - `model.layers.N.mlp.experts.e_score_correction_bias` →
         //     `layers.N.mlp.e_score_correction_bias` (drop `experts.` segment;
         //     the Python reference notes this remap explicitly)
-        // Plus drops keys other vmlx model classes also drop (audit 2026-04-30):
+        // Plus drops keys other vmlx model classes also drop:
         //   - `self_attn.rotary_emb.inv_freq`     (precomputed rope freqs)
         //   - `.tq_bits` per-tensor scalars       (read from config, not weights)
         //   - `lm_head.weight`                    (when tieWordEmbeddings)
-        var out: [String: MLXArray] = [:]
+        //
+        // 2026-05-01: real Laguna mxtq bundles fuse the routed-expert gate
+        // and up projections into a single tensor at
+        // `experts.gate_up_proj.{tq_packed,tq_norms}` (gate stacked atop up
+        // on the out-dim axis). `TurboQuantSwitchGLU` expects them as two
+        // separate `gate_proj.*` / `up_proj.*` tensors (DeepSeek-V4 / Mistral
+        // 4 / NemotronH layout). Split here in O(n_layers) — gate is the
+        // first `moe_intermediate_size` rows on axis=1 and up is the
+        // remainder. Same operation for `tq_norms` (one fewer axis).
+        var firstPass: [String: MLXArray] = [:]
         for (key, value) in weights {
             var k = key
             if k.hasPrefix("model.") {
@@ -552,7 +582,36 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
             if k.contains("self_attn.rotary_emb.inv_freq") { continue }
             if k.hasSuffix(".tq_bits") { continue }
             if cfg.tieWordEmbeddings && k == "lm_head.weight" { continue }
-            out[k] = value
+            firstPass[k] = value
+        }
+
+        // Second pass: split fused gate_up_proj for routed experts.
+        let mid = cfg.moeIntermediateSize
+        var out: [String: MLXArray] = [:]
+        for (k, v) in firstPass {
+            // Match `layers.<i>.mlp.experts.gate_up_proj.<param>` exactly —
+            // the fused tensor lives only on the routed-expert MoE
+            // (`experts`), never on the shared expert (which has separate
+            // gate_proj / up_proj keys per the affine-quant scheme).
+            if k.contains(".mlp.experts.gate_up_proj.tq_packed") {
+                // shape (n_exp, 2 × mid, packed_in)
+                let gateK = k.replacingOccurrences(
+                    of: ".gate_up_proj.tq_packed", with: ".gate_proj.tq_packed")
+                let upK = k.replacingOccurrences(
+                    of: ".gate_up_proj.tq_packed", with: ".up_proj.tq_packed")
+                out[gateK] = v[0..., ..<mid, 0...]
+                out[upK]   = v[0..., mid..., 0...]
+            } else if k.contains(".mlp.experts.gate_up_proj.tq_norms") {
+                // shape (n_exp, 2 × mid)
+                let gateK = k.replacingOccurrences(
+                    of: ".gate_up_proj.tq_norms", with: ".gate_proj.tq_norms")
+                let upK = k.replacingOccurrences(
+                    of: ".gate_up_proj.tq_norms", with: ".up_proj.tq_norms")
+                out[gateK] = v[0..., ..<mid]
+                out[upK]   = v[0..., mid...]
+            } else {
+                out[k] = v
+            }
         }
         return out
     }
