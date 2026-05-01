@@ -184,9 +184,26 @@ wrong scheme).
 - JANGTQ bundle: model loads and produces token salad ("ติ Jeparroll rele Maradecydmai Électionsixarag…") on real chat prompts. TTFT grows pathologically per turn (34s → 81s → 113s).
 - mxfp4 bundle: model loads, then `BENCH_SIMPLE` throws `[rms_norm] (*weight) must have the same size as the last dimension of x but has 12288 elements` — a hidden-size RMSNorm being applied to a wrong-shape tensor.
 - **The mxfp4 throw proves the bug is in the `Mistral3VLM` Swift forward itself — NOT in the JANGTQ codebook path, NOT in the chat template (which now renders correctly post-jinja-fork-pin).**
-- The Python reference at `~/jang/jang-tools/jang_tools/mistral3/model.py` uses plain RoPE at base=1e6 (the YaRN code at line 36-52 is dead) — but Swift uses `initializeRope` which routes via YarnRoPE because `rope_type="yarn"` is in the config. This may be one source of the discrepancy.
-- Code path to investigate: `Libraries/MLXVLM/Models/Mistral3.swift` Language.LanguageModel + Ministral3ModelInner forward; trace which RMSNorm receives a wrong-shape tensor.
-- **DO NOT ship Mistral 3.5 in osaurus until the forward bug is traced and fixed.** Other Mistral 3 family bundles (smaller / older) may also be affected — needs separate verification.
+
+**Upstream investigation (`ml-explore/mlx-swift-lm`) — Mistral 3 history:**
+- Upstream PR #18 added Ministral 3 with Pixtral vision (likely tested on 3B/8B).
+- PR #43 fixed Mistral3TextConfiguration parsing.
+- PR #108 fixed loading error for Mistral-Small-3.2-24B.
+- PR #132 fixed tool calling for Mistral 3.
+- **Upstream has NEVER tested 128B Mistral 3.5 Medium**. The 88-layer / 12288-hidden / 96-head config may exercise edge cases the upstream test suite (smaller bundles) doesn't cover.
+- Our fork's `Mistral3.swift` Ministral3ModelInner forward is identical to upstream's. So the bug is either:
+  1. In a config field upstream's smaller bundles don't set
+  2. In a numerical edge case (e.g. fp16 overflow) that hits 12288 hidden but not 4096
+  3. In the YaRN config interpretation (Swift uses `rope_type=yarn` from config; Python ref's runtime uses plain RoPE at base=1e6 — its YaRN code is dead)
+- Reproducer: `BENCH_SIMPLE BENCH_MODEL=/Volumes/EricsLLMDrive/jangq-ai/OsaurusAI/Mistral-Medium-3.5-128B-mxfp4 BENCH_PROMPT_LEN=10 .build/release/RunBench` — loads in ~30s then immediately throws.
+- Code path: `Libraries/MLXVLM/Models/Mistral3.swift` Ministral3ModelInner.callAsFunction (lines 463-509). The 88-layer loop should produce hidden=12288 at every step but somewhere fails. To diagnose: instrument the layer loop with `print("layer \(i): h.shape = \(h.shape)")` — find the first layer that produces wrong shape.
+- **DO NOT ship Mistral 3.5 in osaurus until the forward bug is traced and fixed.** Other Mistral 3 family bundles (smaller / older) may work fine — needs separate verification once the 128B path is traced.
+
+**Upstream review summary (other deps for completeness):**
+- `osaurus-ai/swift-jinja@58d21aa5` — for-iterable parser fix in our fork; not yet upstream'd to `huggingface/swift-jinja`. Worth opening a PR there for community benefit.
+- `osaurus-ai/mlx-swift@0a56f9041` — pinned by revision (no PRs from us blocked on upstream).
+- `huggingface/swift-transformers` — pinned at 1.0.0+; `swift-jinja 2.x` already absorbed three earlier root-cause fixes we previously carried in our archived `osaurus-ai/Jinja` 1.3.1 fork.
+- `ml-explore/mlx-swift-lm` upstream — last seen at HEAD `7e2b710` (Apr 2026). 321 commits diverged on our fork (mostly JANG/JANGTQ/Cascade-2/Laguna/etc — out of scope to upstream).
 
 ---
 
