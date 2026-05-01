@@ -43,12 +43,14 @@ All loaded from `/Volumes/EricsLLMDrive/`. Bench harness:
 
 | Bundle | Quant | Test | Result |
 |---|---|---|---|
-| Laguna-XS.2-JANGTQ | mixed (codebook MoE + 8-bit affine dense) | BENCH_SIMPLE → tokenizer decode | `Okay, so I need to figure out how / <think> / Okay, let's see. The` — coherent reasoning |
+| Laguna-XS.2-JANGTQ | mixed (codebook MoE + 8-bit affine dense) | BENCH_SIMPLE + BENCH_BATCH_CHAT 3-turn | "That's a great color! Blue has such a calming, peaceful quality..." → "Your favorite color is blue!..." → "Blue is a cool color..." |
 | Mistral-Medium-3.5-128B-JANGTQ | all-codebook decoder + fp16 vision/projector/lm_head | BENCH_SIMPLE → tokenizer decode | Loads in 13s, valid multilingual tokens (English + French) |
-| Nemotron-3-Nano-Omni-30B-JANGTQ | omni JANGTQ | BENCH_OMNI 11-row matrix | All pass: text + image + video + audio + reasoning toggle + mixed |
-| Qwen3.6-27B-MXFP4 | MXFP4 dense | BENCH_BATCH_CHAT 3-turn | Turn 2 says "Blue." (cache reuse). No `<\|im_end\|>` leak |
-| Qwen3.6-35B-A3B-JANGTQ4 | hybrid SSM + codebook MoE | BENCH_COHERENT 3-turn | "Blue is a wonderful choice!" → "Your favorite color is blue." → "Blue is considered a cool color." |
-| MiniMax-M2.7-Small-JANGTQ | MoE JANGTQ | BENCH_COHERENT 3-turn | "Blue is a great choice—it's calming, …" → "Your favorite color is blue." → "Blue is a cool color." |
+| Nemotron-3-Nano-Omni-30B-JANGTQ | omni JANGTQ | BENCH_OMNI 13-row matrix | **All 13 pass**: text + image + video + audio + reasoning toggle + mixed + media-salt + hybrid-SSM-warm-pass |
+| Qwen3.6-27B-MXFP4 | MXFP4 dense | BENCH_BATCH_CHAT + BENCH_QWEN_THINKING_CHECK + BENCH_BATCH_DISK_RESTORE | Multi-turn "Blue.", **255 reasoning deltas / 0 chunk leak**, **disk-cache full hit no Metal crash** (4.5x prompt-time speedup) |
+| Qwen3.6-35B-A3B-JANGTQ4 | hybrid SSM + codebook MoE | BENCH_COHERENT + BENCH_BATCH_CACHE_HIT | "Blue is a wonderful choice!" → "Your favorite color is blue." → "cool color"; paged-tier cache HIT 128/161 |
+| MiniMax-M2.7-Small-JANGTQ | MoE JANGTQ | BENCH_COHERENT 3-turn | "Blue is a great choice—it's calming..." → "Your favorite color is blue." → "Blue is a cool color." |
+| **Gemma-4-26B-A4B-it-JANG_4M-CRACK** | JANG_4M | BENCH_COHERENT 3-turn | "That's a great color! ... Is there a specific shade of blue you like, or do you prefer it because of the ocean or the sky?" → "Your favorite color is blue." → "That is a cool color." |
+| **Holo3-35B-A3B-mxfp4** | mxfp4 (Qwen3.5 MoE arch) | BENCH_COHERENT 3-turn | Empty turn 1 (full reasoning) → "Your favorite color is blue." → "Colors are generally categorized as warm... or cool..." |
 
 ---
 
@@ -173,7 +175,9 @@ wrong scheme).
 
 **Chat template:** DSV4 ships NO `chat_template` field. Bridge sniff (`bos_token == "<\|begin▁of▁sentence\|>"` with curly-quote U+FF5C) auto-engages `DSV4Minimal.jinja` fallback. `VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` opts out.
 
-**Note (open issue):** `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
+**Note (open issues):**
+1. `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
+2. **DSV4 model forward has a separate reshape bug at HEAD** — verified 2026-05-01 against `DeepSeek-V4-Flash-JANGTQ` bundle on disk. `BENCH_SIMPLE` with a 10-token synthetic prompt fails with `[reshape] Cannot reshape array of size 163840 into shape (1,5,16384)` — the model produces 2× the expected positions on axis-1. Factor-of-2 suggests an mHC residual-stream split or a multi-token-prediction artifact not being reduced before reshape. Reproducible with `BENCH_SIMPLE` AND `BENCH_COHERENT`. Pre-existing; not introduced by this pin's commits. Out of scope for the current osaurus integration push — flag for the DSV4 author to investigate. **DO NOT ship DSV4 in osaurus until this is fixed.**
 
 ---
 
