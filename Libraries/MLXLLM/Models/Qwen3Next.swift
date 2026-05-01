@@ -527,9 +527,14 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // 2026-05-01: honor `parameters.maxKVSize` for attention slots
+        // (parity with Qwen35 / NemotronH; Mamba layers ignore the bound).
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
             }
             return KVCacheSimple()
         }

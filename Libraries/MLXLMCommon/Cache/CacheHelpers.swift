@@ -139,9 +139,17 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
             quantizedCache.state = stateArrays
             quantizedCache.offset = restoredKeys.dim(2)
         } else if let tq = cache[cacheLayerIdx] as? TurboQuantKVCache {
-            // Setting state transitions TQ to fill phase with the restored float KV.
-            // The model will re-compress during the next generation cycle if needed.
-            tq.state = [restoredKeys, restoredValues]
+            // 2026-05-01: route through restoreFromDecodedKV (NOT `state =`).
+            // The previous `state =` path transitioned TQ to fill phase with
+            // the lossy decoded float as the new prefill, which then re-
+            // compressed at the next threshold cross — compounding the lossy
+            // round each turn and producing visible token degeneracy on
+            // multi-turn JANGTQ/MXFP4 conversations. The new method seats
+            // the decoded float DIRECTLY as the compressed-phase prefix and
+            // stays in `.compressed` so maybeQuantize skips it.
+            tq.restoreFromDecodedKV(
+                keys: restoredKeys, values: restoredValues,
+                sourceOffset: restoredKeys.dim(2))
         } else if let cacheList = cache[cacheLayerIdx] as? CacheList {
             for i in 0..<cacheList.count {
                 if let simple = cacheList[i] as? KVCacheSimple {
@@ -160,7 +168,11 @@ public func restoreLayerData(from blocks: [CacheBlock], into cache: [any KVCache
                     break
                 }
                 if let tq = cacheList[i] as? TurboQuantKVCache {
-                    tq.state = [restoredKeys, restoredValues]
+                    // Same compounding-quantization fix as the top-level
+                    // TurboQuantKVCache branch above.
+                    tq.restoreFromDecodedKV(
+                        keys: restoredKeys, values: restoredValues,
+                        sourceOffset: restoredKeys.dim(2))
                     break
                 }
             }
@@ -514,7 +526,11 @@ private func restoreKVLayer(
         quantizedCache.state = stateArrays
         quantizedCache.offset = restoredKeys.dim(2)
     } else if let tq = layer as? TurboQuantKVCache {
-        tq.state = [restoredKeys, restoredValues]
+        // Same restoreFromDecodedKV path as paged-cache restore — avoid
+        // compounding quantization on cross-turn round trips.
+        tq.restoreFromDecodedKV(
+            keys: restoredKeys, values: restoredValues,
+            sourceOffset: restoredKeys.dim(2))
     } else if let cacheList = layer as? CacheList {
         for i in 0..<cacheList.count {
             if let simple = cacheList[i] as? KVCacheSimple {
@@ -536,7 +552,9 @@ private func restoreKVLayer(
                 return
             }
             if let tq = cacheList[i] as? TurboQuantKVCache {
-                tq.state = [restoredKeys, restoredValues]
+                tq.restoreFromDecodedKV(
+                    keys: restoredKeys, values: restoredValues,
+                    sourceOffset: restoredKeys.dim(2))
                 return
             }
         }

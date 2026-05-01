@@ -651,9 +651,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, Hidden
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // 2026-05-01: honor `parameters.maxKVSize` for the attention slots.
+        // Audit found Qwen3.5 / Qwen3.6 previously ignored maxKVSize on
+        // `KVCacheSimple()`, leaving the CacheCoordinator's
+        // `defaultMaxKVSize` contract a silent no-op — long-context
+        // prompts could not be bounded. Mamba layers (`isLinear == true`)
+        // ignore the bound by design (their hidden state is fixed-size).
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
             }
             return KVCacheSimple()
         }

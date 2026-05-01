@@ -177,6 +177,61 @@ public class TurboQuantKVCache: BaseKVCache, @unchecked Sendable {
         self.floatValues = nil
     }
 
+    /// Restore from already-decoded float keys/values (paged-cache fast path).
+    ///
+    /// 2026-05-01: paged-cache layers store the DECODED float KV (the unified
+    /// buffer that `state` getter exposes during compressed phase). Restoring
+    /// that float through `state =` would transition the cache back to
+    /// `.fill` phase and silently re-quantize at the next threshold cross —
+    /// compounding the lossy round per turn until output saturates into
+    /// garbage. (See Cache/CacheHelpers.swift for the audit trail.)
+    ///
+    /// This method seats the decoded float DIRECTLY as the compressed-phase
+    /// prefix, leaves the encoded payloads `nil` (paged-cache doesn't carry
+    /// them; only the disk tier does), and stays in `.compressed` phase so
+    /// the maybeQuantizeKVCache gate skips it. Decode-step writes still go
+    /// to the float window via the existing path. Numerical equivalence
+    /// with `restoreCompressed` for the prefix is exact — both produce the
+    /// same decoded float; we just skipped the encode-then-decode round
+    /// trip because we already had the decoded form on disk.
+    public func restoreFromDecodedKV(
+        keys dKeys: MLXArray,
+        values dValues: MLXArray,
+        sourceOffset: Int
+    ) {
+        guard dKeys.ndim == 4, dValues.ndim == 4, sourceOffset > 0 else { return }
+
+        let dim = dKeys.dim(3)
+        if encoderState == nil {
+            // Default seed (matches compressFloatKV path which doesn't
+            // pass an explicit seed either — EncoderState picks one).
+            encoderState = TQEncoder.EncoderState(
+                dim: dim, keyBits: keyBits, valueBits: valueBits)
+        }
+
+        MLX.eval(dKeys, dValues)
+
+        self.compressedKeys = nil
+        self.compressedValues = nil
+        self.decodedKeyBuffer = dKeys
+        self.decodedValueBuffer = dValues
+        self.prefixTokenCount = dKeys.dim(2)
+
+        let B = dKeys.dim(0), H = dKeys.dim(1)
+        let kD = dKeys.dim(3), vD = dValues.dim(3)
+        let windowK = MLXArray.zeros([B, H, windowStep, kD], dtype: dKeys.dtype)
+        let windowV = MLXArray.zeros([B, H, windowStep, vD], dtype: dValues.dtype)
+        self.unifiedKeys = concatenated([dKeys, windowK], axis: 2)
+        self.unifiedValues = concatenated([dValues, windowV], axis: 2)
+        self.windowOffset = 0
+
+        self.phase = .compressed
+        self.offset = sourceOffset
+
+        self.floatKeys = nil
+        self.floatValues = nil
+    }
+
     // MARK: - Create from KVCacheSimple
 
     /// Convert a KVCacheSimple to TurboQuantKVCache by compressing its contents.

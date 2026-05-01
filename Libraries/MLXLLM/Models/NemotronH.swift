@@ -835,6 +835,11 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // 2026-05-01: honor `parameters.maxKVSize` for the attention slots.
+        // Audit found NemotronH previously ignored maxKVSize, leaving the
+        // CacheCoordinator's `defaultMaxKVSize` contract a silent no-op
+        // for the Cascade-2 / Nemotron-Omni hybrid family. Mamba layers
+        // ignore the bound by design (their hidden state is fixed-size).
         let pattern = Array(configuration.hybridOverridePattern)
         return pattern.compactMap { char -> KVCache? in
             let blockType = NemotronHBlockType(from: char)
@@ -842,6 +847,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             case .mamba:
                 return MambaCache()
             case .attention:
+                if let maxKVSize = parameters?.maxKVSize {
+                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                }
                 return KVCacheSimple()
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers
