@@ -490,6 +490,20 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
                     newKey = key.replacingOccurrences(
                         of: "vision_tower", with: "vision_tower.vision_model")
                 }
+                // 2026-05-01: real Mistral 3.5 VLM JANGTQ bundles ship
+                // vision keys as `model.vision_tower.transformer.…`
+                // (verified on Mistral-Medium-3.5-128B-JANGTQ
+                // safetensors index). The replacement above leaves the
+                // outer `model.` prefix in place — but the model wraps
+                // the vision tower at the root (`@ModuleInfo(key:
+                // "vision_tower")`), so the loader reports
+                // `Unhandled keys ["model"]`. Strip the leading
+                // `model.` so the path lands at
+                // `vision_tower.vision_model.…`. Idempotent: keys
+                // already missing the `model.` prefix pass through.
+                if newKey.hasPrefix("model.vision_tower.") {
+                    newKey = String(newKey.dropFirst("model.".count))
+                }
             } else if key.contains("vision_encoder") && !key.contains("vision_tower") {
                 if key.contains("transformer") || key.contains("patch_conv")
                     || key.contains("ln_pre")

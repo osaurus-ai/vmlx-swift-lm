@@ -794,6 +794,13 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
                     newKey = key.replacingOccurrences(
                         of: "vision_tower", with: "vision_tower.vision_model")
                 }
+                // Strip leading `model.` so vision keys land at the
+                // root `vision_tower.…` instead of `model.vision_tower.…`.
+                // Real Mistral 3.5 VLM bundles ship vision keys as
+                // `model.vision_tower.transformer.…`. Idempotent.
+                if newKey.hasPrefix("model.vision_tower.") {
+                    newKey = String(newKey.dropFirst("model.".count))
+                }
             } else if key.contains("vision_encoder") && !key.contains("vision_tower") {
                 // Alternative key format: model.vision_encoder.X -> vision_tower.vision_model.X
                 if key.contains("transformer") || key.contains("patch_conv")
