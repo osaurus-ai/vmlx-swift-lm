@@ -853,6 +853,26 @@ public actor BatchEngine {
                             for layer in slot.cache where layer.isTrimmable {
                                 _ = layer.trim(trimNeeded)
                             }
+                            // 2026-05-01: force materialization of trim mutations
+                            // before the prefill seed-forward consumes the cache.
+                            // Trim is lazy; without this MLX call, trim's pending
+                            // state changes get folded into the SAME command
+                            // buffer that dispatches the JANGTQ kernels for the
+                            // seed forward. The buffer's allocation pressure
+                            // mid-encode can trigger Metal's library-cache
+                            // eviction while the kernel pipeline is still
+                            // referenced by the in-flight buffer →
+                            // `notifyExternalReferencesNonZeroOnDealloc` crash
+                            // inside `Device::clear_library`. Reproducer: 2nd
+                            // request whose prompt is FULLY in disk-tier cache
+                            // (so this remaining.isEmpty branch fires, trim
+                            // runs, and a one-token forward immediately follows).
+                            //
+                            // Sibling to the disk-restore materialization at line
+                            // 778 — that closes the `remaining.nonEmpty` paths;
+                            // this one closes the `remaining.isEmpty + trim`
+                            // path the prior fix missed.
+                            MLX.eval(slot.cache)
                         }
                         let lastToken = MLXArray([Int32(last)])
                             .expandedDimensions(axis: 0)
