@@ -34,6 +34,36 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Permissive value enum for mixed-shape rope_parameters decode
+
+internal enum StringOrNumberOrDict: Codable {
+    case stringOrNumber(StringOrNumber)
+    case dict([String: StringOrNumber])
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let d = try? c.decode([String: StringOrNumber].self) {
+            self = .dict(d)
+            return
+        }
+        if let s = try? c.decode(StringOrNumber.self) {
+            self = .stringOrNumber(s)
+            return
+        }
+        throw DecodingError.dataCorruptedError(
+            in: c,
+            debugDescription: "rope_parameters value must be a dict or scalar")
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .stringOrNumber(let s): try c.encode(s)
+        case .dict(let d): try c.encode(d)
+        }
+    }
+}
+
 // MARK: - Configuration
 
 public struct LagunaConfiguration: Codable, Sendable {
@@ -147,10 +177,36 @@ public struct LagunaConfiguration: Codable, Sendable {
         self.numAttentionHeadsPerLayer = nahpl.isEmpty
             ? Array(repeating: numAttentionHeads, count: numHiddenLayers) : nahpl
 
-        self.ropeParameters =
-            try c.decodeIfPresent([String: [String: StringOrNumber]].self,
-                                  forKey: .ropeParameters)
-            ?? [:]
+        // `rope_parameters` is mixed-shape on real Laguna bundles:
+        //
+        //   {
+        //     "full_attention":    { rope_theta, rope_type, factor, ... },
+        //     "sliding_attention": { rope_theta, rope_type, ... },
+        //     "original_max_position_embeddings": 4096  ← top-level scalar
+        //   }
+        //
+        // Decoding directly as `[String: [String: StringOrNumber]]` fails
+        // because the scalar value isn't a dict. Decode permissively by
+        // walking the JSON object and keeping only the per-layer-type
+        // sub-dicts (entries whose value is itself an object). The
+        // top-level scalars (e.g. `original_max_position_embeddings`)
+        // are propagated via `maxPositionEmbeddings` already and
+        // duplicated inside the per-layer dicts where they're consumed.
+        if let nested = try? c.decode([String: [String: StringOrNumber]].self,
+                                      forKey: .ropeParameters) {
+            self.ropeParameters = nested
+        } else if let raw = try? c.decode([String: StringOrNumberOrDict].self,
+                                          forKey: .ropeParameters) {
+            var filtered: [String: [String: StringOrNumber]] = [:]
+            for (k, v) in raw {
+                if case .dict(let d) = v {
+                    filtered[k] = d
+                }
+            }
+            self.ropeParameters = filtered
+        } else {
+            self.ropeParameters = [:]
+        }
     }
 
     /// Look up the per-layer-type rope theta + partial factor.
