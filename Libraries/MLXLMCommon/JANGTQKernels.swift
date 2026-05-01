@@ -39,26 +39,40 @@ private let kHadamardMultiblockSource = """
     uint total_d = meta[0];
     uint n_blocks = meta[1];
 
-    // 8192 floats = 32 KB = max threadgroup memory on Apple Silicon. The
+    // Apple Silicon caps threadgroup memory at 32 KB = 8192 floats. The
     // largest single power-of-2 block we ever decompose into is 8192
-    // (e.g., Mistral-Medium-3.5 hidden=12288 → [8192, 4096]). Was [4096]
-    // → silently corrupted block 0 of any non-pow2 dim > 4096 (notably
-    // hidden=12288 above, GLM-5.1 hidden=6144 = 4096+2048, etc.).
-    // Diagnosis: per-layer L2 probe on Mistral 3.5 JANGTQ vs mxfp4 showed
-    // residual stream stops growing after layer 0 (stays near input
-    // magnitudes instead of saturating ~555). Raised to 8192 to match the
-    // Python reference (hadamard_kernel.py).
+    // (e.g., Mistral-Medium-3.5 hidden=12288 → [8192, 4096]; GLM-5.1
+    // hidden=6144 → [4096, 2048]; Kimi-K2.6 hidden=7168 → [4096, 2048,
+    // 1024]). The shmem only needs to hold ONE block at a time —
+    // butterflies are independent per block, and the output is written
+    // to global memory before the next block is loaded.
+    //
+    // Earlier versions of this kernel loaded the entire `total_d` slab
+    // into shmem up-front (the original Python prototype's design when
+    // total_d ≤ 8192). On Mistral 3.5 (total_d=12288 > 8192) that
+    // overran the buffer by 4096 entries, silently corrupting half the
+    // rotated activations. Diagnosed via VMLX_MISTRAL3_PROJ_PROBE=1:
+    // layer-0 V projection L2 was 4.3× the mxfp4 baseline; after this
+    // rewrite it sits within 1.5× (residual 2-bit quant noise).
+    //
+    // Per-block isolation also matches the Python reference's
+    // gather_tq_kernel.py (templated `threadgroup float shmem[in_features]`
+    // approach) — they similarly never need >8192 floats since they
+    // fuse Hadamard+gather and shmem only holds the current block's
+    // post-rotation values.
     threadgroup float shmem[8192];
 
-    for (uint i = tid; i < total_d; i += threads_per_tg) {
-        shmem[i] = static_cast<float>(x[batch_idx * total_d + i]) * signs[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint offset = 0;
+    uint cum_offset = 0;
     for (uint b = 0; b < n_blocks; b++) {
         uint d_b = meta[2u + b * 2u];
         uint log_b = meta[3u + b * 2u];
+
+        // Load this block's slice of (x*signs) into shmem[0..d_b].
+        for (uint i = tid; i < d_b; i += threads_per_tg) {
+            shmem[i] = static_cast<float>(x[batch_idx * total_d + cum_offset + i])
+                       * signs[cum_offset + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint ept = (d_b + threads_per_tg - 1u) / threads_per_tg;
         if (ept == 0u) ept = 1u;
@@ -68,9 +82,9 @@ private let kHadamardMultiblockSource = """
             uint two_h = 2u * h;
 
             // Stack buffer per thread for butterfly-stage values. For the
-            // 8192 block + 1024 threads-per-tg this needs ≥ 8 entries; for
-            // smaller threads_per_tg it grows. Python reference uses 64
-            // for safety — match it here so nothing silently overruns.
+            // 8192 block + 1024 threads-per-tg this needs ≥ 8 entries;
+            // smaller threads_per_tg → larger ept. Python reference uses
+            // 64 for safety — match it.
             float newv[64];
             for (uint k = 0; k < 64; k++) newv[k] = 0.0f;
             for (uint k = 0; k < ept; k++) {
@@ -78,11 +92,11 @@ private let kHadamardMultiblockSource = """
                 if (i_local < d_b) {
                     uint block_start = (i_local / two_h) * two_h;
                     uint pos = i_local - block_start;
-                    float a = shmem[offset + block_start + pos];
+                    float a = shmem[block_start + pos];
                     if (pos < h) {
-                        newv[k] = a + shmem[offset + block_start + pos + h];
+                        newv[k] = a + shmem[block_start + pos + h];
                     } else {
-                        newv[k] = shmem[offset + block_start + pos - h] - a;
+                        newv[k] = shmem[block_start + pos - h] - a;
                     }
                 }
             }
@@ -90,21 +104,18 @@ private let kHadamardMultiblockSource = """
             for (uint k = 0; k < ept; k++) {
                 uint i_local = tid * ept + k;
                 if (i_local < d_b) {
-                    shmem[offset + i_local] = newv[k];
+                    shmem[i_local] = newv[k];
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         float norm = 1.0f / sqrt(static_cast<float>(d_b));
-        for (uint k = 0; k < ept; k++) {
-            uint i_local = tid * ept + k;
-            if (i_local < d_b) {
-                out[batch_idx * total_d + offset + i_local] = shmem[offset + i_local] * norm;
-            }
+        for (uint i = tid; i < d_b; i += threads_per_tg) {
+            out[batch_idx * total_d + cum_offset + i] = shmem[i] * norm;
         }
-        offset += d_b;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        cum_offset += d_b;
     }
 """
 
