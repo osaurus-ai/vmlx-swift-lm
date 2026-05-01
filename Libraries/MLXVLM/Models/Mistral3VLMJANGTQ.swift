@@ -558,6 +558,8 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
             // LagunaJANGTQ.sanitize behaviour.
             if config.textConfig.tieWordEmbeddings,
                 newKey == "language_model.lm_head.weight"
+                    || newKey == "language_model.lm_head.scales"
+                    || newKey == "language_model.lm_head.biases"
             {
                 continue
             }

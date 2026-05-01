@@ -830,6 +830,21 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // 2026-05-01: Tied-embeddings — drop redundant `lm_head.*`
+            // keys (weight + scales + biases) when the LM shares
+            // weights with embed_tokens. The forward path falls back
+            // to `embedTokens.asLinear`. Mirrors Mistral3VLMJANGTQ +
+            // Mistral3TextJANGTQ + LagunaModel patterns. Forward-compat:
+            // drops scales/biases too in case a future bundle ships
+            // quantized lm_head despite tied embeddings (rare).
+            if config.textConfig.tieWordEmbeddings,
+                newKey == "language_model.lm_head.weight"
+                    || newKey == "language_model.lm_head.scales"
+                    || newKey == "language_model.lm_head.biases"
+            {
+                continue
+            }
+
             // 2026-05-01: Robust fallback for plain `model.<llm-key>` keys
             // (Mistral 3.5 / `ministral3` outer bundles often ship LM
             // weights without the `language_model.` wrapper). Re-prefix

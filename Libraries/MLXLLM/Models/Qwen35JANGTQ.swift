@@ -650,8 +650,16 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        // Honor `parameters.maxKVSize` for attention slots — parity with
+        // the vanilla Qwen35Model path (commit 1173822). Audit flagged
+        // this JANGTQ variant as inconsistent: `KVCacheSimple()` ignored
+        // the CacheCoordinator's `defaultMaxKVSize` contract on long
+        // JANGTQ runs. Mamba layers ignore the bound (fixed-size state).
         return model.layers.map { layer in
             if layer.isLinear { return MambaCache() }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
             return KVCacheSimple()
         }
     }

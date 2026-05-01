@@ -868,6 +868,21 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 finalValue = value.swappedAxes(1, 2)
             }
 
+            // 2026-05-01: Tied-embeddings — drop redundant `lm_head.*`
+            // when the LM shares weights with `backbone.embeddings`.
+            // Init guard at line 783-785 already declines to allocate
+            // `lmHead`; the redundant tensors otherwise survived only
+            // because `verify: [.noUnusedKeys]` silently absorbed
+            // them. Forward-compat: also drops scales/biases for
+            // bundles that quantize lm_head despite tied embeddings.
+            if configuration.tieWordEmbeddings,
+                key == "lm_head.weight"
+                    || key == "lm_head.scales"
+                    || key == "lm_head.biases"
+            {
+                continue
+            }
+
             sanitized[key] = finalValue
         }
 
