@@ -199,10 +199,45 @@ public class NemotronHOmni: Module, VLMModel, KVCacheDimensionProvider, LoRAMode
             // For omni's hybrid Mamba layers a 3D token input cascades
             // into a 4-vs-3-dim concat trap inside `applyConv` —
             // observed crash on the BatchEngine omni text-only path.
-            // Mirroring `Gemma3.prepare(...)` and `FastVLM.prepare(...)`
-            // which take the same `.logits` route for text-only.
+            //
+            // 2026-04-30 (Bug 2 fix): the previous implementation ran
+            // the ENTIRE prompt unchunked through the model. For prompts
+            // > ~8k tokens the SSM-attention path in `ssmAttn` (SSM.swift)
+            // materializes a `[B, n_heads, L, L]` segsum tensor that grows
+            // O(L²): 34 GB per Mamba layer at L=16k bf16, multiplied by
+            // 23 sequential Mamba layers = peaks of 100s of GB on long
+            // prompts. Repro under `OSAURUS_MLX_MALLOC_TRACE=1` showed
+            // single 298 GiB ternary_op allocations during the segsum
+            // `which` mask + the `surrogateAttentionMatrix.matmul(dtx)`.
+            //
+            // Fix: chunked prefill mirroring `LLMModel.prepare`. Mamba
+            // layers carry running state across chunks via `MambaCache`
+            // (that's what the cache is for); attention layers update
+            // KV in place. Each chunk materializes lazily-built
+            // intermediates and clears Metal cache before the next chunk
+            // runs, bounding peak allocation to O(chunk_size²) per layer
+            // instead of O(prompt_length²). We always return `.logits` so
+            // the BatchEngine never re-axises this output and the .newAxis
+            // trap stays dodged.
+            let prefillStepSize = windowSize ?? 512
+            let tokensShape = input.text.tokens.shape
+            if tokensShape.count >= 2 && tokensShape[0] != 1 {
+                fatalError(
+                    "NemotronHOmni.prepare expects single-sequence input (batch=1), "
+                    + "got shape \(tokensShape).")
+            }
+            var flatTokens = input.text.tokens.reshaped([-1])
+            while flatTokens.size > prefillStepSize {
+                let chunkTokens = flatTokens[..<prefillStepSize][.newAxis, 0...]
+                _ = languageModel.callAsFunction(
+                    chunkTokens, cache: convertedCache)
+                MLX.eval(convertedCache)
+                flatTokens = flatTokens[prefillStepSize...]
+                Memory.clearCache()
+            }
+            let lastChunk = flatTokens[.newAxis, 0...]
             let logits = languageModel.callAsFunction(
-                input.text.tokens, cache: convertedCache)
+                lastChunk, cache: convertedCache)
             return .logits(LMOutput(logits: logits))
         }
 

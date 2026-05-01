@@ -36,7 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "e0b61113f0190e3503ad9123bf4d4508248cd316"),
+        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         // swift-transformers 1.0.0+ transitively uses huggingface/
         // swift-jinja 2.x which already contains the three root-cause
