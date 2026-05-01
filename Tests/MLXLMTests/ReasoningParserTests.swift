@@ -527,6 +527,22 @@ struct ToolCallFormatCapabilityTests {
         #expect(ToolCallFormat.fromCapabilityName("nemotron_h") == .xmlFunction)
     }
 
+    /// Locks in `laguna` model_type → `think_xml` reasoning stamp.
+    /// Poolside's `laguna_glm_thinking_v5/chat_template.jinja` emits
+    /// `<think>...</think>` blocks when `enable_thinking=true`. Without
+    /// this stamp, when (later) the vmlx `laguna` model class lands, the
+    /// CoT output would land as plain `.chunk` events instead of
+    /// `.reasoning` deltas — silently breaking the host's reasoning UI.
+    /// The pre-registration here means stamp resolution Just Works the
+    /// day the model class lands; no follow-up edit needed.
+    @Test func lagunaResolvesToThinkXml() {
+        #expect(reasoningStampFromModelType("laguna") == "think_xml")
+        #expect(reasoningStampFromModelType("laguna_xs") == "think_xml")
+        #expect(reasoningStampFromModelType("laguna_s") == "think_xml")
+        #expect(reasoningStampFromModelType("Laguna") == "think_xml",
+            "case-insensitive match")
+    }
+
     @Test func unknownReturnsNil() {
         #expect(ToolCallFormat.fromCapabilityName(nil) == nil)
         #expect(ToolCallFormat.fromCapabilityName("") == nil)

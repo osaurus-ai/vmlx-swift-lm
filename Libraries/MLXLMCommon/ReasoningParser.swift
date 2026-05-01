@@ -491,6 +491,12 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         "kimi",         // kimi_k2, kimi_k25
         "nemotron_h",   // NemotronH / Cascade series
         "holo",         // Holo3 variants
+        "laguna",       // Poolside Laguna — `laguna_glm_thinking_v5/chat_template.jinja`
+                        // emits `<think>...</think>` when enable_thinking=true.
+                        // Pre-registered here so that on the day the vmlx
+                        // `laguna` model class lands, the reasoning stamp
+                        // resolution doesn't need a follow-up edit and
+                        // CoT output won't leak into `.chunk` events.
     ]
     if thinkXmlPrefixes.contains(where: t.hasPrefix) {
         return "think_xml"
