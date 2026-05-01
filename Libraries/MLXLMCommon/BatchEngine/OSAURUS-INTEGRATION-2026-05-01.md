@@ -265,6 +265,37 @@ Other JANGTQ models (Laguna codebook MoE + power-of-2 dim, Qwen3.6
 codebook MoE, MiniMax codebook MoE, NemotronH-Omni codebook MoE) are
 unaffected.
 
+### Updated investigation note 2026-05-01 (post-deeper-trace)
+
+The codebook-calibration theory above is incomplete. NemotronH-Omni
+also has non-power-of-2 in_features (5120 = 4096 + 1024) on its MoE
+codebook AND it works coherently. So the multi-block Hadamard math
+itself isn't the bug. Likely root cause is **drift compounding over
+88 dense codebook layers** — Mistral 3.5 is the only architecture in
+the suite that uses `JANGTQDenseLinear` at non-power-of-2 in_features
+across many sequential dense layers (Laguna only uses codebook on
+routed MoE experts at power-of-2 moe_intermediate=512; NemotronH-Omni
+similar). Any tiny numerical mismatch (e.g. dtype downcast at norms,
+ordering of Hadamard butterfly stages, kernel rounding) that other
+models tolerate at one or two codebook layers compounds across 88×
+codebook applications into multilingual semi-random output.
+
+To localize: add per-layer logit-norm probe (`||h||_2` after layer i)
+and compare drift across reference. Bench fixture would feed the
+same 5-token input through both mxfp4 and JANGTQ paths and report
+relative L2 error per layer. A single divergent layer would point
+at a specific kernel/op; uniform drift would confirm the
+calibration-or-precision-compound theory.
+
+### Perf optimizations landed in this session
+
+| Lever | Description | Status |
+|---|---|---|
+| Laguna kvMode-aware homogeneous cache | Default to all-Rotating → compile engages → +30% decode (Stage 3 `.rotating`) | ✅ `2bf543f` |
+| Laguna argPartition routing | O(n) instead of O(n log n) for top-k of 256 experts | ✅ `aa94c23` |
+| DSV4 LONG_CTX default ON | +12pp MMLU 200q (74.5→81.5) on architecture-only | ✅ `9147e16` |
+| DSV4 A3 indexer short-circuit | Skip score path when pooledLen ≤ topK on short prefills | ✅ `aa94c23` |
+
 **Upstream investigation (`ml-explore/mlx-swift-lm`) — Mistral 3 history:**
 - Upstream PR #18 added Ministral 3 with Pixtral vision (likely tested on 3B/8B).
 - PR #43 fixed Mistral3TextConfiguration parsing.
