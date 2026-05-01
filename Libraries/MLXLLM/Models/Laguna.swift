@@ -1,0 +1,496 @@
+//
+// Laguna — Poolside agentic-coding 33B/3B-active MoE.
+//
+// Architecture (from jang_tools/laguna/{config,model}.py @ jang-tools 2.5.x):
+//   - 40 hybrid layers: layer 0 dense MLP, layers 1..39 sparse MoE
+//   - Per-layer attention head count: 48 (full) or 64 (SWA), via
+//     `num_attention_heads_per_layer`
+//   - 8 KV heads (constant across layers)
+//   - head_dim 128
+//   - Hybrid mask: `full_attention` layers use causal mask; `sliding_attention`
+//     layers use windowed causal mask (`sliding_window` = 512)
+//   - Dual RoPE per `rope_parameters[layer_type]`:
+//       full_attention    → YaRN base 500K factor 32 partial 0.5
+//       sliding_attention → default base 10K partial 1.0
+//   - q_norm / k_norm: per-head RMSNorm applied AFTER projection,
+//     BEFORE rope/SDPA. Norm dim = head_dim (128).
+//   - `g_proj` per-head sigmoid gating: gates SDPA output
+//     element-wise per attention head before o_proj
+//   - MoE topology: 256 routed experts top-8, expert dim 512, plus
+//     1 shared expert with separate intermediate size 512
+//   - Sigmoid routing with `e_score_correction_bias` (DeepSeek-V3 recipe)
+//   - `moe_routed_scaling_factor`: 2.5
+//   - `tie_word_embeddings`: false (separate lm_head)
+//
+// MXFP4 bundles route through this class via vanilla `Linear` weight
+// loading. JANGTQ bundles need a paired `LagunaJANGTQ.swift` port that
+// swaps each `Linear` for `JANGTQDenseLinear` (same pattern as
+// Mistral3TextJANGTQ.swift). End-to-end weight-load + decode quality
+// verification gated on a real bundle on disk.
+//
+
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+
+// MARK: - Configuration
+
+public struct LagunaConfiguration: Codable, Sendable {
+    public var modelType: String
+    public var vocabularySize: Int
+    public var hiddenSize: Int
+    public var intermediateSize: Int
+    public var numHiddenLayers: Int
+    public var numAttentionHeads: Int
+    public var numKeyValueHeads: Int
+    public var headDim: Int
+    public var maxPositionEmbeddings: Int
+    public var rmsNormEps: Float
+    public var attentionBias: Bool
+    public var slidingWindow: Int
+    public var partialRotaryFactor: Float
+    public var tieWordEmbeddings: Bool
+
+    public var numExperts: Int
+    public var numExpertsPerTok: Int
+    public var moeIntermediateSize: Int
+    public var sharedExpertIntermediateSize: Int
+    public var moeRoutedScalingFactor: Float
+    public var moeApplyRouterWeightOnInput: Bool
+    public var gating: Bool
+
+    /// Per-layer arrays. Defaults populated by `decode` if missing
+    /// from the bundle's `config.json` (some converted bundles omit
+    /// these; the Python reference back-fills in `__post_init__`).
+    public var layerTypes: [String]
+    public var mlpLayerTypes: [String]
+    public var numAttentionHeadsPerLayer: [Int]
+
+    /// Dual RoPE parameter dict keyed by layer type. Each entry has
+    /// `rope_theta`, optional `partial_rotary_factor`, and any YaRN
+    /// scaling fields (factor, original_max_position_embeddings, etc.)
+    /// that aren't currently consumed by this Swift port. The simpler
+    /// path uses the per-layer-type `rope_theta` + `partial_rotary_factor`
+    /// directly via `MLXFast.RoPE`.
+    public var ropeParameters: [String: [String: StringOrNumber]]
+
+    enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case vocabularySize = "vocab_size"
+        case hiddenSize = "hidden_size"
+        case intermediateSize = "intermediate_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case rmsNormEps = "rms_norm_eps"
+        case attentionBias = "attention_bias"
+        case slidingWindow = "sliding_window"
+        case partialRotaryFactor = "partial_rotary_factor"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case numExperts = "num_experts"
+        case numExpertsPerTok = "num_experts_per_tok"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
+        case moeRoutedScalingFactor = "moe_routed_scaling_factor"
+        case moeApplyRouterWeightOnInput = "moe_apply_router_weight_on_input"
+        case gating
+        case layerTypes = "layer_types"
+        case mlpLayerTypes = "mlp_layer_types"
+        case numAttentionHeadsPerLayer = "num_attention_heads_per_layer"
+        case ropeParameters = "rope_parameters"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "laguna"
+        self.vocabularySize = try c.decodeIfPresent(Int.self, forKey: .vocabularySize) ?? 100352
+        self.hiddenSize = try c.decodeIfPresent(Int.self, forKey: .hiddenSize) ?? 2048
+        self.intermediateSize = try c.decodeIfPresent(Int.self, forKey: .intermediateSize) ?? 8192
+        self.numHiddenLayers = try c.decodeIfPresent(Int.self, forKey: .numHiddenLayers) ?? 40
+        self.numAttentionHeads = try c.decodeIfPresent(Int.self, forKey: .numAttentionHeads) ?? 48
+        self.numKeyValueHeads = try c.decodeIfPresent(Int.self, forKey: .numKeyValueHeads) ?? 8
+        self.headDim = try c.decodeIfPresent(Int.self, forKey: .headDim) ?? 128
+        self.maxPositionEmbeddings =
+            try c.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 131072
+        self.rmsNormEps = try c.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1e-6
+        self.attentionBias = try c.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
+        self.slidingWindow = try c.decodeIfPresent(Int.self, forKey: .slidingWindow) ?? 512
+        self.partialRotaryFactor =
+            try c.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 0.5
+        self.tieWordEmbeddings =
+            try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        self.numExperts = try c.decodeIfPresent(Int.self, forKey: .numExperts) ?? 256
+        self.numExpertsPerTok = try c.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 8
+        self.moeIntermediateSize =
+            try c.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 512
+        self.sharedExpertIntermediateSize =
+            try c.decodeIfPresent(Int.self, forKey: .sharedExpertIntermediateSize) ?? 512
+        self.moeRoutedScalingFactor =
+            try c.decodeIfPresent(Float.self, forKey: .moeRoutedScalingFactor) ?? 2.5
+        self.moeApplyRouterWeightOnInput =
+            try c.decodeIfPresent(Bool.self, forKey: .moeApplyRouterWeightOnInput) ?? false
+        self.gating = try c.decodeIfPresent(Bool.self, forKey: .gating) ?? true
+
+        let lt = try c.decodeIfPresent([String].self, forKey: .layerTypes) ?? []
+        self.layerTypes = lt.isEmpty
+            ? Array(repeating: "full_attention", count: numHiddenLayers) : lt
+
+        let mlt = try c.decodeIfPresent([String].self, forKey: .mlpLayerTypes) ?? []
+        self.mlpLayerTypes = mlt.isEmpty
+            ? (["dense"] + Array(repeating: "sparse", count: max(0, numHiddenLayers - 1)))
+            : mlt
+
+        let nahpl = try c.decodeIfPresent([Int].self, forKey: .numAttentionHeadsPerLayer) ?? []
+        self.numAttentionHeadsPerLayer = nahpl.isEmpty
+            ? Array(repeating: numAttentionHeads, count: numHiddenLayers) : nahpl
+
+        self.ropeParameters =
+            try c.decodeIfPresent([String: [String: StringOrNumber]].self,
+                                  forKey: .ropeParameters)
+            ?? [:]
+    }
+
+    /// Look up the per-layer-type rope theta + partial factor.
+    /// Falls back to top-level config when the dict is missing entries.
+    public func ropeFor(layerType: String) -> (theta: Float, partial: Float) {
+        if let entry = ropeParameters[layerType] {
+            let theta = entry["rope_theta"]?.asFloat() ?? 500_000
+            let partial = entry["partial_rotary_factor"]?.asFloat()
+                ?? partialRotaryFactor
+            return (theta, partial)
+        }
+        // Defaults per the reference: full → YaRN-ish 500K, sliding → 10K
+        let theta: Float = layerType == "sliding_attention" ? 10_000 : 500_000
+        let partial: Float = layerType == "sliding_attention" ? 1.0 : partialRotaryFactor
+        return (theta, partial)
+    }
+}
+
+// MARK: - Attention
+
+internal final class LagunaAttention: Module {
+    let layerIndex: Int
+    let nHeads: Int
+    let nKVHeads: Int
+    let headDim: Int
+    let kvGroups: Int
+    let scale: Float
+    let layerType: String
+    let ropeBase: Float
+    let partial: Float
+    let ropeDim: Int
+
+    @ModuleInfo(key: "q_proj") var wq: Linear
+    @ModuleInfo(key: "k_proj") var wk: Linear
+    @ModuleInfo(key: "v_proj") var wv: Linear
+    @ModuleInfo(key: "o_proj") var wo: Linear
+    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
+    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    @ModuleInfo(key: "g_proj") var gProj: Linear?
+
+    let ropeFull: RoPE
+    let ropePartial: RoPE?
+
+    init(_ cfg: LagunaConfiguration, layerIndex: Int) {
+        self.layerIndex = layerIndex
+        self.nHeads = cfg.numAttentionHeadsPerLayer[layerIndex]
+        self.nKVHeads = cfg.numKeyValueHeads
+        self.headDim = cfg.headDim
+        self.kvGroups = nHeads / nKVHeads
+        self.scale = pow(Float(headDim), -0.5)
+        self.layerType = cfg.layerTypes[layerIndex]
+        let (theta, partial) = cfg.ropeFor(layerType: layerType)
+        self.ropeBase = theta
+        self.partial = partial
+        self.ropeDim = Int(Float(headDim) * partial)
+
+        let h = cfg.hiddenSize
+        self._wq.wrappedValue = Linear(h, nHeads * headDim, bias: cfg.attentionBias)
+        self._wk.wrappedValue = Linear(h, nKVHeads * headDim, bias: cfg.attentionBias)
+        self._wv.wrappedValue = Linear(h, nKVHeads * headDim, bias: cfg.attentionBias)
+        self._wo.wrappedValue = Linear(nHeads * headDim, h, bias: cfg.attentionBias)
+        self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: cfg.rmsNormEps)
+        self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: cfg.rmsNormEps)
+        if cfg.gating {
+            self._gProj.wrappedValue = Linear(h, nHeads, bias: false)
+        }
+
+        // Construct two RoPE instances: one for the full head_dim path,
+        // one for the partial-rotary path. Pick the right one per
+        // forward based on `ropeDim == headDim`.
+        self.ropeFull = RoPE(dimensions: headDim, traditional: false, base: ropeBase)
+        if ropeDim != headDim {
+            self.ropePartial = RoPE(dimensions: ropeDim, traditional: false, base: ropeBase)
+        } else {
+            self.ropePartial = nil
+        }
+    }
+
+    private func applyPartialRope(_ t: MLXArray, offset: Int) -> MLXArray {
+        if let ropePartial {
+            // Rotate first ropeDim, keep tail.
+            let rot = t[.ellipsis, ..<ropeDim]
+            let keep = t[.ellipsis, ropeDim...]
+            let rotated = ropePartial(rot, offset: offset)
+            return MLX.concatenated([rotated, keep], axis: -1)
+        }
+        return ropeFull(t, offset: offset)
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let (B, T, _) = (x.dim(0), x.dim(1), x.dim(2))
+        var q = wq(x).reshaped(B, T, nHeads, headDim).transposed(0, 2, 1, 3)
+        var k = wk(x).reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        var v = wv(x).reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        // Per-head q_norm / k_norm AFTER projection, BEFORE rope (matches reference)
+        q = qNorm(q)
+        k = kNorm(k)
+        q = applyPartialRope(q, offset: cache?.offset ?? 0)
+        k = applyPartialRope(k, offset: cache?.offset ?? 0)
+
+        let out = attentionWithCacheUpdate(
+            queries: q, keys: k, values: v,
+            cache: cache, scale: scale, mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, T, nHeads * headDim)
+
+        var result = out
+        if let g = gProj {
+            // Per-head sigmoid gating: gate the SDPA output element-wise
+            // per head. gate shape: (B, T, nHeads) → broadcast to
+            // (B, T, nHeads, headDim) before flattening back.
+            let gate = sigmoid(g(x))
+            let gated = result.reshaped(B, T, nHeads, headDim) * gate.expandedDimensions(axis: -1)
+            result = gated.reshaped(B, T, nHeads * headDim)
+        }
+        return wo(result)
+    }
+}
+
+// MARK: - Dense MLP (layer 0)
+
+internal final class LagunaDenseMLP: Module, UnaryLayer {
+    @ModuleInfo(key: "gate_proj") var gate: Linear
+    @ModuleInfo(key: "up_proj") var up: Linear
+    @ModuleInfo(key: "down_proj") var down: Linear
+
+    init(hidden: Int, intermediate: Int) {
+        self._gate.wrappedValue = Linear(hidden, intermediate, bias: false)
+        self._up.wrappedValue = Linear(hidden, intermediate, bias: false)
+        self._down.wrappedValue = Linear(intermediate, hidden, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        down(silu(gate(x)) * up(x))
+    }
+}
+
+// MARK: - MoE Block
+
+internal final class LagunaMoE: Module, UnaryLayer {
+    let cfg: LagunaConfiguration
+
+    @ModuleInfo(key: "gate") var gate: Linear
+    @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
+    let experts: [LagunaDenseMLP]
+    @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
+
+    init(_ cfg: LagunaConfiguration) {
+        self.cfg = cfg
+        self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
+        self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
+        self.experts = (0..<cfg.numExperts).map { _ in
+            LagunaDenseMLP(hidden: cfg.hiddenSize, intermediate: cfg.moeIntermediateSize)
+        }
+        self._sharedExpert.wrappedValue = LagunaDenseMLP(
+            hidden: cfg.hiddenSize, intermediate: cfg.sharedExpertIntermediateSize)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (B, T, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let flat = x.reshaped(B * T, H)
+        // Bias-corrected sigmoid routing per DeepSeek-V3 recipe.
+        let logits = gate(flat).asType(.float32)
+        let scores = sigmoid(logits + eScoreCorrectionBias.asType(.float32))
+
+        // Top-K selection: argsort descending, take first K. MLX
+        // doesn't expose negative-axis argsort directly; sort positive
+        // axis 1.
+        let topK = cfg.numExpertsPerTok
+        let sortedIdx = MLX.argSort(-scores, axis: 1)
+        let topkIdx = sortedIdx[0..., ..<topK]
+        var topkW = MLX.takeAlong(scores, topkIdx, axis: 1)
+        let normSum = topkW.sum(axis: 1, keepDims: true) + 1e-20
+        topkW = (topkW / normSum) * cfg.moeRoutedScalingFactor
+
+        // Dispatch each token's selected experts. The reference does a
+        // gather + scatter loop over experts; mirror that here. With
+        // 256 experts and most rows hitting only 8, the inner
+        // `mx.any(mask).item()` Bool check skips experts cheaply.
+        var out = MLXArray.zeros(flat.shape, dtype: topkW.dtype)
+        for e in 0..<cfg.numExperts {
+            let mask = (topkIdx .== MLXArray(Int32(e)))
+            // Per-row weight contribution from this expert:
+            // sum( where(mask, topkW, 0), axis=-1 )
+            let zeros = MLXArray.zeros(topkW.shape, dtype: topkW.dtype)
+            let weighted = MLX.which(mask, topkW, zeros)
+            let perRowWeight = weighted.sum(axis: 1, keepDims: false)
+            // Skip if all rows have zero weight on this expert.
+            let totalWeight = perRowWeight.sum().item(Float.self)
+            if totalWeight == 0 { continue }
+            let y = experts[e](flat)
+            out = out + y * perRowWeight.expandedDimensions(axis: -1).asType(out.dtype)
+        }
+        out = out + sharedExpert(flat)
+        return out.reshaped(B, T, H).asType(x.dtype)
+    }
+}
+
+// MARK: - Transformer Block
+
+internal final class LagunaLayer: Module {
+    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
+    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "self_attn") var attention: LagunaAttention
+    let mlp: UnaryLayer
+    let layerType: String
+    let useSliding: Bool
+
+    init(_ cfg: LagunaConfiguration, layerIndex: Int) {
+        self._inputLayerNorm.wrappedValue = RMSNorm(
+            dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
+        self._postAttentionLayerNorm.wrappedValue = RMSNorm(
+            dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
+        self._attention.wrappedValue = LagunaAttention(cfg, layerIndex: layerIndex)
+        if cfg.mlpLayerTypes[layerIndex] == "dense" {
+            self.mlp = LagunaDenseMLP(
+                hidden: cfg.hiddenSize, intermediate: cfg.intermediateSize)
+        } else {
+            self.mlp = LagunaMoE(cfg)
+        }
+        self.layerType = cfg.layerTypes[layerIndex]
+        self.useSliding = layerType == "sliding_attention"
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        fullMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        swaMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let mask = useSliding ? swaMask : fullMask
+        let h = x + attention(inputLayerNorm(x), mask: mask, cache: cache)
+        return h + mlp(postAttentionLayerNorm(h))
+    }
+}
+
+// MARK: - Top-Level Model
+
+public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
+    public let vocabularySize: Int
+    public let kvHeads: [Int]
+
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    let layers: [LagunaLayer]
+    let norm: RMSNorm
+    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    fileprivate let cfg: LagunaConfiguration
+    fileprivate let faIdx: Int
+    fileprivate let swaIdx: Int?
+
+    public init(_ cfg: LagunaConfiguration) {
+        self.cfg = cfg
+        self.vocabularySize = cfg.vocabularySize
+        self.kvHeads = (0..<cfg.numHiddenLayers).map { _ in cfg.numKeyValueHeads }
+
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: cfg.vocabularySize, dimensions: cfg.hiddenSize)
+        self.layers = (0..<cfg.numHiddenLayers).map {
+            LagunaLayer(cfg, layerIndex: $0)
+        }
+        self.norm = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
+        if !cfg.tieWordEmbeddings {
+            self._lmHead.wrappedValue = Linear(cfg.hiddenSize, cfg.vocabularySize, bias: false)
+        }
+        self.faIdx = cfg.layerTypes.firstIndex(of: "full_attention") ?? 0
+        self.swaIdx = cfg.layerTypes.firstIndex(of: "sliding_attention")
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var h = embedTokens(inputs)
+        let cacheArr = cache ?? []
+
+        let fullMask = createAttentionMask(h: h, cache: cacheArr.isEmpty ? nil : cacheArr[faIdx])
+        let swaMask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let swaIdx, !cacheArr.isEmpty {
+            swaMask = createAttentionMask(
+                h: h, cache: cacheArr[swaIdx], windowSize: cfg.slidingWindow)
+        } else {
+            swaMask = .none
+        }
+
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, fullMask: fullMask, swaMask: swaMask,
+                cache: cacheArr.isEmpty ? nil : cacheArr[i])
+        }
+
+        var out = norm(h)
+        if cfg.tieWordEmbeddings {
+            out = embedTokens.asLinear(out)
+        } else if let lmHead {
+            out = lmHead(out)
+        }
+        return out
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        cfg.layerTypes.map { layerType in
+            if layerType == "sliding_attention" {
+                return RotatingKVCache(maxSize: cfg.slidingWindow)
+            } else if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            } else {
+                return KVCacheSimple()
+            }
+        }
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        // Map HF Laguna weight key prefixes to the Swift module pathing:
+        //   - `model.layers.N.{...}` → `layers.N.{...}` (drop "model." prefix)
+        //   - `model.embed_tokens.weight` → `embed_tokens.weight`
+        //   - `model.norm.weight` → `norm.weight`
+        //   - `model.layers.N.mlp.experts.e_score_correction_bias` →
+        //     `layers.N.mlp.e_score_correction_bias` (drop `experts.` segment;
+        //     the Python reference notes this remap explicitly)
+        var out: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            var k = key
+            if k.hasPrefix("model.") {
+                k = String(k.dropFirst("model.".count))
+            }
+            // e_score_correction_bias remap.
+            k = k.replacingOccurrences(
+                of: ".mlp.experts.e_score_correction_bias",
+                with: ".mlp.e_score_correction_bias"
+            )
+            out[k] = value
+        }
+        return out
+    }
+}
+
+// MARK: - LoRA support (empty — Laguna fine-tune isn't a target today)
+
+extension LagunaModel: LoRAModel {
+    public var loraLayers: [Module] { [] }
+}

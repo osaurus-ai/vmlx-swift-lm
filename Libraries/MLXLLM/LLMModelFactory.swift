@@ -129,6 +129,14 @@ public enum LLMTypeRegistry {
             "smollm3": create(SmolLM3Configuration.self, SmolLM3Model.init),
             "ernie4_5": create(Ernie45Configuration.self, Ernie45Model.init),
             "lfm2": create(LFM2Configuration.self, LFM2Model.init),
+            // Laguna (Poolside agentic-coding 33B/3B-active MoE). 40-layer
+            // hybrid SWA + full attention with per-layer head count
+            // (48 full / 64 SWA), dual RoPE, q_norm/k_norm, sigmoid +
+            // bias-corrected routing over 256 routed experts top-8 + 1
+            // shared. See `Models/Laguna.swift`. JANGTQ variant (paired
+            // JANGTQDenseLinear port) follows the Mistral 3 family
+            // pattern in a follow-up.
+            "laguna": create(LagunaConfiguration.self, LagunaModel.init),
         ]
     }
 
