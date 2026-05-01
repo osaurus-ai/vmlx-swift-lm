@@ -2,7 +2,13 @@
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import CompilerPluginSupport
+import Foundation
 import PackageDescription
+
+let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
+let hasLocalRunBench = FileManager.default.fileExists(
+    atPath: "\(packageDirectory)/RunBench"
+)
 
 let package = Package(
     name: "vmlx-swift-lm",
@@ -36,7 +42,9 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
+        .package(
+            url: "https://github.com/osaurus-ai/mlx-swift",
+            revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         // swift-transformers 1.0.0+ transitively uses huggingface/
         // swift-jinja 2.x which already contains the three root-cause
@@ -135,18 +143,6 @@ let package = Package(
             ],
             path: "CompileBench"
         ),
-        .executableTarget(
-            name: "RunBench",
-            dependencies: [
-                "MLXLMCommon",
-                "MLXLLM",
-                "MLXVLM",
-                "MLXHuggingFace",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
-            ],
-            path: "RunBench"
-        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -184,6 +180,23 @@ let package = Package(
         ),
     ]
 )
+
+if hasLocalRunBench {
+    package.targets.append(
+        .executableTarget(
+            name: "RunBench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "RunBench"
+        )
+    )
+}
 
 if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
     || Context.environment["SPI_GENERATE_DOCS"] == "1"

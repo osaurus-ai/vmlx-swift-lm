@@ -117,14 +117,16 @@ struct ChatMessageToolCallTests {
     @Test("multiple tool calls all get emitted with distinct ids")
     func multipleToolCalls() {
         let calls = [
-            ToolCall(function: .init(
-                name: "get_weather",
-                arguments: ["city": .string("NYC")]
-            )),
-            ToolCall(function: .init(
-                name: "get_time",
-                arguments: ["tz": .string("America/New_York")]
-            )),
+            ToolCall(
+                function: .init(
+                    name: "get_weather",
+                    arguments: ["city": .string("NYC")]
+                )),
+            ToolCall(
+                function: .init(
+                    name: "get_time",
+                    arguments: ["tz": .string("America/New_York")]
+                )),
         ]
         let msg = Chat.Message.assistant("", toolCalls: calls)
         let dict = defaultMessageDict(for: msg)
@@ -142,24 +144,46 @@ struct ChatMessageToolCallTests {
 
     @Test("DefaultMessageGenerator passes tool_calls through")
     func defaultGeneratorTransit() {
-        let call = ToolCall(function: .init(
-            name: "search", arguments: ["q": .string("swift")]))
+        let call = ToolCall(
+            function: .init(
+                name: "search", arguments: ["q": .string("swift")]))
         let msg = Chat.Message.assistant("", toolCalls: [call])
         let gen = DefaultMessageGenerator()
         let dict = gen.generate(message: msg)
         #expect(dict["tool_calls"] != nil)
     }
 
-    @Test("NoSystemMessageGenerator drops system but preserves tool_calls")
-    func noSystemGeneratorPreservesToolCalls() {
-        let call = ToolCall(function: .init(
-            name: "f", arguments: [:]))
+    @Test("NoSystemMessageGenerator folds system into user and preserves tool_calls")
+    func noSystemGeneratorPreservesSystemAndToolCalls() {
+        let call = ToolCall(
+            function: .init(
+                name: "f", arguments: [:]))
         let messages: [Chat.Message] = [
-            .system("ignored"),
+            .system("follow system instructions"),
+            .user("hello"),
             .assistant("", toolCalls: [call]),
         ]
         let out = NoSystemMessageGenerator().generate(messages: messages)
-        #expect(out.count == 1)
-        #expect(out.first?["tool_calls"] != nil)
+        #expect(out.count == 2)
+        #expect(out[0]["role"] as? String == "user")
+        #expect((out[0]["content"] as? String)?.contains("System instructions:") == true)
+        #expect((out[0]["content"] as? String)?.contains("follow system instructions") == true)
+        #expect((out[0]["content"] as? String)?.contains("User message:") == true)
+        #expect((out[0]["content"] as? String)?.contains("hello") == true)
+        #expect(out[1]["tool_calls"] != nil)
+    }
+
+    @Test("NoSystemMessageGenerator inserts user turn when only system is present")
+    func noSystemGeneratorPreservesSystemWithoutUser() {
+        let messages: [Chat.Message] = [
+            .system("system only"),
+            .assistant("already answered"),
+        ]
+        let out = NoSystemMessageGenerator().generate(messages: messages)
+        #expect(out.count == 2)
+        #expect(out[0]["role"] as? String == "user")
+        #expect((out[0]["content"] as? String)?.contains("system only") == true)
+        #expect(out[1]["role"] as? String == "assistant")
+        #expect(out[1]["content"] as? String == "already answered")
     }
 }
