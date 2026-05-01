@@ -152,6 +152,36 @@ public actor BatchEngine {
                 stops.insert(id)
             }
         }
+        // 2026-05-01: Defensive widening — osaurus team reported that
+        // `<|im_end|>` tokens leaked into output on some bundles whose
+        // `config.json` listed `eos_token_id` as a single int, missing
+        // the second EOS variant that the chat template actually emits
+        // (turn end). Match Python mlx-lm's behavior: probe a known
+        // list of common end-of-turn special tokens against the
+        // tokenizer's vocabulary and add any that resolve.
+        // `convertTokenToId` returns nil for non-vocab strings, so
+        // tool-call payloads that contain these as plain content do
+        // NOT get tokenized to these IDs — only the genuine special
+        // tokens do. Idempotent: tokens already in `stops` are no-ops.
+        // Conservative list: only tokens that genuinely terminate an
+        // assistant turn in their training. Excludes `<|user|>` and
+        // similar turn-separators that signal "next turn starts" but
+        // legitimately appear in the middle of model output (e.g.
+        // some chat templates).
+        let commonEndTokens = [
+            "<|im_end|>",       // Qwen / Mistral 3 / NemotronH-Omni / many
+            "<|endoftext|>",    // Qwen2/3, GPT-style
+            "<|eot_id|>",       // Llama 3.x
+            "<|end_of_text|>",  // Llama 3.x alt
+            "<|end|>",          // Phi 3, Phi 4
+            "<|end_of_turn|>",  // Gemma family
+            "<end_of_turn>",    // Gemma 2/3 alt spelling
+        ]
+        for token in commonEndTokens {
+            if let id = context.tokenizer.convertTokenToId(token) {
+                stops.insert(id)
+            }
+        }
         self.stopTokenIDs = stops
     }
 
