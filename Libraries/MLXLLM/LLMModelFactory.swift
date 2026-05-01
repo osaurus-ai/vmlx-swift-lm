@@ -183,73 +183,14 @@ public enum LLMTypeRegistry {
             "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
-            "mistral3": { data in
-                // Mistral3 with `vision_config` is a VLM bundle — refuse here so
-                // the factory iterator falls through to VLMModelFactory's
-                // `mistral3` route. Without this, JANGTQ Mistral 3.5 VLM
-                // bundles loaded under the LLM factory throw
-                // `Unhandled keys ["language_model", "multi_modal_projector",
-                // "vision_tower"]` because Mistral3TextJANGTQModel only knows
-                // how to load text-only weights.
-                struct VisionGate: Codable {
-                    let visionConfig: AnyDecodable?
-                    enum CodingKeys: String, CodingKey { case visionConfig = "vision_config" }
-                }
-                struct AnyDecodable: Codable {}
-                if let gate = try? JSONDecoder.json5().decode(VisionGate.self, from: data),
-                    gate.visionConfig != nil
-                {
-                    throw ModelFactoryError.unsupportedModelType(
-                        "mistral3 (has vision_config — route via VLMModelFactory)")
-                }
-                // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
-                struct TextConfigCheck: Codable {
-                    let textConfig: TextModelType?
-                    struct TextModelType: Codable {
-                        let modelType: String?
-                        enum CodingKeys: String, CodingKey { case modelType = "model_type" }
-                    }
-                    enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
-                }
-                if let check = try? JSONDecoder.json5().decode(TextConfigCheck.self, from: data),
-                    check.textConfig?.modelType == "mistral4"
-                {
-                    let config = try JSONDecoder.json5().decode(Mistral4Configuration.self, from: data)
-                    return Mistral4Model(config)
-                }
-                // 2026-04-30: JANGTQ dispatch. `weight_format == "mxtq"`
-                // routes to `Mistral3TextJANGTQModel` which uses
-                // `JANGTQDenseLinear` for attention Q/K/V/O + MLP
-                // gate/up/down — consuming `.tq_packed` + `.tq_norms`
-                // safetensors instead of a flat `.weight`. Reads bits +
-                // seed from the merged `mxtq_bits` / `mxtq_seed` fields
-                // (jang_config.json values were merged into config.json
-                // earlier in the factory dispatch path — same pattern
-                // as MiniMaxJANGTQ).
-                struct JANGTQProbe: Codable {
-                    let weightFormat: String?
-                    let mxtqBits: Int?
-                    let mxtqSeed: Int?
-                    enum CodingKeys: String, CodingKey {
-                        case weightFormat = "weight_format"
-                        case mxtqBits = "mxtq_bits"
-                        case mxtqSeed = "mxtq_seed"
-                    }
-                }
-                if let probe = try? JSONDecoder.json5().decode(JANGTQProbe.self, from: data),
-                    probe.weightFormat?.lowercased() == "mxtq"
-                {
-                    let config = try JSONDecoder.json5().decode(
-                        Mistral3TextConfiguration.self, from: data)
-                    return Mistral3TextJANGTQModel(
-                        config,
-                        bits: probe.mxtqBits ?? 2,
-                        seed: probe.mxtqSeed ?? 42
-                    )
-                }
-                let config = try JSONDecoder.json5().decode(Mistral3TextConfiguration.self, from: data)
-                return Mistral3TextModel(config)
-            },
+            "mistral3": dispatchMistral3LLM,
+            // `ministral3` is the inner text_config.model_type for Mistral 3.5
+            // VLM bundles, but text-only Mistral 3.5 LLM bundles can also expose
+            // it at the OUTER level. Register both keys to the same dispatch so
+            // either shape resolves correctly. The vision_config gate inside
+            // the closure still routes VLM bundles to VLMModelFactory if a user
+            // configured a Mistral 3.5 VLM bundle to expose `ministral3` outer.
+            "ministral3": dispatchMistral3LLM,
             "apertus": create(ApertusConfiguration.self, ApertusModel.init),
             // DSV4 (DeepSeek-V4-Flash / -Pro): architecturally distinct
             // from DSV3 — mHC residual stream, CSA/HCA hybrid attention,
@@ -404,6 +345,77 @@ public enum LLMTypeRegistry {
             return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
+    }
+
+    /// Shared dispatch for `mistral3` and `ministral3` outer model_types.
+    /// Mistral 3 / 3.5 LLM-only bundles can expose either spelling at the
+    /// outer level. Both flow through the same logic:
+    ///
+    ///   1. If `vision_config` is present → throw `unsupportedModelType`
+    ///      so the factory iterator falls through to VLMModelFactory.
+    ///   2. If inner `text_config.model_type == "mistral4"` → Mistral4Model
+    ///      (Mistral 3 wrapper around a Mistral 4 text decoder).
+    ///   3. If `weight_format == "mxtq"` → Mistral3TextJANGTQModel.
+    ///   4. Otherwise → vanilla Mistral3TextModel.
+    static func dispatchMistral3LLM(data: Data) throws -> any LanguageModel {
+        // 1. Vision gate — VLM bundles must not be loaded under this LLM route.
+        struct VisionGate: Codable {
+            let visionConfig: AnyDecodable?
+            enum CodingKeys: String, CodingKey { case visionConfig = "vision_config" }
+        }
+        struct AnyDecodable: Codable {}
+        if let gate = try? JSONDecoder.json5().decode(VisionGate.self, from: data),
+            gate.visionConfig != nil
+        {
+            throw ModelFactoryError.unsupportedModelType(
+                "mistral3/ministral3 (has vision_config — route via VLMModelFactory)")
+        }
+
+        // 2. Mistral3 / Ministral3 wrapper around Mistral4 text decoder.
+        struct TextConfigCheck: Codable {
+            let textConfig: TextModelType?
+            struct TextModelType: Codable {
+                let modelType: String?
+                enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+            }
+            enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
+        }
+        if let check = try? JSONDecoder.json5().decode(TextConfigCheck.self, from: data),
+            check.textConfig?.modelType == "mistral4"
+        {
+            let config = try JSONDecoder.json5().decode(Mistral4Configuration.self, from: data)
+            return Mistral4Model(config)
+        }
+
+        // 3. JANGTQ dispatch — `weight_format == "mxtq"` routes to
+        //    Mistral3TextJANGTQModel which uses JANGTQDenseLinear for
+        //    attention Q/K/V/O + MLP gate/up/down (consuming `.tq_packed` +
+        //    `.tq_norms` safetensors instead of a flat `.weight`).
+        struct JANGTQProbe: Codable {
+            let weightFormat: String?
+            let mxtqBits: Int?
+            let mxtqSeed: Int?
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case mxtqBits = "mxtq_bits"
+                case mxtqSeed = "mxtq_seed"
+            }
+        }
+        if let probe = try? JSONDecoder.json5().decode(JANGTQProbe.self, from: data),
+            probe.weightFormat?.lowercased() == "mxtq"
+        {
+            let config = try JSONDecoder.json5().decode(
+                Mistral3TextConfiguration.self, from: data)
+            return Mistral3TextJANGTQModel(
+                config,
+                bits: probe.mxtqBits ?? 2,
+                seed: probe.mxtqSeed ?? 42
+            )
+        }
+
+        // 4. Vanilla.
+        let config = try JSONDecoder.json5().decode(Mistral3TextConfiguration.self, from: data)
+        return Mistral3TextModel(config)
     }
 
     private static func dispatchDeepseekV3Family(data: Data) throws -> any LanguageModel {
