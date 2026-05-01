@@ -808,15 +808,27 @@ public actor BatchEngine {
                     let hasSSMLayer = slot.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache
                     }
+                    // Full disk hit on hybrid-SSM is ALSO unsafe: the
+                    // restored SSM state already includes the last
+                    // token's recurrence contribution, so the
+                    // remaining.isEmpty branch's "trim KV by 1 and
+                    // re-feed last token" recipe double-counts the
+                    // last token's SSM update. Result: logits sample
+                    // EOS first, decode emits zero tokens (StabilityBench
+                    // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
+                    // Same SSM-state path-dependence rationale as the
+                    // remaining.nonEmpty case below.
                     let unsafePartial = !remaining.isEmpty &&
                         (hasVisualContent || hasSSMLayer)
-                    if unsafePartial {
+                    let unsafeFullHit = remaining.isEmpty && hasSSMLayer
+                    if unsafePartial || unsafeFullHit {
                         let why: String
                         if hasVisualContent { why = "VL vision-token region can't be split" }
+                        else if unsafeFullHit { why = "hybrid SSM full disk hit — re-feeding last token would double-count SSM state" }
                         else                { why = "hybrid SSM recurrence path-dependent on full prefix" }
                         let slotIDStr = slot.id.description
                         Self.logger.info(
-                            "Slot \(slotIDStr, privacy: .public): partial cache hit — rolling back to full prefill (\(why))"
+                            "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (\(why))"
                         )
                         slot.cache = context.model.newCache(parameters: slot.parameters)
                         inputForPrepare = slot.originalInput
