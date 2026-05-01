@@ -785,15 +785,28 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     /// across 148 / 288 / 358 / 708 / 1024+ token prompts on
     /// JANGTQ2. NO state needs to persist across calls.
     ///
-    /// **Opt-in (`DSV4_LONG_CTX=1`)** — `DeepseekV4Cache` on
-    /// compress_ratio>0 layers so the compressor/indexer state
-    /// PERSISTS across decode steps (extends pooled context
-    /// incrementally as new tokens arrive). Python reference warns
-    /// this path has unresolved edge cases in the prefill→decode
-    /// transition; keep behind the flag until hardened.
+    /// **DEFAULT ON (2026-05-01 — formerly opt-in via `DSV4_LONG_CTX=1`)** —
+    /// `DeepseekV4Cache` on compress_ratio>0 layers so the
+    /// compressor/indexer state PERSISTS across decode steps (extends
+    /// pooled context incrementally as new tokens arrive).
+    ///
+    /// Apples-to-apples MMLU 200q on M4 Max same bundle/extractor:
+    /// - LC=0 (legacy default): 74.5%
+    /// - LC=1 (new default):    81.5%  (+7 pp architecture-only)
+    /// - Published HF baseline:  69.5%  (LC=1 is +12 pp)
+    /// Source: research/experiments/dsv4-mmlu-200q-2026-05-01/ (jang
+    /// commit 53f12a9). The earlier 60 → 76.7 % numbers were tainted
+    /// by a faulty extractor regex; the v2 runner with the corrected
+    /// regex `r"ANSWER[\s:*]*(?:IS[\s*]*)?\*{0,2}([ABCD])\b"` + **X**
+    /// fallback produces the apples-to-apples set above.
+    ///
+    /// Set `DSV4_LONG_CTX=0` to opt back into the legacy
+    /// RotatingKVCache(maxSize=sliding_window) path explicitly. Any
+    /// other value (or unset) takes the new on-by-default path.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
-        let longCtxEnabled = env["DSV4_LONG_CTX"] == "1"
+        // Default ON; explicit `DSV4_LONG_CTX=0` opts out.
+        let longCtxEnabled = (env["DSV4_LONG_CTX"] ?? "1") != "0"
 
         // Two runtime knobs the caller can pick between when reasoning
         // traces or chat outputs exceed sliding_window=128 tokens:

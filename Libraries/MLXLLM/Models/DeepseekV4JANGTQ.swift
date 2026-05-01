@@ -158,13 +158,17 @@ public final class DeepseekV4JANGTQModel:
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
-    /// Mirrors `DeepseekV4Model.newCache`. Default path: plain
-    /// RotatingKVCache per layer (compressor fast-path handles long
-    /// prompts during prefill). `DSV4_LONG_CTX=1` opt-in:
-    /// DeepseekV4Cache on compress_ratio>0 layers.
+    /// Mirrors `DeepseekV4Model.newCache`. **DEFAULT ON (2026-05-01)**:
+    /// `DeepseekV4Cache` on compress_ratio>0 layers so the
+    /// compressor/indexer state persists across decode steps. MMLU
+    /// 200q at LC=1 is 81.5 % vs 74.5 % at LC=0 (apples-to-apples,
+    /// same bundle/extractor; jang research commit 53f12a9). Set
+    /// `DSV4_LONG_CTX=0` to opt back into the legacy
+    /// RotatingKVCache(maxSize=sliding_window) path explicitly.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
-        let longCtxEnabled = env["DSV4_LONG_CTX"] == "1"
+        // Default ON; explicit `DSV4_LONG_CTX=0` opts out.
+        let longCtxEnabled = (env["DSV4_LONG_CTX"] ?? "1") != "0"
 
         // Mirror DeepseekV4Model.newCache. Three modes:
         //   - "sliding" (default): RotatingKVCache, 128-token window.

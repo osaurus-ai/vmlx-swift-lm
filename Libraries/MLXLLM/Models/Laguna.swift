@@ -588,13 +588,35 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        cfg.layerTypes.map { layerType in
+        // 2026-05-01: route full-attention layers through `RotatingKVCache`
+        // (with a generous bound when no caller-supplied `maxKVSize`)
+        // so the per-layer cache family is HOMOGENEOUS — all layers are
+        // RotatingKVCache. This unlocks `BatchCompile`'s Stage 3
+        // `.rotating` compile path (BatchEngine.swift:1178-1203):
+        // each layer gets promoted to `CompilableRotatingKVCache` and
+        // the model forward gets traced into a single Metal dispatch.
+        //
+        // Pre-fix: full attention used `KVCacheSimple()` →
+        // `CacheFamily.classify` returned `.heterogeneous` (mix of
+        // RotatingKVCache for SWA + KVCacheSimple for full) → compile
+        // guard at BatchEngine.swift:1237 skipped, dropping decode to
+        // the uncompiled BatchKVCache path. Same root cause as the
+        // SLIDING-WINDOW.md / Gemma3+Gemma4 perf gap. The compile path
+        // shaves 5-15% off decode for `.rotating` (Stage 3 docs); on
+        // a 33B/3B-active all-attention model like Laguna this is the
+        // only sub-2× lever short of a fused attention kernel.
+        //
+        // Bound choice: `cfg.maxPositionEmbeddings` when unset (i.e.,
+        // the largest context the model was trained for). For typical
+        // chat workloads (< 8k tokens) the rotation never engages and
+        // this is bit-identical to `KVCacheSimple` — same memory
+        // semantics, just a different concrete cache class.
+        let fullKVSize = parameters?.maxKVSize ?? cfg.maxPositionEmbeddings
+        return cfg.layerTypes.map { layerType in
             if layerType == "sliding_attention" {
                 return RotatingKVCache(maxSize: cfg.slidingWindow)
-            } else if let maxKVSize = parameters?.maxKVSize {
-                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
             } else {
-                return KVCacheSimple()
+                return RotatingKVCache(maxSize: fullKVSize, keep: 4)
             }
         }
     }
