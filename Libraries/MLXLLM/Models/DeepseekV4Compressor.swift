@@ -339,10 +339,30 @@ public final class DeepseekV4Indexer: Module {
         let pooled = compressor(
             x, rope: rope, v4Cache: v4Cache,
             startPos: startPos, branch: .indexer)
-        if pooled.dim(1) == 0 { return nil }
+        let pooledLen = pooled.dim(1)
+        if pooledLen == 0 { return nil }
 
         let B = x.dim(0)
         let L = x.dim(1)
+        // 2026-05-01 (A3): when the available pool is already <= topK,
+        // every score-matmul + softmax + argPartition step still ends
+        // up selecting every pool entry. Skip the score path entirely
+        // and return identity indices broadcast over (B, L). Saves the
+        // full `q @ pooled.T` matmul + weightsProj projection +
+        // arg-partition per CSA layer per step. For prompts < ~2048
+        // tokens this fires every CSA forward (compress_ratio=4 ×
+        // ~20 layers × per-token decode); reported as next-lever A3
+        // in jang/research/dsv4/DSV4-HSA-CSA-NEXT-LEVERS-2026-05-01.md.
+        // Quality unchanged — the gather downstream concatenates all
+        // selected pool entries either way; order is irrelevant when
+        // selecting all of them.
+        if pooledLen <= topK {
+            let identity = MLXArray(0..<pooledLen).asType(.uint32)
+            // (pooledLen,) → (1, 1, pooledLen) → broadcast (B, L, pooledLen)
+            let expanded = identity.expandedDimensions(axes: [0, 1])
+            return broadcast(expanded, to: [B, L, pooledLen])
+        }
+
         var q = wqB(qResidual)
             .reshaped(B, L, nHeads, headDim)
             .transposed(0, 2, 1, 3)
