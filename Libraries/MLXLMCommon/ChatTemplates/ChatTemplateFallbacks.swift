@@ -287,6 +287,91 @@ public enum ChatTemplateFallbacks {
 {%- endif -%}
 """#
 
+    /// Laguna (Poolside) — `laguna_glm_thinking_v5/chat_template.jinja`
+    /// uses `{%- generation -%}…{%- endgeneration -%}` block tags
+    /// (HF-transformers extension for `assistant_tokens_mask`, NOT
+    /// standard Jinja). swift-jinja throws on the unknown block tag,
+    /// and none of the existing fallbacks (Gemma4 / Nemotron / DSV4)
+    /// emit Laguna's `<system>/<user>/<assistant>/<tool_response>`
+    /// framing. This minimal fallback preserves the role markers and
+    /// the `<think>` / `</think>` toggle that drives reasoning ON/OFF.
+    ///
+    /// Sniff signal in the bridge: `bos_token == "〈|EOS|〉"` — that
+    /// literal string is hard-coded as the first emitted token in the
+    /// native Laguna template (see line 3 of the upstream).
+    public static let lagunaMinimal: String = #"""
+{{- "〈|EOS|〉" -}}
+{%- set enable_thinking = enable_thinking | default(false) -%}
+{%- set add_generation_prompt = add_generation_prompt | default(false) -%}
+{%- set system_message = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations." -%}
+{%- if messages and messages[0].role == "system" -%}
+  {%- set system_message = messages[0].content -%}
+{%- endif -%}
+{%- if (system_message and system_message.strip()) or tools -%}
+  {{- "<system>\n" -}}
+  {%- if system_message and system_message.strip() -%}
+    {{- "\n" -}}{{- system_message.rstrip() -}}
+  {%- endif -%}
+  {%- if tools -%}
+    {{- "\n\n### Tools\n\n" -}}
+    {{- "You may call functions to assist with the user query.\n" -}}
+    {{- "All available function signatures are listed below:\n" -}}
+    {{- "<available_tools>\n" -}}
+    {%- for tool in tools -%}
+      {{- tool | tojson -}}{{- "\n" -}}
+    {%- endfor -%}
+    {{- "</available_tools>\n" -}}
+  {%- endif -%}
+  {{- "\n</system>\n" -}}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- if message.role == "system" -%}
+    {#- handled above -#}
+  {%- elif message.role == "user" -%}
+    {{- "<user>\n" -}}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for item in message.content -%}
+        {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- "\n</user>\n" -}}
+  {%- elif message.role == "assistant" -%}
+    {{- "<assistant>\n" -}}
+    {%- if enable_thinking -%}
+      {{- "<think>\n" -}}
+    {%- else -%}
+      {{- "</think>\n" -}}
+    {%- endif -%}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for item in message.content -%}
+        {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- "\n</assistant>\n" -}}
+  {%- elif message.role == "tool" -%}
+    {{- "<tool_response>\n" -}}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {{- message.content | tojson -}}
+    {%- endif -%}
+    {{- "\n</tool_response>\n" -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {{- "<assistant>\n" -}}
+  {%- if enable_thinking -%}
+    {{- "<think>\n" -}}
+  {%- else -%}
+    {{- "</think>\n" -}}
+  {%- endif -%}
+{%- endif -%}
+"""#
+
     /// Ordered list of (label, template) fallbacks used when the
     /// model's native template throws. Order matters: `gemma4WithTools`
     /// comes first because (a) it subsumes `gemma4Minimal` when no
@@ -296,6 +381,7 @@ public enum ChatTemplateFallbacks {
         ("Gemma4WithTools", gemma4WithTools),
         ("Gemma4Minimal",   gemma4Minimal),
         ("NemotronMinimal", nemotronMinimal),
+        ("LagunaMinimal",   lagunaMinimal),
         ("DSV4Minimal",     dsv4Minimal),
     ]
 }

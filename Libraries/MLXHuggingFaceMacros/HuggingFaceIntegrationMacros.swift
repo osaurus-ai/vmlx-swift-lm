@@ -190,8 +190,25 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.convertTokenToId("<|turn>") != nil { return true }
                                 return false
                             }()
+                            // Laguna (Poolside) sniff: the native template's
+                            // first emitted token is the literal "〈|EOS|〉"
+                            // string (U+3008 + |EOS| + U+3009), which the
+                            // bundle ships as the bos_token. swift-jinja
+                            // throws on the `{% generation %}` block tag,
+                            // so we route directly to the Laguna fallback
+                            // template — none of the other fallbacks emit
+                            // Laguna's `<system>/<user>/<assistant>` framing.
+                            let isLagunaFamily: Bool = {
+                                let marker = String(UnicodeScalar(0x3008)!)
+                                    + "|EOS|" + String(UnicodeScalar(0x3009)!)
+                                return upstream.bosToken == marker
+                            }()
                             let ordered: [(label: String, template: String)]
-                            if isGemmaFamily {
+                            if isLagunaFamily {
+                                ordered = [
+                                    ("LagunaMinimal", MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
+                                ]
+                            } else if isGemmaFamily {
                                 ordered = MLXLMCommon.ChatTemplateFallbacks.orderedFallbacks
                             } else {
                                 ordered = [
