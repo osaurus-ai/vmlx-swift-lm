@@ -255,14 +255,33 @@ internal final class Mistral3JANGTQModelInner: Module {
             maxPositionEmbeddings: originalMaxPos
         ).asType(h.dtype)
 
+        // Per-layer L2-norm probe for root-cause localization (env-gated).
+        // Set `VMLX_MISTRAL3_LAYER_PROBE=1` to log `||h||_2` after each
+        // layer + after the final norm. Compare against the same probe
+        // in `Mistral3.swift` (mxfp4 path) on the same 5-token input.
+        // Uniform drift across layers indicates a precision-compound
+        // issue (codebook decode rounding); a single divergent layer
+        // points at a specific kernel.
+        let probe = ProcessInfo.processInfo.environment["VMLX_MISTRAL3_LAYER_PROBE"] == "1"
         for (i, layer) in layers.enumerated() {
             let mask = layer.useSliding ? swaMask : faMask
             h = layer(
                 h, attentionScale: attentionScale, mask: mask,
                 cache: cache.isEmpty ? nil : cache[i])
+            if probe {
+                let l2 = sqrt((h.asType(.float32) * h.asType(.float32)).sum()).item(Float.self)
+                FileHandle.standardError.write(
+                    Data("[mistral3-probe-jangtq] layer=\(i) L2=\(l2)\n".utf8))
+            }
         }
 
-        return norm(h)
+        let out = norm(h)
+        if probe {
+            let l2 = sqrt((out.asType(.float32) * out.asType(.float32)).sum()).item(Float.self)
+            FileHandle.standardError.write(
+                Data("[mistral3-probe-jangtq] final-norm L2=\(l2)\n".utf8))
+        }
+        return out
     }
 }
 

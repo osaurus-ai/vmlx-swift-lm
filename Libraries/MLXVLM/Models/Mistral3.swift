@@ -514,14 +514,30 @@ private enum Language {
                 maxPositionEmbeddings: originalMaxPos
             ).asType(h.dtype)
 
+            // Per-layer L2 probe (sibling of Mistral3VLMJANGTQ's probe).
+            // VMLX_MISTRAL3_LAYER_PROBE=1 logs `||h||_2` after each layer
+            // + final norm. Compare with JANGTQ probe to find divergent
+            // layer and localize Mistral 3.5 JANGTQ root cause.
+            let probe = ProcessInfo.processInfo.environment["VMLX_MISTRAL3_LAYER_PROBE"] == "1"
             for (i, layer) in layers.enumerated() {
                 let mask = layer.useSliding ? swaMask : faMask
                 h = layer(
                     h, attentionScale: attentionScale, mask: mask,
                     cache: cache.isEmpty ? nil : cache[i])
+                if probe {
+                    let l2 = sqrt((h.asType(.float32) * h.asType(.float32)).sum()).item(Float.self)
+                    FileHandle.standardError.write(
+                        Data("[mistral3-probe-mxfp4] layer=\(i) L2=\(l2)\n".utf8))
+                }
             }
 
-            return norm(h)
+            let out = norm(h)
+            if probe {
+                let l2 = sqrt((out.asType(.float32) * out.asType(.float32)).sum()).item(Float.self)
+                FileHandle.standardError.write(
+                    Data("[mistral3-probe-mxfp4] final-norm L2=\(l2)\n".utf8))
+            }
+            return out
         }
     }
 
