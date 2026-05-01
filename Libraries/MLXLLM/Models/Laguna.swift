@@ -466,8 +466,15 @@ internal final class LagunaMoE: Module, UnaryLayer {
         let scoresForSelection = scores + eScoreCorrectionBias.asType(.float32)
 
         let topK = cfg.numExpertsPerTok
-        let sortedIdx = MLX.argSort(-scoresForSelection, axis: -1)
-        let topkIdx = sortedIdx[.ellipsis, ..<topK]                   // (B, T, K)
+        // 2026-05-01: argPartition (O(n)) instead of argSort
+        // (O(n log n)). For Laguna's 256 experts top-8 this is the
+        // canonical Python ref pattern (see comment block at line 454,
+        // and matches MiniMaxJANGTQ:127 / DeepseekV3:290 / Qwen35JANGTQ:72).
+        // The order of returned indices is unspecified — irrelevant
+        // here because TurboQuantSwitchGLU sums over the K dim regardless.
+        let topkIdx = argPartition(
+            -scoresForSelection, kth: topK - 1, axis: -1
+        )[.ellipsis, ..<topK]                                          // (B, T, K)
         var topkW = MLX.takeAlong(scores, topkIdx, axis: -1)          // (B, T, K) — un-biased!
         let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
         topkW = topkW / normSum
