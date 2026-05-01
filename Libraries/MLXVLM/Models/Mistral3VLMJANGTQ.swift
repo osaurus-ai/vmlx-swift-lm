@@ -664,7 +664,21 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
             } else if newKey.contains("activation_scale") {
                 continue
             } else if newWeights[newKey] == nil {
-                newWeights[newKey] = value
+                // Pixtral patch_conv from HF is PyTorch (out, in, kh, kw);
+                // MLX Conv2d wants (out, kh, kw, in). PixtralVisionModel.
+                // sanitize handles it on its own forward path, but
+                // Mistral3VLMJANGTQ.sanitize fully owns sanitization and
+                // never delegates — same gap as in Mistral3VLM.sanitize.
+                // checkArrayShape makes the transpose idempotent for
+                // pre-converted bundles.
+                if (newKey.contains("patch_conv.weight")
+                    || newKey.contains("patch_embedding.weight"))
+                    && !PixtralVision.checkArrayShape(value)
+                {
+                    newWeights[newKey] = value.transposed(0, 2, 3, 1)
+                } else {
+                    newWeights[newKey] = value
+                }
             }
         }
         return newWeights

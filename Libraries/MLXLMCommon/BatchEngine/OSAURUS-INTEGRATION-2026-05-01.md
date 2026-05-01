@@ -321,6 +321,20 @@ quantization noise. The remaining gap is honest 2-bit quantization
 loss (4 codebook entries per output element); a JANGTQ4 (4-bit)
 Mistral 3.5 build would close it further.
 
+**Confirmed via real chat-prompt test** (commit `38086ca` post-fix, BENCH_HARMONY_CHECK):
+- Prompt: `"What is 2+2? Answer briefly."` (full chat template applied)
+- mxfp4 Mistral 3.5 output: `"4"` (coherent, correct, single chunk)
+- JANGTQ (2-bit) Mistral 3.5 output: `"0000000000…"` (degenerate attractor)
+
+The 2-bit codebook is too lossy for Mistral 3.5's 88-layer × 12288-hidden
+dense decoder. Per-projection probe at layer 0 is correct (within 10%
+of mxfp4) but error compounds across 88 layers into a flat logit
+distribution that argmax decode locks onto a single high-frequency token.
+
+**Action item for jang-tools**: convert a JANGTQ4 (4-bit, 16-entry
+codebook) Mistral 3.5 bundle. The Swift runtime is correct; only the
+on-disk codebook precision needs improvement.
+
 Affected architectures: any model with `hidden_dim > 4096` AND
 non-power-of-2 (so the multiblock Hadamard fires AND the largest
 block exceeds 4096). Other JANGTQ models (MiniMax M2.7-Small=3072,
