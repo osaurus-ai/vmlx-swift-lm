@@ -166,14 +166,18 @@ internal final class LagunaJANGTQMoE: Module, UnaryLayer {
     /// not worth JANGTQ-quantizing).
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    let experts: [LagunaJANGTQDenseMLP]
+    // 2026-05-01: parity with LagunaModel — Module-array fields need
+    // @ModuleInfo + var so the parameter loader can write per-expert
+    // weights. Without this, weight load fails with 'Unable to set
+    // layers.N.mlp.experts on LagunaJANGTQModel.LagunaJANGTQLayer.LagunaJANGTQMoE'.
+    @ModuleInfo(key: "experts") var experts: [LagunaJANGTQDenseMLP]
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaJANGTQDenseMLP
 
     init(_ cfg: LagunaConfiguration, bits: Int, seed: Int) {
         self.cfg = cfg
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
-        self.experts = (0..<cfg.numExperts).map { _ in
+        self._experts.wrappedValue = (0..<cfg.numExperts).map { _ in
             LagunaJANGTQDenseMLP(
                 hidden: cfg.hiddenSize, intermediate: cfg.moeIntermediateSize,
                 bits: bits, seed: seed)

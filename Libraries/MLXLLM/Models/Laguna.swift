@@ -356,14 +356,20 @@ internal final class LagunaMoE: Module, UnaryLayer {
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    let experts: [LagunaDenseMLP]
+    // 2026-05-01: Module-array fields must be wrapped in @ModuleInfo
+    // and declared `var` so mlx-swift's parameter loader can both
+    // discover them via reflection AND update their per-expert weights.
+    // Without the wrapper + var, weight load fails with
+    // 'Unable to set layers.1.mlp.experts on LagunaModel.LagunaLayer.LagunaMoE'
+    // because the loader can't write into a `let` array of Module.
+    @ModuleInfo(key: "experts") var experts: [LagunaDenseMLP]
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
     init(_ cfg: LagunaConfiguration) {
         self.cfg = cfg
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
-        self.experts = (0..<cfg.numExperts).map { _ in
+        self._experts.wrappedValue = (0..<cfg.numExperts).map { _ in
             LagunaDenseMLP(hidden: cfg.hiddenSize, intermediate: cfg.moeIntermediateSize)
         }
         self._sharedExpert.wrappedValue = LagunaDenseMLP(
