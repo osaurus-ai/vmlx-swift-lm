@@ -224,15 +224,46 @@ token salad ("jek, iÅ¾, consequent, dirait, sper, ặ, unar, cy, Ever,
 Back") on real chat prompts. The (bits, gs) shape-walk fix corrected
 the affine-quantized embed_tokens (verified `bits=8 gs=64 → in_dim=12288`),
 but the JANGTQ codebook dense-linear forward in `Mistral3VLMJANGTQ` has
-its own divergence we haven't traced yet. Likely candidates:
-  1. JANGTQDenseLinear codebook lookup convention vs Python `tq_quantize_weight`
-  2. Hadamard rotation seed mismatch for non-power-of-2 12288 dim
-  3. YaRN scaling vs plain RoPE (Python ref's runtime uses plain RoPE
-     base=1e6; Swift uses YarnRoPE because rope_type=yarn in config)
-Investigation path: instrument `Mistral3JANGTQAttention.callAsFunction`
-the same way (env-gated print of every layer's q/k/v/output shape +
-selected element values) and compare to Laguna's working JANGTQ codebook
-forward. mxfp4 bundle is sufficient for shipping until JANGTQ traced.
+its own divergence we haven't traced yet.
+
+**Investigation results:**
+- `~/jang/jang-tools/jang_tools/mistral3/runtime.py` does NOT support
+  JANGTQ Mistral 3.5 — its `nn.quantize` predicate filters layers by
+  `.scales` presence, skipping codebook layers (`tq_packed`/`tq_norms`).
+  So Python ref runs against bf16/fp8/mxfp4 only. **Swift is the only
+  path that runs JANGTQ Mistral 3.5 — no Python parity reference exists.**
+- Theoretical concern: `compute_codebook(d=12288)` produces a Lloyd-Max
+  codebook for the Beta((d-1)/2, (d-1)/2) post-rotation distribution
+  with variance ~1/12288. But for non-power-of-2 dim 12288 = 8192 + 4096,
+  the actual Hadamard rotation is **per-block** (decomposePow2). After
+  per-block rotation:
+    - First 8192 coords have variance ~1/8192 (1.5× the codebook target)
+    - Last 4096 coords have variance ~1/4096 (3× the codebook target)
+  The codebook is mis-calibrated for the actual coordinate distribution.
+  Across 88 layers of dense codebook quant, this drift compounds into
+  multilingual semi-random output. Working JANGTQ models (Laguna XS.2
+  hidden=2048, NemotronH Omni hidden=5120) either have power-of-2 hidden
+  OR use the per-expert MoE codebook (TurboQuantSwitchGLU) where the
+  codebook is computed per-expert at smaller dims (gate_up_proj in_dim=
+  hidden, but down_proj in_dim=moe_intermediate=512 — power-of-2).
+
+  Mistral 3 family is the only architecture that uses ALL-CODEBOOK
+  DENSE decoder at the full hidden_size (12288) in_features.
+
+  Confirming this theory: the Python `compute_codebook` is per-(dim, bits)
+  cached, so per-block codebooks would need a substantial refactor in
+  the conversion pipeline AND the runtime. Out of scope for this session.
+- Other hypotheses: JANGTQDenseLinear forward math (xRot @ w_codebook.T
+  vs x @ hadamard_inverse(w).T) was verified mathematically equivalent.
+  YaRN vs plain RoPE difference is likely benign for short prompts.
+
+**Recommendation for osaurus team:** Ship the **mxfp4** Mistral 3.5
+distribution; do NOT ship JANGTQ Mistral 3.5 until the per-block
+codebook calibration is fixed in the conversion pipeline (`jang_tools`
+side) AND the Swift runtime (`Libraries/MLXLMCommon/JANGTQDenseLinear.swift`).
+Other JANGTQ models (Laguna codebook MoE + power-of-2 dim, Qwen3.6
+codebook MoE, MiniMax codebook MoE, NemotronH-Omni codebook MoE) are
+unaffected.
 
 **Upstream investigation (`ml-explore/mlx-swift-lm`) — Mistral 3 history:**
 - Upstream PR #18 added Ministral 3 with Pixtral vision (likely tested on 3B/8B).
