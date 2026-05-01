@@ -179,11 +179,60 @@ wrong scheme).
 1. `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
 2. **DSV4 model forward has a separate reshape bug at HEAD** — verified 2026-05-01 against `DeepSeek-V4-Flash-JANGTQ` bundle on disk. `BENCH_SIMPLE` with a 10-token synthetic prompt fails with `[reshape] Cannot reshape array of size 163840 into shape (1,5,16384)` — the model produces 2× the expected positions on axis-1. Factor-of-2 suggests an mHC residual-stream split or a multi-token-prediction artifact not being reduced before reshape. Reproducible with `BENCH_SIMPLE` AND `BENCH_COHERENT`. Pre-existing; not introduced by this pin's commits. Out of scope for the current osaurus integration push — flag for the DSV4 author to investigate. **DO NOT ship DSV4 in osaurus until this is fixed.**
 
-**Mistral 3 / 3.5 VLM — open architectural bug (NOT chat template):**
-- Verified 2026-05-01 against both `Mistral-Medium-3.5-128B-JANGTQ` AND `Mistral-Medium-3.5-128B-mxfp4` bundles on `/Volumes/EricsLLMDrive`.
-- JANGTQ bundle: model loads and produces token salad ("ติ Jeparroll rele Maradecydmai Électionsixarag…") on real chat prompts. TTFT grows pathologically per turn (34s → 81s → 113s).
-- mxfp4 bundle: model loads, then `BENCH_SIMPLE` throws `[rms_norm] (*weight) must have the same size as the last dimension of x but has 12288 elements` — a hidden-size RMSNorm being applied to a wrong-shape tensor.
-- **The mxfp4 throw proves the bug is in the `Mistral3VLM` Swift forward itself — NOT in the JANGTQ codebook path, NOT in the chat template (which now renders correctly post-jinja-fork-pin).**
+**Mistral 3 / 3.5 VLM — root cause traced, mxfp4 path FIXED (commit `af89da7`):**
+
+After deep tracing with diagnostic prints + bundle inspection, the real
+root cause was in `JangQuantization` default initializer:
+
+- `JangQuantization()` had `bitWidthsUsed: [Int] = [2, 4, 6]` as the
+  default. mxfp4 bundles ship `jang_config.json` with only an `mxfp4`
+  field — no `quantization` field — so the parser fell through to the
+  default initializer, getting bogus `bitWidthsUsed=[2,4,6]`.
+- `inferPerLayerQuantization` keys on `isAuthoritativeJang =
+  !bitWidthsUsed.isEmpty`. The bogus default classified mxfp4 bundles
+  as authoritative-JANG, ignoring config.json's `quantization.bits`
+  override.
+- This made shape walk pick `defaultBits = bitWidthsUsed.min() = 2`,
+  then for embed_tokens (`weight=[131072, 1536]` uint32, `scales=[131072,
+  384]`) the disambiguation chose `(bits=2, gs=64)` — mathematically
+  valid for the same packed shape but wrong: produces `in_dim = 384 × 64
+  = 24576`, double the correct `hiddenSize = 12288`.
+- Embed forward returned `[B, T, 24576]`. Next RMSNorm has `weight=[12288]`.
+  MLX correctly threw `[rms_norm] (*weight) must have the same size as
+  the last dimension of x but has 12288 elements`.
+
+**Fix in commit `af89da7`:** Default `bitWidthsUsed: [Int] = []`. Added
+`overrideBits` parameter to `inferPerLayerQuantization`, threaded from
+`Load.swift` (`quantization?.bits`). When `isAuthoritativeJang = false`,
+prefer overrideBits over `bitWidthsUsed.min()` fallback.
+
+**Verification (real load + decode on disk):**
+- Mistral-Medium-3.5-128B-mxfp4 BENCH_SIMPLE: `h.shape=[1, 5, 12288]`
+  through all 88 layers + final norm. Decoded tokens: `"Okay, the user
+  just sent a blank message."` — **coherent English**.
+- Regression checks: Laguna (3-turn coherent), Qwen3.6 27B MXFP4
+  (multi-turn cache reuse, "Blue." in turn 2), 13/13 dispatch + multi-
+  turn unit tests pass.
+- Real Mistral 3.5 mxfp4 multi-turn chat blocked only by `kIOGPUCommandBufferCallbackErrorTimeout`
+  on the second 128B load (BENCH_BATCH_CHAT loads twice for compile-OFF
+  + compile-ON). That's M5 Max memory pressure on 128B × 2 loads —
+  not a model bug. Single-load decode is coherent.
+
+**JANGTQ Mistral 3.5 path — separate decoder bug (still open):**
+The `Mistral3VLMJANGTQ` codebook decoder still produces multilingual
+token salad ("jek, iÅ¾, consequent, dirait, sper, ặ, unar, cy, Ever,
+Back") on real chat prompts. The (bits, gs) shape-walk fix corrected
+the affine-quantized embed_tokens (verified `bits=8 gs=64 → in_dim=12288`),
+but the JANGTQ codebook dense-linear forward in `Mistral3VLMJANGTQ` has
+its own divergence we haven't traced yet. Likely candidates:
+  1. JANGTQDenseLinear codebook lookup convention vs Python `tq_quantize_weight`
+  2. Hadamard rotation seed mismatch for non-power-of-2 12288 dim
+  3. YaRN scaling vs plain RoPE (Python ref's runtime uses plain RoPE
+     base=1e6; Swift uses YarnRoPE because rope_type=yarn in config)
+Investigation path: instrument `Mistral3JANGTQAttention.callAsFunction`
+the same way (env-gated print of every layer's q/k/v/output shape +
+selected element values) and compare to Laguna's working JANGTQ codebook
+forward. mxfp4 bundle is sufficient for shipping until JANGTQ traced.
 
 **Upstream investigation (`ml-explore/mlx-swift-lm`) — Mistral 3 history:**
 - Upstream PR #18 added Ministral 3 with Pixtral vision (likely tested on 3B/8B).
