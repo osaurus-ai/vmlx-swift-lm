@@ -134,9 +134,11 @@ public func loadWeights(
         // `(gs=32, bits=8)` for layers actually packed at `(gs=64,
         // bits=4)`) and would re-introduce the wrong values.
         let configGS: Int? = quantization?.groupSize
+        let configBits: Int? = quantization?.bits
         let inferred = JangLoader.inferPerLayerQuantization(
             weights: weights, jangConfig: jangConfig,
-            overrideGroupSize: configGS)
+            overrideGroupSize: configGS,
+            overrideBits: configBits)
 
         if !inferred.perLayerQuantization.isEmpty {
             let b = inferred.quantization?.bits ?? -1

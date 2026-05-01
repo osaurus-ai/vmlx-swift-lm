@@ -36,7 +36,21 @@ public struct JangQuantization: Sendable, Equatable {
         targetBits: Float = 2.5,
         actualBits: Float = 2.85,
         blockSize: Int = 64,
-        bitWidthsUsed: [Int] = [2, 4, 6],
+        // 2026-05-01: default to empty so `isAuthoritativeJang` checks
+        // (`!bitWidthsUsed.isEmpty`) correctly distinguish bundles that
+        // actually have JANG quant metadata vs bundles that just default-
+        // construct this struct (e.g. mxfp4 bundles whose `jang_config.json`
+        // has only a `mxfp4` field, not a `quantization` field). With the
+        // old default `[2, 4, 6]`, mxfp4 bundles were misclassified as
+        // authoritative-JANG, ignoring config.json's quantization.bits and
+        // landing on `defaultBits = bitWidthsUsed.min() = 2` which produced
+        // the (bits=2, gs=64) shape-walk interpretation that doubled the
+        // embed_tokens output dim (24576 instead of hiddenSize=12288) and
+        // crashed the next RMSNorm — observed on
+        // Mistral-Medium-3.5-128B-mxfp4. Real JANG bundles always populate
+        // bit_widths_used explicitly, so this only changes behavior for
+        // non-JANG bundles.
+        bitWidthsUsed: [Int] = [],
         quantizationScheme: String = "asymmetric",
         quantizationBackend: String = "mx.quantize"
     ) {
@@ -1110,7 +1124,8 @@ public struct JangLoader: Sendable {
     public static func inferPerLayerQuantization(
         weights: [String: MLXArray],
         jangConfig: JangConfig,
-        overrideGroupSize: Int? = nil
+        overrideGroupSize: Int? = nil,
+        overrideBits: Int? = nil
     ) -> BaseConfiguration.PerLayerQuantization {
         // Prefer the caller-supplied group_size (typically from
         // config.json's quantization.group_size) over jangConfig's
@@ -1144,8 +1159,29 @@ public struct JangLoader: Sendable {
         }
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
 
-        // Find the default (most common) bit width from jang_config
-        let defaultBits = jangConfig.quantization.bitWidthsUsed.min() ?? 4
+        // Find the default (most common) bit width.
+        // Priority: jang_config.bitWidthsUsed (authoritative when present)
+        // → overrideBits (config.json's quantization.bits — authoritative for
+        //   bundles like mxfp4 whose jang_config has only `mxfp4` field, no
+        //   `quantization` field, so bitWidthsUsed defaults to [2,4,6])
+        // → fallback 4.
+        //
+        // 2026-05-01: this fixes a (bits, gs) ambiguity bug for embed_tokens
+        // on Mistral-Medium-3.5-128B-mxfp4. Bundle is quantized at (bits=4,
+        // gs=32) producing weight=[131072, 1536] uint32 + scales=[131072, 384].
+        // Default bitWidthsUsed=[2,4,6].min()=2 with overrideGroupSize=64
+        // (jangConfig.blockSize default) makes the shape walk pick (bits=2,
+        // gs=64) which is mathematically valid for the same packed shape but
+        // produces in_dim=24576 (2× hiddenSize=12288). Embed forward then
+        // returns [B, T, 24576], failing the next RMSNorm with weight=12288.
+        // Passing overrideBits=4 from config.json's quantization.bits resolves
+        // the ambiguity correctly.
+        let defaultBits: Int
+        if isAuthoritativeJang {
+            defaultBits = jangConfig.quantization.bitWidthsUsed.min() ?? 4
+        } else {
+            defaultBits = overrideBits ?? jangConfig.quantization.bitWidthsUsed.min() ?? 4
+        }
 
         // Group weight keys by their base path (strip .weight/.scales/.biases suffix)
         var quantizedLayers = Set<String>()
