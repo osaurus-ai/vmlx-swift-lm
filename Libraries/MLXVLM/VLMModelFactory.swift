@@ -112,48 +112,11 @@ public enum VLMTypeRegistry {
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
         "pixtral": create(PixtralConfiguration.self, PixtralVLM.init),
-        "mistral3": { data in
-            // 2026-04-30: JANGTQ dispatch for Mistral 3 family VLM
-            // bundles. `weight_format == "mxtq"` routes to
-            // Mistral3VLMJANGTQ which wires JANGTQDenseLinear into
-            // attention Q/K/V/O + MLP gate/up/down on the inner LM.
-            // Pixtral vision tower stays vanilla
-            // (mxtq_bits.vision_tower=passthrough_fp16). Bits + seed
-            // come from the merged jang_config.json fields on
-            // Mistral3VLMConfiguration (decoded into the config struct).
-            struct WFCheck: Codable {
-                let weightFormat: String?
-                enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
-            }
-            if let wf = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
-                wf.weightFormat?.lowercased() == "mxtq"
-            {
-                let config = try JSONDecoder.json5().decode(
-                    Mistral3VLMConfiguration.self, from: data)
-                return Mistral3VLMJANGTQ(
-                    config,
-                    bits: config.mxtqBits ?? 2,
-                    seed: config.mxtqSeed ?? 42
-                )
-            }
-            // Mistral3 VLM may wrap Mistral4 text decoder — check text_config.model_type
-            struct TextCheck: Codable {
-                let textConfig: TextType?
-                struct TextType: Codable {
-                    let modelType: String?
-                    enum CodingKeys: String, CodingKey { case modelType = "model_type" }
-                }
-                enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
-            }
-            if let check = try? JSONDecoder.json5().decode(TextCheck.self, from: data),
-                check.textConfig?.modelType == "mistral4"
-            {
-                let config = try JSONDecoder.json5().decode(Mistral4VLMConfiguration.self, from: data)
-                return Mistral4VLM(config)
-            }
-            let config = try JSONDecoder.json5().decode(Mistral3VLMConfiguration.self, from: data)
-            return Mistral3VLM(config)
-        },
+        "mistral3": dispatchMistral3VLM,
+        // Mistral 3.5 VLM bundles can expose `ministral3` at the OUTER
+        // level (not just as the inner text_config.model_type). Register
+        // both keys to the same dispatch.
+        "ministral3": dispatchMistral3VLM,
         "lfm2_vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "lfm2-vl": create(LFM2VLConfiguration.self, LFM2VL.init),
         "glm_ocr": create(GlmOcrConfiguration.self, GlmOcr.init),
@@ -162,6 +125,50 @@ public enum VLMTypeRegistry {
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
     ]
+
+    /// Shared dispatch for Mistral 3 / 3.5 VLM bundles, registered under
+    /// both `mistral3` (canonical outer model_type) and `ministral3`
+    /// (occasional outer spelling on Mistral 3.5 LLM-with-vision bundles).
+    ///
+    ///   1. `weight_format == "mxtq"` → `Mistral3VLMJANGTQ` (JANGTQ inner LM,
+    ///      vanilla Pixtral vision tower per `mxtq_bits.vision_tower=
+    ///      passthrough_fp16`).
+    ///   2. `text_config.model_type == "mistral4"` → `Mistral4VLM` (Mistral 3
+    ///      VLM wrapping a Mistral 4 text decoder).
+    ///   3. Otherwise → vanilla `Mistral3VLM`.
+    static func dispatchMistral3VLM(data: Data) throws -> any LanguageModel {
+        struct WFCheck: Codable {
+            let weightFormat: String?
+            enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
+        }
+        if let wf = try? JSONDecoder.json5().decode(WFCheck.self, from: data),
+            wf.weightFormat?.lowercased() == "mxtq"
+        {
+            let config = try JSONDecoder.json5().decode(
+                Mistral3VLMConfiguration.self, from: data)
+            return Mistral3VLMJANGTQ(
+                config,
+                bits: config.mxtqBits ?? 2,
+                seed: config.mxtqSeed ?? 42
+            )
+        }
+        struct TextCheck: Codable {
+            let textConfig: TextType?
+            struct TextType: Codable {
+                let modelType: String?
+                enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+            }
+            enum CodingKeys: String, CodingKey { case textConfig = "text_config" }
+        }
+        if let check = try? JSONDecoder.json5().decode(TextCheck.self, from: data),
+            check.textConfig?.modelType == "mistral4"
+        {
+            let config = try JSONDecoder.json5().decode(Mistral4VLMConfiguration.self, from: data)
+            return Mistral4VLM(config)
+        }
+        let config = try JSONDecoder.json5().decode(Mistral3VLMConfiguration.self, from: data)
+        return Mistral3VLM(config)
+    }
 }
 
 public enum VLMProcessorTypeRegistry {
