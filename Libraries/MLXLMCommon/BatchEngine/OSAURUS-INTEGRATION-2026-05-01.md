@@ -287,6 +287,51 @@ relative L2 error per layer. A single divergent layer would point
 at a specific kernel/op; uniform drift would confirm the
 calibration-or-precision-compound theory.
 
+### ROOT CAUSE FOUND 2026-05-01 (commit `a1bfe65`) — Hadamard kernel shmem OOB
+
+The drift-compounding theory was wrong. The actual root cause is two
+buffer-size bugs in the Swift port of the multiblock Hadamard Metal
+kernel (`Libraries/MLXLMCommon/JANGTQKernels.swift`):
+
+1. `threadgroup float shmem[4096]` was too small for any non-pow2 dim
+   that decomposes to a block > 4096. Mistral-Medium-3.5 hidden=12288
+   = `[8192, 4096]` writes shmem[0..12288] into a 4096-element buffer.
+2. `float newv[4]` was too small for `ept = d_b/threads_per_tg = 8`
+   when d_b=8192 (block 0 of Mistral 3.5).
+
+Both already fixed in the **Python reference** at
+`jang/jang-tools/.../hadamard_kernel.py:97` with the explanatory
+comment `"Was 4096 → silently corrupted block 1 of any non-pow2 dim
+> 4096 (notably GLM-5.1 hidden=6144 = 4096+2048)..."`. The Swift port
+had silently kept the older 4096/4 buffer sizes from before the Python
+fix.
+
+Localized via `VMLX_MISTRAL3_PROJ_PROBE=1` per-projection probe at
+layer 0 prefill on the same 5-token input through both mxfp4 and
+JANGTQ paths:
+
+|        | mxfp4   | JANGTQ before | JANGTQ after |
+|--------|---------|---------------|--------------|
+| q.L2   | 28.64   | 33.71 (1.18×) | 24.07 (0.84×) |
+| k.L2   | 28.06   | 17.33 (0.62×) | 21.09 (0.75×) |
+| v.L2   |  0.23   |  0.99 (4.30×) |  0.35 (1.50×) |
+
+After the fix, all three projections sit within typical 2-bit
+quantization noise. The remaining gap is honest 2-bit quantization
+loss (4 codebook entries per output element); a JANGTQ4 (4-bit)
+Mistral 3.5 build would close it further.
+
+Affected architectures: any model with `hidden_dim > 4096` AND
+non-power-of-2 (so the multiblock Hadamard fires AND the largest
+block exceeds 4096). Other JANGTQ models (MiniMax M2.7-Small=3072,
+MiniMax M2.7=6144 → blocks `[4096, 2048]`, Qwen3.6=4096 single
+block, NemotronH=5120 → blocks `[4096, 1024]`) all stayed within
+the old 4096-cap because their largest block was ≤ 4096. That's why
+the bug went undetected on the previously-tested coherent models.
+
+Probe infra is gated behind `VMLX_MISTRAL3_LAYER_PROBE=1` and
+`VMLX_MISTRAL3_PROJ_PROBE=1` — no overhead in production builds.
+
 ### Perf optimizations landed in this session
 
 | Lever | Description | Status |
