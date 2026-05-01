@@ -38,16 +38,19 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
-        // swift-transformers 1.0.0+ transitively uses huggingface/
-        // swift-jinja 2.x which already contains the three root-cause
-        // fixes we previously carried in the osaurus-ai/Jinja 1.3.1
-        // fork (Gemma-4 lexer `{{%` ambiguity, dict-iter single-
-        // identifier binding, standalone SelectExpression). See
-        // `Libraries/MLXLMCommon/ChatTemplates/swift-jinja-patches/`
-        // for the root-cause writeup. Fork is now archival reference
-        // only; `ChatTemplateFallbacks.swift` + `TokenizerBridge`
-        // auto-engage remain as the defensive safety net if a FUTURE
-        // swift-jinja release ever regresses on a new template family.
+        // swift-jinja: pinned to osaurus-ai fork at 58d21aa which
+        // contains a 1-line parser fix lifting the for-loop iterable
+        // from parseFilter() (factor + |filter only) to parseOr()
+        // (full binary + comparison + logical hierarchy, excluding
+        // ternary). Required for Mistral-Medium-3.5's chat template
+        // (`{%- for message in loop_messages + [{...}] %}` was
+        // rejected with "Expected '%}' after for loop.. Got plus
+        // instead"). All 756 swift-jinja tests pass on the fork.
+        // Upstream: https://github.com/osaurus-ai/swift-jinja
+        // SwiftPM transitive resolution honors this override because
+        // it appears before swift-transformers (which depends on
+        // swift-jinja).
+        .package(url: "https://github.com/osaurus-ai/swift-jinja", revision: "58d21aa5b69fdd9eb7e23ce2c3730f47db8e0c9d"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
     ],
     targets: [

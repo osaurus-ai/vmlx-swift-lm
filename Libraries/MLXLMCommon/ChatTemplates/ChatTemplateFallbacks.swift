@@ -287,19 +287,18 @@ public enum ChatTemplateFallbacks {
 {%- endif -%}
 """#
 
-    /// Laguna (Poolside) — `laguna_glm_thinking_v5/chat_template.jinja`
-    /// uses `{%- generation -%}…{%- endgeneration -%}` block tags
-    /// (HF-transformers extension for `assistant_tokens_mask`, NOT
-    /// standard Jinja). swift-jinja throws on the unknown block tag,
-    /// and none of the existing fallbacks (Gemma4 / Nemotron / DSV4)
-    /// emit Laguna's `<system>/<user>/<assistant>/<tool_response>`
-    /// framing. This minimal fallback preserves the role markers and
-    /// the `<think>` / `</think>` toggle that drives reasoning ON/OFF.
-    ///
-    /// Sniff signal in the bridge: `bos_token == "〈|EOS|〉"` — that
-    /// literal string is hard-coded as the first emitted token in the
-    /// native Laguna template (see line 3 of the upstream).
-    public static let lagunaMinimal: String = #"""
+    /// REMOVED 2026-05-01 — kept as `_lagunaMinimal_DEPRECATED` for one
+    /// release in case the osaurus-ai/swift-jinja parseOr fork breaks
+    /// on a Laguna template variant we haven't tested. Verified that
+    /// the native `laguna_glm_thinking_v5/chat_template.jinja` (with
+    /// `{%- generation -%}…{%- endgeneration -%}` block tags) parses
+    /// AND renders correctly through the bridge against the swift-jinja
+    /// fork at 58d21aa5. End-to-end Laguna BENCH_BATCH_CHAT 3-turn is
+    /// coherent ("That's a great color!..." → "Your favorite color is
+    /// blue!..." → "Blue is a cool color..."). No fallback engaged in
+    /// the verified path; the bridge sniff that previously force-routed
+    /// to this template was removed in the same commit.
+    private static let _lagunaMinimal_DEPRECATED: String = #"""
 {{- "〈|EOS|〉" -}}
 {%- set enable_thinking = enable_thinking | default(false) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
@@ -372,6 +371,96 @@ public enum ChatTemplateFallbacks {
 {%- endif -%}
 """#
 
+    /// Mistral 3 / Mistral 3.5 / Mistral-Medium-3.5 minimal fallback.
+    ///
+    /// The native template uses
+    /// `{%- for message in loop_messages + [{'role':'__sentinel__'}] %}`
+    /// — swift-jinja can't parse `+` concatenation inside the
+    /// for-iterable expression, throwing `Expected '%}' after for
+    /// loop.. Got plus instead`. Reported on real
+    /// `Mistral-Medium-3.5-128B-JANGTQ` 2026-05-01.
+    ///
+    /// This fallback preserves the Mistral-family markers
+    /// `[SYSTEM_PROMPT] / [INST] / [/INST] / [AVAILABLE_TOOLS] /
+    /// [/AVAILABLE_TOOLS] / [TOOL_CALLS] / [TOOL_RESULTS]`. Drops
+    /// the consecutive-message aggregation logic the native template
+    /// uses (which is what needed the `+ [sentinel]` trick) — most
+    /// chats don't have consecutive same-role messages.
+    ///
+    /// Bridge sniff: `convertTokenToId("[INST]") != nil` is the
+    /// cleanest Mistral-family signal — it's a special token across
+    /// every Mistral 3 / 3.5 / 4 distribution.
+    /// REMOVED 2026-05-01 — same rationale as the Laguna deprecation
+    /// directly above. The osaurus-ai/swift-jinja fork (58d21aa5)
+    /// fixes the for-loop-iterable parser to accept binary `+`
+    /// expressions, so Mistral 3.5's native template
+    /// (`{%- for message in loop_messages + [{...}] %}`) now parses
+    /// and renders correctly with the FULL `[MODEL_SETTINGS]
+    /// {"reasoning_effort": "..."}` plumbing the model was trained on.
+    /// Kept private as `_mistral3Minimal_DEPRECATED` for one release
+    /// as defensive reference.
+    private static let _mistral3Minimal_DEPRECATED: String = #"""
+{%- if messages and messages[0].role == "system" -%}
+  {{- "[SYSTEM_PROMPT]" -}}
+  {%- if messages[0].content is string -%}
+    {{- messages[0].content -}}
+  {%- else -%}
+    {%- for item in messages[0].content -%}
+      {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- "[/SYSTEM_PROMPT]" -}}
+{%- endif -%}
+{%- set effort = reasoning_effort | default("none") -%}
+{{- "[MODEL_SETTINGS]" -}}
+{{- '{"reasoning_effort": "' -}}{{- effort -}}{{- '"}' -}}
+{{- "[/MODEL_SETTINGS]" -}}
+{%- if tools -%}
+  {{- "[AVAILABLE_TOOLS]" -}}
+  {{- tools | tojson -}}
+  {{- "[/AVAILABLE_TOOLS]" -}}
+{%- endif -%}
+{%- for message in messages -%}
+  {%- if message.role == "system" -%}
+    {#- handled above -#}
+  {%- elif message.role == "user" -%}
+    {{- "[INST]" -}}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {%- for item in message.content -%}
+        {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
+        {%- if item.type == "image" -%}{{- "[IMG]" -}}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- "[/INST]" -}}
+  {%- elif message.role == "assistant" -%}
+    {%- if message.tool_calls -%}
+      {{- "[TOOL_CALLS]" -}}
+      {{- message.tool_calls | tojson -}}
+      {{- "[/TOOL_CALLS]" -}}
+    {%- else -%}
+      {%- if message.content is string -%}
+        {{- message.content -}}
+      {%- else -%}
+        {%- for item in message.content -%}
+          {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {{- eos_token -}}
+    {%- endif -%}
+  {%- elif message.role == "tool" -%}
+    {{- "[TOOL_RESULTS]" -}}
+    {%- if message.content is string -%}
+      {{- message.content -}}
+    {%- else -%}
+      {{- message.content | tojson -}}
+    {%- endif -%}
+    {{- "[/TOOL_RESULTS]" -}}
+  {%- endif -%}
+{%- endfor -%}
+"""#
+
     /// Ordered list of (label, template) fallbacks used when the
     /// model's native template throws. Order matters: `gemma4WithTools`
     /// comes first because (a) it subsumes `gemma4Minimal` when no
@@ -381,7 +470,6 @@ public enum ChatTemplateFallbacks {
         ("Gemma4WithTools", gemma4WithTools),
         ("Gemma4Minimal",   gemma4Minimal),
         ("NemotronMinimal", nemotronMinimal),
-        ("LagunaMinimal",   lagunaMinimal),
         ("DSV4Minimal",     dsv4Minimal),
     ]
 }

@@ -190,25 +190,32 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 if upstream.convertTokenToId("<|turn>") != nil { return true }
                                 return false
                             }()
-                            // Laguna (Poolside) sniff: the native template's
-                            // first emitted token is the literal "〈|EOS|〉"
-                            // string (U+3008 + |EOS| + U+3009), which the
-                            // bundle ships as the bos_token. swift-jinja
-                            // throws on the `{% generation %}` block tag,
-                            // so we route directly to the Laguna fallback
-                            // template — none of the other fallbacks emit
-                            // Laguna's `<system>/<user>/<assistant>` framing.
-                            let isLagunaFamily: Bool = {
-                                let marker = String(UnicodeScalar(0x3008)!)
-                                    + "|EOS|" + String(UnicodeScalar(0x3009)!)
-                                return upstream.bosToken == marker
-                            }()
+                            // Note (2026-05-01): the Laguna `〈|EOS|〉`
+                            // and Mistral 3 `[INST]` family sniffs were
+                            // REMOVED. They previously force-routed to
+                            // family-specific minimal fallbacks because
+                            // swift-jinja's `parseFilter()` rejected
+                            // for-iterable expressions (Mistral's
+                            // `loop_messages + [sentinel]`) and unknown
+                            // block tags (Laguna's `{% generation %}`).
+                            //
+                            // The osaurus-ai/swift-jinja fork at
+                            // 58d21aa5 fixes the for-iterable parsing
+                            // (lifts to parseOr — handles `+` etc.
+                            // without consuming the for-loop's `if`
+                            // filter token). Verified: BOTH Mistral 3.5
+                            // and Laguna native templates now parse
+                            // and render correctly. The sniffs would
+                            // preempt native templates and emit the
+                            // less-faithful minimal fallbacks instead;
+                            // removing them lets the native templates
+                            // run with their full reasoning_effort
+                            // plumbing, MODEL_SETTINGS block, and
+                            // generation block tags intact. Fallbacks
+                            // remain registered in `ordered` below as
+                            // insurance for future regressions.
                             let ordered: [(label: String, template: String)]
-                            if isLagunaFamily {
-                                ordered = [
-                                    ("LagunaMinimal", MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
-                                ]
-                            } else if isGemmaFamily {
+                            if isGemmaFamily {
                                 ordered = MLXLMCommon.ChatTemplateFallbacks.orderedFallbacks
                             } else {
                                 ordered = [
