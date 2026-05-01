@@ -85,6 +85,14 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     public var multimodalProjectorBias: Bool { _multimodalProjectorBias ?? false }
     public var eosTokenId: [Int]? { _eosTokenId }
 
+    /// JANGTQ runtime knobs. Set to non-nil by the VLMModelFactory
+    /// `mistral3` closure when `weight_format == "mxtq"` so the
+    /// Mistral3VLM init can route to the JANGTQ-aware language model
+    /// inner. Plain MXFP4 / full-precision bundles leave these nil.
+    public var weightFormat: String? { _weightFormat }
+    public var mxtqBits: Int? { _mxtqBits }
+    public var mxtqSeed: Int? { _mxtqSeed }
+
     private let _ignoreIndex: Int?
     private let _imageTokenIndex: Int?
     private let _imageTokenId: Int?
@@ -94,6 +102,9 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
     private let _spatialMergeSize: Int?
     private let _multimodalProjectorBias: Bool?
     private let _eosTokenId: [Int]?
+    private let _weightFormat: String?
+    private let _mxtqBits: Int?
+    private let _mxtqSeed: Int?
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -108,6 +119,9 @@ public struct Mistral3VLMConfiguration: Codable, Sendable {
         case _spatialMergeSize = "spatial_merge_size"
         case _multimodalProjectorBias = "multimodal_projector_bias"
         case _eosTokenId = "eos_token_id"
+        case _weightFormat = "weight_format"
+        case _mxtqBits = "mxtq_bits"
+        case _mxtqSeed = "mxtq_seed"
     }
 }
 

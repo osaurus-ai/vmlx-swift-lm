@@ -220,6 +220,23 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .mistral
         }
 
+        // Ministral3 (Mistral 3.5 inner text_config.model_type). When a
+        // bundle exposes the inner type at the outer level (rare but
+        // possible for text-only Ministral3 LLM bundles), match it
+        // here so tool calling routes correctly. The outer `mistral3`
+        // wrapper case is already handled above.
+        if type.hasPrefix("ministral3") {
+            return .mistral
+        }
+
+        // Laguna (Poolside agentic-coding MoE). `laguna_glm_thinking_v5/
+        // chat_template.jinja` uses GLM-family function-calling tags.
+        // Matches the same parser as glm4_moe / glm5 / deepseek (V3
+        // family) which all share the GLM-style tool format.
+        if type.hasPrefix("laguna") {
+            return .glm4
+        }
+
         // Kimi family (kimi_k2, kimi_k15, etc.). JANG converters stamp
         // `capabilities.toolParser = "kimi_k2"`; non-JANG bundles fall
         // through to this model_type sniff.
