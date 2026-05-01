@@ -526,6 +526,19 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // Tied embeddings: when config.tieWordEmbeddings is true the
+            // language model's lm_head shares weights with embed_tokens.
+            // The model class declares `var lmHead: Linear?` and only
+            // initialises it when NOT tied, so a redundant lm_head.weight
+            // shipped in the safetensors throws an unhandled-key error at
+            // load. Drop it. Mirror of Mistral3TextJANGTQ.sanitize and
+            // LagunaJANGTQ.sanitize behaviour.
+            if config.textConfig.tieWordEmbeddings,
+                newKey == "language_model.lm_head.weight"
+            {
+                continue
+            }
+
             if newKey.contains("weight_scale_inv") {
                 let scaleInv = value
                 let weightKey = newKey.replacingOccurrences(of: "_scale_inv", with: "")
