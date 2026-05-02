@@ -273,7 +273,6 @@ internal final class Mistral3JANGTQModelInner: Module {
         }
 
         let cache = cache ?? []
-        let offset = cache.first?.offset ?? 0
 
         let faMask = createAttentionMask(h: h, cache: cache[faIndex])
 
@@ -281,22 +280,36 @@ internal final class Mistral3JANGTQModelInner: Module {
         if let swaIndex, let slidingWindow, !cache.isEmpty {
             let t = h.dim(1)
             if t > 1 {
+                // Sibling of Mistral3.swift's offset gating — only
+                // read SWA cache offset when both sliding layers are
+                // present AND we're in prefill, to keep the compile
+                // path viable on bundles without SWA.
                 let swaOffset = min(slidingWindow, cache[swaIndex].offset)
                 swaMask = .array(
                     createCausalMask(n: t, offset: swaOffset, windowSize: slidingWindow))
             }
         }
 
+        // llama4 scaling skip when beta=0: avoids reading
+        // cache.first?.offset on CompilableKVCache (which calls
+        // `.item()` and crashes inside MLX compile). See
+        // Mistral3.swift's matching block for the full rationale.
         let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
-        let originalMaxPos =
-            config.ropeParameters?["original_max_position_embeddings"]?.asInt()
-            ?? config.maxPositionEmbeddings ?? 4096
-        let attentionScale = mistral3VLMJANGTQGetLlama4AttentionScale(
-            start: offset,
-            stop: offset + h.dim(1),
-            beta: beta,
-            maxPositionEmbeddings: originalMaxPos
-        ).asType(h.dtype)
+        let attentionScale: MLXArray
+        if beta == 0 {
+            attentionScale = MLXArray(Float(1.0)).asType(h.dtype)
+        } else {
+            let offset = cache.first?.offset ?? 0
+            let originalMaxPos =
+                config.ropeParameters?["original_max_position_embeddings"]?.asInt()
+                ?? config.maxPositionEmbeddings ?? 4096
+            attentionScale = mistral3VLMJANGTQGetLlama4AttentionScale(
+                start: offset,
+                stop: offset + h.dim(1),
+                beta: beta,
+                maxPositionEmbeddings: originalMaxPos
+            ).asType(h.dtype)
+        }
 
         // Per-layer L2-norm probe for root-cause localization (env-gated).
         // Set `VMLX_MISTRAL3_LAYER_PROBE=1` to log `||h||_2` after each

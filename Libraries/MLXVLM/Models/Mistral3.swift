@@ -527,7 +527,6 @@ private enum Language {
             }
 
             let cache = cache ?? []
-            let offset = cache.first?.offset ?? 0
 
             let faMask = createAttentionMask(h: h, cache: cache[faIndex])
 
@@ -535,22 +534,42 @@ private enum Language {
             if let swaIndex, let slidingWindow, !cache.isEmpty {
                 let t = h.dim(1)
                 if t > 1 {
+                    // SWA offset only sourced when there ARE sliding
+                    // layers AND we're in prefill (t > 1). The offset
+                    // read triggers `.item()` on CompilableKVCache,
+                    // which crashes inside MLX compile — so guard it
+                    // behind both conditions to keep compile-ON viable
+                    // for SWA-free Mistral 3.5 bundles (sliding_window=null).
                     let swaOffset = min(slidingWindow, cache[swaIndex].offset)
                     swaMask = .array(
                         createCausalMask(n: t, offset: swaOffset, windowSize: slidingWindow))
                 }
             }
 
+            // llama4 attention scaling: when beta=0 (Mistral 3.5
+            // baseline), the formula `1 + beta * log(...)` collapses
+            // to identically 1 regardless of position. Skip the
+            // position-based MLX op AND skip reading
+            // `cache.first?.offset` — the offset getter on
+            // CompilableKVCache calls `.item()` which crashes inside
+            // MLX compile transformations. Mistral 3.5 mxfp4 ships
+            // with beta=0 so this path covers production decoders.
             let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
-            let originalMaxPos =
-                config.ropeParameters?["original_max_position_embeddings"]?.asInt()
-                ?? config.maxPositionEmbeddings ?? 4096
-            let attentionScale = getLlama4AttentionScale(
-                start: offset,
-                stop: offset + h.dim(1),  // Use h's length (embeddings), not inputs (token IDs)
-                beta: beta,
-                maxPositionEmbeddings: originalMaxPos
-            ).asType(h.dtype)
+            let attentionScale: MLXArray
+            if beta == 0 {
+                attentionScale = MLXArray(Float(1.0)).asType(h.dtype)
+            } else {
+                let offset = cache.first?.offset ?? 0
+                let originalMaxPos =
+                    config.ropeParameters?["original_max_position_embeddings"]?.asInt()
+                    ?? config.maxPositionEmbeddings ?? 4096
+                attentionScale = getLlama4AttentionScale(
+                    start: offset,
+                    stop: offset + h.dim(1),  // Use h's length (embeddings), not inputs (token IDs)
+                    beta: beta,
+                    maxPositionEmbeddings: originalMaxPos
+                ).asType(h.dtype)
+            }
 
             // Per-layer L2 probe (sibling of Mistral3VLMJANGTQ's probe).
             // VMLX_MISTRAL3_LAYER_PROBE=1 logs `||h||_2` after each layer
