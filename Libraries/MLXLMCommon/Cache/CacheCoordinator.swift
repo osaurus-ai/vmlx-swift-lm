@@ -296,12 +296,14 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Store SSM companion states for hybrid models
         if isHybrid, let ssmStates, !ssmStates.isEmpty {
-            let boundary = min(totalTokens, blockLayerData.count * blockSize)
-            ssmStateCache.store(
-                ssmStates: ssmStates,
-                tokens: promptTokens,
-                boundary: boundary
-            )
+            let boundary = totalTokens - (totalTokens % blockSize)
+            if boundary > 0 {
+                ssmStateCache.store(
+                    ssmStates: ssmStates,
+                    tokens: promptTokens,
+                    boundary: boundary
+                )
+            }
         }
     }
 
