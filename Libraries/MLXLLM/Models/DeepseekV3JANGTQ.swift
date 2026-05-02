@@ -400,7 +400,32 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
     ///    triplets on attention / shared / bookend modules are still
     ///    stacked via the standard DeepseekV3 sanitize path above.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var newWeights = weights
+        // --- Job 0: Kimi-K2.6 (kimi_k25) shape adapter.
+        //
+        // Kimi K2.6 ships as a multimodal-shaped bundle — its weights
+        // live under `language_model.*` (LLM stack) plus
+        // `vision_tower.*` and `mm_projector.*` (the multimodal
+        // pieces). Plain DeepSeek V3 bundles use top-level paths.
+        // The factory (`dispatchDeepseekV3Family`) flattens the
+        // config (`text_config` unwrap) so the LLM-only path can run
+        // Kimi K2.6 without a Kimi VLM class. Mirror that flattening
+        // on the weight side: strip the `language_model.` prefix and
+        // drop vision-tower / projector tensors. Idempotent — flat
+        // bundles pass through unchanged.
+        var newWeights: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            if key.hasPrefix("vision_tower.")
+                || key.hasPrefix("mm_projector.")
+                || key.hasPrefix("multi_modal_projector.")
+            {
+                continue
+            }
+            var newKey = key
+            if newKey.hasPrefix("language_model.") {
+                newKey = String(newKey.dropFirst("language_model.".count))
+            }
+            newWeights[newKey] = value
+        }
 
         // --- Job 1: FP8 weight_scale_inv dequant (affine pass-through
         // for JANGTQ bundles; matches `DeepseekV3Model.sanitize`).
@@ -414,14 +439,13 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
             let scaled = p * scaleInv[0..., .newAxis, 0..., .newAxis]
             return scaled.reshaped([m + padBottom, n + padSide])[0 ..< m, 0 ..< n]
         }
-        for (key, value) in weights {
+        let postShapeWeights = newWeights
+        for (key, value) in postShapeWeights {
             if key.contains("weight_scale_inv") {
                 let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
-                if let weight = weights[weightKey] {
+                if let weight = postShapeWeights[weightKey] {
                     newWeights[weightKey] = dequant(weight: weight, scaleInv: value)
                 }
-            } else if newWeights[key] == nil {
-                newWeights[key] = value
             }
         }
 

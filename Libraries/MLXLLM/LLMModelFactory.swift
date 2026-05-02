@@ -433,15 +433,49 @@ public enum LLMTypeRegistry {
             let weightFormat: String?
             enum CodingKeys: String, CodingKey { case weightFormat = "weight_format" }
         }
-        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: data),
+
+        // Kimi-K2.6 (model_type=kimi_k25) wraps the LLM config under
+        // `text_config` (the bundle is multimodal-shaped even when no
+        // vision tower is loaded by this LLM-only path). Plain DeepSeek
+        // V3 bundles have the LLM config at the top level. Detect by
+        // looking for a `text_config` object and re-encoding it as the
+        // primary payload before the existing decoders run — mirrors
+        // Mistral3VLM's text_config unwrap pattern.
+        let effectiveData: Data
+        do {
+            if let json = try JSONSerialization.jsonObject(
+                with: data, options: [.fragmentsAllowed]) as? [String: Any],
+                let textConfig = json["text_config"] as? [String: Any]
+            {
+                // Carry weight_format / mxtq_bits / mxtq_seed forward
+                // from the top-level into the unwrapped text_config so
+                // dispatchers downstream still see them.
+                var merged = textConfig
+                for k in ["weight_format", "mxtq_bits", "mxtq_seed",
+                          "model_type", "quantization"]
+                {
+                    if merged[k] == nil, let v = json[k] {
+                        merged[k] = v
+                    }
+                }
+                effectiveData = try JSONSerialization.data(
+                    withJSONObject: merged, options: [])
+            } else {
+                effectiveData = data
+            }
+        } catch {
+            effectiveData = data
+        }
+
+        if let check = try? JSONDecoder.json5().decode(FormatCheck.self, from: effectiveData),
             check.weightFormat == "mxtq"
         {
             let config = try JSONDecoder.json5().decode(
-                DeepseekV3JANGTQConfiguration.self, from: data)
+                DeepseekV3JANGTQConfiguration.self, from: effectiveData)
             return DeepseekV3JANGTQModel(config)
         }
         let config = try JSONDecoder.json5().decode(
-            DeepseekV3Configuration.self, from: data)
+            DeepseekV3Configuration.self, from: effectiveData)
         return DeepseekV3Model(config)
     }
 
