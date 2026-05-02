@@ -80,11 +80,19 @@ public struct JangPressLoadOptions: Sendable, Equatable {
 /// `BatchEngine` and `TokenIterator` use `controller` for the
 /// `willStartInference()` / `didFinishInference()` brackets that
 /// keep the failsafe state machine ticking.
+///
+/// **Lifetime**: this struct STRONGLY OWNS its tiers. The caller
+/// holds the runtime alive for the duration of the model session
+/// — typically next to `ModelContext` — and the embedded
+/// `controller` / `mmap` / `mach` / `embed` references stay valid
+/// as long as the runtime does. On `JangPressActivation.deactivate(_:)`
+/// the controller is disarmed but the references remain (deinit
+/// runs when the runtime is dropped).
 public struct JangPressRuntime: Sendable {
-    public weak var mmap: JangPressMmapTier?
-    public weak var mach: JangPressMachCache?
-    public weak var embed: JangPressEmbedTier?
-    public weak var controller: JangPressController?
+    public var mmap: JangPressMmapTier?
+    public var mach: JangPressMachCache?
+    public var embed: JangPressEmbedTier?
+    public var controller: JangPressController?
 
     public init(
         mmap: JangPressMmapTier? = nil,

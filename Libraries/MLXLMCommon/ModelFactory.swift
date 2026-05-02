@@ -358,6 +358,42 @@ public func loadModel(
     }
 }
 
+/// Load a model from a local directory AND activate the JangPress
+/// cold-weight tier (axis E) per `jangPress`.
+///
+/// Returns the `ModelContext` paired with a `JangPressRuntime` that
+/// owns the JangPress tiers (mmap / mach / embed / controller). The
+/// runtime stays valid as long as the caller holds it; on drop the
+/// controller's deinit cancels its memory-pressure listener and
+/// quiesce timer.
+///
+/// When `jangPress.enabled == false` (the default — `.disabled`),
+/// the runtime is `.none` and behavior is identical to the plain
+/// `loadModel(from:using:)`.
+///
+/// **Caller contract**: hold the returned `JangPressRuntime` alive
+/// for the model session. Pair it with the `ModelContext` in the
+/// caller's session struct. To shut JangPress down before model
+/// unload, call `JangPressActivation.deactivate(runtime)`.
+///
+/// - Parameters:
+///   - directory: directory of configuration and weights
+///   - tokenizerLoader: the ``TokenizerLoader`` to use for loading the tokenizer
+///   - jangPress: optional JangPress activation options
+/// - Returns: tuple of (`ModelContext`, `JangPressRuntime`)
+public func loadModel(
+    from directory: URL,
+    using tokenizerLoader: any TokenizerLoader,
+    jangPress: JangPressLoadOptions
+) async throws -> (ModelContext, JangPressRuntime) {
+    let context = try await load {
+        try await $0.load(from: directory, using: tokenizerLoader)
+    }
+    let runtime = JangPressActivation.activate(
+        bundleURL: directory, options: jangPress)
+    return (context, runtime)
+}
+
 /// Load a model from a local directory of configuration and weights.
 ///
 /// Returns a ``ModelContainer`` holding a ``ModelContext``
