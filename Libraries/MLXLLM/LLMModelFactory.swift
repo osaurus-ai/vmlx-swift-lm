@@ -157,13 +157,21 @@ public enum LLMTypeRegistry {
                 //     and the model's `sanitize` splits the fused tensor
                 //     at load time.
                 //
-                // bits / seed come from `mxtq_bits` / `mxtq_seed` keys
-                // merged into config.json by the factory pre-decode
-                // (same path as MiniMax / Mistral 3 family JANGTQ).
+                // 2026-05-02 update: also support **mxfp4** Laguna bundles.
+                // Those ship the routed experts as MLX standard affine
+                // quant (`weight` + `scales` + `biases` per gate_up_proj /
+                // down_proj — gate_up still FUSED on the out-dim axis).
+                // Detect by `weight_format != "mxtq"` AND no `mxtq_bits`
+                // top-level key; route to the affine `SwitchGLU` MoE path
+                // (jangtq=nil) instead of the codebook
+                // `TurboQuantSwitchGLU` path. Sanitize splits the fused
+                // gate_up_proj for both formats.
                 struct LagunaProbe: Codable {
+                    let weightFormat: String?
                     let mxtqBits: Int?
                     let mxtqSeed: Int?
                     enum CodingKeys: String, CodingKey {
+                        case weightFormat = "weight_format"
                         case mxtqBits = "mxtq_bits"
                         case mxtqSeed = "mxtq_seed"
                     }
@@ -171,9 +179,19 @@ public enum LLMTypeRegistry {
                 let probe = try? JSONDecoder.json5().decode(LagunaProbe.self, from: data)
                 let cfg = try JSONDecoder.json5().decode(
                     LagunaConfiguration.self, from: data)
-                return LagunaModel(
-                    cfg, bits: probe?.mxtqBits ?? 2,
-                    seed: probe?.mxtqSeed ?? 42)
+                let isMxtq =
+                    probe?.weightFormat?.lowercased() == "mxtq"
+                    || probe?.mxtqBits != nil
+                let jangtqContext: LagunaMoEContext?
+                if isMxtq {
+                    jangtqContext = LagunaMoEContext(
+                        bits: probe?.mxtqBits ?? 2,
+                        mxtqSeed: probe?.mxtqSeed ?? 42)
+                } else {
+                    // mxfp4 / affine bundle: nil context → SwitchGLU path.
+                    jangtqContext = nil
+                }
+                return LagunaModel(cfg, jangtq: jangtqContext)
             },
         ]
     }

@@ -416,28 +416,72 @@ internal final class LagunaDenseMLP: Module, UnaryLayer {
 // primitive DeepSeek-V4 / Mistral 4 / NemotronH JANGTQ already use) and
 // splits the fused `gate_up_proj` tensor at sanitize time into the
 // `gate_proj` / `up_proj` halves the primitive expects.
+//
+// 2026-05-02: also support **mxfp4** Laguna bundles. Those ship the
+// routed experts as MLX standard affine quant (`weight` + `scales` +
+// `biases` per gate_up_proj/down_proj), NOT TurboQuant codebook. Add
+// a polymorphic `LagunaSwitchMLPLayer` protocol and dispatch the
+// experts module to either `TurboQuantSwitchGLU` (mxtq) or a
+// standard `SwitchGLU` (mxfp4) at construction time. Mirrors the
+// `NemotronHJANGTQContext` pattern in NemotronH.
+
+/// Type-erased switch-MLP forward. Both `TurboQuantSwitchGLU` (codebook
+/// MoE used for JANGTQ Laguna bundles) and `SwitchGLU` (affine-quant MoE
+/// used for mxfp4 Laguna bundles) implement
+/// `callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray`.
+internal protocol LagunaSwitchMLPLayer: Module {
+    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray
+}
+
+extension TurboQuantSwitchGLU: LagunaSwitchMLPLayer {}
+extension SwitchGLU: LagunaSwitchMLPLayer {}
+
+/// Bundle-format hint for Laguna's MoE. Non-nil → JANGTQ codebook path
+/// via `TurboQuantSwitchGLU` with the supplied `bits` / `seed`. Nil →
+/// affine mxfp4 path via standard `SwitchGLU` (per-Linear quant info
+/// auto-substituted by MLX from `config.json::quantization.{bits,
+/// group_size}` at load time).
+public struct LagunaMoEContext: Sendable {
+    public let bits: Int
+    public let mxtqSeed: Int
+    public init(bits: Int, mxtqSeed: Int) {
+        self.bits = bits
+        self.mxtqSeed = mxtqSeed
+    }
+}
 
 internal final class LagunaMoE: Module, UnaryLayer {
     let cfg: LagunaConfiguration
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
-    @ModuleInfo(key: "experts") var experts: TurboQuantSwitchGLU
+    /// `experts` is type-erased so JANGTQ bundles can hold a
+    /// `TurboQuantSwitchGLU` (codebook) and mxfp4 bundles can hold a
+    /// `SwitchGLU` (affine). Dispatched via `LagunaSwitchMLPLayer`.
+    @ModuleInfo(key: "experts") var experts: Module
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
-    init(_ cfg: LagunaConfiguration, bits: Int, seed: Int) {
+    init(_ cfg: LagunaConfiguration, jangtq: LagunaMoEContext?) {
         self.cfg = cfg
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
-        // Routed experts: codebook MoE via TurboQuantSwitchGLU.
-        // inputDims == hiddenSize (gate/up in_dim == down out_dim);
-        // hiddenDims == moeIntermediateSize (gate/up out_dim == down in_dim).
-        self._experts.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: cfg.hiddenSize,
-            hiddenDims: cfg.moeIntermediateSize,
-            numExperts: cfg.numExperts,
-            bits: bits, seed: seed)
-        // Shared expert is affine-quant Linear (NOT codebook).
+        // Routed experts: codebook MoE via TurboQuantSwitchGLU when the
+        // bundle stamps mxtq; affine mxfp4 path via standard SwitchGLU
+        // otherwise. inputDims == hiddenSize (gate/up in_dim == down
+        // out_dim); hiddenDims == moeIntermediateSize.
+        if let jangtq {
+            self._experts.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: cfg.hiddenSize,
+                hiddenDims: cfg.moeIntermediateSize,
+                numExperts: cfg.numExperts,
+                bits: jangtq.bits, seed: jangtq.mxtqSeed)
+        } else {
+            self._experts.wrappedValue = SwitchGLU(
+                inputDims: cfg.hiddenSize,
+                hiddenDims: cfg.moeIntermediateSize,
+                numExperts: cfg.numExperts)
+        }
+        // Shared expert is affine-quant Linear (NOT codebook) on both paths.
         self._sharedExpert.wrappedValue = LagunaDenseMLP(
             hidden: cfg.hiddenSize, intermediate: cfg.sharedExpertIntermediateSize)
     }
@@ -479,8 +523,18 @@ internal final class LagunaMoE: Module, UnaryLayer {
         let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
         topkW = topkW / normSum
 
-        // SwitchGLU dispatch: returns (B, T, K, H).
-        let yK = experts(x, topkIdx)
+        // SwitchGLU dispatch: returns (B, T, K, H). `experts` is
+        // type-erased — TurboQuantSwitchGLU (mxtq) and SwitchGLU
+        // (mxfp4) both implement the same `(x, indices)` shape
+        // contract via `LagunaSwitchMLPLayer`.
+        guard let switchLayer = experts as? LagunaSwitchMLPLayer else {
+            fatalError(
+                "LagunaMoE.experts must conform to LagunaSwitchMLPLayer "
+                + "(got \(type(of: experts))). Bundle weight_format may be "
+                + "unsupported — only mxtq (codebook) and mxfp4 (affine) "
+                + "are wired today.")
+        }
+        let yK = switchLayer(x, topkIdx)
         // Weight by router scores and sum over the K dim → (B, T, H).
         var y = (yK * topkW.expandedDimensions(axis: -1).asType(yK.dtype)).sum(axis: -2)
         // Routed scaling factor applies to the routed contribution only.
@@ -500,7 +554,7 @@ internal final class LagunaLayer: Module {
     let layerType: String
     let useSliding: Bool
 
-    init(_ cfg: LagunaConfiguration, layerIndex: Int, bits: Int, seed: Int) {
+    init(_ cfg: LagunaConfiguration, layerIndex: Int, jangtq: LagunaMoEContext?) {
         self._inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -510,7 +564,7 @@ internal final class LagunaLayer: Module {
             self.mlp = LagunaDenseMLP(
                 hidden: cfg.hiddenSize, intermediate: cfg.intermediateSize)
         } else {
-            self.mlp = LagunaMoE(cfg, bits: bits, seed: seed)
+            self.mlp = LagunaMoE(cfg, jangtq: jangtq)
         }
         self.layerType = cfg.layerTypes[layerIndex]
         self.useSliding = layerType == "sliding_attention"
@@ -543,13 +597,14 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let faIdx: Int
     fileprivate let swaIdx: Int?
 
-    /// `bits` and `seed` are forwarded to the `TurboQuantSwitchGLU` codebook
-    /// MoE used for routed experts. They default to JANGTQ-2L (`bits=2`,
-    /// `seed=42`), the canonical Laguna distribution. Real bundles report
-    /// `mxtq_bits` / `mxtq_seed` in `jang_config.json`; the `LLMModelFactory`
-    /// merges those into `config.json` before this init runs and threads
-    /// the resolved values via the explicit args.
-    public init(_ cfg: LagunaConfiguration, bits: Int = 2, seed: Int = 42) {
+    /// `jangtq != nil` selects the `TurboQuantSwitchGLU` codebook MoE
+    /// path with the supplied `bits` / `mxtqSeed`. `jangtq == nil`
+    /// selects the affine `SwitchGLU` mxfp4 path. The factory
+    /// (`LLMModelFactory.swift`) reads `weight_format` and `mxtq_bits`
+    /// from `config.json` and threads the right context here. Default
+    /// is JANGTQ-2L (the canonical Laguna distribution) for backwards
+    /// compatibility with existing call sites.
+    public init(_ cfg: LagunaConfiguration, jangtq: LagunaMoEContext? = LagunaMoEContext(bits: 2, mxtqSeed: 42)) {
         self.cfg = cfg
         self.vocabularySize = cfg.vocabularySize
         self.kvHeads = (0..<cfg.numHiddenLayers).map { _ in cfg.numKeyValueHeads }
@@ -557,7 +612,7 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: cfg.vocabularySize, dimensions: cfg.hiddenSize)
         self.layers = (0..<cfg.numHiddenLayers).map {
-            LagunaLayer(cfg, layerIndex: $0, bits: bits, seed: seed)
+            LagunaLayer(cfg, layerIndex: $0, jangtq: jangtq)
         }
         self.norm = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
         if !cfg.tieWordEmbeddings {
@@ -682,6 +737,20 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         // Second pass: split fused gate_up_proj for routed experts.
+        // Both JANGTQ (codebook: tq_packed/tq_norms) and mxfp4 (affine:
+        // weight/scales/biases) bundles ship the routed expert gate+up
+        // FUSED on the out-dim axis. SwitchGLU (affine) and
+        // TurboQuantSwitchGLU (codebook) both expect the two halves at
+        // separate `gate_proj.*` / `up_proj.*` keys. Split in O(n_layers)
+        // — gate is the first `moe_intermediate_size` rows on the
+        // out-dim axis, up is the remainder.
+        //
+        // Tensor shapes (verified on real bundles):
+        //   JANGTQ tq_packed : (n_exp, 2 × mid, packed_in)  → split axis=1
+        //   JANGTQ tq_norms  : (n_exp, 2 × mid)             → split axis=1
+        //   mxfp4 weight     : (n_exp, 2 × mid, packed_in)  → split axis=1
+        //   mxfp4 scales     : (n_exp, 2 × mid, in/gs)      → split axis=1
+        //   mxfp4 biases     : (n_exp, 2 × mid, in/gs)      → split axis=1
         let mid = cfg.moeIntermediateSize
         var out: [String: MLXArray] = [:]
         for (k, v) in firstPass {
@@ -690,7 +759,6 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
             // (`experts`), never on the shared expert (which has separate
             // gate_proj / up_proj keys per the affine-quant scheme).
             if k.contains(".mlp.experts.gate_up_proj.tq_packed") {
-                // shape (n_exp, 2 × mid, packed_in)
                 let gateK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_packed", with: ".gate_proj.tq_packed")
                 let upK = k.replacingOccurrences(
@@ -698,13 +766,30 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
                 out[gateK] = v[0..., ..<mid, 0...]
                 out[upK]   = v[0..., mid..., 0...]
             } else if k.contains(".mlp.experts.gate_up_proj.tq_norms") {
-                // shape (n_exp, 2 × mid)
                 let gateK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_norms", with: ".gate_proj.tq_norms")
                 let upK = k.replacingOccurrences(
                     of: ".gate_up_proj.tq_norms", with: ".up_proj.tq_norms")
                 out[gateK] = v[0..., ..<mid]
                 out[upK]   = v[0..., mid...]
+            } else if k.contains(".mlp.experts.gate_up_proj.weight")
+                || k.contains(".mlp.experts.gate_up_proj.scales")
+                || k.contains(".mlp.experts.gate_up_proj.biases")
+            {
+                // mxfp4 affine path — split the same out-dim axis (axis=1
+                // of the (n_exp, 2×mid, …) tensor) into gate / up halves.
+                let suffix: String
+                if k.hasSuffix(".weight") { suffix = ".weight" }
+                else if k.hasSuffix(".scales") { suffix = ".scales" }
+                else { suffix = ".biases" }
+                let gateK = k.replacingOccurrences(
+                    of: ".gate_up_proj" + suffix,
+                    with: ".gate_proj" + suffix)
+                let upK = k.replacingOccurrences(
+                    of: ".gate_up_proj" + suffix,
+                    with: ".up_proj" + suffix)
+                out[gateK] = v[0..., ..<mid, 0...]
+                out[upK]   = v[0..., mid..., 0...]
             } else {
                 out[k] = v
             }
