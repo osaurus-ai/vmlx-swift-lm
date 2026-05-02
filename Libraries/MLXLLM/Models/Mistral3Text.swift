@@ -229,13 +229,6 @@ public class Mistral3TextModelInner: Module {
             h = embedTokens(inputs)
         }
 
-        let offset: Int
-        if let cache {
-            offset = cache[0].offset
-        } else {
-            offset = 0
-        }
-
         // Create full attention mask
         let faMask = createAttentionMask(h: h, cache: cache?[faIdx])
 
@@ -247,13 +240,22 @@ public class Mistral3TextModelInner: Module {
             swaMask = .none
         }
 
-        // Compute attention scale: use llama4 scaling if parameters are available,
-        // otherwise use a constant scale of 1.0
+        // Compute attention scale: use llama4 scaling if parameters
+        // are available AND beta != 0; otherwise fall back to a
+        // constant scale of 1.0.
+        //
+        // beta == 0 collapses 1 + beta * log(...) to identically 1
+        // — we short-circuit so we don't read `cache[0].offset`
+        // (which crashes inside MLX compile on CompilableKVCache via
+        // its `.item()`-backed getter). Sibling fix to Mistral3.swift
+        // and Mistral3VLMJANGTQ.swift compile-ON unblocks.
         let attnScale: MLXArray
         if let ropeParams = args.ropeParameters,
             let llama4ScalingBeta = ropeParams["llama_4_scaling_beta"]?.asFloat(),
-            let originalMaxPosEmbed = ropeParams["original_max_position_embeddings"]?.asInt()
+            let originalMaxPosEmbed = ropeParams["original_max_position_embeddings"]?.asInt(),
+            llama4ScalingBeta != 0
         {
+            let offset = cache.map { $0[0].offset } ?? 0
             attnScale = getLlama4AttentionScale(
                 start: offset,
                 stop: offset + inputs.dim(1),
