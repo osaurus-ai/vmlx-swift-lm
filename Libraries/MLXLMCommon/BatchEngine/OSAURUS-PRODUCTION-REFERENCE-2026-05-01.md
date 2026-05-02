@@ -520,7 +520,7 @@ would close the precision gap while the runtime stays unchanged.
 | MiniMax-M2.7-Small                      | JANGTQ     | ✅                         | passes          | n/a        |
 | Holo3-35B-A3B (qwen3_5_moe)             | mxfp4      | ✅ via reasoning stream    | 12/12           | n/a        |
 | Laguna-XS.2                             | JANGTQ     | ✅ "2+2 equals 4."         | passes          | n/a        |
-| Laguna-XS.2                             | mxfp4      | ❌ expert format mismatch  | n/a             | n/a        |
+| Laguna-XS.2                             | mxfp4      | ✅ "2+2 equals 4." (4699d3a) | 12/12         | n/a        |
 | DeepSeek-V4-Flash                       | JANGTQ     | ✅ "2+2 = 4..."           | passes          | n/a        |
 | Kimi-K2.6-Small / Med                   | JANGTQ     | bundle missing tokenizer   | blocked         | n/a        |
 
@@ -531,7 +531,7 @@ would close the precision gap while the runtime stays unchanged.
 | # | Item                                  | Owner       | Action                          |
 |---|---------------------------------------|-------------|----------------------------------|
 | 1 | JANGTQ Mistral 3.5 text degenerate    | jang-tools  | Emit JANGTQ4 bundle              |
-| 2 | Laguna mxfp4 expert format mismatch   | vmlx-swift  | Either ship JANGTQ-only or add affine MoE class |
+| 2 | ~~Laguna mxfp4 expert format~~        | ✅ done     | Polymorphic MoE landed in `4699d3a` |
 | 3 | Kimi-K2.6 bundle missing tokenizer    | jangq-ai    | Re-publish bundle with `tokenizer.json` |
 | 4 | BatchEngine LM-only double-load OOM   | bench harness | Restructure `BENCH_BATCH_CHAT` to share one loaded model |
 | 5 | Stage 4 hybrid-trace compile pending  | vmlx-swift  | Mamba+attn unified compile trace |
@@ -565,6 +565,73 @@ would close the precision gap while the runtime stays unchanged.
 - `DSV4_FORCE_JANGTQ=1` — force JANGTQ dispatch when bundle weight_format mislabeled
 - `OSAURUS_MLX_CLEAR_LIBRARY_TRACE=1` — Metal library-eviction trace
 - `MLX_CLEAR_LIBRARY_RELEASE=1` — restore eager-release (testing only)
+
+---
+
+## 15. Component invariants (osaurus must respect these)
+
+These are the runtime contracts that the SDK guarantees, and that osaurus
+should NOT try to bypass. Violating any of these will silently corrupt
+state — there's no defensive runtime check.
+
+### KV cache
+
+| Invariant                                                          | Why                                                                 |
+|--------------------------------------------------------------------|----------------------------------------------------------------------|
+| `coordinator.setHybrid(true)` MUST be called before admitting any slot whose cache contains `MambaCache`/`ArraysCache` | SSM-state extract/restore is gated on this flag — silent skip otherwise |
+| `parameters.maxKVSize` overrides `coordinator.config.defaultMaxKVSize` | Coordinator only fills `nil` slots at admission                      |
+| `parameters.kvMode` overrides `coordinator.config.defaultKVMode`    | Same reason                                                          |
+| `slot.cache` layer count must equal `model.kvHeads.count`           | Per-layer routing assumes 1:1                                        |
+| `mediaSalt` MUST be computed from image/video/audio bytes (not from path) | Path-based salt would alias different content with same path        |
+
+### Reasoning + tool calling
+
+| Invariant                                                          | Why                                                                 |
+|--------------------------------------------------------------------|----------------------------------------------------------------------|
+| Wire BOTH `.chunk` and `.reasoning` events through to UI            | Reasoning-heavy models (think_xml, harmony, deepseek_r1) emit during reasoning phase ONLY |
+| `enable_thinking: false` in `additionalContext` toggles off reasoning prefill where supported | Otherwise reasoning runs even when caller doesn't want it          |
+| `ToolCallProcessor` runs AFTER `ReasoningParser` in the pipeline    | Tool calls embedded in reasoning channel get extracted correctly    |
+| Don't strip harmony/think markers before `BatchEngine.generate` | The pipeline does it — pre-stripping breaks parser state machines   |
+
+### Hybrid SSM
+
+| Invariant                                                          | Why                                                                 |
+|--------------------------------------------------------------------|----------------------------------------------------------------------|
+| Mamba state is restored DURING prefill, NOT post-decode             | `SSMReDeriver` async path was reverted (Metal race); inline-at-prefill-end is the only correct path |
+| Full disk hit on hybrid SSM rolls back to full prefill              | "Trim KV by 1 + re-feed last token" double-counts SSM recurrence    |
+| Partial disk/paged hit on hybrid SSM rolls back to full prefill     | SSM recurrence is path-dependent on FULL prefix                     |
+
+### Compile path
+
+| Invariant                                                          | Why                                                                 |
+|--------------------------------------------------------------------|----------------------------------------------------------------------|
+| Compile only engages with `maxBatchSize == 1` (Stage 1B.3)         | Stage 1B.4 (per-bucket shared buffers) pending                       |
+| Heterogeneous cache (`KVCacheSimple` + `RotatingKVCache` mix) skips compile | Stage 4 trace grouping pending                                       |
+| `cache.first?.offset` Int read MUST NOT happen inside a compile trace | `CompilableKVCache.offset` getter calls `.item()` which crashes inside `MLX.compile` |
+| Mistral 3.5 family must short-circuit `getLlama4AttentionScale` when `beta == 0` | Same as above — it reads cache offset                              |
+
+### Hadamard kernel + JANGTQ codebook
+
+| Invariant                                                          | Why                                                                 |
+|--------------------------------------------------------------------|----------------------------------------------------------------------|
+| Sidecar (`jangtq_runtime.safetensors`) MUST be loaded before any `JANGTQDenseLinear`/`TurboQuantSwitchGLU` forward | The kernels fatalError otherwise                                      |
+| Hadamard kernel allocates `shmem[8192]` (32 KB Apple Silicon limit) | Larger blocks must use the H_2n Swift recursion in `hadamardRotate`  |
+| `signs` vector deterministic by `(in_features, seed)`               | Converter uses `numpy.default_rng(seed).choice([-1, 1], size=in_features)` — sidecar carries the materialized result |
+| `codebook` symmetric Lloyd-Max for Beta((d-1)/2, (d-1)/2)           | Compute-once-per-(in_features, bits)                                 |
+| Per-row `tq_norms` always positive (0 → bias to 1e-10 in converter) | Avoids divide-by-zero at inference                                  |
+
+### Bundle-format dispatch (factory)
+
+| `weight_format` field in config.json                  | Routes to                                              |
+|-------------------------------------------------------|---------------------------------------------------------|
+| `"mxtq"` (or any `"jangtq*"` alias)                   | JANGTQ codebook path (`TurboQuantSwitchGLU`/`JANGTQDenseLinear`) |
+| `"mxfp4"` (or absent + `quantization.bits == 4`)      | mxfp4 affine path (`SwitchGLU` + `QuantizedLinear`)     |
+| `"jang"` / `"jang_2l"` / `"jang_4m"`                  | JANG (mixed-quant) — affine via per-layer override     |
+| absent + bf16 weights                                 | Plain `Linear` / unquantized                            |
+
+For Laguna specifically (commit `4699d3a`): factory checks `weight_format == "mxtq"`
+**OR** `mxtq_bits` top-level key presence to decide MoE primitive. Both
+formats fuse `gate_up_proj` → sanitize splits unconditionally.
 
 ---
 
