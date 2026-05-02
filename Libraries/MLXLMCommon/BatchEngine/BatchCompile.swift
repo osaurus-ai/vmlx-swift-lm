@@ -288,6 +288,67 @@ public enum BatchCompile {
         }
     }
 
+    // MARK: - Stage 1B.4 scaffold (NOT YET WIRED)
+
+    /// Stage 1B.4 placeholder — owns a per-bucket shared cache buffer
+    /// and a compiled forward closure for `maxBatchSize > 1` deployments.
+    ///
+    /// **Status (2026-05-02):** scaffold only. `init` fatalErrors so any
+    /// accidental instantiation surfaces immediately. The full wiring
+    /// (cache buffer, slot↔row lifecycle, liveness-mask plumbing,
+    /// per-bucket trace) is the next iteration's work — see
+    /// `STAGE-1B4-DESIGN-2026-05-02.md` for the architecture.
+    ///
+    /// Why this exists in the codebase before its full implementation:
+    /// future agents picking up Stage 1B.4 inherit a clean entry point
+    /// and don't have to redesign the API surface from scratch. The
+    /// `BatchEngine.maybePromoteToBucket(slot:)` hook below targets
+    /// this type.
+    public final class BucketHandle: @unchecked Sendable {
+        public let key: BucketKey
+
+        /// Per-layer `[B, H, maxLen, D]` cache buffers. Empty in the
+        /// scaffold; the full impl populates one entry per layer at
+        /// admission time.
+        public var cacheLayers: [KVCache] = []
+
+        /// Slot ID → row index in the bucket. Refreshed at admit/finish.
+        public var slotRows: [String: Int] = [:]
+
+        /// `[B]`-shaped int32 array (0 = dead, 1 = live). The compile
+        /// trace captures this; Stage 1B.4 refreshes it per step via
+        /// `_updateInternal`.
+        public var liveMask: MLXArray?
+
+        /// Compiled forward closure shared across all slots in the
+        /// bucket. `nil` until first prefill assembles the trace.
+        public var compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+        public init(key: BucketKey) {
+            self.key = key
+            // Intentionally trip if anyone wires this in before the
+            // full implementation lands. Removing this fatalError is
+            // the next iteration's first PR.
+            preconditionFailure(
+                "BucketHandle is a Stage 1B.4 scaffold — see "
+                + "STAGE-1B4-DESIGN-2026-05-02.md. Production code must "
+                + "stay on the `maxBatchSize == 1` Stage 1B.3 path or "
+                + "the uncompiled Stage 0 path until the bucket "
+                + "implementation lands.")
+        }
+
+        /// Pick the lowest-index free row, or `nil` if the bucket is full.
+        /// Stage 1B.4 will use this at slot admission to assign rows.
+        public func firstFreeRow() -> Int? {
+            guard !slotRows.isEmpty || key.batchSize > 0 else { return nil }
+            let occupied = Set(slotRows.values)
+            for i in 0..<key.batchSize {
+                if !occupied.contains(i) { return i }
+            }
+            return nil
+        }
+    }
+
     /// Build an `MLXArray` liveness mask of shape `[B]`, bool.
     ///
     /// Live rows are `true`; dead (padding) rows are `false`. Passed to

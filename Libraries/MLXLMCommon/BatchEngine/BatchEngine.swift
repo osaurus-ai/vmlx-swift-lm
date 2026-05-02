@@ -1101,6 +1101,37 @@ public actor BatchEngine {
         activeSlots[slotIndex] = slot
     }
 
+    // MARK: - Multi-Batch Compile Promotion (Stage 1B.4 scaffold)
+
+    /// Stage 1B.4 hook — multi-batch compile promotion.
+    ///
+    /// **Status (2026-05-02):** intentional no-op. The full
+    /// implementation (per-bucket `BucketHandle`, shared `[B, H,
+    /// maxLen, D]` cache buffers, slot↔row lifecycle, liveness-mask
+    /// plumbing through Compilable cache classes, multi-bucket
+    /// fallback ladder) is deferred to its own iteration. Half-shipping
+    /// would risk regressing the verified Stage 1B.3 single-slot path.
+    /// See `STAGE-1B4-DESIGN-2026-05-02.md` for the architecture.
+    ///
+    /// What the full implementation will do here:
+    ///   1. Look up an existing `BucketHandle` for `slot`'s cache family
+    ///      and `compiledMaxCacheLength`, or build a new one.
+    ///   2. If the bucket has a free row, assign it to this slot and
+    ///      view the slot's cache as a row of the bucket's shared buffer.
+    ///   3. Build the bucket's compiled forward closure on first admit.
+    ///   4. Store the bucket reference on the slot so `stepBatchDecode`
+    ///      can route through the compiled trace.
+    ///
+    /// Falls back to the uncompiled `stepBatchDecode` path silently —
+    /// no error, just no compile speedup. That's the production
+    /// behaviour today for `maxBatchSize > 1` deployments and is what
+    /// callers expect.
+    private func maybePromoteToBucket(slot: inout BatchSlot) {
+        // Intentional no-op. See STAGE-1B4-DESIGN-2026-05-02.md.
+        _ = slot
+        return
+    }
+
     // MARK: - Compile-Decode Promotion (Stage 1B.3)
 
     /// Promote a slot's cache to `CompilableKVCache` layers and build a
@@ -1112,9 +1143,10 @@ public actor BatchEngine {
     ///
     /// Preconditions (all must hold for promotion):
     ///  - `slot.parameters.enableCompiledBatchDecode == true`
-    ///  - `self.maxBatchSize == 1` — Stage 1B.3 scope. Stage 1B.4 lifts
-    ///    this via a per-bucket `BucketHandle` with shared multi-row
-    ///    `[B, H, maxLen, D]` buffers.
+    ///  - `self.maxBatchSize == 1` — Stage 1B.3 scope. `maxBatchSize > 1`
+    ///    routes to `maybePromoteToBucket(slot:)` (Stage 1B.4 scaffold;
+    ///    currently a no-op until full per-bucket cache + lifecycle
+    ///    lands — see `STAGE-1B4-DESIGN-2026-05-02.md`).
     ///  - `HardwareInfo.isCompiledDecodeSupported` — dodges MLX#3329 on
     ///    affected macOS Tahoe Metal driver builds.
     ///  - `CacheFamily.classify(slot.cache) == .simple` — compile is only
@@ -1130,7 +1162,15 @@ public actor BatchEngine {
     /// then routes this slot's decode tokens through the closure.
     private func maybePromoteToCompiledDecode(slot: inout BatchSlot) {
         guard slot.parameters.enableCompiledBatchDecode else { return }
-        guard self.maxBatchSize == 1 else { return }
+        // Stage 1B.3 scope: single-slot path. Multi-slot promotion is
+        // routed through `maybePromoteToBucket(slot:)` once Stage 1B.4
+        // wires up `BucketHandle`. Today that helper is a no-op so
+        // multi-slot deployments stay on the uncompiled `stepBatchDecode`
+        // path. See STAGE-1B4-DESIGN-2026-05-02.md.
+        if self.maxBatchSize > 1 {
+            self.maybePromoteToBucket(slot: &slot)
+            return
+        }
         guard HardwareInfo.isCompiledDecodeSupported else { return }
 
         let family = CacheFamily.classify(slot.cache)
