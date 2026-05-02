@@ -73,8 +73,9 @@ public enum Chat {
             _ content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .system, content: content,
-                 images: images, videos: videos, audios: audios)
+            Self(
+                role: .system, content: content,
+                images: images, videos: videos, audios: audios)
         }
 
         /// Build an assistant message with plain text content.
@@ -82,8 +83,9 @@ public enum Chat {
             _ content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .assistant, content: content,
-                 images: images, videos: videos, audios: audios)
+            Self(
+                role: .assistant, content: content,
+                images: images, videos: videos, audios: audios)
         }
 
         /// Build an assistant message that issued one or more tool
@@ -108,8 +110,9 @@ public enum Chat {
             _ content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [], audios: [UserInput.Audio] = []
         ) -> Self {
-            Self(role: .user, content: content,
-                 images: images, videos: videos, audios: audios)
+            Self(
+                role: .user, content: content,
+                images: images, videos: videos, audios: audios)
         }
 
         /// Build a tool-role message carrying the result of a tool call.
@@ -239,15 +242,59 @@ public struct DefaultMessageGenerator: MessageGenerator {
     }
 }
 
-/// Implementation of ``MessageGenerator`` that produces the default
-/// dict shape but omits `system` roles.
+/// Implementation of ``MessageGenerator`` for templates that cannot accept
+/// `system` roles.
+///
+/// System instructions are preserved by folding them into the first user
+/// message. This keeps unsupported roles out of the rendered chat template
+/// without silently discarding host instructions.
 public struct NoSystemMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(messages: [Chat.Message]) -> [Message] {
-        messages
-            .filter { $0.role != .system }
+        foldSystemMessagesIntoFirstUser(messages)
             .map { generate(message: $0) }
+    }
+
+    private func foldSystemMessagesIntoFirstUser(_ messages: [Chat.Message]) -> [Chat.Message] {
+        var systemTexts: [String] = []
+        var remaining: [Chat.Message] = []
+
+        for message in messages {
+            if message.role == .system {
+                if message.content.contains(where: { !$0.isWhitespace }) {
+                    systemTexts.append(message.content)
+                }
+            } else {
+                remaining.append(message)
+            }
+        }
+
+        guard !systemTexts.isEmpty else { return remaining }
+
+        let systemPreamble = """
+            System instructions:
+            \(systemTexts.joined(separator: "\n\n"))
+            """
+
+        guard let firstUserIndex = remaining.firstIndex(where: { $0.role == .user }) else {
+            remaining.insert(.user(systemPreamble), at: 0)
+            return remaining
+        }
+
+        var user = remaining[firstUserIndex]
+        if user.content.contains(where: { !$0.isWhitespace }) {
+            user.content = """
+                \(systemPreamble)
+
+                User message:
+                \(user.content)
+                """
+        } else {
+            user.content = systemPreamble
+        }
+        remaining[firstUserIndex] = user
+        return remaining
     }
 }
 

@@ -8,6 +8,38 @@ import MLXNN
 import MLXOptimizers
 import XCTest
 
+private actor EvalTestSamplingGate {
+    static let shared = EvalTestSamplingGate()
+
+    func sampleToken(vocabSize: Int, samplerId: Int) -> Int {
+        let logits = MLXRandom.normal([1, vocabSize])
+        return withRandomState(MLXRandom.RandomState(seed: UInt64(samplerId))) {
+            if samplerId % 2 == 0 {
+                return categorical(logits).item(Int.self)
+            } else {
+                return logits.argMax(axis: -1).item(Int.self)
+            }
+        }
+    }
+
+    func sampleSequence(samplerId: Int, samplesPerTask: Int) -> [Int] {
+        let logits = MLXArray.ones([1, 50])
+        var taskResults: [Int] = []
+        let sampler = CategoricalSampler(temperature: 1.0)
+
+        for sampleId in 0 ..< samplesPerTask {
+            let token = withRandomState(
+                MLXRandom.RandomState(seed: UInt64(samplerId * 1000 + sampleId))
+            ) {
+                sampler.sample(logits: logits)
+            }
+            taskResults.append(token.item(Int.self))
+        }
+
+        return taskResults
+    }
+}
+
 public class EvalTests: XCTestCase {
 
     func testLlamaEval() throws {
@@ -112,14 +144,8 @@ public class EvalTests: XCTestCase {
 
             for samplerId in 0 ..< numSamplers {
                 group.addTask {
-                    let logits = MLXRandom.normal([1, vocabSize])
-                    return withRandomState(MLXRandom.RandomState(seed: UInt64(samplerId))) {
-                        if samplerId % 2 == 0 {
-                            return categorical(logits).item(Int.self)
-                        } else {
-                            return logits.argMax(axis: -1).item(Int.self)
-                        }
-                    }
+                    await EvalTestSamplingGate.shared.sampleToken(
+                        vocabSize: vocabSize, samplerId: samplerId)
                 }
             }
 
@@ -146,7 +172,7 @@ public class EvalTests: XCTestCase {
         quantize(model: model, groupSize: 64, bits: 4)
         eval(model)
 
-        let prompt = MLXArray(Array(0..<20))[.newAxis, .ellipsis]
+        let prompt = MLXArray(Array(0 ..< 20))[.newAxis, .ellipsis]
         let input = LMInput(text: .init(tokens: prompt))
         let maxTokens = 100
 
@@ -156,7 +182,7 @@ public class EvalTests: XCTestCase {
 
         let baselineStart = CFAbsoluteTimeGetCurrent()
         var baselineCount = 0
-        while let _ = baselineIterator.next() {
+        while baselineIterator.next() != nil {
             baselineCount += 1
         }
         let baselineElapsed = CFAbsoluteTimeGetCurrent() - baselineStart
@@ -175,7 +201,7 @@ public class EvalTests: XCTestCase {
 
         let compiledStart = CFAbsoluteTimeGetCurrent()
         var compiledCount = 0
-        while let _ = compiledIterator.next() {
+        while compiledIterator.next() != nil {
             compiledCount += 1
         }
         let compiledElapsed = CFAbsoluteTimeGetCurrent() - compiledStart
@@ -199,20 +225,8 @@ public class EvalTests: XCTestCase {
 
             for samplerId in 0 ..< numSamplers {
                 group.addTask {
-                    let logits = MLXArray.ones([1, 50])
-                    var taskResults: [Int] = []
-                    let sampler = CategoricalSampler(temperature: 1.0)
-
-                    for sampleId in 0 ..< samplesPerTask {
-                        let token = withRandomState(
-                            MLXRandom.RandomState(seed: UInt64(samplerId * 1000 + sampleId))
-                        ) {
-                            return sampler.sample(logits: logits)
-                        }
-                        taskResults.append(token.item(Int.self))
-                    }
-
-                    return taskResults
+                    await EvalTestSamplingGate.shared.sampleSequence(
+                        samplerId: samplerId, samplesPerTask: samplesPerTask)
                 }
             }
 
