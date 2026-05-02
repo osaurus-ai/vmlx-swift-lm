@@ -441,28 +441,96 @@ public enum JANGTQKernels {
 
     /// Hadamard rotate `x` (any batch shape with `dim` last). Returns fp32.
     /// `signs` must be shape `(dim,)` fp32.
+    ///
+    /// Apple Silicon caps threadgroup memory at 32 KB = 8192 floats, so the
+    /// per-block Metal kernel can only process blocks up to 8192 elements.
+    /// Mistral-Medium-3.5 hits this on `down_proj.in_features=28672` →
+    /// `decomposePow2(28672) = [16384, 8192, 4096]`. The 16384-block has
+    /// no in-shmem implementation; we instead split it in Swift via the
+    /// well-known recursion
+    ///     `H_{2n}(u,v) = [H_n((u+v)/√2), H_n((u-v)/√2)]`
+    /// applying it once for each "doubling above 8192". The signs are
+    /// applied to the original input ONCE before the split (signs are
+    /// per-input-coordinate diagonal, so they commute with the split as
+    /// long as we don't double-apply), and each leaf-call uses an all-
+    /// ones sign vector.
     public static func hadamardRotate(_ x: MLXArray, signs: MLXArray, dim: Int) -> MLXArray {
-        // Flatten leading dims into batch
-        var xFlat = x.reshaped([-1, dim]).asType(.float32)
+        let xFlat = x.reshaped([-1, dim]).asType(.float32)
         let batch = xFlat.shape[0]
-        let meta = makeHadamardMeta(totalDim: dim)
+
         let blocks = decomposePow2(dim)
-        let largestBlock = blocks.max() ?? dim
-        let tgSize = min(1024, max(32, largestBlock))
-        let outArrs = JANGTQKernelLibrary.hadamardMultiblock(
-            [xFlat, signs, meta],
-            template: nil,
-            grid: (tgSize, batch, 1),
-            threadGroup: (tgSize, 1, 1),
-            outputShapes: [[batch, dim]],
-            outputDTypes: [.float32]
-        )
-        var rot = outArrs[0]
-        // Restore leading shape
-        if x.ndim > 2 || (x.ndim == 2 && x.dim(0) != batch) {
-            rot = rot.reshaped(x.shape)
+        let maxBlock = blocks.max() ?? dim
+        if maxBlock <= 8192 {
+            // Fast path: every block fits in shmem — single kernel
+            // dispatch processes all blocks back-to-back.
+            let meta = makeHadamardMeta(totalDim: dim)
+            let tgSize = min(1024, max(32, maxBlock))
+            let outArrs = JANGTQKernelLibrary.hadamardMultiblock(
+                [xFlat, signs, meta],
+                template: nil,
+                grid: (tgSize, batch, 1),
+                threadGroup: (tgSize, 1, 1),
+                outputShapes: [[batch, dim]],
+                outputDTypes: [.float32]
+            )
+            var rot = outArrs[0]
+            if x.ndim > 2 || (x.ndim == 2 && x.dim(0) != batch) {
+                rot = rot.reshaped(x.shape)
+            }
+            return rot
         }
-        return rot
+
+        // Slow path (shmem-overflow case): process each pow2 block
+        // separately, splitting > 8192 blocks via the H_{2n} recursion.
+        var blockOuts: [MLXArray] = []
+        var offset = 0
+        for d_b in blocks {
+            let blockX = xFlat[0..., offset..<(offset + d_b)]
+            let blockSigns = signs[offset..<(offset + d_b)]
+            blockOuts.append(
+                hadamardBlockRecursive(blockX, signs: blockSigns, d_b: d_b))
+            offset += d_b
+        }
+        let merged = MLX.concatenated(blockOuts, axis: -1)
+        if x.ndim > 2 || (x.ndim == 2 && x.dim(0) != batch) {
+            return merged.reshaped(x.shape)
+        }
+        return merged
+    }
+
+    /// Recursive single-block Hadamard. For `d_b <= 8192` dispatches the
+    /// Metal kernel directly. For `d_b > 8192` applies the H_{2n}
+    /// recursion in Swift, using all-ones signs in the recursive calls
+    /// (signs were consumed by the caller's sign-multiplication step).
+    private static func hadamardBlockRecursive(
+        _ x: MLXArray, signs: MLXArray, d_b: Int
+    ) -> MLXArray {
+        if d_b <= 8192 {
+            // Use the multi-block kernel with n_blocks=1.
+            let meta = makeHadamardMeta(totalDim: d_b)
+            let tgSize = min(1024, max(32, d_b))
+            let outArrs = JANGTQKernelLibrary.hadamardMultiblock(
+                [x, signs, meta],
+                template: nil,
+                grid: (tgSize, x.shape[0], 1),
+                threadGroup: (tgSize, 1, 1),
+                outputShapes: [x.shape],
+                outputDTypes: [.float32]
+            )
+            return outArrs[0]
+        }
+        // Apply signs ONCE to the input. The recursive halves use ones.
+        let xSigned = x * signs
+        let half = d_b / 2
+        let u = xSigned[0..., 0..<half]
+        let v = xSigned[0..., half..<d_b]
+        let invSqrt2 = MLXArray(Float(1.0 / sqrt(2.0)))
+        let a = (u + v) * invSqrt2
+        let b = (u - v) * invSqrt2
+        let onesSigns = MLXArray.ones([half], dtype: .float32)
+        let halfA = hadamardBlockRecursive(a, signs: onesSigns, d_b: half)
+        let halfB = hadamardBlockRecursive(b, signs: onesSigns, d_b: half)
+        return MLX.concatenated([halfA, halfB], axis: -1)
     }
 
     /// Fused gate+up+SwiGLU.
