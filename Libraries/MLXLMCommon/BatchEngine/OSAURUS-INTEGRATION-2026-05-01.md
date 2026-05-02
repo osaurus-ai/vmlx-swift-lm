@@ -335,6 +335,43 @@ distribution that argmax decode locks onto a single high-frequency token.
 codebook) Mistral 3.5 bundle. The Swift runtime is correct; only the
 on-disk codebook precision needs improvement.
 
+### Cross-reference: Python + vmlx upstream parity
+
+Verified that **no end-to-end Python or upstream-vmlx reference
+implementation exists for JANGTQ Mistral 3.5**:
+
+- `~/jang/jang-tools/jang_tools/mistral3/runtime.py:90-100` filters its
+  `nn.quantize` predicate by `.scales` presence — JANGTQ codebook layers
+  ship as `tq_packed`/`tq_norms` (no `.scales`), so the Python runtime
+  silently leaves them at random init. Python ref does NOT actually run
+  JANGTQ Mistral 3.5; it can only run bf16/fp8/mxfp4 variants.
+
+- `~/vmlx/docs/AUDIT-LAGUNA-MISTRAL.md` documents that the Mistral 3.5
+  bundle was "still uploading" at the time of the upstream audit and
+  was never end-to-end validated through the upstream-vmlx engine.
+
+- The vmlx upstream Swift code at
+  `~/vmlx/swift/Sources/vMLXLMCommon/JANGTQKernels.swift` predates this
+  fork's iter-12 fix sweep — it still has the original `shmem[4096]` cap
+  and the `for k=0..16` loop bound bug. Never validated against a real
+  Mistral 3.5 JANGTQ run.
+
+- Python reference at `~/jang/jang-tools/jang_tools/mistral3/model.py`
+  ignores the YaRN `rope_type=yarn` config and uses plain RoPE at
+  `base=1e6` for both Q and K (`mx.fast.rope` with `scale=1.0`). The
+  `_yarn_inv_freq` function is defined but unused. Swift `initializeRope`
+  honors `rope_type=yarn` and applies full YaRN inv_freq scaling
+  (`Libraries/MLXLMCommon/RoPEUtils.swift:243`). mxfp4 path produces
+  coherent text under the YaRN-applied path, so YaRN is correct for the
+  trained weights — the Python ref's plain-RoPE path is the buggy one.
+
+**Net implication for Mistral 3.5 JANGTQ debugging**: this fork is the
+first end-to-end runner; there is no apples-to-apples reference output
+to compare against. The kernel-correctness bar reached in this iteration
+(L2 preservation + determinism + per-projection L2 within 10-50% of
+mxfp4 + residual stream saturation matching mxfp4) is the strongest
+correctness evidence available without a working Python parity path.
+
 Affected architectures: any model with `hidden_dim > 4096` AND
 non-power-of-2 (so the multiblock Hadamard fires AND the largest
 block exceeds 4096). Other JANGTQ models (MiniMax M2.7-Small=3072,
