@@ -137,6 +137,45 @@ final class JANGTQKernelsTests: XCTestCase {
             "3-D input must round-trip through hadamardRotate with shape preserved.")
     }
 
+    /// Orthogonality check: the Randomized Hadamard Transform is
+    /// orthogonal, so it must preserve the input's L2 norm (within
+    /// floating-point precision). Test cases cover:
+    ///
+    ///   - power-of-2 dim ≤ 8192 (single-block kernel path)
+    ///   - non-pow2 dim ≤ 8192 (multi-block kernel path, all blocks fit)
+    ///   - non-pow2 dim with a block ≤ 8192 only after recursion
+    ///     (Mistral 3.5 down_proj 28672 case — Swift-side H_2n recursion)
+    ///
+    /// Catches buffer-size regressions (commit `a1bfe65` shmem 4096→8192,
+    /// `38086ca` per-block isolation, `6096875` H_2n recursion for
+    /// blocks > 8192).
+    func testHadamardRotatePreservesL2Norm() {
+        for dim in [4096, 8192, 12288, 28672] {
+            // Use a simple deterministic pattern: x[i] = (i + 1) / dim.
+            let xFloats = (0..<dim).map { Float($0 + 1) / Float(dim) }
+            let x = MLXArray(xFloats).reshaped([1, dim])
+            // Alternating signs ensures the rotation actually does work
+            // (an all-ones signs is degenerate for the per-coord step).
+            let signsFloats = (0..<dim).map { i -> Float in i.isMultiple(of: 2) ? 1.0 : -1.0 }
+            let signs = MLXArray(signsFloats)
+            realise(x, signs)
+
+            let rotated = JANGTQKernels.hadamardRotate(x, signs: signs, dim: dim)
+            realise(rotated)
+
+            // L2 norm preservation (orthogonal transform).
+            let xL2 = sqrt((x.asType(.float32) * x.asType(.float32)).sum())
+                .item(Float.self)
+            let rotL2 = sqrt((rotated * rotated).sum()).item(Float.self)
+            // Allow 0.5% relative error for fp32 accumulation drift.
+            let relErr = abs(rotL2 - xL2) / max(xL2, 1e-9)
+            XCTAssertLessThan(
+                relErr, 0.005,
+                "hadamardRotate must preserve L2 norm at dim=\(dim); "
+                    + "input L2=\(xL2), rotated L2=\(rotL2), relErr=\(relErr)")
+        }
+    }
+
     // MARK: - JANGTQRuntimeCache signs/codebook lookup contract
 
     /// Lookups by (inFeatures, seed) and (inFeatures, bits) must be
