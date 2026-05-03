@@ -37,6 +37,9 @@ let package = Package(
         .library(
             name: "MLXDistributedCore",
             targets: ["MLXDistributedCore"]),
+        .library(
+            name: "MLXDistributedTransport",
+            targets: ["MLXDistributedTransport"]),
     ],
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
@@ -55,6 +58,14 @@ let package = Package(
         // swift-jinja).
         .package(url: "https://github.com/osaurus-ai/swift-jinja", revision: "58d21aa5b69fdd9eb7e23ce2c3730f47db8e0c9d"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        // SwiftNIO stack — used by MLXDistributedTransport for TLS-backed
+        // pipeline-parallel inference (Phase 2). swift-nio is already
+        // resolved transitively via swift-transformers; we pin the floor
+        // to a recent version known to compile under Swift 6.1 strict
+        // concurrency.
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
+        .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.34.0"),
     ],
     targets: [
         .target(
@@ -113,6 +124,20 @@ let package = Package(
             name: "MLXDistributedCore",
             dependencies: [],
             path: "Libraries/MLXDistributedCore",
+            exclude: [
+                "README.md"
+            ]
+        ),
+        .target(
+            name: "MLXDistributedTransport",
+            dependencies: [
+                "MLXDistributedCore",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "NIOHTTP2", package: "swift-nio-http2"),
+            ],
+            path: "Libraries/MLXDistributedTransport",
             exclude: [
                 "README.md"
             ]
@@ -185,6 +210,11 @@ let package = Package(
             name: "MLXDistributedCoreTests",
             dependencies: ["MLXDistributedCore"],
             path: "Tests/MLXDistributedCoreTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedTransportTests",
+            dependencies: ["MLXDistributedTransport", "MLXDistributedCore"],
+            path: "Tests/MLXDistributedTransportTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
