@@ -87,6 +87,13 @@ public final class JangPressController: @unchecked Sendable {
     /// before each inference and cleared after.
     private var inferenceInFlight: Bool = false
 
+    /// iter 24: tracks whether we've completed the first inference.
+    /// On the first transition from in-flight → finished, we trigger
+    /// the post-load page-cache reclaim — by then MLX has finished
+    /// pread'ing weights into Metal buffers and the kernel page cache
+    /// is pure redundancy.
+    private var firstInferenceCompleted: Bool = false
+
     /// Wall-clock of last inference tick. Used to determine quiesce.
     private var lastInferenceTick: Date = Date()
 
@@ -209,14 +216,38 @@ public final class JangPressController: @unchecked Sendable {
     }
 
     /// Engine calls this AFTER inference completes (or aborts). Starts
-    /// the quiesce countdown if armed.
+    /// the quiesce countdown if armed. iter 24: also triggers the
+    /// post-load page-cache reclaim on the FIRST call.
     public func didFinishInference() {
-        lock.withLock {
+        let shouldFirstReclaim: Bool = lock.withLock {
             inferenceInFlight = false
             lastInferenceTick = Date()
             if state == .armed || state == .quiescing {
                 state = .quiescing
                 scheduleQuiesce()
+            }
+            let first = !firstInferenceCompleted
+            firstInferenceCompleted = true
+            return first
+        }
+
+        // iter 24: AFTER MLX has finished pread'ing weights into Metal
+        // buffers (which definitely happened by the end of the first
+        // inference), the kernel page cache holding those same bytes
+        // is pure redundancy. Drop it asynchronously off the inference
+        // path. This is the v1 "real win" of JangPress on JANGTQ
+        // bundles where MLX always copies.
+        if shouldFirstReclaim, let tier = mmapTier {
+            queue.async { [weak self] in
+                let t0 = Date()
+                tier.releaseAllRoutedRanges()
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                let s = tier.snapshotIfBuilt()
+                let routedMB = s.totalRoutedBytes / 1024 / 1024
+                let msg = "[JangPressController] first-inference reclaim: madvise DONTNEED on \(s.expertCount) tiles (\(routedMB) MB routed) in \(ms) ms\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+                self?.log.notice("first-inference reclaim: madvise DONTNEED on \(s.expertCount) tiles (\(routedMB) MB routed) in \(ms) ms")
+                self?.notifyObserver()
             }
         }
     }

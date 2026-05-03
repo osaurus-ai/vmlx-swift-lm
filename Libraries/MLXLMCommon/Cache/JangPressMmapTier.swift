@@ -88,7 +88,12 @@ public final class JangPressMmapTier: @unchecked Sendable {
 
     /// Shards opened from the bundle. Held strongly so the mmap
     /// regions stay alive for the lifetime of the tier.
-    public private(set) var shards: [URL: JangPressShard] = [:]
+    /// Lazily populated by `ensureBuilt()` on first use.
+    public var shards: [URL: JangPressShard] {
+        ensureBuilt()
+        return _shards
+    }
+    private var _shards: [URL: JangPressShard] = [:]
 
     /// (layer, expert) → list of (shard, byteRange) for the three
     /// expert projections (gate / up / down). One expert may contribute
@@ -101,7 +106,12 @@ public final class JangPressMmapTier: @unchecked Sendable {
             parts.reduce(0) { $0 + ($1.range.upperBound - $1.range.lowerBound) }
         }
     }
-    public private(set) var experts: [TileKey: ExpertRanges] = [:]
+    /// Lazily populated by `ensureBuilt()` on first use.
+    public var experts: [TileKey: ExpertRanges] {
+        ensureBuilt()
+        return _experts
+    }
+    private var _experts: [TileKey: ExpertRanges] = [:]
 
     /// Tile identifier — matches the shape used by
     /// `JangPressMachCache`.
@@ -114,29 +124,57 @@ public final class JangPressMmapTier: @unchecked Sendable {
         }
     }
 
+    /// iter 24: build state machine. Init is now O(1) and does no I/O.
+    /// All shard opens, header parses, and tile indexing are deferred
+    /// to `ensureBuilt()` which fires on first acquire/release/snapshot.
+    /// This addresses the load-time SIGKILL on memory-tight hosts where
+    /// JangPress was racing MLX's pread for limited RAM.
+    private let buildLock = NSLock()
+    private var didBuild = false
+    private var buildError: Error?
+
     public init(config: JangPressMmapConfig) throws {
         self.config = config
+        // No work in init. The bundle URL is validated lazily inside
+        // ensureBuilt() so that Engine.load completes regardless of
+        // whether the bundle actually exists / is readable. A missing
+        // bundle becomes a noop tier (acquire/release no-op cleanly)
+        // rather than a hard load failure.
+    }
 
-        // 1. Find every *.safetensors shard.
+    /// Lazily perform shard sniff + mmap + tile indexing. Idempotent;
+    /// concurrent callers will block on `buildLock` and observe the
+    /// already-built state. Errors are captured + re-thrown on the
+    /// first call only (subsequent calls observe no-op state).
+    private func ensureBuilt() {
+        // Fast path — already built.
+        if didBuild { return }
+        buildLock.lock(); defer { buildLock.unlock() }
+        if didBuild { return }
+        defer { didBuild = true }
+
         let fm = FileManager.default
-        let shardURLs = try fm.contentsOfDirectory(
-            at: config.bundleURL,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ).filter { $0.pathExtension == "safetensors" }
+        let shardURLs: [URL]
+        do {
+            shardURLs = try fm.contentsOfDirectory(
+                at: config.bundleURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ).filter { $0.pathExtension == "safetensors" }
+        } catch {
+            buildError = error
+            FileHandle.standardError.write(Data(
+                "[JangPressMmapTier] enumerate \(config.bundleURL.path) failed: \(error) — tier inert\n".utf8))
+            return
+        }
 
-        // 2. iter 19: header-sniff each shard FIRST to identify which
-        //    contain routed-expert tensors. Skip mmap'ing shards that
-        //    have only attention/embed/lm_head/etc — that reduces
-        //    page-cache competition with MLX-swift's own mmap views
-        //    of those same files, and addresses the OFF→ON output drift
-        //    documented in JANGPRESS-DEEP-TRACE.md Issue 5b.
+        // iter 19: header-sniff each shard FIRST to identify which
+        // contain routed-expert tensors. Skip mmap'ing shards that have
+        // only attention/embed/lm_head/etc.
         var openedShards: [URL: JangPressShard] = [:]
         var skippedCount = 0
         for url in shardURLs {
-            // Header-only sniff: which tensor names are in this shard?
             guard let names = JangPressShard.sniffTensorNames(at: url) else {
-                // Header parse failed — fall back to full open, log.
                 do {
                     openedShards[url] = try JangPressShard(path: url)
                 } catch {
@@ -145,7 +183,6 @@ public final class JangPressMmapTier: @unchecked Sendable {
                 }
                 continue
             }
-            // Does this shard contain ANY routed-expert tensor?
             let hasRoutedExpert = names.contains(where: { name in
                 Self.parseRoutedExpertName(name) != nil
             })
@@ -160,14 +197,13 @@ public final class JangPressMmapTier: @unchecked Sendable {
                 skippedCount += 1
             }
         }
-        self.shards = openedShards
+        self._shards = openedShards
         if skippedCount > 0 {
             FileHandle.standardError.write(Data(
-                "[JangPressMmapTier] sniffed \(shardURLs.count) shards, mmap'd \(openedShards.count), skipped \(skippedCount) (no routed experts)\n".utf8))
+                "[JangPressMmapTier] lazy-built: sniffed \(shardURLs.count) shards, mmap'd \(openedShards.count), skipped \(skippedCount) (no routed experts)\n".utf8))
         }
 
-        // 3. Walk every tensor name across all shards, attribute to
-        //    (layer, expert) via the two known regex patterns.
+        // Walk tensor names + build (layer, expert) → byte-range map.
         var byKey: [TileKey: [(URL, Range<UInt64>)]] = [:]
         for (url, shard) in openedShards {
             for name in shard.tensors.keys {
@@ -177,7 +213,6 @@ public final class JangPressMmapTier: @unchecked Sendable {
                 byKey[TileKey(layer: layer, expert: expert), default: []].append((url, range))
             }
         }
-
         var built: [TileKey: ExpertRanges] = [:]
         for (key, parts) in byKey {
             built[key] = ExpertRanges(
@@ -186,10 +221,11 @@ public final class JangPressMmapTier: @unchecked Sendable {
                 parts: parts.map { (shard: $0.0, range: $0.1) }
             )
         }
-        self.experts = built
+        self._experts = built
 
-        // 4. Initial advise. If startCold, mark every routed range
-        //    as DONTNEED — the first inference will WILLNEED its top-k.
+        // startCold: mark every routed range DONTNEED right after building.
+        // This is the post-MLX-pread reclaim — kernel page cache for these
+        // bytes is redundant once MLX has copied to Metal buffer.
         if config.startCold {
             for (_, ranges) in built {
                 for part in ranges.parts {
@@ -203,13 +239,15 @@ public final class JangPressMmapTier: @unchecked Sendable {
 
     // MARK: - Routing API
 
-    /// Pre-fault the given experts. Does the corresponding number of
+    /// Pre-fault the given experts. Triggers `ensureBuilt()` on first
+    /// use; thereafter does the corresponding number of
     /// `madvise(MADV_WILLNEED)` syscalls — one per (gate/up/down) part.
     public func acquire(layer: Int, experts: [Int]) {
+        ensureBuilt()
         for e in experts {
-            guard let r = self.experts[TileKey(layer: layer, expert: e)] else { continue }
+            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
             for part in r.parts {
-                shards[part.shard]?.advise(.willNeed, range: part.range)
+                _shards[part.shard]?.advise(.willNeed, range: part.range)
             }
         }
     }
@@ -217,10 +255,11 @@ public final class JangPressMmapTier: @unchecked Sendable {
     /// Mark the given experts as MADV_DONTNEED — kernel can reclaim
     /// their pages under pressure.
     public func release(layer: Int, experts: [Int]) {
+        ensureBuilt()
         for e in experts {
-            guard let r = self.experts[TileKey(layer: layer, expert: e)] else { continue }
+            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
             for part in r.parts {
-                shards[part.shard]?.advise(.dontNeed, range: part.range)
+                _shards[part.shard]?.advise(.dontNeed, range: part.range)
             }
         }
     }
@@ -231,10 +270,40 @@ public final class JangPressMmapTier: @unchecked Sendable {
     /// confident these experts will stay dormant for ≥30 s. Cost: the
     /// next acquire pays a disk re-fault (~ms per tile).
     public func forceRelease(layer: Int, experts: [Int]) {
+        ensureBuilt()
         for e in experts {
-            guard let r = self.experts[TileKey(layer: layer, expert: e)] else { continue }
+            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
             for part in r.parts {
-                shards[part.shard]?.forceInvalidate(range: part.range)
+                _shards[part.shard]?.forceInvalidate(range: part.range)
+            }
+        }
+    }
+
+    /// iter 24: bulk-release every routed range with `madvise(DONTNEED)`.
+    /// Designed to run RIGHT AFTER first inference completes — at that
+    /// point MLX-swift has finished pread'ing the safetensors into its
+    /// own Metal buffers, so the kernel page cache for those same bytes
+    /// is pure redundancy. Dropping it gives RAM back for other apps.
+    ///
+    /// This is the v1 "real win" of JangPress on JANGTQ bundles where
+    /// MLX always copies (cf. the v2 storage-hook fork that would let
+    /// MLX wrap our mmap directly).
+    public func releaseAllRoutedRanges() {
+        ensureBuilt()
+        for (_, ranges) in _experts {
+            for part in ranges.parts {
+                _shards[part.shard]?.advise(.dontNeed, range: part.range)
+            }
+        }
+    }
+
+    /// Same as `releaseAllRoutedRanges` but uses msync(MS_INVALIDATE) for
+    /// guaranteed reclaim regardless of pressure level.
+    public func forceReleaseAllRoutedRanges() {
+        ensureBuilt()
+        for (_, ranges) in _experts {
+            for part in ranges.parts {
+                _shards[part.shard]?.forceInvalidate(range: part.range)
             }
         }
     }
@@ -246,20 +315,47 @@ public final class JangPressMmapTier: @unchecked Sendable {
         public var expertCount: Int
         public var totalRoutedBytes: UInt64
         public var byLayer: [Int: Int]
+        public var built: Bool
     }
 
+    /// Returns a stats snapshot. Will trigger `ensureBuilt()` to populate
+    /// real data; for the "is this initialized?" probe use
+    /// `snapshotIfBuilt()` instead.
     public func snapshot() -> Stats {
+        ensureBuilt()
         var byLayer: [Int: Int] = [:]
         var total: UInt64 = 0
-        for (key, r) in experts {
+        for (key, r) in _experts {
             byLayer[key.layer, default: 0] += 1
             total += r.totalBytes
         }
         return Stats(
-            shardCount: shards.count,
-            expertCount: experts.count,
+            shardCount: _shards.count,
+            expertCount: _experts.count,
             totalRoutedBytes: total,
-            byLayer: byLayer)
+            byLayer: byLayer,
+            built: didBuild)
+    }
+
+    /// Probe-only snapshot: does NOT trigger ensureBuilt(). Returns
+    /// zeros + built=false until something actually uses the tier.
+    public func snapshotIfBuilt() -> Stats {
+        buildLock.lock(); defer { buildLock.unlock() }
+        if !didBuild {
+            return Stats(shardCount: 0, expertCount: 0, totalRoutedBytes: 0, byLayer: [:], built: false)
+        }
+        var byLayer: [Int: Int] = [:]
+        var total: UInt64 = 0
+        for (key, r) in _experts {
+            byLayer[key.layer, default: 0] += 1
+            total += r.totalBytes
+        }
+        return Stats(
+            shardCount: _shards.count,
+            expertCount: _experts.count,
+            totalRoutedBytes: total,
+            byLayer: byLayer,
+            built: true)
     }
 
     // MARK: - Tensor name parsing

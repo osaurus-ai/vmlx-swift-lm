@@ -85,7 +85,12 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     public let config: JangPressEmbedConfig
 
     /// Shards that hold embed_tokens and/or lm_head.
-    public private(set) var shards: [URL: JangPressShard] = [:]
+    /// Lazily populated by `ensureBuilt()` on first use.
+    public var shards: [URL: JangPressShard] {
+        ensureBuilt()
+        return _shards
+    }
+    private var _shards: [URL: JangPressShard] = [:]
 
     /// Per-tensor metadata we need at acquire/release time.
     public struct TensorView: Sendable {
@@ -96,8 +101,17 @@ public final class JangPressEmbedTier: @unchecked Sendable {
         public let hiddenSize: Int
         public let dataOffset: UInt64     // absolute byte offset of row 0 in shard file
     }
-    public private(set) var embedTokens: TensorView?
-    public private(set) var lmHead: TensorView?
+    public var embedTokens: TensorView? {
+        ensureBuilt()
+        return _embedTokens
+    }
+    private var _embedTokens: TensorView?
+
+    public var lmHead: TensorView? {
+        ensureBuilt()
+        return _lmHead
+    }
+    private var _lmHead: TensorView?
 
     /// Per-token-id activation count. Updated by `recordTokenActivity`
     /// during the first ~1000 decode steps; the warm-up window builds
@@ -105,8 +119,21 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     private var tokenFrequency: [Int: UInt64] = [:]
     private var observedSamples: UInt64 = 0
 
+    /// iter 24: build state machine. Init is now O(1) — actual file I/O
+    /// is deferred to `ensureBuilt()` which fires on first use.
+    private let buildLock = NSLock()
+    private var didBuild = false
+
     public init(config: JangPressEmbedConfig) throws {
         self.config = config
+        // No work in init. ensureBuilt() does sniff + open + tensor lookup.
+    }
+
+    private func ensureBuilt() {
+        if didBuild { return }
+        buildLock.lock(); defer { buildLock.unlock() }
+        if didBuild { return }
+        defer { didBuild = true }
 
         // Embed + LM head tensor name candidates. Different model
         // families use different canonical names; we accept all common
@@ -126,11 +153,11 @@ public final class JangPressEmbedTier: @unchecked Sendable {
         ]
         let allCandidates = embedCandidates.union(headCandidates)
 
-        // 1. iter 20: header-sniff each shard FIRST. Only mmap the shards
-        //    that actually contain embed_tokens or lm_head — typically
-        //    just one shard out of 86 on DSV4. Saves ~37 seconds at load
-        //    by eliminating 85 redundant JangPressShard.init mmap+parse
-        //    cycles. Same fix as iter 19 sniff in JangPressMmapTier.
+        // iter 20: header-sniff each shard FIRST. Only mmap the shards
+        // that actually contain embed_tokens or lm_head — typically
+        // just one shard out of 86 on DSV4. Saves ~37 seconds at load
+        // by eliminating 85 redundant JangPressShard.init mmap+parse
+        // cycles.
         let fm = FileManager.default
         let shardURLs = (try? fm.contentsOfDirectory(
             at: config.bundleURL,
@@ -140,11 +167,9 @@ public final class JangPressEmbedTier: @unchecked Sendable {
 
         var skippedCount = 0
         for url in shardURLs {
-            // Header-only sniff: which tensor names are in this shard?
             guard let names = JangPressShard.sniffTensorNames(at: url) else {
-                // Header parse failed — fall back to full open (rare).
                 do {
-                    self.shards[url] = try JangPressShard(path: url)
+                    self._shards[url] = try JangPressShard(path: url)
                 } catch {
                     FileHandle.standardError.write(Data(
                         "[JangPressEmbedTier] sniff+open failed \(url.lastPathComponent): \(error)\n".utf8))
@@ -154,7 +179,7 @@ public final class JangPressEmbedTier: @unchecked Sendable {
             let hasEmbedOrHead = names.contains(where: { allCandidates.contains($0) })
             if hasEmbedOrHead {
                 do {
-                    self.shards[url] = try JangPressShard(path: url)
+                    self._shards[url] = try JangPressShard(path: url)
                 } catch {
                     FileHandle.standardError.write(Data(
                         "[JangPressEmbedTier] open failed \(url.lastPathComponent): \(error)\n".utf8))
@@ -165,24 +190,27 @@ public final class JangPressEmbedTier: @unchecked Sendable {
         }
         if skippedCount > 0 {
             FileHandle.standardError.write(Data(
-                "[JangPressEmbedTier] sniffed \(shardURLs.count) shards, mmap'd \(self.shards.count), skipped \(skippedCount) (no embed/lm_head)\n".utf8))
+                "[JangPressEmbedTier] lazy-built: sniffed \(shardURLs.count) shards, mmap'd \(self._shards.count), skipped \(skippedCount) (no embed/lm_head)\n".utf8))
         }
 
         // 2. Locate the embedding + LM head tensors among the (small)
-        // set of shards we actually opened.
-        for (url, shard) in shards {
-            if self.embedTokens == nil {
+        // set of shards we actually opened. Note: we write to the
+        // underscored backing fields (`_embedTokens` / `_lmHead`)
+        // because the public computed properties trigger ensureBuilt()
+        // (would re-enter the build lock).
+        for (url, shard) in _shards {
+            if self._embedTokens == nil {
                 for name in embedCandidates {
                     if let d = shard.descriptor(for: name) {
-                        self.embedTokens = Self.makeView(name: name, shard: url, descriptor: d)
+                        self._embedTokens = Self.makeView(name: name, shard: url, descriptor: d)
                         break
                     }
                 }
             }
-            if self.lmHead == nil, !config.skipLMHead {
+            if self._lmHead == nil, !config.skipLMHead {
                 for name in headCandidates {
                     if let d = shard.descriptor(for: name) {
-                        self.lmHead = Self.makeView(name: name, shard: url, descriptor: d)
+                        self._lmHead = Self.makeView(name: name, shard: url, descriptor: d)
                         break
                     }
                 }
@@ -270,6 +298,30 @@ public final class JangPressEmbedTier: @unchecked Sendable {
             hasLMHead: lmHead != nil,
             vocabSize: embedTokens?.vocabSize ?? 0,
             hiddenSize: embedTokens?.hiddenSize ?? 0,
+            observedTokenSamples: observedSamples,
+            distinctTokensSeen: tokenFrequency.count,
+            hotPercent: config.hotPercent)
+    }
+
+    /// iter 24: probe-only snapshot that doesn't trigger ensureBuilt().
+    /// Returns hasEmbedTokens=false / zeros until something actually
+    /// uses the tier (so /v1/cache/jangpress doesn't force a full
+    /// sniff pass just for stats).
+    public func snapshotIfBuilt() -> Stats {
+        buildLock.lock(); defer { buildLock.unlock() }
+        if !didBuild {
+            return Stats(
+                hasEmbedTokens: false, hasLMHead: false,
+                vocabSize: 0, hiddenSize: 0,
+                observedTokenSamples: observedSamples,
+                distinctTokensSeen: tokenFrequency.count,
+                hotPercent: config.hotPercent)
+        }
+        return Stats(
+            hasEmbedTokens: _embedTokens != nil,
+            hasLMHead: _lmHead != nil,
+            vocabSize: _embedTokens?.vocabSize ?? 0,
+            hiddenSize: _embedTokens?.hiddenSize ?? 0,
             observedTokenSamples: observedSamples,
             distinctTokensSeen: tokenFrequency.count,
             hotPercent: config.hotPercent)
