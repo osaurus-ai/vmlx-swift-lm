@@ -204,15 +204,20 @@ struct JangPressMmapTierTests {
         let stats = tier.snapshot()
         // 2 shards opened
         #expect(stats.shardCount == 2)
-        // 3 routed experts: (layer=0, exp=0), (layer=0, exp=1),
-        // (layer=1, exp=0) — the stacked switch_mlp is indexed once.
-        #expect(stats.expertCount == 3)
-        // Layer 0 has 2 experts; layer 1 has 1 (the stacked one)
+        // iter 25 (Issue 4): stacked tiles in layer 1 are split into
+        // per-expert byte sub-ranges using shape[0] (=2 in the test
+        // fixture). So layer 1 now reports 2 split-experts instead of 1
+        // synthetic-whole-tile entry.
+        //   Layer 0: 2 per-expert entries (unchanged)
+        //   Layer 1: 2 split-from-stacked entries (was 1)
+        //   Total = 4 (was 3)
+        #expect(stats.expertCount == 4)
         #expect(stats.byLayer[0] == 2)
-        #expect(stats.byLayer[1] == 1)
-        // 9 expert tile bytes (3 layers/experts × 3 projections × 32 bytes)
-        // = 3 × 3 × 32 minus 1 expert (layer=1 is stacked, also 3×32).
-        // Our model: 6 (per-expert L0) + 3 (stacked L1) = 9 tiles × 32 B = 288 B
+        #expect(stats.byLayer[1] == 2)
+        // Total routed bytes is unchanged by the split (whole-tile
+        // bytes are now distributed across N per-expert sub-ranges).
+        // 6 (per-expert L0) × 32 + 3 projections × 2 experts × 16 (L1
+        // split-half) = 192 + 96 = 288 B.
         #expect(stats.totalRoutedBytes == 288)
     }
 
@@ -243,7 +248,9 @@ struct JangPressMmapTierTests {
         // The actual page-state observation requires kernel/vmstat hooks.
         let tier = try JangPressMmapTier(
             config: .init(bundleURL: dir, hotPercent: 0, startCold: true))
-        #expect(tier.snapshot().expertCount == 3)
+        // iter 25: stacked tile in layer 1 splits into 2 per-expert
+        // entries (shape[0]=2 in the test fixture), so total = 2 + 2 = 4.
+        #expect(tier.snapshot().expertCount == 4)
     }
 
     @Test("forceRelease + reacquire produces byte-identical data")
