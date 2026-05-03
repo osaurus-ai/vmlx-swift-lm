@@ -182,10 +182,21 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CmlxDistributedShim",
+            dependencies: [],
+            path: "Libraries/CmlxDistributedShim",
+            publicHeadersPath: "include",
+            cSettings: [
+                // mlx-c headers needed by the shim.
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+            ]
+        ),
+        .target(
             name: "MLXDistributedTP",
             dependencies: [
                 "MLXDistributedCore",
                 "MLXDistributedJACCL",
+                "CmlxDistributedShim",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
