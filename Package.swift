@@ -112,7 +112,10 @@ let package = Package(
         .target(
             name: "MLXDistributedCore",
             dependencies: [],
-            path: "Libraries/MLXDistributedCore"
+            path: "Libraries/MLXDistributedCore",
+            exclude: [
+                "README.md"
+            ]
         ),
         .target(
             name: "BenchmarkHelpers",
