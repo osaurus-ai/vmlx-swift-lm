@@ -67,3 +67,88 @@ final class TXTSchemaEncodeTests: XCTestCase {
         XCTAssertEqual(txt["dist.models"], "*")
     }
 }
+
+final class TXTSchemaDecodeTests: XCTestCase {
+    func testDecodesMinimalReplica() throws {
+        let id = UUID(uuidString: "9F9E1F44-0000-0000-0000-000000000001")!
+        let txt: [String: String] = [
+            "dist.v": "1",
+            "dist.peer.id": id.uuidString.lowercased(),
+            "dist.modes": "replica",
+            "dist.tls.port": "7901",
+            "dist.tls.fp": String(repeating: "a", count: 64),
+            "dist.models": "ab12cd34ef561234",
+            "dist.coord": "0"
+        ]
+        let peer = try TXTSchema.decode(txt, hostname: "host.local")
+        XCTAssertEqual(peer.id, id)
+        XCTAssertEqual(peer.hostname, "host.local")
+        XCTAssertEqual(peer.capabilities.modes, [.replica])
+        XCTAssertEqual(peer.modelHashes, .explicit(["ab12cd34ef561234"]))
+        XCTAssertFalse(peer.willingToBeCoordinator)
+    }
+
+    func testRejectsUnknownSchemaVersion() {
+        let txt: [String: String] = [
+            "dist.v": "99",
+            "dist.peer.id": UUID().uuidString,
+            "dist.modes": "replica",
+            "dist.tls.port": "1",
+            "dist.tls.fp": String(repeating: "a", count: 64),
+            "dist.models": "*",
+            "dist.coord": "0"
+        ]
+        XCTAssertThrowsError(try TXTSchema.decode(txt, hostname: "h"))
+    }
+
+    func testRejectsMissingRequiredKeys() {
+        let txt: [String: String] = ["dist.v": "1"]
+        XCTAssertThrowsError(try TXTSchema.decode(txt, hostname: "h"))
+    }
+
+    func testDecodesOverflowSentinel() throws {
+        let txt: [String: String] = [
+            "dist.v": "1", "dist.peer.id": UUID().uuidString,
+            "dist.modes": "replica", "dist.tls.port": "1",
+            "dist.tls.fp": String(repeating: "a", count: 64),
+            "dist.models": "*", "dist.coord": "0"
+        ]
+        let peer = try TXTSchema.decode(txt, hostname: "h")
+        XCTAssertEqual(peer.modelHashes, .overflow)
+    }
+
+    func testRoundTripsAllFields() throws {
+        let id = UUID()
+        let original = Peer(
+            id: id,
+            hostname: "rt.local",
+            capabilities: PeerCapabilities(modes: [.wired, .pipelined, .replica]),
+            endpoints: [
+                .tls(host: "10.0.0.2", port: 9999,
+                     fingerprintSHA256: String(repeating: "f", count: 64)),
+                .rdma(gid: "fe80000000000005", devices: ["mlx5_0"])
+            ],
+            modelHashes: .explicit(["abcd000000000001", "abcd000000000002"]),
+            memFreeMiB: 42,
+            willingToBeCoordinator: true
+        )
+
+        let txt = try TXTSchema.encode(original)
+        let decoded = try TXTSchema.decode(txt, hostname: "rt.local")
+
+        XCTAssertEqual(decoded.id, id)
+        XCTAssertEqual(decoded.capabilities.modes, original.capabilities.modes)
+        XCTAssertEqual(decoded.modelHashes, original.modelHashes)
+        XCTAssertEqual(decoded.memFreeMiB, 42)
+        XCTAssertTrue(decoded.willingToBeCoordinator)
+
+        let hasRDMA = decoded.endpoints.contains {
+            if case .rdma = $0 { return true } else { return false }
+        }
+        let hasTLS = decoded.endpoints.contains {
+            if case .tls = $0 { return true } else { return false }
+        }
+        XCTAssertTrue(hasRDMA)
+        XCTAssertTrue(hasTLS)
+    }
+}
