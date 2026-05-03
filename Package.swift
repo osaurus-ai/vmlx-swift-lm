@@ -40,6 +40,9 @@ let package = Package(
         .library(
             name: "MLXDistributedTransport",
             targets: ["MLXDistributedTransport"]),
+        .library(
+            name: "MLXDistributedJACCL",
+            targets: ["MLXDistributedJACCL"]),
     ],
     dependencies: [
         // Bumped 2026-05-02: a21d2af = backport of ml-explore/mlx#3462
@@ -160,6 +163,22 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXDistributedJACCL",
+            dependencies: [
+                "MLXDistributedCore",
+                // Depend on MLX so its dependency on Cmlx pulls in the
+                // mlx_distributed_* C symbols at link time. We reach
+                // those symbols via @_silgen_name in JACCL.swift instead
+                // of importing Cmlx, since mlx-swift doesn't export Cmlx
+                // as a library product.
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXDistributedJACCL",
+            exclude: [
+                "README.md"
+            ]
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -232,6 +251,11 @@ let package = Package(
             name: "MLXDistributedTransportTests",
             dependencies: ["MLXDistributedTransport", "MLXDistributedCore"],
             path: "Tests/MLXDistributedTransportTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedJACCLTests",
+            dependencies: ["MLXDistributedJACCL"],
+            path: "Tests/MLXDistributedJACCLTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
