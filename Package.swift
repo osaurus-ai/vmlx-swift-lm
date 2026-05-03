@@ -66,6 +66,12 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.65.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.0"),
         .package(url: "https://github.com/apple/swift-nio-http2.git", from: "1.34.0"),
+        // swift-certificates for self-signed cert generation in
+        // MLXDistributedTransport (TLS-PP transport). swift-asn1 is
+        // transitive; we declare swift-crypto explicitly so we can
+        // consume its Crypto product directly.
+        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"),
     ],
     targets: [
         .target(
@@ -136,6 +142,8 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "NIOHTTP2", package: "swift-nio-http2"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Libraries/MLXDistributedTransport",
             exclude: [
