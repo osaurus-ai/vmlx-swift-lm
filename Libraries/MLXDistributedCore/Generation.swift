@@ -69,3 +69,18 @@ public struct ParallelPlan: Sendable, Equatable {
         self.model = model
     }
 }
+
+/// Transport hook for `Mode.pipelined`. Implemented by
+/// `MLXDistributedTransport.TLSPipelinedTransport` and similar future
+/// backends (e.g. JACCL in Phase 6). Decoupled from `MLXDistributedCore`
+/// so this target stays pure-Swift / no-NIO.
+public protocol PipelinedTransport: Sendable {
+    /// Stream tokens by routing the request through the supplied peer
+    /// chain. Each peer in `stages` is one rank; rank 0 is the driver
+    /// (caller), rank N is the last stage that emits tokens. The
+    /// transport decides how to dial them and how activations flow.
+    func generate(
+        _ request: GenerateRequest,
+        stages: [Peer]
+    ) -> AsyncStream<Token>
+}

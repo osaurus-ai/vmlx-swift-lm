@@ -39,6 +39,10 @@ public struct ActivationFrame: Sendable, Equatable {
         case tokenStream = 4
         /// Any rank → driver: structured failure (frame text payload).
         case error = 5
+        /// Last stage → driver: end-of-stream for the current request.
+        /// Sent after the final `tokenStream`, signals the caller can
+        /// stop reading. Payload is empty.
+        case tokensComplete = 6
     }
 }
 
