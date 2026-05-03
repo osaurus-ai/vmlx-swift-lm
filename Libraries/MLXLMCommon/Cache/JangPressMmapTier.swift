@@ -113,6 +113,17 @@ public final class JangPressMmapTier: @unchecked Sendable {
     }
     private var _experts: [TileKey: ExpertRanges] = [:]
 
+    /// iter 25: layers whose routed-expert tensor was a STACKED tile
+    /// (one safetensor of shape `[N_experts, ...]`) → number of experts
+    /// the tile was split into. Used by `acquireLayer(_:)` to WILLNEED
+    /// the whole stack when the caller doesn't know per-route experts.
+    /// Lazily populated by `ensureBuilt()` on first use.
+    public var stackedLayers: [Int: Int] {
+        ensureBuilt()
+        return _stackedLayerExpertCount
+    }
+    private var _stackedLayerExpertCount: [Int: Int] = [:]
+
     /// Tile identifier — matches the shape used by
     /// `JangPressMachCache`.
     public struct TileKey: Hashable, Sendable {
@@ -204,13 +215,62 @@ public final class JangPressMmapTier: @unchecked Sendable {
         }
 
         // Walk tensor names + build (layer, expert) → byte-range map.
+        //
+        // iter 25 (Issue 4): stacked-tile patterns (A, C, D, G, L, M)
+        // hold ALL experts of a layer in one safetensors tensor of
+        // shape `[N_experts, ...]`. Previously we registered the WHOLE
+        // tile under synthetic expert id 0, so `acquire(layer, [e])`
+        // WILLNEED-faulted the entire 67-304 MB tile (60-200 ms cold-
+        // fault per layer). We now split stacked tensors into per-
+        // expert byte sub-ranges using shape[0] as the stacked-axis
+        // dim, so `acquire(layer, [e])` only faults
+        // ~total_bytes / N_experts (1-2 MB) for each routed expert.
+        //
+        // Per-expert patterns (B, E, F, H, I, J, K) already have the
+        // expert id encoded in the tensor name; they take the no-split
+        // path unchanged.
+        //
+        // Layers indexed via the stacked path are tracked in
+        // `_stackedLayerExpertCount` so `acquireLayer(_:)` can WILLNEED
+        // the whole stack when the caller doesn't know the routing
+        // decision (legacy hint path, controller wake-all).
         var byKey: [TileKey: [(URL, Range<UInt64>)]] = [:]
+        var stackedLayerN: [Int: Int] = [:]
         for (url, shard) in openedShards {
             for name in shard.tensors.keys {
                 guard let (layer, expert) = Self.parseRoutedExpertName(name),
-                      let range = shard.byteRange(for: name)
+                      let desc = shard.descriptor(for: name)
                 else { continue }
-                byKey[TileKey(layer: layer, expert: expert), default: []].append((url, range))
+                let isStacked = expert == 0 && Self.isStackedTensorName(name)
+                if isStacked, !desc.shape.isEmpty, desc.shape[0] > 1 {
+                    // Split [N, …] tensor into N per-expert sub-ranges.
+                    let nExperts = desc.shape[0]
+                    let perExpertBytes = desc.dataLength / UInt64(nExperts)
+                    // Sanity check: total must be evenly divisible by N.
+                    // If not (corrupt header / unexpected layout), fall
+                    // back to whole-tile registration under id 0.
+                    if perExpertBytes * UInt64(nExperts) != desc.dataLength {
+                        let fullRange = desc.dataOffset
+                            ..< desc.dataOffset + desc.dataLength
+                        byKey[TileKey(layer: layer, expert: 0),
+                              default: []].append((url, fullRange))
+                        continue
+                    }
+                    stackedLayerN[layer] = max(stackedLayerN[layer] ?? 0,
+                                               nExperts)
+                    for e in 0..<nExperts {
+                        let off = desc.dataOffset
+                            + UInt64(e) * perExpertBytes
+                        let subrange = off ..< off + perExpertBytes
+                        byKey[TileKey(layer: layer, expert: e),
+                              default: []].append((url, subrange))
+                    }
+                } else {
+                    let fullRange = desc.dataOffset
+                        ..< desc.dataOffset + desc.dataLength
+                    byKey[TileKey(layer: layer, expert: expert),
+                          default: []].append((url, fullRange))
+                }
             }
         }
         var built: [TileKey: ExpertRanges] = [:]
@@ -222,6 +282,7 @@ public final class JangPressMmapTier: @unchecked Sendable {
             )
         }
         self._experts = built
+        self._stackedLayerExpertCount = stackedLayerN
 
         // startCold: mark every routed range DONTNEED right after building.
         // This is the post-MLX-pread reclaim — kernel page cache for these
@@ -260,6 +321,45 @@ public final class JangPressMmapTier: @unchecked Sendable {
             guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
             for part in r.parts {
                 _shards[part.shard]?.advise(.dontNeed, range: part.range)
+            }
+        }
+    }
+
+    /// iter 25: WILLNEED every expert in a layer. Use this when the
+    /// caller has a per-LAYER hint but no per-EXPERT route (e.g. legacy
+    /// code that hadn't been wired into routing yet). For a stacked
+    /// layer of N experts, this issues N madvise calls (one per
+    /// per-expert sub-range) — equivalent IO cost to the pre-iter-25
+    /// whole-tile fault, but exposed here as an explicit choice so the
+    /// per-expert acquire path stays the default.
+    public func acquireLayer(_ layer: Int) {
+        ensureBuilt()
+        if let n = _stackedLayerExpertCount[layer] {
+            acquire(layer: layer, experts: Array(0..<n))
+        } else {
+            // Per-expert layout: enumerate this layer's known experts.
+            let layerExperts = _experts.keys
+                .filter { $0.layer == layer }
+                .map { $0.expert }
+            if !layerExperts.isEmpty {
+                acquire(layer: layer, experts: layerExperts)
+            }
+        }
+    }
+
+    /// iter 25: complement of `acquireLayer` — DONTNEED every expert
+    /// in a layer. Useful for "I know this whole layer is going cold"
+    /// hints (post-prefill pruning, e.g.).
+    public func releaseLayer(_ layer: Int) {
+        ensureBuilt()
+        if let n = _stackedLayerExpertCount[layer] {
+            release(layer: layer, experts: Array(0..<n))
+        } else {
+            let layerExperts = _experts.keys
+                .filter { $0.layer == layer }
+                .map { $0.expert }
+            if !layerExperts.isEmpty {
+                release(layer: layer, experts: layerExperts)
             }
         }
     }
@@ -455,6 +555,22 @@ public final class JangPressMmapTier: @unchecked Sendable {
     /// C, D) where one tensor holds ALL N experts, we synthesize
     /// expert id 0 (the caller acquires/releases the whole stack via
     /// experts=[0] for that layer).
+    /// iter 25: returns true iff the tensor name matches one of the
+    /// STACKED-expert layout patterns (A, C, D, G, L, M). Stacked
+    /// tensors hold all experts of a layer in a single tensor of shape
+    /// `[N_experts, ...]`; the indexer splits these into per-expert
+    /// byte sub-ranges so `acquire(layer, [e])` only WILLNEEDs the
+    /// routed expert's slice.
+    public static func isStackedTensorName(_ name: String) -> Bool {
+        let range = NSRange(name.startIndex..<name.endIndex, in: name)
+        for regex in [switchMlpRegex, jangtqStackedRegex, affineStackedRegex,
+                      switchMlpJangtqRegex, nemotronSwitchMlpRegex,
+                      nemotronSwitchMlpAffineRegex] {
+            if regex.firstMatch(in: name, range: range) != nil { return true }
+        }
+        return false
+    }
+
     public static func parseRoutedExpertName(_ name: String) -> (layer: Int, expert: Int)? {
         let range = NSRange(name.startIndex..<name.endIndex, in: name)
 

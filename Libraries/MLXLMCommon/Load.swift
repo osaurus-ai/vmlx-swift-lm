@@ -37,27 +37,89 @@ public func loadWeights(
         // JANG v1 models use .jang.safetensors files that need uint8->uint32 repacking
         weights = try JangLoader.loadV1Weights(at: modelDirectory)
     } else {
+        // iter 25: collect candidate shard URLs first so we can detect
+        // CORRUPT bundles that contain MULTIPLE concurrent shard sets
+        // (e.g. an incomplete `model-NNNNN-of-00113.safetensors` partial
+        // sitting alongside a complete `model-NNNNN-of-00115.safetensors`
+        // — common after a re-download into a non-empty directory).
+        // Mixed sets overwrite each other during the load loop, leaving
+        // tensor shapes inconsistent and producing nonsense per-layer
+        // quant inferences (the JANG_2L "uint32 vs bfloat16" fatal in
+        // quantized_matmul). Detect and surface explicitly.
+        var allShardURLs: [URL] = []
         let enumerator = FileManager.default.enumerator(
             at: modelDirectory, includingPropertiesForKeys: nil)!
         for case let url as URL in enumerator {
-            if url.pathExtension == "safetensors" {
-                // Skip the JANGTQ sidecar — it contains runtime signs/codebook
-                // arrays that go into JANGTQRuntimeCache, not module params.
-                if url.lastPathComponent == "jangtq_runtime.safetensors" {
-                    continue
-                }
-                let (w, m) = try loadArraysAndMetadata(url: url)
-                for (key, value) in w {
-                    weights[key] = value
-                }
-                if metadata.isEmpty {
-                    metadata = m
-                }
+            guard url.pathExtension == "safetensors" else { continue }
+            if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
+            allShardURLs.append(url)
+        }
+        // Detect mixed `model-NNNNN-of-MMMMM.safetensors` sets: parse
+        // the trailing `MMMMM` total and group by it. >1 distinct total
+        // means we're looking at multiple shard sets in one directory.
+        let shardTotalRegex = try! NSRegularExpression(
+            pattern: #"model-\d+-of-(\d+)\.safetensors$"#)
+        var totalsSeen: [Int: Int] = [:]   // total → count
+        for url in allShardURLs {
+            let n = url.lastPathComponent
+            let nr = NSRange(n.startIndex..<n.endIndex, in: n)
+            if let m = shardTotalRegex.firstMatch(in: n, range: nr),
+               m.numberOfRanges >= 2,
+               let totalRange = Range(m.range(at: 1), in: n),
+               let total = Int(n[totalRange])
+            {
+                totalsSeen[total, default: 0] += 1
+            }
+        }
+        if totalsSeen.count > 1 {
+            // Pick the LARGEST total whose count equals that total
+            // (= the COMPLETE shard set). All others are partials.
+            let completeTotal = totalsSeen.first(where: { $0.key == $0.value })?.key
+                ?? totalsSeen.keys.max()!
+            let summary = totalsSeen
+                .map { "\($0.value)/\($0.key)" }
+                .sorted()
+                .joined(separator: ", ")
+            let completeTag = String(format: "%05d", completeTotal)
+            let warning = "[loadWeights] WARNING: bundle "
+                + "\(modelDirectory.path) contains MULTIPLE concurrent "
+                + "shard sets (\(summary)). Using only "
+                + "`-of-\(completeTag).safetensors`. Delete the partial "
+                + "set(s) to silence this warning.\n"
+            FileHandle.standardError.write(Data(warning.utf8))
+            allShardURLs = allShardURLs.filter {
+                $0.lastPathComponent.hasSuffix(
+                    "-of-\(String(format: "%05d", completeTotal)).safetensors")
+            }
+        }
+        for url in allShardURLs {
+            let (w, m) = try loadArraysAndMetadata(url: url)
+            for (key, value) in w {
+                weights[key] = value
+            }
+            if metadata.isEmpty {
+                metadata = m
             }
         }
     }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
+    //
+    // Cap MetalAllocator's buffer_cache_ during sanitize() to keep the
+    // per-shard `MLX.stacked()` intermediate buffers from ballooning the
+    // pool to 100+ GB on high-shard JANGTQ bundles (MiniMax 117 shards,
+    // Mistral 3.5 78 shards, Holo3 39+). The cache only helps with reuse
+    // during inference, not during a one-shot load — capping it here
+    // forces freed intermediates to actually release back to the OS
+    // instead of accumulating in the pool.
+    //
+    // Restored to the prior limit after sanitize so steady-state
+    // inference performance is unaffected.
+    let priorCacheLimit = MLX.Memory.cacheLimit
+    MLX.Memory.cacheLimit = 1 * 1024 * 1024 * 1024  // 1 GB during load
+    defer {
+        MLX.Memory.cacheLimit = priorCacheLimit
+    }
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     // JANGTQ native: load the signs/codebook sidecar into the runtime cache
