@@ -115,7 +115,15 @@ class MiniMaxSparseMoeBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gates = gate(x)
+        // CRITICAL: upcast x to fp32 before the gate Linear. Mirrors the
+        // Python reference (`mlx_lm/models/minimax.py:178`):
+        //     gates = self.gate(x.astype(mx.float32))
+        //
+        // With 154+ experts, bf16 precision in the gate matmul produces
+        // near-tied scores that cause argpartition top-k to pick different
+        // experts on each run — non-deterministic garbage at T=0.
+        // (2026-05-02 fix; identical to MiniMaxJANGTQ.swift:120 fix.)
+        let gates = gate(x.asType(.float32))
 
         var scores = sigmoid(gates)
         let originalScores = scores
