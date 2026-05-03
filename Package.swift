@@ -156,7 +156,8 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
-            path: "RunBench"
+            path: "RunBench",
+            exclude: ["coherency-matrix.sh", "test_slice.swift.bak"]
         ),
         .testTarget(
             name: "MLXLMTests",
