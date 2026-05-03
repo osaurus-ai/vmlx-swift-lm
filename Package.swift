@@ -34,6 +34,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXDistributedCore",
+            targets: ["MLXDistributedCore"]),
     ],
     dependencies: [
         .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
@@ -107,6 +110,11 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXDistributedCore",
+            dependencies: [],
+            path: "Libraries/MLXDistributedCore"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -168,6 +176,11 @@ let package = Package(
                 "README.md"
             ],
             resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+        ),
+        .testTarget(
+            name: "MLXDistributedCoreTests",
+            dependencies: ["MLXDistributedCore"],
+            path: "Tests/MLXDistributedCoreTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
