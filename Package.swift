@@ -43,6 +43,9 @@ let package = Package(
         .library(
             name: "MLXDistributedJACCL",
             targets: ["MLXDistributedJACCL"]),
+        .library(
+            name: "MLXDistributedTP",
+            targets: ["MLXDistributedTP"]),
     ],
     dependencies: [
         // Bumped 2026-05-02: a21d2af = backport of ml-explore/mlx#3462
@@ -179,6 +182,19 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXDistributedTP",
+            dependencies: [
+                "MLXDistributedCore",
+                "MLXDistributedJACCL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXDistributedTP",
+            exclude: [
+                "README.md"
+            ]
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -256,6 +272,11 @@ let package = Package(
             name: "MLXDistributedJACCLTests",
             dependencies: ["MLXDistributedJACCL"],
             path: "Tests/MLXDistributedJACCLTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedTPTests",
+            dependencies: ["MLXDistributedTP", "MLXDistributedCore"],
+            path: "Tests/MLXDistributedTPTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
