@@ -42,7 +42,16 @@ let package = Package(
             targets: ["MLXDistributedTransport"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
+        // Bumped 2026-05-02: a21d2af = backport of ml-explore/mlx#3462
+        // (retain bound buffers under MTLResourceHazardTrackingModeUntracked
+        // + commandBufferWithUnretainedReferences). Fixes Invalid Resource
+        // crashes at TurboQuant decode B≥16 on M5 Max. Submodule layered:
+        //   7086ba37 backport: Retain bound buffers (#3462)
+        //   96aa27a5 trace(metal): mx::malloc tracer
+        //   f58e52da trace(custom_kernel): clear_library trace
+        //   fa3a9616 fix(metal): keep MTLComputePipelineState alive
+        // Env knob MLX_METAL_RETAIN_BOUND_BUFFERS=0 reverts to old behaviour.
+        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "a21d2afd96912f992a03f5cae3216b065f97929a"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         // swift-jinja: pinned to osaurus-ai fork at 58d21aa which
         // contains a 1-line parser fix lifting the for-loop iterable
