@@ -134,6 +134,15 @@ private let kFusedSwiGLUSource = """
     uint out_features = meta[2];
     uint packed_cols = meta[3];
     uint bits = meta[4];
+    // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    // `meta[5]` carries the SwiGLU clamp magnitude × 1000 as uint, so
+    //   swiglu_limit = float(meta[5]) / 1000.0
+    // A value of 0 disables the clamp (ordinary SwiGLU). DeepSeek-V4
+    // sets this to 10000 → limit = 10.0, matching the codex_dsv4_fixkit
+    // reference. Other models pass 0 → no clamp → byte-identical to the
+    // pre-2026-05-04 kernel output.
+    uint swiglu_limit_q1000 = meta[5];
+    float swiglu_limit = static_cast<float>(swiglu_limit_q1000) * 0.001f;
 
     if (out_idx_0 >= out_features) return;
 
@@ -212,6 +221,18 @@ private let kFusedSwiGLUSource = """
             float nu = static_cast<float>(norms_up[expert * out_features + oi]);
             float gv = acc_g[o] * ng;
             float uv = acc_u[o] * nu;
+            // 2026-05-04: optional DSV4-style limited SwiGLU clamp.
+            //   gate = min(gate, +limit)        (one-sided)
+            //   up   = clamp(up,  -limit, +limit) (two-sided)
+            //   y    = silu(gate) * up
+            // When `swiglu_limit == 0` (every non-DSV4 caller), this
+            // collapses to the original ordinary SwiGLU expression
+            // exactly. See codex_dsv4_fixkit/scripts/runtime_dsv4_fixed.py
+            // and jang_tools/dsv4/mlx_model.py:_dsv4_swiglu.
+            if (swiglu_limit > 0.0f) {
+                gv = metal::min(gv, swiglu_limit);
+                uv = metal::max(metal::min(uv, swiglu_limit), -swiglu_limit);
+            }
             out_act[base_off + oi] = (gv / (1.0f + metal::fast::exp(-gv))) * uv;
         }
     }
@@ -548,14 +569,26 @@ public enum JANGTQKernels {
         codebook: MLXArray,
         rhsIndices: MLXArray,
         batchTokens: Int, K: Int,
-        inFeatures: Int, outFeatures: Int, bits: Int = 2
+        inFeatures: Int, outFeatures: Int, bits: Int = 2,
+        // 2026-05-04 (DSV4 SWA/CSA/HSA correctness):
+        // SwiGLU clamp magnitude. 0.0 (default) preserves the historical
+        // ordinary-SwiGLU output bit-for-bit. DSV4 callers must pass 10.0
+        // — that activates `silu(min(gate, 10)) * clip(up, -10, 10)` per
+        // jang_tools/dsv4/mlx_model.py and codex_dsv4_fixkit/scripts/
+        // runtime_dsv4_fixed.py. The kernel encodes this as
+        // `meta[5] = round(swigluLimit * 1000)` (uint) and divides by
+        // 1000 inside Metal — small enough to fit in a uint32 for the
+        // realistic range while being ~1e-3 precise.
+        swigluLimit: Float = 0.0
     ) -> MLXArray {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         let nDispatches = batchTokens * K
+        let limitQ1000 = UInt32(max(0, Int((swigluLimit * 1000.0).rounded())))
         let meta = MLXArray([
             UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
+            limitQ1000,
         ])
         let opt = 10
         let outGroups = (outFeatures + opt - 1) / opt

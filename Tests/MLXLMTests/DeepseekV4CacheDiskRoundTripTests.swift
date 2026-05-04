@@ -3,13 +3,15 @@
 //
 // L2 disk round-trip tests for DSV4 per-layer cache types.
 //
-// Verifies:
-//   - plain `RotatingKVCache` (default DSV4 path) encodes via
+// Verifies (post-2026-05-04 pure-long-context pass):
+//   - plain `RotatingKVCache` (cr=0 layers only) encodes via
 //     `TQDiskSerializer` and decodes via `restoreRotatingLayer`
-//   - `DeepseekV4Cache` (DSV4_LONG_CTX=1 opt-in path) conforms to
-//     `RotatingKVCacheWrapper` so its inner rotating state round-trips
-//     transparently; compressor/indexer buffer state is ephemeral
-//     and correctly NOT persisted (recomputable from prompt tokens)
+//   - `DeepseekV4Cache` (every cr>0 layer — there is no fallback
+//     anymore) conforms to `RotatingKVCacheWrapper` so its inner
+//     rotating state round-trips, AND its compressor + indexer pool
+//     tensors plus per-branch incomplete-window buffers ROUND-TRIP
+//     through `state` / `metaState` so multi-turn prefix-cache reuse
+//     doesn't have to re-derive the pool from prompt tokens every turn.
 //   - A mixed per-layer array of both types encodes and restores
 //     without kind-tag drift.
 
@@ -61,57 +63,68 @@ struct DeepseekV4CacheDiskRoundTripTests {
             "offset must survive disk round-trip")
     }
 
-    @Test("DeepseekV4Cache disk round-trip: rotating state persists, compressor cleared")
+    @Test("DeepseekV4Cache disk round-trip: rotating + pool + buffers all survive")
     func deepseekV4CacheRoundTrip() {
-        let v4 = DeepseekV4Cache(slidingWindow: 16)
+        let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
         Self.fillRotating(v4.local)
-        // Stash ephemeral buffer state via the internal API — prove it
-        // does NOT survive the round-trip (documented contract).
-        let dummyBuf = MLXArray.ones([1, 5, 8])
-        v4.setBuffers(.compressor, kv: dummyBuf, gate: dummyBuf)
-        v4.setPooled(.compressor, value: dummyBuf)
+        // Populate pool + per-branch buffer state. New (post-2026-05-04)
+        // contract: ALL of this round-trips so multi-turn chat doesn't
+        // re-derive the pool from prompt tokens every turn.
+        let pool = MLXArray.ones([1, 5, 8]) * 7.0
+        let bufKV = MLXArray.ones([1, 3, 8])
+        let bufGate = MLXArray.ones([1, 3, 8]) * 2.0
+        v4.setPooled(.compressor, value: pool)
+        v4.setBuffers(.compressor, kv: bufKV, gate: bufGate)
+        v4.setPooled(.indexer, value: pool * 3.0)
 
-        let originalLocalState = v4.local.state
         let originalOffset = v4.offset
-        let originalMeta = v4.local.metaState
 
-        // Encode — should go through the RotatingKVCacheWrapper path.
+        // Encode — DSV4 path now uses dedicated `dsv4_*` keys (not the
+        // `rot_*` rotating-only keys) so the pool tensors can round-trip.
         let encoded = TQDiskSerializer.serialize(cache: [v4])
-        #expect(encoded["rot_0_keys"] != nil,
-            "DeepseekV4Cache must serialize as rotating via wrapper protocol")
-        #expect(encoded["rot_0_values"] != nil)
+        #expect(encoded["dsv4_0_keys"] != nil,
+            "DeepseekV4Cache must serialize via the dsv4 layer kind")
+        #expect(encoded["dsv4_0_values"] != nil)
+        #expect(encoded["__dsv4_0_meta__"] != nil,
+            "dsv4 layer must persist 7-element meta tuple")
+        #expect(encoded["dsv4_0_pool_comp"] != nil,
+            "compressor pool must be in the encoded dict")
+        #expect(encoded["dsv4_0_pool_idx"] != nil,
+            "indexer pool must be in the encoded dict")
 
         // Decode into a fresh v4 cache.
-        let target = DeepseekV4Cache(slidingWindow: 16)
+        let target = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
         _ = restoreFromDiskArrays(encoded, into: [target])
         #expect(target.offset == originalOffset,
             "inner offset must survive round-trip")
-        #expect(target.local.metaState == originalMeta,
-            "inner rotating metaState must survive")
-        #expect(target.local.state.count == originalLocalState.count)
-        // Compressor/Indexer buffer state must be CLEAR on the restored
-        // cache (ephemeral — not serialized).
-        let (bufKV, bufGate) = target.getBuffers(.compressor)
-        #expect(bufKV == nil && bufGate == nil,
-            "compressor buffers must be nil on restore — they recompute on next prefill")
-        #expect(target.getPooled(.compressor) == nil)
+        // Pool state survives (the new contract).
+        let restoredPool = target.getPooled(.compressor)
+        #expect(restoredPool != nil,
+            "compressor pool must survive disk round-trip (multi-turn prefix-cache reuse)")
+        let (rbufKV, rbufGate) = target.getBuffers(.compressor)
+        #expect(rbufKV != nil && rbufGate != nil,
+            "incomplete-window buffer state must survive disk round-trip")
+        #expect(target.getPooled(.indexer) != nil,
+            "indexer pool must survive disk round-trip")
     }
 
     @Test("Mixed per-layer array: RotatingKVCache + DeepseekV4Cache round-trip together")
     func mixedPerLayerRoundTrip() {
         let layer0 = RotatingKVCache(maxSize: 16, keep: 0)
         Self.fillRotating(layer0)
-        let layer1 = DeepseekV4Cache(slidingWindow: 16)
+        let layer1 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
         Self.fillRotating(layer1.local)
 
         let caches: [any KVCache] = [layer0, layer1]
         let encoded = TQDiskSerializer.serialize(cache: caches)
-        #expect(encoded["rot_0_keys"] != nil)
-        #expect(encoded["rot_1_keys"] != nil)
+        #expect(encoded["rot_0_keys"] != nil,
+            "layer 0 (plain RotatingKVCache) keeps the rot_* keys")
+        #expect(encoded["dsv4_1_keys"] != nil,
+            "layer 1 (DeepseekV4Cache) goes through the dsv4_* keys")
 
         let target: [any KVCache] = [
             RotatingKVCache(maxSize: 16, keep: 0),
-            DeepseekV4Cache(slidingWindow: 16),
+            DeepseekV4Cache(slidingWindow: 16, compressRatio: 4),
         ]
         _ = restoreFromDiskArrays(encoded, into: target)
         #expect(target[0].offset == layer0.offset)
@@ -120,7 +133,7 @@ struct DeepseekV4CacheDiskRoundTripTests {
 
     @Test("DeepseekV4Cache conforms to RotatingKVCacheWrapper protocol")
     func wrapperProtocolConformance() {
-        let v4 = DeepseekV4Cache(slidingWindow: 16)
+        let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
         let wrapper: RotatingKVCacheWrapper? = v4
         #expect(wrapper != nil,
             "DeepseekV4Cache must conform to RotatingKVCacheWrapper")

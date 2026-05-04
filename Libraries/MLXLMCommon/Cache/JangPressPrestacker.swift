@@ -20,7 +20,9 @@ import Glibc
 
 public enum JangPressPrestacker {
     private static let version = "v2"
+    private static let alignmentVersion = "align-v1"
     private static let outputName = "jangpress-prestacked.safetensors"
+    private static let alignmentManifestName = "jangpress-align-manifest.json"
 
     public static func prepareBundleIfNeeded(
         originalURL: URL,
@@ -29,50 +31,70 @@ public enum JangPressPrestacker {
         guard enabled else { return originalURL }
 
         let env = ProcessInfo.processInfo.environment
-        if env["JANGPRESS_PRESTACK"] == "0" {
+        let prestackDisabled = env["JANGPRESS_PRESTACK"] == "0"
+        if prestackDisabled && env["JANGPRESS_ALIGN_SAFETENSORS"] == "0" {
             return originalURL
         }
 
         let originalURL = originalURL.resolvingSymlinksInPath()
         let sidecar = originalURL.appendingPathComponent("jangtq_runtime.safetensors")
-        guard FileManager.default.fileExists(atPath: sidecar.path) else {
-            return originalURL
+        let hasJANGTQSidecar = FileManager.default.fileExists(atPath: sidecar.path)
+        var preparedURL = originalURL
+
+        if hasJANGTQSidecar && !prestackDisabled {
+            do {
+                let scan = try scanBundle(originalURL)
+                guard !scan.groups.isEmpty else {
+                    return try prepareAlignedBundleIfNeeded(
+                        originalURL,
+                        originalIsJANGTQ: true,
+                        env: env)
+                }
+
+                let cacheURL = try cacheDirectory(for: originalURL, files: scan.files)
+                try ensureOverlayLinks(from: originalURL, to: cacheURL)
+                let outputURL = cacheURL.appendingPathComponent(outputName)
+                let manifestURL = cacheURL.appendingPathComponent("jangpress-prestack-manifest.json")
+
+                if FileManager.default.fileExists(atPath: outputURL.path),
+                   FileManager.default.fileExists(atPath: manifestURL.path)
+                {
+                    log("using existing prestacked overlay \(cacheURL.path)")
+                    preparedURL = cacheURL
+                } else {
+                    try FileManager.default.createDirectory(
+                        at: cacheURL, withIntermediateDirectories: true)
+                    let plan = try buildWritePlan(from: scan.groups)
+                    guard !plan.isEmpty else { return originalURL }
+                    try writeSafetensors(plan: plan, to: outputURL)
+                    try writeManifest(plan: plan, source: originalURL, to: manifestURL)
+                    let totalBytes = plan.reduce(UInt64(0)) { $0 + $1.totalBytes }
+                    log(String(format:
+                        "wrote %d prestacked routed tensors (%.1f GB) into %@",
+                        plan.count, Double(totalBytes) / 1_073_741_824.0,
+                        outputURL.path))
+                    preparedURL = cacheURL
+                }
+            } catch {
+                if env["JANGPRESS_PRESTACK_STRICT"] == "1" {
+                    throw error
+                }
+                log("prestack failed, falling back to original bundle: \(error)")
+                preparedURL = originalURL
+            }
         }
 
         do {
-            let scan = try scanBundle(originalURL)
-            guard !scan.groups.isEmpty else { return originalURL }
-
-            let cacheURL = try cacheDirectory(for: originalURL, files: scan.files)
-            try ensureOverlayLinks(from: originalURL, to: cacheURL)
-            let outputURL = cacheURL.appendingPathComponent(outputName)
-            let manifestURL = cacheURL.appendingPathComponent("jangpress-prestack-manifest.json")
-
-            if FileManager.default.fileExists(atPath: outputURL.path),
-               FileManager.default.fileExists(atPath: manifestURL.path)
-            {
-                log("using existing prestacked overlay \(cacheURL.path)")
-                return cacheURL
-            }
-
-            try FileManager.default.createDirectory(
-                at: cacheURL, withIntermediateDirectories: true)
-            let plan = try buildWritePlan(from: scan.groups)
-            guard !plan.isEmpty else { return originalURL }
-            try writeSafetensors(plan: plan, to: outputURL)
-            try writeManifest(plan: plan, source: originalURL, to: manifestURL)
-            let totalBytes = plan.reduce(UInt64(0)) { $0 + $1.totalBytes }
-            log(String(format:
-                "wrote %d prestacked routed tensors (%.1f GB) into %@",
-                plan.count, Double(totalBytes) / 1_073_741_824.0,
-                outputURL.path))
-            return cacheURL
+            return try prepareAlignedBundleIfNeeded(
+                preparedURL,
+                originalIsJANGTQ: hasJANGTQSidecar,
+                env: env)
         } catch {
             if env["JANGPRESS_PRESTACK_STRICT"] == "1" {
                 throw error
             }
-            log("prestack failed, falling back to original bundle: \(error)")
-            return originalURL
+            log("safetensors alignment failed, falling back to \(preparedURL.path): \(error)")
+            return preparedURL
         }
     }
 
@@ -183,6 +205,7 @@ public enum JangPressPrestacker {
 
     private struct HeaderRead {
         var dataBase: UInt64
+        var metadata: [String: Any]?
         var tensors: [String: [String: Any]]
     }
 
@@ -207,6 +230,7 @@ public enum JangPressPrestacker {
             throw NSError(domain: "JangPressPrestacker", code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "invalid safetensors JSON: \(url.path)"])
         }
+        let metadata = dict["__metadata__"] as? [String: Any]
         var tensors: [String: [String: Any]] = [:]
         for (key, value) in dict where key != "__metadata__" {
             guard let item = value as? [String: Any] else { continue }
@@ -219,7 +243,7 @@ public enum JangPressPrestacker {
             }
             tensors[key] = normalized
         }
-        return HeaderRead(dataBase: 8 + headerLength, tensors: tensors)
+        return HeaderRead(dataBase: 8 + headerLength, metadata: metadata, tensors: tensors)
     }
 
     private static func buildWritePlan(from groups: [String: TensorGroup]) throws -> [WriteTensor] {
@@ -384,6 +408,409 @@ public enum JangPressPrestacker {
         ]
         let data = try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: [.atomic])
+    }
+
+    // MARK: - Generic safetensors alignment overlay
+
+    private struct AlignmentTensor {
+        var key: String
+        var dtype: String
+        var shape: [Int]
+        var sourceOffset: UInt64
+        var byteLength: UInt64
+        var dataOffset: UInt64 = 0
+    }
+
+    private struct AlignmentFilePlan {
+        var source: SourceFile
+        var metadata: [String: Any]?
+        var tensors: [AlignmentTensor]
+        var needsAlignment: Bool
+        var containsRoutedTensor: Bool
+
+        var payloadBytes: UInt64 {
+            tensors.reduce(UInt64(0)) { $0 + $1.byteLength }
+        }
+    }
+
+    private struct AlignmentScan {
+        var files: [SourceFile]
+        var plans: [AlignmentFilePlan]
+
+        var needsAlignment: Bool {
+            plans.contains { $0.needsAlignment }
+        }
+
+        var containsRoutedTensor: Bool {
+            plans.contains { $0.containsRoutedTensor }
+        }
+
+        var rewriteBytes: UInt64 {
+            plans.filter(\.needsAlignment).reduce(UInt64(0)) {
+                $0 + $1.payloadBytes
+            }
+        }
+    }
+
+    private static func prepareAlignedBundleIfNeeded(
+        _ directory: URL,
+        originalIsJANGTQ: Bool,
+        env: [String: String]
+    ) throws -> URL {
+        guard env["JANGPRESS_ALIGN_SAFETENSORS"] != "0" else {
+            return directory
+        }
+        // JANGTQ bundles already use the prestack overlay path. Rewriting
+        // every source shard for those models can double very large cache
+        // footprints, so keep it opt-in unless a focused investigation
+        // requests it.
+        if originalIsJANGTQ && env["JANGPRESS_ALIGN_JANGTQ"] != "1" {
+            return directory
+        }
+
+        let scan = try scanAlignmentBundle(directory)
+        guard scan.containsRoutedTensor, scan.needsAlignment else {
+            return directory
+        }
+
+        let cacheURL = try alignmentCacheDirectory(for: directory, files: scan.files)
+        let manifestURL = cacheURL.appendingPathComponent(alignmentManifestName)
+        if FileManager.default.fileExists(atPath: manifestURL.path) {
+            log("using existing aligned safetensors overlay \(cacheURL.path)")
+            return cacheURL
+        }
+
+        try FileManager.default.createDirectory(
+            at: cacheURL, withIntermediateDirectories: true)
+        let rewriteNames = Set(scan.plans.filter(\.needsAlignment).map {
+            $0.source.url.lastPathComponent
+        })
+        try ensureAlignedOverlayLinks(from: directory, to: cacheURL, rewriting: rewriteNames)
+
+        var rewritten = 0
+        for plan in scan.plans where plan.needsAlignment {
+            let outputURL = cacheURL.appendingPathComponent(plan.source.url.lastPathComponent)
+            try writeAlignedSafetensors(plan: plan, to: outputURL)
+            rewritten += 1
+        }
+        try writeAlignmentManifest(
+            scan: scan,
+            rewrittenCount: rewritten,
+            source: directory,
+            to: manifestURL)
+        log(String(format:
+            "wrote aligned safetensors overlay: files=%d payload=%.1f GB into %@",
+            rewritten,
+            Double(scan.rewriteBytes) / 1_073_741_824.0,
+            cacheURL.path))
+        return cacheURL
+    }
+
+    private static func scanAlignmentBundle(_ directory: URL) throws -> AlignmentScan {
+        let fm = FileManager.default
+        let entries = try fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles])
+
+        var files: [SourceFile] = []
+        var plans: [AlignmentFilePlan] = []
+
+        for url in entries where url.pathExtension == "safetensors" {
+            let values = try url.resourceValues(
+                forKeys: [.fileSizeKey, .contentModificationDateKey])
+            let source = SourceFile(
+                url: url,
+                size: UInt64(values.fileSize ?? 0),
+                modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0)
+            files.append(source)
+
+            let header = try readSafetensorsHeader(url)
+            var tensors: [AlignmentTensor] = []
+            var needsAlignment = false
+            var containsRouted = false
+            for (key, value) in header.tensors {
+                guard let dtype = value["dtype"] as? String,
+                      let shape = value["shape"] as? [Int],
+                      let offsets = value["data_offsets"] as? [UInt64],
+                      offsets.count == 2,
+                      offsets[1] >= offsets[0]
+                else { continue }
+
+                let sourceOffset = header.dataBase + offsets[0]
+                let byteLength = offsets[1] - offsets[0]
+                let alignment = UInt64(dtypeAlignment(dtype))
+                if alignment > 1, sourceOffset % alignment != 0 {
+                    needsAlignment = true
+                }
+                if isRoutedTensorKey(key) {
+                    containsRouted = true
+                }
+                tensors.append(AlignmentTensor(
+                    key: key,
+                    dtype: dtype,
+                    shape: shape,
+                    sourceOffset: sourceOffset,
+                    byteLength: byteLength))
+            }
+
+            plans.append(AlignmentFilePlan(
+                source: source,
+                metadata: header.metadata,
+                tensors: tensors.sorted { lhs, rhs in
+                    if lhs.sourceOffset == rhs.sourceOffset {
+                        return lhs.key < rhs.key
+                    }
+                    return lhs.sourceOffset < rhs.sourceOffset
+                },
+                needsAlignment: needsAlignment,
+                containsRoutedTensor: containsRouted))
+        }
+
+        return AlignmentScan(
+            files: files.sorted { $0.url.path < $1.url.path },
+            plans: plans.sorted { $0.source.url.path < $1.source.url.path })
+    }
+
+    private static func writeAlignedSafetensors(
+        plan: AlignmentFilePlan,
+        to outputURL: URL
+    ) throws {
+        let tmpURL = outputURL.deletingLastPathComponent()
+            .appendingPathComponent(".\(outputURL.lastPathComponent).tmp-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: tmpURL.path, contents: nil)
+
+        let outFD = systemOpen(tmpURL.path, O_WRONLY | O_TRUNC)
+        guard outFD >= 0 else {
+            throw posixError("open", path: tmpURL.path)
+        }
+        defer { _ = systemClose(outFD) }
+
+        let (headerData, arranged) = try buildAlignedHeader(plan: plan)
+        var headerLength = UInt64(headerData.count).littleEndian
+        try withUnsafeBytes(of: &headerLength) { raw in
+            try writeAll(fd: outFD, raw.baseAddress!, raw.count)
+        }
+        try headerData.withUnsafeBytes { raw in
+            try writeAll(fd: outFD, raw.baseAddress!, raw.count)
+        }
+
+        let inFD = systemOpen(plan.source.url.path, O_RDONLY)
+        guard inFD >= 0 else {
+            throw posixError("open", path: plan.source.url.path)
+        }
+        defer { _ = systemClose(inFD) }
+
+        var currentOffset: UInt64 = 0
+        for tensor in arranged {
+            if tensor.dataOffset > currentOffset {
+                try writeZeroPadding(
+                    fd: outFD,
+                    count: tensor.dataOffset - currentOffset)
+                currentOffset = tensor.dataOffset
+            }
+            try copyByteRange(
+                inFD: inFD,
+                sourcePath: plan.source.url.path,
+                sourceOffset: tensor.sourceOffset,
+                byteLength: tensor.byteLength,
+                outFD: outFD)
+            currentOffset += tensor.byteLength
+        }
+
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.removeItem(at: outputURL)
+        }
+        try FileManager.default.moveItem(at: tmpURL, to: outputURL)
+    }
+
+    private static func buildAlignedHeader(
+        plan: AlignmentFilePlan
+    ) throws -> (Data, [AlignmentTensor]) {
+        var dataBase: UInt64 = 4096
+        var arranged = plan.tensors
+        var headerData = Data()
+
+        for _ in 0..<8 {
+            var dataOffset: UInt64 = 0
+            for i in arranged.indices {
+                let alignment = UInt64(dtypeAlignment(arranged[i].dtype))
+                if alignment > 1 {
+                    let absoluteMisalignment = (dataBase + dataOffset) % alignment
+                    if absoluteMisalignment != 0 {
+                        dataOffset += alignment - absoluteMisalignment
+                    }
+                }
+                arranged[i].dataOffset = dataOffset
+                dataOffset += arranged[i].byteLength
+            }
+
+            var header: [String: Any] = [:]
+            if let metadata = plan.metadata {
+                header["__metadata__"] = metadata
+            }
+            for tensor in arranged {
+                header[tensor.key] = [
+                    "dtype": tensor.dtype,
+                    "shape": tensor.shape,
+                    "data_offsets": [
+                        tensor.dataOffset,
+                        tensor.dataOffset + tensor.byteLength,
+                    ],
+                ]
+            }
+
+            headerData = try JSONSerialization.data(
+                withJSONObject: header,
+                options: [.sortedKeys])
+            let dataBaseAlignment = 4096
+            let misalignment = (8 + headerData.count) % dataBaseAlignment
+            if misalignment != 0 {
+                headerData.append(Data(
+                    repeating: 0x20,
+                    count: dataBaseAlignment - misalignment))
+            }
+            let newDataBase = UInt64(8 + headerData.count)
+            if newDataBase == dataBase {
+                return (headerData, arranged)
+            }
+            dataBase = newDataBase
+        }
+
+        return (headerData, arranged)
+    }
+
+    private static func copyByteRange(
+        inFD: Int32,
+        sourcePath: String,
+        sourceOffset: UInt64,
+        byteLength: UInt64,
+        outFD: Int32
+    ) throws {
+        let bufferSize = 4 * 1024 * 1024
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 4096)
+        defer { buffer.deallocate() }
+
+        var remaining = byteLength
+        var offset = sourceOffset
+        while remaining > 0 {
+            let toRead = min(UInt64(bufferSize), remaining)
+            let n = systemPread(inFD, buffer, Int(toRead), Int64(offset))
+            guard n > 0 else {
+                throw posixError("pread", path: sourcePath)
+            }
+            try writeAll(fd: outFD, buffer, n)
+            remaining -= UInt64(n)
+            offset += UInt64(n)
+        }
+    }
+
+    private static func writeZeroPadding(fd: Int32, count: UInt64) throws {
+        guard count > 0 else { return }
+        let bufferSize = 4096
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 4096)
+        defer { buffer.deallocate() }
+        buffer.initializeMemory(as: UInt8.self, repeating: 0, count: bufferSize)
+        var remaining = count
+        while remaining > 0 {
+            let n = min(UInt64(bufferSize), remaining)
+            try writeAll(fd: fd, buffer, Int(n))
+            remaining -= n
+        }
+    }
+
+    private static func ensureAlignedOverlayLinks(
+        from source: URL,
+        to cache: URL,
+        rewriting: Set<String>
+    ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: cache, withIntermediateDirectories: true)
+        let entries = try fm.contentsOfDirectory(
+            at: source, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        for entry in entries {
+            let name = entry.lastPathComponent
+            if rewriting.contains(name) || name == alignmentManifestName {
+                continue
+            }
+            let dst = cache.appendingPathComponent(name)
+            if fm.fileExists(atPath: dst.path) { continue }
+            try fm.createSymbolicLink(at: dst, withDestinationURL: entry)
+        }
+    }
+
+    private static func writeAlignmentManifest(
+        scan: AlignmentScan,
+        rewrittenCount: Int,
+        source: URL,
+        to url: URL
+    ) throws {
+        let object: [String: Any] = [
+            "version": alignmentVersion,
+            "source": source.path,
+            "file_count": scan.files.count,
+            "rewritten_file_count": rewrittenCount,
+            "payload_bytes": scan.rewriteBytes,
+            "created": Date().timeIntervalSince1970,
+        ]
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private static func alignmentCacheDirectory(
+        for originalURL: URL,
+        files: [SourceFile]
+    ) throws -> URL {
+        let env = ProcessInfo.processInfo.environment
+        let root: URL
+        if let override = env["JANGPRESS_ALIGN_CACHE_DIR"] ?? env["JANGPRESS_PRESTACK_CACHE_DIR"],
+           !override.isEmpty
+        {
+            root = URL(fileURLWithPath: override)
+        } else {
+            root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("vmlx-swift-lm", isDirectory: true)
+                .appendingPathComponent("jangpress-align", isDirectory: true)
+        }
+        let hash = stableHash(([alignmentVersion, originalURL.path] + files.map {
+            "\($0.url.lastPathComponent):\($0.size):\($0.modified)"
+        }).joined(separator: "|"))
+        return root
+            .appendingPathComponent(originalURL.lastPathComponent + "-" + hash, isDirectory: true)
+    }
+
+    private static func dtypeAlignment(_ dtype: String) -> Int {
+        switch dtype {
+        case "F64", "I64", "U64", "C64": return 8
+        case "F32", "I32", "U32": return 4
+        case "F16", "BF16", "I16", "U16": return 2
+        default: return 1
+        }
+    }
+
+    private static func isRoutedTensorKey(_ key: String) -> Bool {
+        if key.hasSuffix(".tq_bits") {
+            return false
+        }
+        let payloadSuffixes = [
+            ".weight", ".scales", ".biases", ".tq_packed", ".tq_norms",
+        ]
+        guard payloadSuffixes.contains(where: { key.contains($0) }) else {
+            return false
+        }
+        let routedMarkers = [
+            ".mlp.switch_mlp.",
+            ".mlp.experts.",
+            ".block_sparse_moe.switch_mlp.",
+            ".block_sparse_moe.experts.",
+            ".ffn.switch_mlp.",
+            ".ffn.experts.",
+            ".mixer.switch_mlp.",
+            ".mixer.experts.",
+        ]
+        return routedMarkers.contains { key.contains($0) }
     }
 
     private struct KeyMatch {

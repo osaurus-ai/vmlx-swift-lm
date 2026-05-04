@@ -110,16 +110,26 @@ public class TurboQuantSwitchGLU: Module {
     public let numExperts: Int
     public let bits: Int
     public let mxtqSeed: Int
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// SwiGLU clamp magnitude. `0.0` (default) preserves ordinary SwiGLU
+    /// `silu(gate) * up` for every non-DSV4 caller — output is bit-identical
+    /// to the pre-2026-05-04 path. DSV4 sets this to `10.0` to activate the
+    /// limited-SwiGLU expression `silu(min(gate, 10)) * clip(up, -10, 10)`
+    /// the Python `_dsv4_swiglu` reference uses (mlx_model.py L1090) and
+    /// the codex_dsv4_fixkit Python runtime patch installs.
+    public let swigluLimit: Float
 
     public init(
         inputDims: Int, hiddenDims: Int, numExperts: Int,
-        bits: Int = 2, seed: Int = 42
+        bits: Int = 2, seed: Int = 42,
+        swigluLimit: Float = 0.0
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.bits = bits
         self.mxtqSeed = seed
+        self.swigluLimit = swigluLimit
         self._gateProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
             numExperts: numExperts, bits: bits, seed: seed
@@ -165,13 +175,17 @@ public class TurboQuantSwitchGLU: Module {
         // 2. Fused gate+up+SwiGLU — broadcast mode: K_meta = K so the kernel
         //    can compute token_idx = dispatch_idx / K and k_idx = dispatch_idx % K.
         //    Total dispatches = batchTokens * K.
+        //    `swigluLimit > 0` activates the DSV4 limited-SwiGLU clamp inside
+        //    the kernel; `0.0` (default for every non-DSV4 model) keeps the
+        //    historical ordinary `silu(gate) * up` expression bit-for-bit.
         let xAct = JANGTQKernels.fusedGateUpSwiGLU(
             xRot: xRot,
             packedGate: gateProj.packed, normsGate: gateProj.norms,
             packedUp: upProj.packed, normsUp: upProj.norms,
             codebook: cbGate, rhsIndices: idxFlat,
             batchTokens: batchTokens, K: K,
-            inFeatures: inputDims, outFeatures: hiddenDims, bits: bits
+            inFeatures: inputDims, outFeatures: hiddenDims, bits: bits,
+            swigluLimit: swigluLimit
         )
         // xAct shape: (batchTokens * K, hidden_dims)
 

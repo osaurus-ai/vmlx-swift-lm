@@ -568,7 +568,8 @@ public func loadModel(
         && resolvedOptions.backend == .mmap
     let context = try await withMmapSafetensorsEnv(
         enabled: loadConfiguration.useMmapSafetensors,
-        tensorBuffers: useTensorMmapBuffers
+        tensorBuffers: useTensorMmapBuffers,
+        startColdPercent: useTensorMmapBuffers ? resolvedOptions.compressPct : nil
     ) {
         try await load {
             try await $0.load(from: loadDirectory, using: tokenizerLoader)
@@ -632,21 +633,35 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
 private func withMmapSafetensorsEnv<R>(
     enabled: Bool,
     tensorBuffers: Bool,
+    startColdPercent: Int?,
     _ body: () async throws -> R
 ) async throws -> R {
 #if canImport(Darwin) || canImport(Glibc)
     let mmapKey = "MLX_SAFETENSORS_MMAP"
     let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
+    let startColdKey = "MLX_SAFETENSORS_MMAP_START_COLD"
+    let coldPctKey = "MLX_SAFETENSORS_MMAP_COLD_PCT"
     let priorMmap = getenv(mmapKey).map { String(cString: $0) }
     let priorTensor = getenv(tensorKey).map { String(cString: $0) }
+    let priorStartCold = getenv(startColdKey).map { String(cString: $0) }
+    let priorColdPct = getenv(coldPctKey).map { String(cString: $0) }
     if enabled {
         setenv(mmapKey, "1", 1)
         if tensorBuffers {
             setenv(tensorKey, "1", 1)
         }
+        if let startColdPercent, startColdPercent > 0 {
+            setenv(startColdKey, "1", 1)
+            setenv(
+                coldPctKey,
+                String(max(0, min(100, startColdPercent))),
+                1)
+        }
     } else {
         unsetenv(mmapKey)
         unsetenv(tensorKey)
+        unsetenv(startColdKey)
+        unsetenv(coldPctKey)
     }
     defer {
         if let priorMmap {
@@ -658,6 +673,16 @@ private func withMmapSafetensorsEnv<R>(
             setenv(tensorKey, priorTensor, 1)
         } else {
             unsetenv(tensorKey)
+        }
+        if let priorStartCold {
+            setenv(startColdKey, priorStartCold, 1)
+        } else {
+            unsetenv(startColdKey)
+        }
+        if let priorColdPct {
+            setenv(coldPctKey, priorColdPct, 1)
+        } else {
+            unsetenv(coldPctKey)
         }
     }
 #endif

@@ -107,6 +107,31 @@ public protocol RotatingKVCacheWrapper: KVCache {
     var rotating: RotatingKVCache { get }
 }
 
+/// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+/// A composite cache that wraps a `RotatingKVCache` for the local sliding
+/// window AND maintains compressor + indexer pool tensors plus per-branch
+/// incomplete-window buffer state. The disk-cache subsystem uses this
+/// abstraction to persist the full hybrid cache without depending on the
+/// concrete `DeepseekV4Cache` type (which lives in MLXLLM).
+public enum HybridPoolBranch: Sendable {
+    case compressor
+    case indexer
+}
+
+public protocol HybridPoolCache: RotatingKVCacheWrapper {
+    /// Required identity of the associated layer's CSA/HSA chunking.
+    var compressRatio: Int { get }
+    var slidingWindow: Int { get }
+
+    /// Pool tensors — `nil` when no rows have been emitted yet.
+    func hybridPool(branch: HybridPoolBranch) -> MLXArray?
+    func setHybridPool(branch: HybridPoolBranch, value: MLXArray?)
+
+    /// Per-branch incomplete-window buffer state.
+    func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?)
+    func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?)
+}
+
 public protocol QuantizedKVCacheProtocol: KVCache {
     /// The quantization group size used
     var groupSize: Int { get }

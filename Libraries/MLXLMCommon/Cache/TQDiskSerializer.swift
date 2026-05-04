@@ -99,6 +99,13 @@ public enum TQDiskSerializer {
         /// wrap-around context. Added 2026-04-15 — closes the central skip
         /// in CacheCoordinator.swift:424.
         case rotating = 6
+        /// `DeepseekV4Cache` — RotatingKVCache window AND compressor +
+        /// indexer pool tensors AND per-branch incomplete-window buffer
+        /// state. Added 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass)
+        /// so multi-turn `/v1/chat/completions` prefix-cache reuse can
+        /// keep the long-context summary across turns instead of
+        /// re-deriving it from prompt tokens every turn.
+        case deepseekV4 = 7
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -196,12 +203,20 @@ public enum TQDiskSerializer {
             } else if let mamba = layer as? MambaCache {
                 serializeMambaLayer(mamba, index: i, into: &result)
                 result[kindKey(for: i)] = kindArray(.mamba)
+            } else if let hybrid = layer as? HybridPoolCache {
+                // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+                // serialize the rotating window AND the compressor +
+                // indexer pool tensors + per-branch incomplete-window
+                // buffer state so multi-turn prefix-cache reuse keeps
+                // the long-context summary across turns. Pre-fix this
+                // path went through the `RotatingKVCacheWrapper`
+                // branch and dropped the pool entirely.
+                serializeDeepseekV4Layer(hybrid, index: i, into: &result)
             } else if let wrapper = layer as? RotatingKVCacheWrapper {
-                // Composite cache that wraps a rotating cache (e.g.
-                // DeepseekV4Cache). Serialize the inner rotating state —
-                // the wrapper's extra buffers (compressor/indexer pool)
-                // are ephemeral and get recomputed from prompt tokens
-                // on the next prefill.
+                // Composite cache that wraps a rotating cache. Serialize
+                // the inner rotating state — wrapper-specific buffers,
+                // if any, are ephemeral by default. (DSV4 is special-
+                // cased above to round-trip its pool state in full.)
                 serializeRotatingLayer(wrapper.rotating, index: i, into: &result)
             } else if let rot = layer as? RotatingKVCache {
                 serializeRotatingLayer(rot, index: i, into: &result)
@@ -342,6 +357,69 @@ public enum TQDiskSerializer {
         }
     }
 
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Serialize a single `DeepseekV4Cache` layer — the rotating window
+    /// (same payload as `serializeRotatingLayer`) PLUS:
+    ///
+    ///   `dsv4_{i}_pool_comp`      — compressor pool tensor (or zero-row sentinel when nil)
+    ///   `dsv4_{i}_pool_idx`       — indexer pool tensor
+    ///   `dsv4_{i}_buf_comp_kv`    — compressor incomplete-window buffer (kv leg)
+    ///   `dsv4_{i}_buf_comp_gate`  — compressor incomplete-window buffer (gate leg)
+    ///   `dsv4_{i}_buf_idx_kv`     — indexer incomplete-window buffer (kv)
+    ///   `dsv4_{i}_buf_idx_gate`   — indexer incomplete-window buffer (gate)
+    ///   `__dsv4_{i}_meta__`       — Int32 array
+    ///                                 [keep, maxSize, step, offset, idx,
+    ///                                  compressRatio, slidingWindow]
+    ///
+    /// All "buffer/pool" arrays use a `(1, 0, 1)` zero-row sentinel for
+    /// "nil" so the safetensors round-trip never has to deal with
+    /// optional shapes.
+    private static func serializeDeepseekV4Layer(
+        _ dsv4: HybridPoolCache,
+        index i: Int,
+        into result: inout [String: MLXArray]
+    ) {
+        let local = dsv4.rotating
+        let state = local.state
+        guard state.count == 2 else {
+            result[kindKey(for: i)] = kindArray(.skip)
+            return
+        }
+        let meta = local.metaState
+        guard meta.count == 5,
+              let keep = Int32(meta[0]),
+              let maxSize = Int32(meta[1]),
+              let step = Int32(meta[2]),
+              let offset = Int32(meta[3]),
+              let idx = Int32(meta[4])
+        else {
+            result[kindKey(for: i)] = kindArray(.skip)
+            return
+        }
+
+        result["dsv4_\(i)_keys"] = state[0]
+        result["dsv4_\(i)_values"] = state[1]
+        result["__dsv4_\(i)_meta__"] = MLXArray([
+            keep, maxSize, step, offset, idx,
+            Int32(dsv4.compressRatio),
+            Int32(dsv4.slidingWindow),
+        ])
+
+        let zeroSentinel = MLXArray.zeros([1, 0, 1], dtype: .float32)
+        result["dsv4_\(i)_pool_comp"] = dsv4.hybridPool(branch: .compressor) ?? zeroSentinel
+        result["dsv4_\(i)_pool_idx"] = dsv4.hybridPool(branch: .indexer) ?? zeroSentinel
+
+        let compBuf = dsv4.hybridBuffers(branch: .compressor)
+        result["dsv4_\(i)_buf_comp_kv"] = compBuf.kv ?? zeroSentinel
+        result["dsv4_\(i)_buf_comp_gate"] = compBuf.gate ?? zeroSentinel
+
+        let idxBuf = dsv4.hybridBuffers(branch: .indexer)
+        result["dsv4_\(i)_buf_idx_kv"] = idxBuf.kv ?? zeroSentinel
+        result["dsv4_\(i)_buf_idx_gate"] = idxBuf.gate ?? zeroSentinel
+
+        result[kindKey(for: i)] = kindArray(.deepseekV4)
+    }
+
     /// Serialize a single QuantizedKVCache layer's state (4 or 6 arrays
     /// covering qweight/scales/[biases] for both keys and values), plus
     /// group size, bit width and offset metadata so the restore path can
@@ -421,6 +499,30 @@ public enum TQDiskSerializer {
         public let bits: Int
     }
 
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Components for a `DeepseekV4Cache` layer — rotating window state
+    /// PLUS compressor + indexer pool tensors + per-branch
+    /// incomplete-window buffer state.
+    public struct DeepseekV4LayerComponents {
+        public let keys: MLXArray
+        public let values: MLXArray
+        public let keep: Int
+        public let maxSize: Int
+        public let step: Int
+        public let offset: Int
+        public let idx: Int
+        public let compressRatio: Int
+        public let slidingWindow: Int
+        /// Pool tensors — `nil` when the source cache had no pool yet
+        /// (sentinel zero-row tensor on disk decoded back to nil).
+        public let poolComp: MLXArray?
+        public let poolIdx: MLXArray?
+        public let bufCompKV: MLXArray?
+        public let bufCompGate: MLXArray?
+        public let bufIdxKV: MLXArray?
+        public let bufIdxGate: MLXArray?
+    }
+
     /// Result of deserializing one cache layer from a dict.
     public enum LayerData {
         case tq(TQLayerComponents)
@@ -428,6 +530,7 @@ public enum TQDiskSerializer {
         case mamba(MambaLayerComponents)
         case qkv(QKVLayerComponents)
         case rotating(RotatingLayerComponents)
+        case deepseekV4(DeepseekV4LayerComponents)
         /// Layer was serialized as `.skip` (cache type we don't persist).
         case skip
     }
@@ -558,6 +661,12 @@ public enum TQDiskSerializer {
             case .rotating:
                 if let comp = deserializeRotatingLayer(index: i, from: arrays) {
                     out.append(IndexedLayerData(index: i, data: .rotating(comp)))
+                } else {
+                    out.append(IndexedLayerData(index: i, data: .skip))
+                }
+            case .deepseekV4:
+                if let comp = deserializeDeepseekV4Layer(index: i, from: arrays) {
+                    out.append(IndexedLayerData(index: i, data: .deepseekV4(comp)))
                 } else {
                     out.append(IndexedLayerData(index: i, data: .skip))
                 }
@@ -743,6 +852,42 @@ public enum TQDiskSerializer {
             offset: Int(m[3]),
             idx: Int(m[4])
         )
+    }
+
+    /// 2026-05-04: Deserialize a single `DeepseekV4Cache` layer.
+    /// Reads `dsv4_{i}_keys/values`, the 7-element
+    /// `__dsv4_{i}_meta__` tuple, and the 6 pool/buffer slots. Sentinel
+    /// `(1, 0, 1)` zero-row tensors decode back to nil.
+    private static func deserializeDeepseekV4Layer(
+        index i: Int,
+        from arrays: [String: MLXArray]
+    ) -> DeepseekV4LayerComponents? {
+        guard let keys = arrays["dsv4_\(i)_keys"],
+              let values = arrays["dsv4_\(i)_values"],
+              let metaArr = arrays["__dsv4_\(i)_meta__"]
+        else { return nil }
+        guard !metaArr.shape.isEmpty, metaArr.shape[0] == 7 else { return nil }
+        let m = metaArr.asArray(Int32.self)
+        guard m.count == 7 else { return nil }
+
+        func unsentinel(_ key: String) -> MLXArray? {
+            guard let arr = arrays[key] else { return nil }
+            if arr.ndim >= 2 && arr.dim(1) == 0 { return nil }
+            return arr
+        }
+
+        return DeepseekV4LayerComponents(
+            keys: keys, values: values,
+            keep: Int(m[0]), maxSize: Int(m[1]), step: Int(m[2]),
+            offset: Int(m[3]), idx: Int(m[4]),
+            compressRatio: Int(m[5]),
+            slidingWindow: Int(m[6]),
+            poolComp: unsentinel("dsv4_\(i)_pool_comp"),
+            poolIdx: unsentinel("dsv4_\(i)_pool_idx"),
+            bufCompKV: unsentinel("dsv4_\(i)_buf_comp_kv"),
+            bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate"),
+            bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv"),
+            bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate"))
     }
 
     // MARK: - Helpers

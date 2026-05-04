@@ -86,6 +86,16 @@ public class SwitchGLU: Module {
     let activation: (MLXArray) -> MLXArray
     let isSiluActivation: Bool
     let isGeluActivation: Bool
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Optional 2-argument GLU closure that takes `(gate, up)` and returns
+    /// the activated `gate * up` result. When non-nil, this OVERRIDES
+    /// the standard `activation(gate) * up` path (and the compiled
+    /// SwiGLU/GeGLU fast-paths) so DSV4 can apply
+    /// `silu(min(gate, 10)) * clip(up, -10, 10)` — symmetric clamping
+    /// of BOTH gate and up that the one-arg `activation` API can only
+    /// express on `gate`. Every other caller passes `nil` and gets the
+    /// historical bit-for-bit-identical fast paths.
+    let glue: ((MLXArray, MLXArray) -> MLXArray)?
 
     // Lazy fused gate+up gatherQuantizedMM cache.
     //
@@ -121,12 +131,14 @@ public class SwitchGLU: Module {
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
-        bias: Bool = false
+        bias: Bool = false,
+        glue: ((MLXArray, MLXArray) -> MLXArray)? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
+        self.glue = glue
         // Detect common activation types for compiled fast path.
         // Use safeGeluApproximate for comparison to avoid MLXNN's compiledGeluApproximate
         // which uses the Power primitive (x ** 3) and crashes on some Metal GPUs during
@@ -240,7 +252,13 @@ public class SwitchGLU: Module {
             let splits = MLX.split(combined, parts: 2, axis: -1)
             let xGate = splits[0]
             let xUp = splits[1]
-            if isSiluActivation {
+            if let glue {
+                // DSV4 limited-SwiGLU and any other caller that needs to
+                // post-process BOTH gate and up symmetrically. Skips the
+                // compiled SwiGLU/GeGLU fast paths intentionally — the
+                // closure is the source of truth.
+                activated = glue(xGate, xUp)
+            } else if isSiluActivation {
                 activated = compiledSwiGLU(xGate, xUp)
             } else if isGeluActivation {
                 activated = compiledGeGLU(xGate, xUp)
@@ -253,7 +271,9 @@ public class SwitchGLU: Module {
             // feature flag is off.
             let xUp = upProj(x, idx, sortedIndices: doSort)
             let xGate = gateProj(x, idx, sortedIndices: doSort)
-            if isSiluActivation {
+            if let glue {
+                activated = glue(xGate, xUp)
+            } else if isSiluActivation {
                 activated = compiledSwiGLU(xGate, xUp)
             } else if isGeluActivation {
                 activated = compiledGeGLU(xGate, xUp)

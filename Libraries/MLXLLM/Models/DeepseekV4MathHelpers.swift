@@ -19,6 +19,28 @@ import MLXNN
 
 public enum DeepseekV4Math {
 
+    // MARK: - Per-head Q RMSNorm ones cache
+    //
+    // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    // The DSV4 attention applies a unit-weight RMSNorm-like rescale per
+    // head before partial RoPE: `q * rsqrt((q^2).mean(-1) + eps)`. The
+    // Python reference fuses this into a single `mx.fast.rms_norm` kernel
+    // with a cached ones tensor. The cache is keyed on `(headDim, dtype)`
+    // and shared across all 64 attention heads × 43 layers. NSLock-guarded
+    // so concurrent SwitchGLU/attention forwards never race the cache.
+    private static let qNormOnesLock = NSLock()
+    nonisolated(unsafe) private static var qNormOnesCache: [String: MLXArray] = [:]
+
+    public static func qNormOnes(headDim: Int, dtype: DType) -> MLXArray {
+        let key = "\(headDim)|\(dtype)"
+        qNormOnesLock.lock(); defer { qNormOnesLock.unlock() }
+        if let w = qNormOnesCache[key] { return w }
+        let w = MLXArray.ones([headDim], dtype: dtype)
+        qNormOnesCache[key] = w
+        return w
+    }
+
+
     // MARK: - mHC split-Sinkhorn (collapse matrices)
     //
     // Given `mixes` of shape (..., 3*hcMult) and per-block scale/base
@@ -288,6 +310,39 @@ public enum DeepseekV4Math {
         let scaled = invFreqArr / factor
         return scaled * (MLXArray(1.0) - smooth) + invFreqArr * smooth
         _ = maxPos  // reserved for future extrapolation logic
+    }
+
+    // MARK: - LM head fp32 matmul
+    //
+    // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    // DeepSeek-V4 reference inference (`inference/model.py`
+    // `ParallelHead.get_logits`) explicitly performs the lm_head matmul
+    // in fp32 — the weights are stored as fp32 and the activations are
+    // cast to fp32 before `F.linear`. Hidden contraction is 4096 wide,
+    // and bf16/fp16 accumulation drops ~0.5 ULP per logit which
+    // empirically flips arithmetic-style next-token answers. Mirror
+    // that here: dequantize quantized lm_heads to fp32, cast `h` to
+    // fp32, then matmul.
+    public static func lmHeadFp32(_ h: MLXArray, lmHead: Linear) -> MLXArray {
+        if let q = lmHead as? QuantizedLinear {
+            let wF32 = MLX.dequantized(
+                q.weight, scales: q.scales, biases: q.biases,
+                groupSize: q.groupSize, bits: q.bits
+            ).asType(.float32)
+            let hF32 = h.asType(.float32)
+            var out = hF32.matmul(wF32.transposed())
+            if let b = q.bias {
+                out = out + b.asType(.float32)
+            }
+            return out
+        }
+        let wF32 = lmHead.weight.asType(.float32)
+        let hF32 = h.asType(.float32)
+        var out = hF32.matmul(wF32.transposed())
+        if let b = lmHead.bias {
+            out = out + b.asType(.float32)
+        }
+        return out
     }
 
     // MARK: - Compressor + Indexer attention masks (PR #1195 port)

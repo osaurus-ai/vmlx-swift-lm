@@ -393,6 +393,18 @@ private func restoreFromV2Arrays(
                 totalTokens = comp.offset
             }
 
+        case .deepseekV4(let comp):
+            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+            // Restore the rotating window AND the compressor + indexer
+            // pool tensors + per-branch incomplete-window buffer state
+            // so multi-turn /v1/chat/completions prefix-cache reuse
+            // doesn't have to re-derive the long-context summary from
+            // prompt tokens every turn.
+            restoreDeepseekV4Layer(comp, into: cache[i])
+            if totalTokens == 0 {
+                totalTokens = comp.offset
+            }
+
         case .skip:
             // Cache type we don't know how to persist. No-op.
             continue
@@ -660,6 +672,39 @@ private func restoreRotatingLayer(
             }
         }
     }
+}
+
+/// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+/// Restore a full hybrid `DeepseekV4Cache` layer — rotating window
+/// state PLUS compressor + indexer pool tensors + per-branch
+/// incomplete-window buffer state. Silently no-ops on type mismatch.
+private func restoreDeepseekV4Layer(
+    _ comp: TQDiskSerializer.DeepseekV4LayerComponents,
+    into layer: any KVCache
+) {
+    func apply(_ hybrid: HybridPoolCache) {
+        hybrid.rotating.state = [comp.keys, comp.values]
+        hybrid.rotating.metaState = [
+            String(comp.keep),
+            String(comp.maxSize),
+            String(comp.step),
+            String(comp.offset),
+            String(comp.idx),
+        ]
+        hybrid.setHybridPool(branch: .compressor, value: comp.poolComp)
+        hybrid.setHybridPool(branch: .indexer, value: comp.poolIdx)
+        hybrid.setHybridBuffers(
+            branch: .compressor,
+            kv: comp.bufCompKV, gate: comp.bufCompGate)
+        hybrid.setHybridBuffers(
+            branch: .indexer,
+            kv: comp.bufIdxKV, gate: comp.bufIdxGate)
+    }
+    if let hybrid = layer as? HybridPoolCache {
+        apply(hybrid)
+        return
+    }
+    // Type mismatch — caller will fall back to fresh prefill.
 }
 
 /// Helper: restore Mamba SSM state into a `MambaCache` layer (or a

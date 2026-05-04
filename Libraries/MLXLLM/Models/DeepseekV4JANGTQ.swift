@@ -16,14 +16,13 @@
 //   - DSV4-Flash JANGTQ4 (173 GB) — routed 4-bit affine g=32, non-
 //     routed 8-bit affine g=32
 //
-// NOTE: `TurboQuantSwitchGLU` fuses gate+up+SwiGLU into a single Metal
-// kernel (`fusedGateUpSwiGLU`) that does NOT currently apply the
-// `swiglu_limit=10` clamp the Python reference uses on routed experts.
-// Shared experts (dense path) still apply the clamp via `DeepseekV4MLP`.
-// This is an acceptable approximation for Phase 1b runtime testing;
-// the MXTQ codebook's natural boundedness provides regularization.
-// Adding clamp support to the fused kernel is tracked for Phase 2 if
-// coherence checks fail.
+// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+// `TurboQuantSwitchGLU` now accepts a `swigluLimit:` parameter that
+// activates the DSV4 limited-SwiGLU clamp inside the fused gate+up
+// Metal kernel: `silu(min(gate, 10)) * clip(up, -10, 10)`. This
+// matches the codex_dsv4_fixkit `runtime_dsv4_fixed.py` patch and
+// the `jang_tools.dsv4.mlx_model._dsv4_swiglu` reference. Shared
+// experts (dense path) keep applying the clamp via `DeepseekV4MLP`.
 
 import Foundation
 import MLX
@@ -50,7 +49,13 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
             bits: mxtqBits,
-            seed: mxtqSeed)
+            seed: mxtqSeed,
+            // DSV4-Flash always routes through limited-SwiGLU. Pulling
+            // the magnitude from `config.swigluLimit` (10.0 by default)
+            // matches the dense path applied by `DeepseekV4MLP` and the
+            // Python `_dsv4_swiglu` helper. Without this clamp, deep MoE
+            // stacks diverge numerically per the DSV4 reference impl.
+            swigluLimit: config.swigluLimit)
         self.gate = DeepseekV4MoEGate(config: config, layerIdx: layerIdx)
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
             hiddenSize: config.hiddenSize,
@@ -161,25 +166,13 @@ public final class DeepseekV4JANGTQModel:
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
-    /// Mirrors `DeepseekV4Model.newCache`. **DEFAULT ON (2026-05-01)**:
-    /// `DeepseekV4Cache` on compress_ratio>0 layers so the
-    /// compressor/indexer state persists across decode steps. MMLU
-    /// 200q at LC=1 is 81.5 % vs 74.5 % at LC=0 (apples-to-apples,
-    /// same bundle/extractor; jang research commit 53f12a9). Set
-    /// `DSV4_LONG_CTX=0` to opt back into the legacy
-    /// RotatingKVCache(maxSize=sliding_window) path explicitly.
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass — pure long-context):
+    /// Identical to `DeepseekV4Model.newCache(parameters:)` —
+    /// always allocates the hybrid `DeepseekV4Cache` for `cr>0` layers
+    /// and a `RotatingKVCache(window=128)` for `cr=0` layers. The
+    /// `DSV4_LONG_CTX` toggle is gone (was a regression vector).
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
-        // Default ON; explicit `DSV4_LONG_CTX=0` opts out.
-        let longCtxEnabled = (env["DSV4_LONG_CTX"] ?? "1") != "0"
-
-        // Mirror DeepseekV4Model.newCache. Three modes:
-        //   - "sliding" (default): RotatingKVCache, 128-token window.
-        //   - "full":    KVCacheSimple, all tokens kept.
-        //   - "tq":      KVCacheSimple now; BatchQuantize.maybeCompress
-        //                promotes to TurboQuantKVCache once offset > min.
-        //                Caller must also set kvMode=.turboQuant in
-        //                GenerateParameters for the promotion to fire.
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let callerWantsTQ: Bool = {
             guard let p = parameters else { return false }
@@ -193,21 +186,25 @@ public final class DeepseekV4JANGTQModel:
             case "full", "tq":
                 return KVCacheSimple()
             default:
-                if longCtxEnabled {
-                    let cr =
-                        config.compressRatios.count > layerIdx
-                        ? config.compressRatios[layerIdx] : 0
-                    if cr > 0 {
-                        return DeepseekV4Cache(slidingWindow: config.slidingWindow)
-                    }
+                let cr =
+                    config.compressRatios.count > layerIdx
+                    ? config.compressRatios[layerIdx]
+                    : DeepseekV4Model.defaultCompressRatio(
+                        layerIdx: layerIdx,
+                        numLayers: config.numHiddenLayers)
+                if cr > 0 {
+                    return DeepseekV4Cache(
+                        slidingWindow: config.slidingWindow,
+                        compressRatio: cr)
                 }
-                return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                return RotatingKVCache(
+                    maxSize: config.slidingWindow, keep: 0)
             }
         }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        lmHead(model(inputs, cache: cache))
+        DeepseekV4Math.lmHeadFp32(model(inputs, cache: cache), lmHead: lmHead)
     }
 
     /// Reuse DeepseekV4Model's sanitize — the weight naming contract

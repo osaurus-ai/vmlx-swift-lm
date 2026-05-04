@@ -206,14 +206,15 @@ class DeepseekV4Attention: Module {
         let qResidual = qNorm(wqA(x))
         var q = wqB(qResidual)
         q = q.reshaped(B, L, numHeads, headDim)
-        // Per-head fp32 RMSNorm-like rescale (NOT a learned norm — just
-        // variance normalization). Essential or middle layers drift
-        // exponentially. Python: q * rsqrt((q^2).mean(-1) + eps).
-        let qF32 = q.asType(.float32)
-        let qRescale = rsqrt(
-            (qF32 * qF32).mean(axis: -1, keepDims: true)
-                + MLXArray(config.rmsNormEps))
-        q = (qF32 * qRescale).asType(x.dtype)
+        // Per-head unit-weight RMSNorm via the fused `MLXFast.rmsNorm`
+        // kernel (1 dispatch vs 3 ops for the manual rsqrt path).
+        // Mirrors Python `mx.fast.rms_norm(q, weight=_get_q_norm_ones(...),
+        // eps=...)` — reuses a `(headDim, dtype)`-cached ones tensor so
+        // the 64 heads × 43 layers don't reallocate per token.
+        q = MLXFast.rmsNorm(
+            q,
+            weight: DeepseekV4Math.qNormOnes(headDim: headDim, dtype: q.dtype),
+            eps: config.rmsNormEps)
         q = q.transposed(0, 2, 1, 3)
 
         // --- KV projection (single latent head) ---
@@ -229,18 +230,37 @@ class DeepseekV4Attention: Module {
 
         // --- Cache update (sliding-window local) ---
         var keys = kv
-        var values = kv
         if let cache = cache {
-            (keys, values) = cache.update(keys: kv, values: kv)
+            (keys, _) = cache.update(keys: kv, values: kv)
         }
         var fullKV = keys
+        let windowLen = fullKV.dim(2)
 
         // --- Compressor + Indexer global context (compressRatio > 0 layers) ---
-        // Fast path: plain sliding-window cache has no persistent
-        // buffer, so for L < compressRatio the compressor produces an
-        // empty pool and we short-circuit. Saves ~150 matmuls per token
-        // across the 41 compress_ratio>0 layers during short-prompt
-        // decode.
+        //
+        // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+        // Two paths now distinguished by query length:
+        //
+        //   * decode (L == 1): build `(B, 1, k, D)` of selected pool
+        //     rows for the single query (or the whole pool if no topk
+        //     gating fires) and concat onto `full_kv`. No mask needed —
+        //     the only query is causally OK against every selected row
+        //     because the indexer enforces `(k_idx + 1) * ratio <= q + 1`
+        //     in scoring, and the compressor only emits pool rows whose
+        //     summarized window has fully ended.
+        //
+        //   * prefill (L > 1): keep the pool flat at `(B, 1, P, D)` and
+        //     build a 2-segment mask `[window_visibility | comp_visibility]`
+        //     so each query sees only the local window keys it should
+        //     AND only the pool rows whose summarized window ended at
+        //     or before that query's position. ANDed with the indexer's
+        //     selection mask on `cr=4` layers. The previous implementation
+        //     padded the mask with all-ones, allowing query `q` to see
+        //     pool rows summarizing tokens with positions > q, AND
+        //     gathered `(B, 1, L*k, D)` — leaking query `i`'s selected
+        //     rows into query `j`'s attention.
+        var dsv4PrefillMask: MLXArray? = nil
+        var poolEntries: Int = 0
         if compressRatio > 0 {
             let v4Cache = cache as? DeepseekV4Cache
             if v4Cache != nil || L >= compressRatio {
@@ -249,51 +269,104 @@ class DeepseekV4Attention: Module {
                     // pooled shape: (B, W, headDim) where W = pooled count.
                     let W = pooled.dim(1)
                     if W > 0 {
-                        if compressRatio == 4, let idx = indexer,
-                            let topK = idx(
+                        var topK: MLXArray? = nil
+                        if compressRatio == 4, let idx = indexer {
+                            topK = idx(
                                 x, qResidual: qResidual, rope: rope,
                                 positionRope: rope, v4Cache: v4Cache, startPos: offset)
-                        {
-                            // topK shape: (B, L, k). Gather `k` rows from
-                            // `pooled` per query position. For SDPA we
-                            // need keys broadcast to (B, 1, allSelected,
-                            // headDim) — we flatten (L*k) into the
-                            // "time" axis so all queries see all their
-                            // selected pooled keys.
-                            let k = topK.dim(-1)
-                            // pooled: (B, W, D) → (B, 1, 1, W, D)
-                            let expanded = pooled.expandedDimensions(axes: [1, 2])
-                            let pooledBroad = broadcast(
-                                expanded, to: [B, 1, L, W, headDim])
-                            // idx: (B, L, k) → (B, 1, L, k, 1) broadcast over D
-                            let idxExp = topK.expandedDimensions(axes: [1, 4])
-                            let idxBroad = broadcast(
-                                idxExp, to: [B, 1, L, k, headDim])
-                            let gathered = takeAlong(
-                                pooledBroad, idxBroad, axis: 3)
-                            // (B, 1, L*k, D)
-                            pooled = gathered.reshaped(B, 1, L * k, headDim)
-                        } else {
-                            pooled = pooled.expandedDimensions(axis: 1)  // (B, 1, W, D)
                         }
+
+                        if L == 1 {
+                            // DECODE FAST PATH — gather only the topk
+                            // rows for the single query (or all rows
+                            // when topk == nil / W <= topK), shape
+                            // `(B, 1, k, D)`.
+                            if let tk = topK {
+                                let k = tk.dim(-1)
+                                // pooled: (B, W, D) → (B, 1, 1, W, D)
+                                let expanded = pooled.expandedDimensions(axes: [1, 2])
+                                let pooledBroad = broadcast(
+                                    expanded, to: [B, 1, L, W, headDim])
+                                // tk: (B, L=1, k) → (B, 1, L, k, 1)
+                                let idxExp = tk.expandedDimensions(axes: [1, 4])
+                                let idxBroad = broadcast(
+                                    idxExp, to: [B, 1, L, k, headDim])
+                                let gathered = takeAlong(
+                                    pooledBroad, idxBroad, axis: 3)
+                                // (B, 1, k, D)
+                                pooled = gathered.reshaped(B, 1, k, headDim)
+                            } else {
+                                pooled = pooled.expandedDimensions(axis: 1)
+                            }
+                        } else {
+                            // PREFILL PATH — flat pool, mask carries
+                            // visibility.
+                            pooled = pooled.expandedDimensions(axis: 1)
+                            // local sliding-window visibility (B,1,L,windowLen)
+                            var localMask = DeepseekV4Math.buildWindowMask(
+                                batch: B, queryLen: L, offset: offset,
+                                window: config.slidingWindow,
+                                windowLen: windowLen)
+                            // compressed-pool causal visibility (B,1,L,W)
+                            var compMask = DeepseekV4Math.compressedVisibility(
+                                batch: B, queryLen: L, offset: offset,
+                                compressedLen: W, ratio: compressRatio)
+                            if let tk = topK {
+                                let sel = DeepseekV4Math.indexerSelectionMask(
+                                    topk: tk, compressedLen: W)
+                                compMask = MLX.logicalAnd(compMask, sel)
+                            }
+                            // Pre-broadcast both halves to the same query
+                            // dim (already done by helpers); concat along
+                            // last axis.
+                            _ = localMask
+                            dsv4PrefillMask = concatenated(
+                                [localMask, compMask], axis: -1)
+                        }
+
                         if pooled.dim(2) > 0 {
+                            poolEntries = pooled.dim(2)
                             fullKV = concatenated([fullKV, pooled], axis: 2)
-                            values = fullKV
                         }
                     }
                 }
             }
         }
 
-        // --- Mask extension for extra pooled keys ---
+        // --- Resolve final attention mask ---
+        // Three cases:
+        //   (a) DSV4-built prefill mask present → use it directly.
+        //   (b) Caller-provided array mask → trim/pad to `fullKV.dim(2)`
+        //       (legacy code path, also triggered for `cr == 0` SWA-only
+        //        layers that bypass DSV4 mask construction).
+        //   (c) Bool-causal sentinel from `createAttentionMask` → leave it
+        //       alone; SDPA will compute the causal mask itself.
         var adjustedMask = mask
-        if case .array(let maskArr) = mask,
-            fullKV.dim(2) > maskArr.dim(-1)
+        if let dsv4 = dsv4PrefillMask {
+            adjustedMask = .array(dsv4)
+        } else if case .array(let maskArr) = mask,
+            poolEntries > 0
         {
+            // Decode path: extend the mask with all-ones for the pool
+            // entries (every selected row is causally valid for the
+            // single query — see above).
             let padShape =
                 Array(maskArr.shape.dropLast()) + [fullKV.dim(2) - maskArr.dim(-1)]
             let pad = MLXArray.ones(padShape, dtype: maskArr.dtype)
             adjustedMask = .array(concatenated([maskArr, pad], axis: -1))
+        } else if case .array(let maskArr) = mask,
+            fullKV.dim(2) != maskArr.dim(-1)
+        {
+            // Defensive: align array mask to actual key length.
+            if maskArr.dim(-1) > fullKV.dim(2) {
+                let trimmed = maskArr[.ellipsis, (-fullKV.dim(2))...]
+                adjustedMask = .array(trimmed)
+            } else {
+                let padShape =
+                    Array(maskArr.shape.dropLast()) + [fullKV.dim(2) - maskArr.dim(-1)]
+                let pad = MLXArray.zeros(padShape, dtype: maskArr.dtype)
+                adjustedMask = .array(concatenated([maskArr, pad], axis: -1))
+            }
         }
 
         // --- SDPA with attention sinks (fp32 accum for head_dim=512) ---
@@ -396,31 +469,44 @@ class DeepseekV4MoEGate: Module {
     }
 
     /// Returns (indices, weights) where indices has shape (B, L, topK)
-    /// and weights has shape (B, L, topK). For hash layers, weights is
-    /// a synthetic uniform 1/topK so the downstream SwitchGLU gets the
-    /// same contract as softmax-routed layers.
+    /// and weights has shape (B, L, topK).
+    ///
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Hash layers now match the Python `Gate.__call__` reference
+    /// (`jang_tools.dsv4.mlx_model.Gate.__call__`) — they gather the
+    /// PER-TOKEN gate scores at the hash-selected expert ids instead
+    /// of returning a synthetic uniform `routedScalingFactor / topK`.
+    /// Without this fix every hash-routed layer collapsed all six
+    /// selected experts to the same weight, throwing away the
+    /// information the gate matmul + sqrtsoftplus produced and
+    /// flattening the routing geometry the model was trained with.
     func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> (MLXArray, MLXArray) {
-        if isHashLayer, let ids = inputIds {
-            // Hash routing: tid2eid is (vocab, topK) — pre-stamped at
-            // convert time with which topK experts each token id
-            // routes to. `tid2eid[ids]` for ids shape (B, L) returns
-            // (B, L, topK) directly via fancy index.
-            let (B, L) = (x.dim(0), x.dim(1))
-            let indices = tid2eid[ids]  // (B, L, topK)
-            // Uniform weights — every selected expert contributes
-            // equally, scaled by the routed factor / topK.
-            let weights = MLXArray.ones([B, L, topK], dtype: .float32)
-                * (routedScalingFactor / Float(topK))
-            return (indices.asType(.uint32), weights)
-        }
-
-        // Non-hash: compute scores via sqrt(softplus(logits))
-        // The matmul is performed in fp32 per the bug-fix contract.
+        // Compute the gate logits in fp32 even on hash layers — the
+        // hash path needs them to score the (deterministic) selected
+        // experts.
         let xF32 = x.asType(.float32)
         let wF32 = weight.asType(.float32)
         let logits = xF32.matmul(wF32.transposed())
         let scores = DeepseekV4Math.sqrtSoftplus(logits)
 
+        if isHashLayer, let ids = inputIds {
+            // Hash routing: tid2eid is (vocab, topK) — pre-stamped at
+            // convert time with which topK experts each token id
+            // routes to. `tid2eid[ids]` for ids shape (B, L) returns
+            // (B, L, topK) directly via fancy index.
+            let indices = tid2eid[ids].asType(.int32)  // (B, L, topK)
+            // Gate the experts using their actual sqrtsoftplus score
+            // (mirror Python `mx.take_along_axis(scores, inds, axis=-1)`).
+            var weights = takeAlong(scores, indices, axis: -1)
+            if normTopkProb {
+                let denom = weights.sum(axis: -1, keepDims: true) + 1e-20
+                weights = weights / denom
+            }
+            weights = weights * routedScalingFactor
+            return (indices.asType(.uint32), weights)
+        }
+
+        // Non-hash: standard sqrtsoftplus + noaux-biased top-k.
         let (indices, weights) = DeepseekV4Math.sqrtSoftplusSelect(
             scores: scores,
             noauxBias: bias,  // zeros-initialized — effectively no bias unless loaded
@@ -451,22 +537,22 @@ class DeepseekV4MoE: Module, UnaryLayer {
         self.layerIdx = layerIdx
         self.topK = config.numExpertsPerTok
         let limit = config.swigluLimit
-        // Activation: silu(min(gate, limit)) * clip(up, ±limit).
-        // SwitchGLU accepts a scalar activation applied to gate, with
-        // up multiplied after. Our helper fuses both legs.
+        // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+        // Symmetric DSV4 limited-SwiGLU — `silu(min(gate, limit)) *
+        // clip(up, -limit, +limit)`. We pass a 2-arg `glue` closure to
+        // SwitchGLU (instead of a 1-arg `activation`) so BOTH gate and
+        // up get clamped before the multiply. The Python reference
+        // (`jang_tools.dsv4.mlx_model._dsv4_swiglu`) also runs the
+        // multiply in fp32 before casting back to gate.dtype to avoid
+        // per-layer precision drift across the 43 MoE layers; we mirror
+        // that here.
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            activation: { gate in
-                // SwitchGLU computes act(gate) * up. Our "activation" is
-                // applied to gate only — so we return the limited silu
-                // branch here. Up clamping happens inside ops that form
-                // gate*up — but SwitchGLU multiplies AFTER activation,
-                // so the `up` side escapes our clamp. Acceptable for
-                // now (the dominant overflow came from the silu(gate)
-                // blowing up, not up — per §J bug #2 investigation).
-                return silu(minimum(gate, MLXArray(limit)))
+            activation: MLXNN.silu,
+            glue: { gate, up in
+                DeepseekV4Math.dsv4SwiGLU(gate: gate, up: up, limit: limit)
             })
         self.gate = DeepseekV4MoEGate(config: config, layerIdx: layerIdx)
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
@@ -775,68 +861,30 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             config.hiddenSize, config.vocabSize, bias: false)
     }
 
-    /// Build per-layer caches. Per `research/DSV-EXHAUSTIVE-VARIABLES-
-    /// GUIDE.md §12` + `DSV4-RUNTIME-ARCHITECTURE.md §17`:
+    /// Build per-layer caches.
     ///
-    /// **Default (safe) path** — plain `RotatingKVCache` for every
-    /// layer. Long prompts work correctly because during prefill, the
-    /// attention's compressor fast-path triggers on `L >= compress_
-    /// ratio` (cache=nil branch in the Compressor) and pools global
-    /// context into full_kv before SDPA. During decode (L=1), the
-    /// compressor auto-skips (L < compress_ratio) and local sliding-
-    /// window attention proceeds. Verified coherent on Python ref
-    /// across 148 / 288 / 358 / 708 / 1024+ token prompts on
-    /// JANGTQ2. NO state needs to persist across calls.
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass — pure long-context):
+    /// DSV4-Flash IS a hybrid SWA+CSA+HSA architecture by definition.
+    /// The previous "long-ctx off" fallback (a plain `RotatingKVCache`
+    /// for every layer) was producing measurably degraded output on
+    /// any chat that exceeded `sliding_window=128` tokens, because the
+    /// `cr>0` layers lost their compressed/indexed global context after
+    /// the local window rotated. The toggle is removed; every layer
+    /// now allocates the canonical cache for its `compress_ratio`:
+    ///   - `cr == 0` (layers 0 and n-1) → `RotatingKVCache(window=128)`
+    ///   - `cr > 0`  (every other layer) → `DeepseekV4Cache(window=128, cr=cr)`
     ///
-    /// **DEFAULT ON (2026-05-01 — formerly opt-in via `DSV4_LONG_CTX=1`)** —
-    /// `DeepseekV4Cache` on compress_ratio>0 layers so the
-    /// compressor/indexer state PERSISTS across decode steps (extends
-    /// pooled context incrementally as new tokens arrive).
-    ///
-    /// Apples-to-apples MMLU 200q on M4 Max same bundle/extractor:
-    /// - LC=0 (legacy default): 74.5%
-    /// - LC=1 (new default):    81.5%  (+7 pp architecture-only)
-    /// - Published HF baseline:  69.5%  (LC=1 is +12 pp)
-    /// Source: research/experiments/dsv4-mmlu-200q-2026-05-01/ (jang
-    /// commit 53f12a9). The earlier 60 → 76.7 % numbers were tainted
-    /// by a faulty extractor regex; the v2 runner with the corrected
-    /// regex `r"ANSWER[\s:*]*(?:IS[\s*]*)?\*{0,2}([ABCD])\b"` + **X**
-    /// fallback produces the apples-to-apples set above.
-    ///
-    /// Set `DSV4_LONG_CTX=0` to opt back into the legacy
-    /// RotatingKVCache(maxSize=sliding_window) path explicitly. Any
-    /// other value (or unset) takes the new on-by-default path.
+    /// `DSV4_KV_MODE` env override is preserved so the host can pick
+    /// the local KV sizing tradeoff:
+    ///   - default (unset / "sliding"): rotating window + DeepseekV4Cache pool
+    ///   - "full"  : plain KVCacheSimple on every layer (no compression,
+    ///               no pool — for memory-permits long-reasoning runs
+    ///               that don't need the hybrid path)
+    ///   - "tq"    : KVCacheSimple, BatchEngine swaps to TurboQuantKVCache
+    ///               once offset > min-tokens (caller must also set
+    ///               `GenerateParameters.kvMode = .turboQuant(...)`)
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
-        // Default ON; explicit `DSV4_LONG_CTX=0` opts out.
-        let longCtxEnabled = (env["DSV4_LONG_CTX"] ?? "1") != "0"
-
-        // Two runtime knobs the caller can pick between when reasoning
-        // traces or chat outputs exceed sliding_window=128 tokens:
-        //
-        //   - "sliding" (default): RotatingKVCache(maxSize=128). Decode
-        //     only sees the last 128 tokens locally; works in-distribution
-        //     for short outputs (<= 128 new tokens). Reasoning traces past
-        //     128 tokens lose visibility into the original prompt and the
-        //     model drifts off-topic — confirmed on HumanEval+ chat mode
-        //     long traces (2026-04-25). Use for FIM / short Q&A.
-        //
-        //   - "full": KVCacheSimple. No rotation, no compression — the
-        //     model attends to ALL prior tokens. Memory grows linearly
-        //     with sequence length. Local-attention layers see more than
-        //     their trained window so it's OOD for those layers, but in
-        //     practice attention naturally focuses on nearby tokens and
-        //     long outputs stay coherent. Use when memory permits.
-        //
-        //   - "tq": KVCacheSimple at construction; the caller passes
-        //     `GenerateParameters.kvMode = .turboQuant(3, 3)` so the
-        //     BatchEngine's `BatchQuantize.maybeCompress` swaps each
-        //     layer to `TurboQuantKVCache` once the offset crosses the
-        //     min-tokens threshold. Best of both — full context, ~26x
-        //     less memory than full f16 KV. Use for long reasoning.
-        //
-        // `DSV4_KV_MODE` env var overrides; otherwise auto-promote to
-        // full-context when the caller explicitly asks for TurboQuant.
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
         let callerWantsTQ: Bool = {
             guard let p = parameters else { return false }
@@ -848,33 +896,39 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         return (0..<config.numHiddenLayers).map { layerIdx in
             switch mode {
             case "full", "tq":
-                // Full-context cache. For "tq" the BatchEngine will swap
-                // this for TurboQuantKVCache once enough tokens accumulate.
                 return KVCacheSimple()
             default:
-                // "sliding" or unrecognized → status-quo path.
-                if longCtxEnabled {
-                    let cr =
-                        config.compressRatios.count > layerIdx
-                        ? config.compressRatios[layerIdx] : 0
-                    if cr > 0 {
-                        return DeepseekV4Cache(slidingWindow: config.slidingWindow)
-                    }
+                let cr =
+                    config.compressRatios.count > layerIdx
+                    ? config.compressRatios[layerIdx]
+                    : Self.defaultCompressRatio(
+                        layerIdx: layerIdx,
+                        numLayers: config.numHiddenLayers)
+                if cr > 0 {
+                    return DeepseekV4Cache(
+                        slidingWindow: config.slidingWindow,
+                        compressRatio: cr)
                 }
-                // Default path. Note: `RotatingKVCache(maxSize:, keep:)`
-                // rotates once the window fills during prefill, but the
-                // compressor branch has already pooled the older tokens
-                // into `full_kv` before SDPA sees them — so no context
-                // is actually lost on compress_ratio>0 layers during
-                // PREFILL. Decode (L=1) does lose the older tokens.
-                return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                return RotatingKVCache(
+                    maxSize: config.slidingWindow, keep: 0)
             }
         }
     }
 
+    /// Mirror of the per-layer compress_ratio default in
+    /// `DeepseekV4Attention.init` for bundles whose
+    /// `config.compressRatios` array isn't populated. Layers 0 and n-1
+    /// are pure SWA (`cr=0`); middle layers alternate `4` (HSA+CSA)
+    /// and `128` (CSA only).
+    static func defaultCompressRatio(layerIdx: Int, numLayers: Int) -> Int {
+        if layerIdx == 0 || layerIdx == numLayers - 1 { return 0 }
+        let i = layerIdx - 1
+        return (i % 2 == 1) ? 4 : 128
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let h = model(inputs, cache: cache)
-        return lmHead(h)
+        return DeepseekV4Math.lmHeadFp32(h, lmHead: lmHead)
     }
 
     /// Weight sanitize — remap DSV4 bundle key names to match module

@@ -32,15 +32,23 @@ import MLXNN
 // attention forward takes a fast-path that skips the compressor
 // entirely (Python mirror: `if v4_cache is None and L < compress_ratio
 // → skip`).
-public final class DeepseekV4Cache: RotatingKVCacheWrapper {
+public final class DeepseekV4Cache: HybridPoolCache {
     /// Expose the inner rotating cache so `TQDiskSerializer` and
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
-    /// Compressor/Indexer pool buffers are NOT serialized — they get
-    /// recomputed from prompt tokens on the next prefill.
+    /// Compressor/Indexer pool tensors and their incomplete-window
+    /// buffers ALSO round-trip via `state` / `metaState` so prefix-cache
+    /// reuse for multi-turn chat doesn't have to re-derive the pool
+    /// from prompt tokens every turn.
     public var rotating: RotatingKVCache { local }
     /// Local sliding-window cache (compress_ratio-agnostic).
     public let local: RotatingKVCache
-    let slidingWindow: Int
+    public let slidingWindow: Int
+    /// Per-layer compress_ratio. Required (no nil): the proportional
+    /// pool-row truncation in `trim(_:)` needs it, the paged cache
+    /// uses it as part of the block hash so `cr=4` and `cr=128` layer
+    /// blocks never collide, and the disk serializer stamps it as a
+    /// metaState entry.
+    public let compressRatio: Int
     /// Compressor buffer state (raw kv/gate not yet ready to pool)
     /// and pooled summary so far.
     fileprivate var compBufferKV: MLXArray?
@@ -52,8 +60,10 @@ public final class DeepseekV4Cache: RotatingKVCacheWrapper {
     fileprivate var idxBufferGate: MLXArray?
     fileprivate var idxPooled: MLXArray?
 
-    public init(slidingWindow: Int) {
+    public init(slidingWindow: Int, compressRatio: Int) {
+        precondition(compressRatio > 0, "DeepseekV4Cache requires compressRatio > 0; cr=0 layers should use a plain RotatingKVCache.")
         self.slidingWindow = slidingWindow
+        self.compressRatio = compressRatio
         self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
     }
 
@@ -65,20 +75,111 @@ public final class DeepseekV4Cache: RotatingKVCacheWrapper {
         local.update(keys: keys, values: values)
     }
 
+    /// Round-trip layout (kept stable for `TQDiskSerializer`):
+    ///   index 0..<localCount       — `local.state` (rotating window)
+    ///   index localCount + 0       — compPooled (or empty zero-row tensor)
+    ///   index localCount + 1       — compBufferKV (or empty)
+    ///   index localCount + 2       — compBufferGate (or empty)
+    ///   index localCount + 3       — idxPooled
+    ///   index localCount + 4       — idxBufferKV
+    ///   index localCount + 5       — idxBufferGate
+    /// `metaState` carries the entry tag list + `compress_ratio` + the
+    /// number of `local.state` arrays so deserialization knows where to
+    /// split.
     public var state: [MLXArray] {
-        get { local.state }
-        set { local.state = newValue }
+        get {
+            let localState = local.state
+            return localState
+                + [serializableArray(compPooled),
+                   serializableArray(compBufferKV),
+                   serializableArray(compBufferGate),
+                   serializableArray(idxPooled),
+                   serializableArray(idxBufferKV),
+                   serializableArray(idxBufferGate)]
+        }
+        set {
+            // Last 6 slots are the DSV4 pool/buffer arrays; everything
+            // before them is `local.state`.
+            precondition(newValue.count >= 6,
+                "DeepseekV4Cache.state setter expects at least 6 trailing pool slots")
+            let split = newValue.count - 6
+            local.state = Array(newValue[0..<split])
+            compPooled = nullableFromArray(newValue[split + 0])
+            compBufferKV = nullableFromArray(newValue[split + 1])
+            compBufferGate = nullableFromArray(newValue[split + 2])
+            idxPooled = nullableFromArray(newValue[split + 3])
+            idxBufferKV = nullableFromArray(newValue[split + 4])
+            idxBufferGate = nullableFromArray(newValue[split + 5])
+        }
     }
 
     public var metaState: [String] {
-        get { local.metaState }
-        set { local.metaState = newValue }
+        get {
+            // First entries are `local.metaState`; we tack on dsv4-
+            // specific scalars so the disk serializer + restore path
+            // can reconstruct without guessing.
+            local.metaState + [
+                "dsv4_cache_v1",
+                String(compressRatio),
+                String(slidingWindow),
+            ]
+        }
+        set {
+            // Strip the DSV4 trailer if present and pass the rest to
+            // local. We don't need to re-read compressRatio from the
+            // trailer because it's an init-time invariant of the
+            // surrounding layer's attention module — but accept the
+            // legacy code path that didn't write it.
+            if newValue.count >= 3,
+               newValue[newValue.count - 3] == "dsv4_cache_v1"
+            {
+                local.metaState = Array(newValue[0..<(newValue.count - 3)])
+            } else {
+                local.metaState = newValue
+            }
+        }
     }
 
     public var isTrimmable: Bool { local.isTrimmable }
 
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Proportional pool-row truncation matching `llama.cpp dsv4_clear_rows`.
+    /// Pre-fix this only delegated to `local.trim(n)` — the contaminated
+    /// pool rows survived multi-turn prefix-cache reuse and produced the
+    /// "polite-assistant attractor loops" reported on /v1/chat/completions.
     @discardableResult
-    public func trim(_ n: Int) -> Int { local.trim(n) }
+    public func trim(_ n: Int) -> Int {
+        let rv = local.trim(n)
+        // Incomplete-window buffers are start_pos-keyed and invalidated
+        // by ANY trim — clear unconditionally (Python comment
+        // mlx_model.py L497-501).
+        compBufferKV = nil
+        compBufferGate = nil
+        idxBufferKV = nil
+        idxBufferGate = nil
+        if n <= 0 || compressRatio <= 0 {
+            return rv
+        }
+        // Drop the trailing `max(1, n / compress_ratio)` rows from each
+        // pool. Most-recently-appended row may have been computed from
+        // a window overlapping output tokens — keeping it would
+        // re-introduce contamination (Python L532-537).
+        let rowsToDrop = max(1, n / compressRatio)
+        compPooled = trimTrailingRows(compPooled, drop: rowsToDrop)
+        idxPooled = trimTrailingRows(idxPooled, drop: rowsToDrop)
+        return rv
+    }
+
+    private func trimTrailingRows(_ pool: MLXArray?, drop: Int) -> MLXArray? {
+        guard let pool = pool else { return nil }
+        let nRows = pool.dim(1)
+        let keep = max(0, nRows - drop)
+        if keep == 0 { return nil }
+        if keep < nRows {
+            return pool[0..., 0..<keep, 0...]
+        }
+        return pool
+    }
 
     public func innerState() -> [MLXArray] { local.innerState() }
 
@@ -89,12 +190,37 @@ public final class DeepseekV4Cache: RotatingKVCacheWrapper {
     }
 
     public func copy() -> any KVCache {
-        // Compressor pool state is NOT deep-copied for snapshot/restore;
-        // the caller should treat compressor state as ephemeral (it's
-        // recomputable from prompt tokens via re-prefill).
-        let dup = DeepseekV4Cache(slidingWindow: slidingWindow)
-        dup.state = local.state
+        // Deep-copy: clone local KV plus all four pool/buffer slots so
+        // the snapshot is fully independent of the original cache.
+        // Pre-fix `copy()` constructed a fresh cache and only set
+        // `state = local.state`, which silently dropped the pool
+        // entirely — so any caller that relied on `copy()` to
+        // checkpoint multi-turn state lost the long-context summary.
+        let dup = DeepseekV4Cache(slidingWindow: slidingWindow,
+                                   compressRatio: compressRatio)
+        dup.state = self.state
         return dup
+    }
+
+    // MARK: - State (de)serialization helpers
+
+    /// MLX state arrays cannot be `nil`, so we substitute a zero-row
+    /// sentinel and recover it on the way back. The sentinel is shape
+    /// (1, 0, 1) fp32 — distinguishable from any real pool tensor by
+    /// having axis-1 size 0.
+    private func serializableArray(_ arr: MLXArray?) -> MLXArray {
+        guard let arr else {
+            return MLXArray.zeros([1, 0, 1], dtype: .float32)
+        }
+        return arr
+    }
+
+    private func nullableFromArray(_ arr: MLXArray) -> MLXArray? {
+        // Sentinel for nil: any tensor whose axis-1 dim is 0.
+        if arr.ndim >= 2 && arr.dim(1) == 0 {
+            return nil
+        }
+        return arr
     }
 
     // State accessors for Compressor/Indexer. Public so disk round-trip
@@ -132,6 +258,47 @@ public final class DeepseekV4Cache: RotatingKVCacheWrapper {
     }
 
     public enum BranchKey { case compressor, indexer }
+
+    // MARK: - HybridPoolCache conformance
+    //
+    // 2026-05-04: forward the protocol API used by the disk serializer
+    // and the paged cache to the existing `getPooled`/`setPooled` /
+    // `getBuffers`/`setBuffers` accessors. The protocol exists so the
+    // MLXLMCommon disk-cache subsystem can persist DSV4 layers without
+    // an MLXLLM dependency.
+    private static func bridge(_ branch: HybridPoolBranch) -> BranchKey {
+        switch branch {
+        case .compressor: return .compressor
+        case .indexer: return .indexer
+        }
+    }
+
+    public func hybridPool(branch: HybridPoolBranch) -> MLXArray? {
+        getPooled(Self.bridge(branch))
+    }
+
+    public func setHybridPool(branch: HybridPoolBranch, value: MLXArray?) {
+        let key = Self.bridge(branch)
+        if let value {
+            setPooled(key, value: value)
+        } else {
+            // Clear by setting an empty zero-row sentinel — the existing
+            // `setPooled` API requires a non-nil value, so model both
+            // branches with a small zero-row tensor.
+            switch key {
+            case .compressor: compPooled = nil
+            case .indexer: idxPooled = nil
+            }
+        }
+    }
+
+    public func hybridBuffers(branch: HybridPoolBranch) -> (kv: MLXArray?, gate: MLXArray?) {
+        getBuffers(Self.bridge(branch))
+    }
+
+    public func setHybridBuffers(branch: HybridPoolBranch, kv: MLXArray?, gate: MLXArray?) {
+        setBuffers(Self.bridge(branch), kv: kv, gate: gate)
+    }
 }
 
 // MARK: - Compressor
