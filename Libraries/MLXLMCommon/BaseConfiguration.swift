@@ -117,6 +117,16 @@ public struct BaseConfiguration: Codable, Sendable {
                 // mlx-community/bitnet-b1.58-2B-4T-4bit
                 case "quant_method", "linear_class", "quantization_mode": continue
 
+                // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+                // DSV4 JANGTQ bundles stamp the routed-expert MXTQ bit
+                // width as scalar siblings of `bits` / `group_size` inside
+                // the `quantization` dict (`mxtq_bits: 2` /
+                // `routed_expert_bits: 2`). Without these in the skip
+                // list the per-layer-override decode below tries to
+                // parse `2` as a `Quantization` sub-dict and throws
+                // `configurationDecodingError`, blocking model load.
+                case "mxtq_bits", "routed_expert_bits", "mxtq_seed": continue
+
                 default:
                     if let f = try? container.decode(Bool.self, forKey: key) {
                         if !f {

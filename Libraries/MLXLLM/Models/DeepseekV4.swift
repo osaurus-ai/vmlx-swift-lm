@@ -1074,6 +1074,27 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             out["\(pfx).\(rest)"] = value
         }
 
+        // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+        // DSV4-Flash JANGTQ bundles ship a pre-stacked
+        // `jangtq_stacked.safetensors` overlay where the routed-expert
+        // weights live at
+        // `layers.{L}.mlp.switch_mlp.{gate,down,up}_proj.{packed,norms}`
+        // — note the missing `tq_` prefix. Older Swift JANGTQ bundles
+        // and the in-tree `TurboQuantSwitchLinear` use `tq_packed` /
+        // `tq_norms`. Rewrite the un-prefixed names so the
+        // `@ParameterInfo` keys match. Layout-preserving rename only.
+        for layerIdx in 0..<config.numHiddenLayers {
+            for projName in ["gate_proj", "down_proj", "up_proj"] {
+                for (src, dst) in [("packed", "tq_packed"), ("norms", "tq_norms")] {
+                    let from = "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(src)"
+                    let to = "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(dst)"
+                    if let v = out.removeValue(forKey: from), out[to] == nil {
+                        out[to] = v
+                    }
+                }
+            }
+        }
+
         // Second pass: stack per-expert weights into switch_mlp.{gate,
         // up,down}_proj.*. Two formats supported:
         //
