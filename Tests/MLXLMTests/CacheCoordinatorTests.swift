@@ -5,6 +5,62 @@ import Testing
 
 // MARK: - CacheCoordinator Tests
 
+/// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+/// Verify the paged-incompatible short-circuit. With `setPagedIncompatible(true)`
+/// a fetch should miss the paged tier even when an exact-prefix block
+/// hash exists, so the disk tier (the only one that understands
+/// `LayerKind.deepseekV4`) gets a chance to handle the hit.
+@Test func coordinatorPagedIncompatibleSkipsPagedTier() {
+    let blockSize = 4
+    let config = CacheCoordinatorConfig(
+        usePagedCache: true,
+        enableDiskCache: false,
+        pagedBlockSize: blockSize,
+        maxCacheBlocks: 20
+    )
+    let coordinator = CacheCoordinator(config: config)
+
+    // Pre-populate the paged tier with one block.
+    let tokens = [10, 11, 12, 13]
+    let keys = MLXArray.ones([1, 1, blockSize, 4])
+    let values = MLXArray.ones([1, 1, blockSize, 4]) * 2.0
+    coordinator.storeAfterGeneration(
+        promptTokens: tokens,
+        perLayerData: [(keys: keys, values: values)],
+        ssmStates: nil,
+        cache: nil)
+
+    // Sanity: paged tier hits without the flag.
+    if case .hit(_, _, let detail, _, _, _) = coordinator.fetch(tokens: tokens) {
+        #expect(detail == .paged, "baseline: paged tier should hit")
+    } else {
+        Issue.record("baseline: paged tier should hit before flipping incompatible flag")
+    }
+
+    // Flip the flag: subsequent fetch + store must skip the paged tier.
+    coordinator.setPagedIncompatible(true)
+    #expect(coordinator.isPagedIncompatible == true)
+    let result = coordinator.fetch(tokens: tokens)
+    if case .miss = result {
+        // expected — paged tier skipped, no disk tier present
+    } else {
+        Issue.record(
+            "paged-incompatible coordinator must miss when only paged tier holds the prefix")
+    }
+
+    // store must also skip the paged tier — replaying the store on the
+    // flagged coordinator must not allocate new paged blocks.
+    let beforeBlocks = coordinator.pagedCache?.stats.allocatedBlocks ?? 0
+    coordinator.storeAfterGeneration(
+        promptTokens: [20, 21, 22, 23],
+        perLayerData: [(keys: keys, values: values)],
+        ssmStates: nil,
+        cache: nil)
+    let afterBlocks = coordinator.pagedCache?.stats.allocatedBlocks ?? 0
+    #expect(beforeBlocks == afterBlocks,
+        "paged-incompatible store must not allocate new paged blocks")
+}
+
 @Test func coordinatorMiss() {
     let config = CacheCoordinatorConfig(
         usePagedCache: true,

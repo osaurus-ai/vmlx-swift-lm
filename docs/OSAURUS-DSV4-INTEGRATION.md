@@ -153,9 +153,16 @@ means `maxTokens` ran out before the model closed `</think>`. Bumping
 - DSV4 with `compress_ratio > 0` layers is NOT compatible with the
   paged KV cache (`PagedCacheManager`). The paged block ring assumes
   uniform per-token KV; DSV4's pool rows summarize variable spans of
-  raw KV. The `cr == 0` SWA-only layers (the first and last) are
-  paged-compatible but the heterogeneous mix isn't, so the host should
-  treat the entire DSV4 model as paged-incompatible.
+  raw KV. **The runtime detects this automatically as of 2026-05-04**:
+  at first slot admission the `CacheCoordinator` flips to
+  `isPagedIncompatible = true` and skips the paged tier for fetch +
+  store; the disk tier (which understands `LayerKind.deepseekV4`)
+  becomes the exclusive prefix-reuse path. Hosts do NOT need to set
+  `CacheCoordinatorConfig.usePagedCache = false` — the default value
+  is fine; the runtime guard activates on its own. Without the guard,
+  the paged tier would silently report a token-id-hash hit on empty
+  blocks for DSV4 prompts, suppressing the disk-tier lookup that
+  would actually hit.
 
 ## Known good bundle smoke test
 

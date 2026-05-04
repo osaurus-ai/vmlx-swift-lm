@@ -111,9 +111,19 @@ NOT compatible with:
 - `QuantizedKVCache` (qweight packing differs per-layer).
 
 For DSV4-Flash specifically: the entire model is paged-incompatible
-because every cr>0 layer would need its own ring shape. Use the
-default `[KVCache]` array path — the disk-backed prefix cache via
-`TQDiskSerializer` handles multi-turn reuse without the paged manager.
+because every cr>0 layer would need its own ring shape. **As of
+2026-05-04 the runtime detects this automatically**: at first slot
+admission (BatchEngine) or first prefill (TokenIterator / ChatSession)
+the coordinator is flipped to `isPagedIncompatible = true` and the
+fetch + store paths skip the paged tier entirely, routing prefix
+reuse exclusively through the disk tier (`TQDiskSerializer` understands
+`LayerKind.deepseekV4`). Hosts do NOT need to set
+`CacheCoordinatorConfig.usePagedCache = false` for DSV4 — leave it at
+the default and the guard activates on its own.
+
+If you build a custom coordinator path that bypasses BatchEngine /
+TokenIterator, call `coordinator.setPagedIncompatible(true)` before
+any `fetch` / `storeAfterGeneration` for DSV4 sessions.
 
 ## Trim semantics
 

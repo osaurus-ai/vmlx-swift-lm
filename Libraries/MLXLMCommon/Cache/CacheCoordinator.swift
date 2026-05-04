@@ -72,7 +72,19 @@ public final class CacheCoordinator: @unchecked Sendable {
     /// Whether the model has hybrid (attention + SSM) layers.
     private var _isHybrid: Bool = false
 
-    /// Lock protecting `_isHybrid`.
+    /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+    /// Whether the model has hybrid pool caches (DeepseekV4 SWA+CSA+HSA)
+    /// that the paged cache can't represent. When true, fetch + store
+    /// skip the paged tier entirely; the disk tier (which understands
+    /// `LayerKind.deepseekV4`) handles prefix-cache reuse instead. This
+    /// closes a silent regression where the paged tier reported a hit
+    /// for DSV4 prompts (because token-id hashes match) but the blocks
+    /// had no per-layer data (because `extractLayerData` returns nil
+    /// for hybrid layers), so the `restoreLayerData` short-circuit
+    /// suppressed the disk-tier lookup that WOULD have hit.
+    private var _isPagedIncompatible: Bool = false
+
+    /// Lock protecting `_isHybrid` and `_isPagedIncompatible`.
     private let lock = OSAllocatedUnfairLock()
 
     // MARK: - Initialization
@@ -124,6 +136,20 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _isHybrid }
     }
 
+    /// 2026-05-04: mark the model as paged-incompatible (DSV4 hybrid pool
+    /// caches). Forces the coordinator's fetch + store paths to skip the
+    /// paged tier so the disk tier (`TQDiskSerializer`) is the only
+    /// prefix-reuse mechanism — which is correct for DSV4, where the
+    /// cache state can't be reduced to per-token KV blocks.
+    public func setPagedIncompatible(_ incompatible: Bool) {
+        lock.withLock { _isPagedIncompatible = incompatible }
+    }
+
+    /// Whether the model is paged-incompatible (hybrid pool caches).
+    public var isPagedIncompatible: Bool {
+        lock.withLock { _isPagedIncompatible }
+    }
+
     // MARK: - Fetch
 
     /// Perform a tiered cache lookup for the given token sequence.
@@ -146,8 +172,17 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
     public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
+        // 2026-05-04: skip the paged tier entirely for paged-incompatible
+        // models (DSV4 hybrid pool caches). Without this short-circuit,
+        // paged would report a hit on the token-id hash but `restoreLayerData`
+        // would silently restore zero tokens (DSV4 layers aren't KV-bearing
+        // in the paged taxonomy), and the disk tier — which DOES handle
+        // DSV4 via `LayerKind.deepseekV4` — would never get consulted.
+        let skipPaged = isPagedIncompatible
+
         // Tier 1: Paged cache (in-memory)
-        if let pagedCache,
+        if !skipPaged,
+           let pagedCache,
            let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
         {
             var ssmStates: [MLXArray]? = nil
@@ -248,8 +283,9 @@ public final class CacheCoordinator: @unchecked Sendable {
         let blockLayerData = splitLayerDataIntoBlocks(
             perLayerData, blockSize: blockSize, totalTokens: totalTokens)
 
-        // Store in paged cache
-        if let pagedCache {
+        // Store in paged cache (skip when the model is paged-incompatible —
+        // see `isPagedIncompatible` above).
+        if !isPagedIncompatible, let pagedCache {
             pagedCache.storeTokenSequence(
                 tokens: promptTokens, layerData: blockLayerData, mediaSalt: mediaSalt)
         }

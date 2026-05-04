@@ -791,6 +791,23 @@ public struct TokenIterator: TokenIteratorProtocol {
         // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
         // persistence + paged restore on cache hit.
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
+            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+            // Mirror BatchEngine.admit's detection — if the cache has any
+            // hybrid pool layer (DSV4 SWA+CSA+HSA), flip the coordinator
+            // to paged-incompatible so the fetch routes through the disk
+            // tier (which understands `LayerKind.deepseekV4`) instead of
+            // the paged tier (which would report a hash hit on empty
+            // blocks for DSV4 and silently bypass the disk lookup that
+            // would actually hit). Idempotent.
+            if !coordinator.isPagedIncompatible {
+                let hasHybridPool = self.cache.contains { $0 is HybridPoolCache }
+                if hasHybridPool {
+                    coordinator.setPagedIncompatible(true)
+                    Self.logger.info(
+                        "TokenIterator: coordinator flipped to isPagedIncompatible=true"
+                    )
+                }
+            }
             let result = coordinator.fetch(
                 tokens: promptTokenIds, mediaSalt: mediaSalt)
             switch result {

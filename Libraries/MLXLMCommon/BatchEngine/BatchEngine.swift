@@ -668,6 +668,24 @@ public actor BatchEngine {
                 }
             }
 
+            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
+            // Detect paged-incompatible models at admission so the
+            // coordinator routes prefix reuse through the disk tier
+            // (`TQDiskSerializer` understands `LayerKind.deepseekV4`)
+            // instead of the paged tier (which would report a token-id
+            // hash hit on empty blocks for DSV4 and starve the disk
+            // tier of the lookup that would actually hit). Idempotent —
+            // safe to run on every admission.
+            if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
+                let hasHybridPool = cache.contains { $0 is HybridPoolCache }
+                if hasHybridPool {
+                    coordinator.setPagedIncompatible(true)
+                    Self.logger.info(
+                        "Coordinator flipped to isPagedIncompatible=true on first hybrid-pool slot admission"
+                    )
+                }
+            }
+
             let slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
             activeSlots.append(slot)
         }
