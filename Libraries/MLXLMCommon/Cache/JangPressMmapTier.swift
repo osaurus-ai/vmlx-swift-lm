@@ -1,20 +1,21 @@
 // Copyright © 2026 Jinho Jang. All rights reserved.
 //
-// JangPressMmapTier — bundle-aware mmap+madvise tier for routed
-// MoE expert weights.
+// JangPressMmapTier — bundle-aware mmap probe for routed MoE expert
+// weights.
 //
 // PURPOSE
 // =======
-// Open every safetensors shard in a bundle once at load time as a
-// read-only `JangPressShard`. Walk the shards' tensor indexes to
-// identify which entries are routed-expert tiles (per-architecture
-// regex patterns). Build an in-memory map of (layer, expert) →
-// (shard, byteRange). At inference time:
+// Open safetensors shards in a bundle as read-only `JangPressShard`s
+// and walk their tensor indexes to identify routed-expert tiles
+// (per-architecture regex patterns). Build an in-memory map of
+// (layer, expert) → (shard, byteRange) so status surfaces can report
+// routed tile counts and routed bytes.
 //
-//   • acquire(layer, experts) → call madvise(.willNeed) on those
-//     ranges so the kernel pre-faults.
-//   • release(layer, experts) → call madvise(.dontNeed) so the
-//     kernel can reclaim those pages under pressure.
+// This tier is a probe/status utility. It is not the canonical MLX
+// weight store, and it does not drive per-token acquire/release in
+// production. Real steady-state RAM savings come only when the pinned
+// osaurus mlx-swift runtime honors `MLX_SAFETENSORS_MMAP=1` and loads
+// safetensors through the C++ whole-shard mmap loader.
 //
 // COMPARED TO JangPressMachCache
 // =======================================
@@ -27,19 +28,16 @@
 //       canonical storage with our region — gated on MLX-swift fork).
 //     • Kernel uses WKdm to compress dormant pages.
 //
-//   JangPressMmapTier (file-backed mmap + madvise)
+//   JangPressMmapTier (file-backed mmap probe)
 //     • Uses the bundle file as the source of truth.
-//     • No extra RAM — pages are file-backed, shared with the kernel
-//       page cache. Multiple opens of the same file share pages.
-//     • Discard reclaims pages back to the file (no compression);
-//       refault re-reads from disk.
+//     • No durable extra RAM — pages are file-backed and can be
+//       reclaimed by the kernel. Multiple opens of the same file share
+//       pages.
 //     • Doesn't conflict with MLX — they hold ANOTHER copy in their
 //       allocator. Our mmap is a parallel read-only view.
-//     • Win comes when memory pressure removes our mmap pages —
-//       MLX's copies are still resident, so the model still works.
-//       BUT: in the future, if MLX is taught to read from our mmap
-//       directly (replacing its allocator), we save the duplicate
-//       copy entirely.
+//     • The probe alone does not save canonical model RAM. The win
+//       comes from the MLX C++ mmap safetensors loader replacing the
+//       stock `pread()` copy with mmap-backed tensor storage.
 //
 // REGEX PATTERNS PER FAMILY
 // =========================
@@ -63,16 +61,16 @@ public struct JangPressMmapConfig: Sendable {
     /// every `*.safetensors` file in this directory.
     public let bundleURL: URL
 
-    /// 0..100 — fraction of the routed-expert pool to keep MADV_WILLNEED
-    /// ("hot") at all times. Bottom (1 - hotPct/100) gets MADV_DONTNEED
-    /// when idle. Default 30 % hot.
+    /// 0..100 legacy hot fraction retained for API/source
+    /// compatibility. The production probe no longer has per-token
+    /// acquire/release call sites, so this value is informational.
     public var hotPercent: Int
 
-    /// When true, the entire data area of every shard starts with
-    /// MADV_DONTNEED. The first inference's `acquire()` calls switch
-    /// the active set to MADV_WILLNEED. Use this for memory-tight
-    /// startups; under low pressure on a roomy machine prefer false
-    /// (default) so all weights start resident.
+    /// When true, routed ranges in this probe mapping are marked
+    /// `MADV_DONTNEED` after indexing. This can release redundant file
+    /// cache pages created by the probe, but it does not release the
+    /// canonical MLX tensor storage unless the patched MLX mmap loader
+    /// owns that storage.
     public var startCold: Bool
 
     public init(bundleURL: URL, hotPercent: Int = 30, startCold: Bool = false) {
@@ -236,13 +234,25 @@ public final class JangPressMmapTier: @unchecked Sendable {
         // decision (legacy hint path, controller wake-all).
         var byKey: [TileKey: [(URL, Range<UInt64>)]] = [:]
         var stackedLayerN: [Int: Int] = [:]
+        var descriptorCount = 0
+        var parsedRoutedNames = 0
+        var missingDescriptors = 0
+        var stackedTensorNames = 0
+        var wholeTensorNames = 0
         for (url, shard) in openedShards {
+            descriptorCount += shard.tensors.count
             for name in shard.tensors.keys {
-                guard let (layer, expert) = Self.parseRoutedExpertName(name),
-                      let desc = shard.descriptor(for: name)
-                else { continue }
+                guard let (layer, expert) = Self.parseRoutedExpertName(name) else {
+                    continue
+                }
+                parsedRoutedNames += 1
+                guard let desc = shard.descriptor(for: name) else {
+                    missingDescriptors += 1
+                    continue
+                }
                 let isStacked = expert == 0 && Self.isStackedTensorName(name)
                 if isStacked, !desc.shape.isEmpty, desc.shape[0] > 1 {
+                    stackedTensorNames += 1
                     // Split [N, …] tensor into N per-expert sub-ranges.
                     let nExperts = desc.shape[0]
                     let perExpertBytes = desc.dataLength / UInt64(nExperts)
@@ -266,6 +276,7 @@ public final class JangPressMmapTier: @unchecked Sendable {
                               default: []].append((url, subrange))
                     }
                 } else {
+                    wholeTensorNames += 1
                     let fullRange = desc.dataOffset
                         ..< desc.dataOffset + desc.dataLength
                     byKey[TileKey(layer: layer, expert: expert),
@@ -284,9 +295,16 @@ public final class JangPressMmapTier: @unchecked Sendable {
         self._experts = built
         self._stackedLayerExpertCount = stackedLayerN
 
-        // startCold: mark every routed range DONTNEED right after building.
-        // This is the post-MLX-pread reclaim — kernel page cache for these
-        // bytes is redundant once MLX has copied to Metal buffer.
+        let debug = ProcessInfo.processInfo.environment["JANGPRESS_DEBUG"] == "1"
+            || ProcessInfo.processInfo.environment["JANGPRESS_MMAP_DEBUG"] == "1"
+        if debug {
+            FileHandle.standardError.write(Data(
+                "[JangPressMmapTier] index: descriptors=\(descriptorCount) parsed=\(parsedRoutedNames) missingDesc=\(missingDescriptors) stacked=\(stackedTensorNames) whole=\(wholeTensorNames) experts=\(built.count) layers=\(stackedLayerN.count) routedBytes=\(built.values.reduce(UInt64(0)) { $0 + $1.totalBytes })\n".utf8))
+        }
+
+        // startCold: mark every routed probe range DONTNEED right after
+        // building. This releases only the probe's file-backed pages; it
+        // does not affect stock MLX pread copies.
         if config.startCold {
             for (_, ranges) in built {
                 for part in ranges.parts {
@@ -298,115 +316,15 @@ public final class JangPressMmapTier: @unchecked Sendable {
         }
     }
 
-    // MARK: - Routing API
-
-    /// Pre-fault the given experts. Triggers `ensureBuilt()` on first
-    /// use; thereafter does the corresponding number of
-    /// `madvise(MADV_WILLNEED)` syscalls — one per (gate/up/down) part.
-    public func acquire(layer: Int, experts: [Int]) {
-        ensureBuilt()
-        for e in experts {
-            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
-            for part in r.parts {
-                _shards[part.shard]?.advise(.willNeed, range: part.range)
-            }
-        }
-    }
-
-    /// Mark the given experts as MADV_DONTNEED — kernel can reclaim
-    /// their pages under pressure.
-    public func release(layer: Int, experts: [Int]) {
-        ensureBuilt()
-        for e in experts {
-            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
-            for part in r.parts {
-                _shards[part.shard]?.advise(.dontNeed, range: part.range)
-            }
-        }
-    }
-
-    /// iter 25: WILLNEED every expert in a layer. Use this when the
-    /// caller has a per-LAYER hint but no per-EXPERT route (e.g. legacy
-    /// code that hadn't been wired into routing yet). For a stacked
-    /// layer of N experts, this issues N madvise calls (one per
-    /// per-expert sub-range) — equivalent IO cost to the pre-iter-25
-    /// whole-tile fault, but exposed here as an explicit choice so the
-    /// per-expert acquire path stays the default.
-    public func acquireLayer(_ layer: Int) {
-        ensureBuilt()
-        if let n = _stackedLayerExpertCount[layer] {
-            acquire(layer: layer, experts: Array(0..<n))
-        } else {
-            // Per-expert layout: enumerate this layer's known experts.
-            let layerExperts = _experts.keys
-                .filter { $0.layer == layer }
-                .map { $0.expert }
-            if !layerExperts.isEmpty {
-                acquire(layer: layer, experts: layerExperts)
-            }
-        }
-    }
-
-    /// iter 25: complement of `acquireLayer` — DONTNEED every expert
-    /// in a layer. Useful for "I know this whole layer is going cold"
-    /// hints (post-prefill pruning, e.g.).
-    public func releaseLayer(_ layer: Int) {
-        ensureBuilt()
-        if let n = _stackedLayerExpertCount[layer] {
-            release(layer: layer, experts: Array(0..<n))
-        } else {
-            let layerExperts = _experts.keys
-                .filter { $0.layer == layer }
-                .map { $0.expert }
-            if !layerExperts.isEmpty {
-                release(layer: layer, experts: layerExperts)
-            }
-        }
-    }
-
-    /// Stronger version of `release` — uses `msync(MS_INVALIDATE)` to
-    /// force the kernel to drop pages immediately rather than treating
-    /// it as a hint. Use during quiesce-time compaction when you're
-    /// confident these experts will stay dormant for ≥30 s. Cost: the
-    /// next acquire pays a disk re-fault (~ms per tile).
-    public func forceRelease(layer: Int, experts: [Int]) {
-        ensureBuilt()
-        for e in experts {
-            guard let r = self._experts[TileKey(layer: layer, expert: e)] else { continue }
-            for part in r.parts {
-                _shards[part.shard]?.forceInvalidate(range: part.range)
-            }
-        }
-    }
-
-    /// iter 24: bulk-release every routed range with `madvise(DONTNEED)`.
-    /// Designed to run RIGHT AFTER first inference completes — at that
-    /// point MLX-swift has finished pread'ing the safetensors into its
-    /// own Metal buffers, so the kernel page cache for those same bytes
-    /// is pure redundancy. Dropping it gives RAM back for other apps.
-    ///
-    /// This is the v1 "real win" of JangPress on JANGTQ bundles where
-    /// MLX always copies (cf. the v2 storage-hook fork that would let
-    /// MLX wrap our mmap directly).
-    public func releaseAllRoutedRanges() {
-        ensureBuilt()
-        for (_, ranges) in _experts {
-            for part in ranges.parts {
-                _shards[part.shard]?.advise(.dontNeed, range: part.range)
-            }
-        }
-    }
-
-    /// Same as `releaseAllRoutedRanges` but uses msync(MS_INVALIDATE) for
-    /// guaranteed reclaim regardless of pressure level.
-    public func forceReleaseAllRoutedRanges() {
-        ensureBuilt()
-        for (_, ranges) in _experts {
-            for part in ranges.parts {
-                _shards[part.shard]?.forceInvalidate(range: part.range)
-            }
-        }
-    }
+    // MARK: - Probe API
+    //
+    // The acquire/release/madvise surface that lived here was deleted
+    // in iter 26 — none of it had production call sites and the
+    // parallel-mmap design couldn't actually compress anything (see
+    // docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md). What remains is
+    // the tile-classification probe (`snapshot()` / `snapshotIfBuilt()`)
+    // which `LoadBundleFacts.inspect` and tests use to count routed
+    // bytes per layer/expert without faulting in the data segment.
 
     // MARK: - Stats
 

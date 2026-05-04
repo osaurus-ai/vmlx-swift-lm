@@ -334,12 +334,14 @@ class JambaMambaMixer: Module {
 }
 
 class JambaSparseMoeBlock: Module {
+    let layerIdx: Int
     let numExpertsPerTok: Int
 
     @ModuleInfo(key: "router") var router: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
 
-    public init(_ config: JambaConfiguration) {
+    public init(_ config: JambaConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok
 
         _router.wrappedValue = Linear(config.hiddenSize, config.numExperts, bias: false)
@@ -355,6 +357,7 @@ class JambaSparseMoeBlock: Module {
         let gates = router(x)
         let k = numExpertsPerTok
         let inds = stopGradient(MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k])
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         scores = MLX.softmax(scores, axis: -1, precise: true)
 
@@ -375,7 +378,7 @@ class JambaDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "pre_ff_layernorm") var preFFLayerNorm: RMSNorm
 
-    public init(_ config: JambaConfiguration, layerType: String) {
+    public init(_ config: JambaConfiguration, layerIdx: Int, layerType: String) {
         self.isAttn = layerType == "attention"
 
         if isAttn {
@@ -385,7 +388,7 @@ class JambaDecoderLayer: Module {
         }
 
         if config.numExperts > 1 {
-            _feedForward.wrappedValue = JambaSparseMoeBlock(config)
+            _feedForward.wrappedValue = JambaSparseMoeBlock(config, layerIdx: layerIdx)
             self.isSparseMoe = true
         } else {
             _feedForward.wrappedValue = JambaMLP(config)
@@ -437,8 +440,8 @@ public class JambaModelInner: Module {
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
 
         let layersBlockType = config.layersBlockType!
-        self.layers = layersBlockType.enumerated().map { (_, type) in
-            JambaDecoderLayer(config, layerType: type)
+        self.layers = layersBlockType.enumerated().map { layerIdx, type in
+            JambaDecoderLayer(config, layerIdx: layerIdx, layerType: type)
         }
 
         _finalLayerNorm.wrappedValue = RMSNorm(

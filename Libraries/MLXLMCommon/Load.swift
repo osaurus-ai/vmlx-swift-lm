@@ -92,6 +92,13 @@ public func loadWeights(
                     "-of-\(String(format: "%05d", completeTotal)).safetensors")
             }
         }
+        // Stock MLX loader (pread + allocator::malloc). The mmap-backed
+        // alternative in MmapSafetensorsLoader.swift is documented as
+        // experimental: the public Swift `MLXArray(rawPointer:..)` API
+        // does not yield Metal-buffer-backed arrays for arbitrary mmap
+        // pointers, so GPU ops on the resulting arrays read garbage.
+        // See docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md for the
+        // diagnostic + the upstream MLX C++ work needed to enable it.
         for url in allShardURLs {
             let (w, m) = try loadArraysAndMetadata(url: url)
             for (key, value) in w {

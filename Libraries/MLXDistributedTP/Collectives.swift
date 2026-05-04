@@ -2,6 +2,21 @@ import Foundation
 import MLX
 import CmlxDistributedShim
 
+// mlx-c default-stream handle. Private to this file. Cached lazily so
+// every collective dispatches against the same stream.
+@_silgen_name("mlx_default_cpu_stream_new")
+private func _mlx_default_cpu_stream_new() -> UnsafeMutableRawPointer?
+
+/// Construct the default stream lazily on each collective. The
+/// underlying mlx-c stream handles are heap-allocated descriptors —
+/// constructing one per call is cheap (~µs) and sidesteps Swift 6
+/// strict-concurrency global-mutable-state diagnostics. If profiling
+/// shows this is hot we can switch to a `@unchecked Sendable` wrapper
+/// or per-actor caching.
+@inline(__always) private func defaultStream() -> UnsafeMutableRawPointer? {
+    _mlx_default_cpu_stream_new()
+}
+
 /// Tensor-level collectives. Each is a no-op on a size-1 group (matches
 /// Python's `mx.distributed.all_sum` etc. semantics) so call sites don't
 /// need to gate on `group.isMultiRank`.
@@ -54,6 +69,12 @@ public enum Collectives {
     // MARK: - Internal bridging
 
     /// Calls a 4-arg collective (res, x, group, stream).
+    ///
+    /// The mlx-c distributed entry points reject a null `mlx_stream`
+    /// (see `mlx-c/mlx/c/distributed.cpp:82`). We pass MLX's default
+    /// CPU stream — these collectives are CPU-side coordination ops
+    /// (the heavy compute happens via the buffer-shared metal arrays
+    /// that are pre-evaluated before the collective fires).
     private static func invoke(
         _ x: MLXArray,
         group: Group,
@@ -67,7 +88,7 @@ public enum Collectives {
         var resPtr: UnsafeMutableRawPointer? = nil
         let srcPtr = unsafeBitCast(x.ctx, to: UnsafeMutableRawPointer?.self)
         let grpPtr = group.handle.raw.ctx
-        let stmPtr: UnsafeMutableRawPointer? = nil  // default stream
+        let stmPtr = defaultStream()
         let rc = call(&resPtr, srcPtr, grpPtr, stmPtr)
         precondition(rc == 0, "mlx-c collective failed with rc=\(rc)")
         return mlxArrayFromCtx(resPtr)
@@ -89,7 +110,7 @@ public enum Collectives {
         var resPtr: UnsafeMutableRawPointer? = nil
         let srcPtr = unsafeBitCast(x.ctx, to: UnsafeMutableRawPointer?.self)
         let grpPtr = group.handle.raw.ctx
-        let stmPtr: UnsafeMutableRawPointer? = nil
+        let stmPtr = defaultStream()
         let rc = call(&resPtr, srcPtr, intArg, grpPtr, stmPtr)
         precondition(rc == 0, "mlx-c send/recv failed with rc=\(rc)")
         return mlxArrayFromCtx(resPtr)

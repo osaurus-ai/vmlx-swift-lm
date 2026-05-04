@@ -73,7 +73,8 @@ final class JangTokenizerFallbackTests: XCTestCase {
     /// Write a minimal `jang_config.json` with the given source_model block.
     private func writeJangConfig(
         at modelDir: URL,
-        sourceModel: [String: Any]? = nil
+        sourceModel: [String: Any]? = nil,
+        sourceModelString: String? = nil
     ) throws {
         var payload: [String: Any] = [
             "format": "JANG",
@@ -82,6 +83,8 @@ final class JangTokenizerFallbackTests: XCTestCase {
         ]
         if let sourceModel {
             payload["source_model"] = sourceModel
+        } else if let sourceModelString {
+            payload["source_model"] = sourceModelString
         }
         let data = try JSONSerialization.data(withJSONObject: payload)
         try FileManager.default.createDirectory(
@@ -203,6 +206,48 @@ final class JangTokenizerFallbackTests: XCTestCase {
             "Resolver must skip snapshots without tokenizer files.")
     }
 
+    func testResolveFallsBackFromKimiStringSourceModel() throws {
+        // Kimi K2.x JANGTQ bundles use source_model as a repo string and
+        // carry tokenizer_config.json + tiktoken.model, but no tokenizer.json.
+        // The local TikTokenTokenizer files are not loadable by
+        // swift-transformers, so the resolver should use the cached source
+        // snapshot when one is present.
+        let jangDir = tmpRoot.appendingPathComponent("Kimi-K2.6-Small-JANGTQ")
+        try writeJangConfig(
+            at: jangDir,
+            sourceModelString: "JANGQ-AI/Kimi-K2.6-Small")
+        try writeFile(
+            at: jangDir.appendingPathComponent("tokenizer_config.json"),
+            contents: #"{"tokenizer_class":"TikTokenTokenizer"}"#)
+        try writeFile(at: jangDir.appendingPathComponent("tiktoken.model"))
+        let expectedSnapshot = try fakeHFSnapshot(
+            org: "JANGQ-AI", name: "Kimi-K2.6-Small")
+
+        let resolved = JangLoader.resolveTokenizerDirectory(
+            for: jangDir, huggingFaceCacheRoot: hfCacheRoot)
+
+        assertSamePath(resolved, expectedSnapshot,
+            "Kimi TikTokenTokenizer dirs without tokenizer.json should fall back to source.")
+    }
+
+    func testResolveKeepsGeneratedKimiTokenizerJsonLocal() throws {
+        let jangDir = tmpRoot.appendingPathComponent("Kimi-generated-tokenizer")
+        try writeJangConfig(
+            at: jangDir,
+            sourceModelString: "JANGQ-AI/Kimi-K2.6-Small")
+        try writeFile(
+            at: jangDir.appendingPathComponent("tokenizer_config.json"),
+            contents: #"{"tokenizer_class":"TikTokenTokenizer"}"#)
+        try writeFile(at: jangDir.appendingPathComponent("tokenizer.json"))
+        _ = try fakeHFSnapshot(org: "JANGQ-AI", name: "Kimi-K2.6-Small")
+
+        let resolved = JangLoader.resolveTokenizerDirectory(
+            for: jangDir, huggingFaceCacheRoot: hfCacheRoot)
+
+        assertSamePath(resolved, jangDir,
+            "A generated tokenizer.json in the local overlay should remain the preferred path.")
+    }
+
     // MARK: - resolveTokenizerDirectory — defensive fallbacks
 
     func testResolveReturnsSelfWhenSourceModelMissingOrg() throws {
@@ -301,5 +346,18 @@ final class JangTokenizerFallbackTests: XCTestCase {
         XCTAssertEqual(config.sourceModel.architecture, "minimax_m2")
         XCTAssertEqual(config.sourceModel.dtype, "bfloat16")
         XCTAssertEqual(config.sourceModel.parameters, "230000000000")
+    }
+
+    func testLoadConfigParsesRepoStringSourceModel() throws {
+        let dir = tmpRoot.appendingPathComponent("string_source_model")
+        try writeJangConfig(
+            at: dir,
+            sourceModelString: "JANGQ-AI/Kimi-K2.6-Small")
+
+        let config = try JangLoader.loadConfig(at: dir)
+
+        XCTAssertEqual(config.sourceModel.org, "JANGQ-AI")
+        XCTAssertEqual(config.sourceModel.name, "Kimi-K2.6-Small")
+        XCTAssertEqual(config.sourceModel.huggingFaceRepoID, "JANGQ-AI/Kimi-K2.6-Small")
     }
 }

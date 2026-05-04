@@ -256,6 +256,7 @@ class LFM2MoEMLP: Module, UnaryLayer {
 
 class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     let args: LFM2MoEConfiguration
+    let layerIdx: Int
     let numExperts: Int
     let topK: Int
     let normTopKProb: Bool
@@ -265,8 +266,9 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "expert_bias") var expertBias: MLXArray?
 
-    init(_ args: LFM2MoEConfiguration) {
+    init(_ args: LFM2MoEConfiguration, layerIdx: Int) {
         self.args = args
+        self.layerIdx = layerIdx
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerToken
         self.normTopKProb = args.normTopkProb
@@ -294,6 +296,7 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
 
         let k = topK
         let indices = argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var scores = takeAlong(gates, indices, axis: -1)
         if normTopKProb {
             let denom = scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype)
@@ -330,7 +333,7 @@ class LFM2MoEDecoderLayer: Module {
         if usesDenseFeedForward {
             _feedForward.wrappedValue = LFM2MoEMLP(args)
         } else {
-            _feedForward.wrappedValue = Lfm2MoeSparseMoeBlock(args)
+            _feedForward.wrappedValue = Lfm2MoeSparseMoeBlock(args, layerIdx: layerIdx)
         }
 
         _operatorNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.normEps)

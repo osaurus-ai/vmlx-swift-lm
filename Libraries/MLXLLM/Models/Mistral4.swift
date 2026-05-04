@@ -315,11 +315,13 @@ class Mistral4MoEGate: Module {
 // MARK: - MoE Block
 
 class Mistral4MoE: Module, UnaryLayer {
+    let layerIndex: Int
     @ModuleInfo var gate: Mistral4MoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: Mistral4MLP?
 
-    init(_ config: Mistral4Configuration) {
+    init(_ config: Mistral4Configuration, layerIndex: Int) {
+        self.layerIndex = layerIndex
         self.gate = Mistral4MoEGate(config)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
@@ -337,6 +339,7 @@ class Mistral4MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: inds)
         var y = switchMLP(x, inds)
         y = (y * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         if let sharedExperts {
@@ -362,7 +365,7 @@ class Mistral4DecoderLayer: Module {
             && layerIndex % config.moeLayerFreq == 0
 
         if isMoE {
-            self._mlp.wrappedValue = Mistral4MoE(config)
+            self._mlp.wrappedValue = Mistral4MoE(config, layerIndex: layerIndex)
         } else {
             self._mlp.wrappedValue = Mistral4MLP(
                 hiddenSize: config.hiddenSize, intermediateSize: config.intermediateSize)

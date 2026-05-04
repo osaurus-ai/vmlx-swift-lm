@@ -436,6 +436,7 @@ class DeepseekV4MoEGate: Module {
 
 class DeepseekV4MoE: Module, UnaryLayer {
     let config: DeepseekV4Configuration
+    let layerIdx: Int
     let topK: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     var gate: DeepseekV4MoEGate
@@ -447,6 +448,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
+        self.layerIdx = layerIdx
         self.topK = config.numExpertsPerTok
         let limit = config.swigluLimit
         // Activation: silu(min(gate, limit)) * clip(up, ±limit).
@@ -475,6 +477,7 @@ class DeepseekV4MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: currentInputIds)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
         y = y + sharedExperts(x)
@@ -1053,7 +1056,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     if tensors.count == config.nRoutedExperts {
                         let stackedKey =
                             "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).\(suffix)"
-                        out[stackedKey] = stacked(tensors)
+                        if out[stackedKey] == nil {
+                            out[stackedKey] = stacked(tensors)
+                        }
                         for e in 0..<config.nRoutedExperts {
                             out.removeValue(
                                 forKey: "\(prefix).\(e).\(projName).\(suffix)")

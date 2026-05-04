@@ -96,13 +96,15 @@ private class MiniMaxJANGTQAttention: Module {
 // MARK: - MoE block (JANGTQ — swaps SwitchGLU for TurboQuantSwitchGLU)
 
 private class MiniMaxJANGTQSparseMoeBlock: Module {
+    let layerIdx: Int
     let numExpertsPerTok: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: TurboQuantSwitchGLU
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
-    init(_ args: MiniMaxJANGTQConfiguration) {
+    init(_ args: MiniMaxJANGTQConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numLocalExperts, bias: false)
@@ -135,6 +137,7 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
 
         let k = numExpertsPerTok
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         scores = takeAlong(originalScores, inds, axis: -1)
 
         scores = scores
@@ -154,9 +157,9 @@ private class MiniMaxJANGTQDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    init(_ args: MiniMaxJANGTQConfiguration) {
+    init(_ args: MiniMaxJANGTQConfiguration, layerIdx: Int) {
         _selfAttn.wrappedValue = MiniMaxJANGTQAttention(args)
-        _blockSparseMoe.wrappedValue = MiniMaxJANGTQSparseMoeBlock(args)
+        _blockSparseMoe.wrappedValue = MiniMaxJANGTQSparseMoeBlock(args, layerIdx: layerIdx)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -185,7 +188,7 @@ public class MiniMaxJANGTQModelInner: Module {
         self.args = args
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-        self.layers = (0 ..< args.hiddenLayers).map { _ in MiniMaxJANGTQDecoderLayer(args) }
+        self.layers = (0 ..< args.hiddenLayers).map { MiniMaxJANGTQDecoderLayer(args, layerIdx: $0) }
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
     }
 
@@ -259,11 +262,19 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                 for key in ["tq_packed", "tq_norms"] {
                     let first = "\(prefix).experts.0.\(orig).\(key)"
                     guard sanitized[first] != nil else { continue }
+                    let target = "\(prefix).switch_mlp.\(updated).\(key)"
+                    if sanitized[target] != nil {
+                        for e in 0 ..< configuration.numLocalExperts {
+                            sanitized.removeValue(
+                                forKey: "\(prefix).experts.\(e).\(orig).\(key)")
+                        }
+                        continue
+                    }
                     let stacked = (0 ..< configuration.numLocalExperts).map { e -> MLXArray in
                         sanitized.removeValue(
                             forKey: "\(prefix).experts.\(e).\(orig).\(key)")!
                     }
-                    sanitized["\(prefix).switch_mlp.\(updated).\(key)"] = MLX.stacked(stacked)
+                    sanitized[target] = MLX.stacked(stacked)
                 }
             }
         }

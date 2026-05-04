@@ -238,6 +238,20 @@ let package = Package(
             path: "CompileBench"
         ),
         .executableTarget(
+            name: "TPRankWorker",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                "MLXDistributedTP",
+                "MLXDistributedJACCL",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
+            ],
+            path: "Tools/TPRankWorker"
+        ),
+        .executableTarget(
             name: "RunBench",
             dependencies: [
                 "MLXLMCommon",

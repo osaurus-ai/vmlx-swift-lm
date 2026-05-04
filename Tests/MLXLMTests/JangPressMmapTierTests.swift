@@ -221,23 +221,10 @@ struct JangPressMmapTierTests {
         #expect(stats.totalRoutedBytes == 288)
     }
 
-    @Test("acquire/release issues madvise without crashing")
-    func acquireRelease() throws {
-        let dir = try Self.standardBundle()
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let tier = try JangPressMmapTier(
-            config: .init(bundleURL: dir, hotPercent: 30, startCold: true))
-
-        // Should not throw / crash.
-        tier.acquire(layer: 0, experts: [0, 1])
-        tier.release(layer: 0, experts: [0, 1])
-        tier.acquire(layer: 1, experts: [0])
-        tier.release(layer: 1, experts: [0])
-
-        // Acquiring a non-existent expert is a no-op (no throw).
-        tier.acquire(layer: 99, experts: [99])
-    }
+    // (former acquire/release test deleted in iter 26 — those methods
+    //  were removed from JangPressMmapTier alongside the orphaned
+    //  controller. The tier is now a tile-classification probe; see
+    //  docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.)
 
     @Test("startCold flag triggers initial dontNeed pass")
     func startCold() throws {
@@ -253,41 +240,9 @@ struct JangPressMmapTierTests {
         #expect(tier.snapshot().expertCount == 4)
     }
 
-    @Test("forceRelease + reacquire produces byte-identical data")
-    func forceReleaseRoundTrip() throws {
-        let dir = try Self.standardBundle()
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let tier = try JangPressMmapTier(
-            config: .init(bundleURL: dir, hotPercent: 0, startCold: false))
-
-        // Pick the first stored expert tile and snapshot its bytes BEFORE
-        // any release. This is the "ground truth".
-        let expertKey = JangPressMmapTier.TileKey(layer: 0, expert: 0)
-        guard let ranges = tier.experts[expertKey] else {
-            Issue.record("expected expert (layer=0, e=0) to exist")
-            return
-        }
-        guard let firstPart = ranges.parts.first else {
-            Issue.record("expected at least one part for expert")
-            return
-        }
-        guard let shard = tier.shards[firstPart.shard] else {
-            Issue.record("expected shard to be opened")
-            return
-        }
-
-        let original = Array(shard.bytes(in: firstPart.range))
-        #expect(original.count == 32)
-
-        // Force-release: msync(MS_INVALIDATE). Pages dropped from cache.
-        tier.forceRelease(layer: 0, experts: [0])
-
-        // Re-acquire: madvise(WILLNEED) + read again.
-        tier.acquire(layer: 0, experts: [0])
-        let reread = Array(shard.bytes(in: firstPart.range))
-        #expect(reread == original, "post-forceRelease re-read must be byte-identical to pre-release")
-    }
+    // (former forceRelease test deleted in iter 26 — see acquire/release
+    //  note above. Byte-level shard reads are still covered by the
+    //  JangPressShard test suite.)
 
     @Test("sniff path skips non-expert shards from mmap")
     func sniffSkipsNonExpertShards() throws {

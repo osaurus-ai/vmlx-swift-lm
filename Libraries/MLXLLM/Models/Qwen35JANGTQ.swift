@@ -446,6 +446,7 @@ public struct Qwen35JANGTQConfiguration: Codable, Sendable {
 /// the per-expert projections through `TurboQuantSwitchGLU` so the
 /// codebook Metal kernels run instead of `gather_qmm`.
 final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
+    let layerIdx: Int
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
@@ -456,7 +457,8 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35JANGTQTextConfiguration) {
+    init(_ args: Qwen35JANGTQTextConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
@@ -489,6 +491,7 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
         )([gates])
         let inds = routed[0]
         let scores = routed[1]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
         let y = switchMLP(x, inds)
         let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
@@ -528,7 +531,7 @@ final class Qwen35JANGTQDecoderLayer: Module {
         }
 
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35JANGTQSparseMoeBlock(args)
+            _mlp.wrappedValue = Qwen35JANGTQSparseMoeBlock(args, layerIdx: layerIdx)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
@@ -729,11 +732,19 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
                     for kind in ["tq_packed", "tq_norms"] {
                         let first = "\(prefix).experts.0.\(orig).\(kind)"
                         guard weights[first] != nil else { continue }
+                        let target = "\(prefix).switch_mlp.\(updated).\(kind)"
+                        if weights[target] != nil {
+                            for e in 0 ..< configuration.numExperts {
+                                weights.removeValue(
+                                    forKey: "\(prefix).experts.\(e).\(orig).\(kind)")
+                            }
+                            continue
+                        }
                         let stacked: [MLXArray] = (0 ..< configuration.numExperts).map { e in
                             weights.removeValue(
                                 forKey: "\(prefix).experts.\(e).\(orig).\(kind)")!
                         }
-                        weights["\(prefix).switch_mlp.\(updated).\(kind)"] = MLX.stacked(stacked)
+                        weights[target] = MLX.stacked(stacked)
                     }
                 }
             }

@@ -86,6 +86,39 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    // MARK: - JangPress runtime
+
+    /// Locked storage for the optional JangPress runtime. Settable
+    /// from `loadModelContainer(from:using:loadConfiguration:)` so the
+    /// runtime stays alive for the model's lifetime; callers (osaurus
+    /// settings panel, JANG Studio inspector) poll status from
+    /// anywhere via ``jangPressStatus()``.
+    private let _jangPressRuntime = OSAllocatedUnfairLock<JangPressRuntime>(
+        initialState: .none)
+
+    /// Read the current JangPress runtime. `.none` when JangPress was
+    /// not activated for this load (e.g. `LoadConfiguration.jangPress
+    /// == .disabled` or auto-threshold not met).
+    public var jangPressRuntime: JangPressRuntime {
+        _jangPressRuntime.withLock { $0 }
+    }
+
+    /// Replace the JangPress runtime. Called once at load time by
+    /// `loadModelContainer(from:using:loadConfiguration:)`. Safe to
+    /// call multiple times — each call replaces; ARC drops the prior
+    /// runtime and its tiers release.
+    public func setJangPressRuntime(_ runtime: JangPressRuntime) {
+        _jangPressRuntime.withLock { $0 = runtime }
+    }
+
+    /// Snapshot the current JangPress status. Returns
+    /// `JangPressStatus.disabled` when the runtime is `.none`.
+    /// Cheap enough to call on a polling timer (no heavy work; reads
+    /// cached counters under a single lock).
+    public func jangPressStatus() -> JangPressStatus {
+        jangPressRuntime.status()
+    }
+
     public var configuration: ModelConfiguration {
         get async {
             await context.read { $0.configuration }

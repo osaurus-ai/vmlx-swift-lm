@@ -114,6 +114,7 @@ class Qwen3MoEMLP: Module, UnaryLayer {
 }
 
 class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+    let layerIdx: Int
     let numExperts: Int
     let topK: Int
     let normTopkProb: Bool
@@ -121,7 +122,8 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
 
-    init(_ args: Qwen3MoEConfiguration) {
+    init(_ args: Qwen3MoEConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerToken
         self.normTopkProb = args.normTopkProb
@@ -138,6 +140,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
 
         let k = topK
         let inds = MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(softGates, inds, axis: -1)
 
         if normTopkProb {
@@ -171,7 +174,7 @@ class Qwen3MoeDecoderLayer: Module {
         if !args.mlpOnlyLayers.contains(layerIdx),
             args.numExperts > 0, (layerIdx + 1) % args.decoderSparseStep == 0
         {
-            self.mlp = Qwen3MoESparseMoeBlock(args)
+            self.mlp = Qwen3MoESparseMoeBlock(args, layerIdx: layerIdx)
         } else {
             self.mlp = Qwen3MoEMLP(
                 dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)

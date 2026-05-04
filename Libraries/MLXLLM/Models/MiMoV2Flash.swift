@@ -269,17 +269,19 @@ class MiMoV2FlashMoEGate: Module {
 }
 
 class MiMoV2FlashMoE: Module, UnaryLayer {
+    let layerIdx: Int
     let numExpertsPerTok: Int
     let gate: MiMoV2FlashMoEGate
 
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: MiMoV2FlashMLP?
 
-    init(_ config: MiMoV2FlashConfiguration) {
+    init(_ config: MiMoV2FlashConfiguration, layerIdx: Int) {
         guard let nRoutedExperts = config.nRoutedExperts else {
             fatalError("MiMoV2FlashMoE requires nRoutedExperts.")
         }
 
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok
         self.gate = MiMoV2FlashMoEGate(config)
 
@@ -300,6 +302,7 @@ class MiMoV2FlashMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var y = switchMLP(x, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         if let sharedExperts {
@@ -317,10 +320,10 @@ class MiMoV2FlashDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    init(_ config: MiMoV2FlashConfiguration, isMoe: Bool, isSlidingWindow: Bool) {
+    init(_ config: MiMoV2FlashConfiguration, layerIdx: Int, isMoe: Bool, isSlidingWindow: Bool) {
         self.isSlidingWindow = isSlidingWindow
         _selfAttn.wrappedValue = MiMoV2FlashAttention(config, isSlidingWindow: isSlidingWindow)
-        self.mlp = isMoe ? MiMoV2FlashMoE(config) : MiMoV2FlashMLP(config)
+        self.mlp = isMoe ? MiMoV2FlashMoE(config, layerIdx: layerIdx) : MiMoV2FlashMLP(config)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.layernormEpsilon)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -352,6 +355,7 @@ public class MiMoV2FlashModelInner: Module {
         self.layers = (0 ..< config.hiddenLayers).map { index in
             MiMoV2FlashDecoderLayer(
                 config,
+                layerIdx: index,
                 isMoe: config.moeLayerFreq[index] == 1,
                 isSlidingWindow: config.hybridLayerPattern[index] == 1
             )

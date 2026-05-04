@@ -519,10 +519,14 @@ internal class NemotronHSwitchMLP: Module, NemotronHSwitchMLPLayer {
 // MARK: - MoE
 
 internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
+    let layerIdx: Int
     let numExpertsPerTok: Int
     let hasSharedExperts: Bool
+    let moeLatentSize: Int?
 
     @ModuleInfo(key: "gate") var gate: NemotronHMoEGate
+    @ModuleInfo(key: "fc1_latent_proj") var fc1LatentProj: Linear?
+    @ModuleInfo(key: "fc2_latent_proj") var fc2LatentProj: Linear?
     /// `switch_mlp` is type-erased so that JANGTQ bundles can swap in
     /// `NemotronHJANGTQSwitchMLP` (TurboQuant-backed fc1/fc2) without
     /// duplicating the surrounding MoE plumbing. Both variants implement
@@ -530,14 +534,23 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: Module
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
-    init(_ args: NemotronHConfiguration, jangtq: NemotronHJANGTQContext? = nil) {
+    init(_ args: NemotronHConfiguration, layerIdx: Int, jangtq: NemotronHJANGTQContext? = nil) {
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = args.numExpertsPerTok
         self.hasSharedExperts = args.nSharedExperts != nil && args.nSharedExperts! > 0
+        self.moeLatentSize = args.moeLatentSize
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
+        let expertInputDims = args.moeLatentSize ?? args.hiddenSize
+        if let latentSize = args.moeLatentSize {
+            self._fc1LatentProj.wrappedValue = Linear(
+                args.hiddenSize, latentSize, bias: false)
+            self._fc2LatentProj.wrappedValue = Linear(
+                latentSize, args.hiddenSize, bias: false)
+        }
         if let jangtq {
             self._switchMLP.wrappedValue = NemotronHJANGTQSwitchMLP(
-                inputDims: args.hiddenSize,
+                inputDims: expertInputDims,
                 hiddenDims: args.moeIntermediateSize,
                 numExperts: args.nRoutedExperts,
                 bits: jangtq.bits,
@@ -545,7 +558,7 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             )
         } else {
             self._switchMLP.wrappedValue = NemotronHSwitchMLP(
-                inputDims: args.hiddenSize,
+                inputDims: expertInputDims,
                 hiddenDims: args.moeIntermediateSize,
                 numExperts: args.nRoutedExperts
             )
@@ -563,14 +576,19 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
+        let expertInput = fc1LatentProj.map { $0(x) } ?? x
         // Dispatch through the type-erased protocol — both
         // `NemotronHSwitchMLP` (affine) and `NemotronHJANGTQSwitchMLP`
         // (TurboQuant) implement `callAsFunction(_:_:)`.
         guard let layer = switchMLP as? NemotronHSwitchMLPLayer else {
             fatalError("NemotronHMoE.switch_mlp must conform to NemotronHSwitchMLPLayer (got \(type(of: switchMLP)))")
         }
-        var y = layer(x, inds)
+        var y = layer(expertInput, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        if let fc2LatentProj {
+            y = fc2LatentProj(y)
+        }
 
         if let sharedExperts {
             y = y + sharedExperts(x)
@@ -603,6 +621,7 @@ internal class NemotronHBlock: Module {
 
     init(
         _ args: NemotronHConfiguration,
+        layerIdx: Int,
         blockType: Character,
         jangtq: NemotronHJANGTQContext? = nil
     ) {
@@ -621,7 +640,7 @@ internal class NemotronHBlock: Module {
         case .mlp:
             _mixer.wrappedValue = NemotronHMLP(args)
         case .moe:
-            _mixer.wrappedValue = NemotronHMoE(args, jangtq: jangtq)
+            _mixer.wrappedValue = NemotronHMoE(args, layerIdx: layerIdx, jangtq: jangtq)
         }
 
         super.init()
@@ -666,8 +685,8 @@ internal class NemotronHBackbone: Module {
             embeddingCount: args.vocabSize, dimensions: args.hiddenSize)
 
         let pattern = Array(args.hybridOverridePattern)
-        self._layers.wrappedValue = pattern.map {
-            NemotronHBlock(args, blockType: $0, jangtq: jangtq)
+        self._layers.wrappedValue = pattern.enumerated().map { layerIdx, blockType in
+            NemotronHBlock(args, layerIdx: layerIdx, blockType: blockType, jangtq: jangtq)
         }
 
         self._normF.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
@@ -861,6 +880,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         var sanitized = [String: MLXArray]()
 
         for (key, value) in weights {
+            // Nemotron-H bundles can ship MTP speculative-decoding heads
+            // (`mtp.*`). The normal causal runtime does not instantiate
+            // or use them; Python/JANG loaders drop the same keys.
+            if key.hasPrefix("mtp.") || key.hasSuffix(".importance") {
+                continue
+            }
+
             var finalValue = value
 
             // Handle conv1d weight axis swap
@@ -936,12 +962,20 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 let probe = "\(prefix).experts.0.\(proj).tq_packed"
                 guard sanitized[probe] != nil else { continue }
                 for kind in ["tq_packed", "tq_norms"] {
+                    let target = "\(prefix).switch_mlp.\(fc).\(kind)"
+                    if sanitized[target] != nil {
+                        for e in 0 ..< configuration.nRoutedExperts {
+                            sanitized.removeValue(
+                                forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
+                        }
+                        continue
+                    }
                     let stacked: [MLXArray] = (0 ..< configuration.nRoutedExperts).compactMap { e in
                         sanitized.removeValue(
                             forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
                     }
                     if !stacked.isEmpty {
-                        sanitized["\(prefix).switch_mlp.\(fc).\(kind)"] = MLX.stacked(stacked)
+                        sanitized[target] = MLX.stacked(stacked)
                         tqStackedCount += 1
                     }
                 }
@@ -991,6 +1025,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var nGroups: Int
     public var intermediateSize: Int
     public var moeIntermediateSize: Int
+    public var moeLatentSize: Int?
     public var moeSharedExpertIntermediateSize: Int
     public var nRoutedExperts: Int
     public var nSharedExperts: Int?
@@ -1026,6 +1061,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case nGroups = "n_groups"
         case intermediateSize = "intermediate_size"
         case moeIntermediateSize = "moe_intermediate_size"
+        case moeLatentSize = "moe_latent_size"
         case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
         case nRoutedExperts = "n_routed_experts"
         case nSharedExperts = "n_shared_experts"
@@ -1064,6 +1100,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
         moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
+        moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         moeSharedExpertIntermediateSize = try container.decode(
             Int.self, forKey: .moeSharedExpertIntermediateSize)
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
@@ -1125,6 +1162,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         nGroups: Int,
         intermediateSize: Int,
         moeIntermediateSize: Int,
+        moeLatentSize: Int? = nil,
         moeSharedExpertIntermediateSize: Int,
         nRoutedExperts: Int,
         numExpertsPerTok: Int,
@@ -1161,6 +1199,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.nGroups = nGroups
         self.intermediateSize = intermediateSize
         self.moeIntermediateSize = moeIntermediateSize
+        self.moeLatentSize = moeLatentSize
         self.moeSharedExpertIntermediateSize = moeSharedExpertIntermediateSize
         self.nRoutedExperts = nRoutedExperts
         self.nSharedExperts = nSharedExperts

@@ -180,17 +180,19 @@ class GLM4MoEGate: Module {
 }
 
 class GLM4MoE: Module, UnaryLayer {
+    let layerIdx: Int
     let numExpertsPerTok: Int
     let gate: GLM4MoEGate
 
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM4MoEMLP?
 
-    init(_ config: GLM4MoEConfiguration) {
+    init(_ config: GLM4MoEConfiguration, layerIdx: Int) {
         guard let nRoutedExperts = config.nRoutedExperts else {
             fatalError("GLM4MoE requires nRoutedExperts")
         }
 
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok
         self.gate = GLM4MoEGate(config)
 
@@ -212,6 +214,7 @@ class GLM4MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var y = switchMLP(x, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         if let sharedExperts {
@@ -232,7 +235,7 @@ class GLM4MoEDecoderLayer: Module {
         _attention.wrappedValue = GLM4MoEAttention(args)
 
         if args.nRoutedExperts != nil && layerIdx >= args.firstKDenseReplace {
-            self.mlp = GLM4MoE(args)
+            self.mlp = GLM4MoE(args, layerIdx: layerIdx)
         } else {
             self.mlp = GLM4MoEMLP(args)
         }

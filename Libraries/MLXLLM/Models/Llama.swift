@@ -50,10 +50,18 @@ class LlamaAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        // Prepare the queries, keys and values for the attention computation
-        queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+        // Prepare the queries, keys and values for the attention computation.
+        // Using `-1` for the heads axis lets the same code work both for the
+        // standard unsharded case (heads-axis = args.attentionHeads / kvHeads)
+        // and after tensor-parallel sharding by `MLXDistributedTP`'s
+        // `AllToShardedLinear` (heads-axis = args.attentionHeads / world_size).
+        // The math is identical in the unsharded case because
+        // `wq(x).shape[-1] == args.attentionHeads * headDim` and
+        // `wk/wv(x).shape[-1] == args.kvHeads * headDim`.
+        let headDim = args.resolvedHeadDimensions
+        queries = queries.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        keys = keys.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, -1, headDim).transposed(0, 2, 1, 3)
 
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)

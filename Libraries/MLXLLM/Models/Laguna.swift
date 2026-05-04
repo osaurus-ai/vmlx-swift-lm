@@ -452,6 +452,7 @@ public struct LagunaMoEContext: Sendable {
 
 internal final class LagunaMoE: Module, UnaryLayer {
     let cfg: LagunaConfiguration
+    let layerIndex: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
@@ -461,8 +462,9 @@ internal final class LagunaMoE: Module, UnaryLayer {
     @ModuleInfo(key: "experts") var experts: Module
     @ModuleInfo(key: "shared_expert") var sharedExpert: LagunaDenseMLP
 
-    init(_ cfg: LagunaConfiguration, jangtq: LagunaMoEContext?) {
+    init(_ cfg: LagunaConfiguration, layerIndex: Int, jangtq: LagunaMoEContext?) {
         self.cfg = cfg
+        self.layerIndex = layerIndex
         self._gate.wrappedValue = Linear(cfg.hiddenSize, cfg.numExperts, bias: false)
         self._eScoreCorrectionBias.wrappedValue = MLXArray.zeros([cfg.numExperts])
         // Routed experts: codebook MoE via TurboQuantSwitchGLU when the
@@ -519,6 +521,7 @@ internal final class LagunaMoE: Module, UnaryLayer {
         let topkIdx = argPartition(
             -scoresForSelection, kth: topK - 1, axis: -1
         )[.ellipsis, ..<topK]                                          // (B, T, K)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: topkIdx)
         var topkW = MLX.takeAlong(scores, topkIdx, axis: -1)          // (B, T, K) — un-biased!
         let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
         topkW = topkW / normSum
@@ -564,7 +567,7 @@ internal final class LagunaLayer: Module {
             self.mlp = LagunaDenseMLP(
                 hidden: cfg.hiddenSize, intermediate: cfg.intermediateSize)
         } else {
-            self.mlp = LagunaMoE(cfg, jangtq: jangtq)
+            self.mlp = LagunaMoE(cfg, layerIndex: layerIndex, jangtq: jangtq)
         }
         self.layerType = cfg.layerTypes[layerIndex]
         self.useSliding = layerType == "sliding_attention"

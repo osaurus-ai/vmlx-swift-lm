@@ -26,9 +26,7 @@ struct JangPressActivationTests {
         let runtime = JangPressActivation.activate(
             bundleURL: URL(fileURLWithPath: "/nonexistent"),
             options: .disabled)
-        #expect(runtime.controller == nil)
         #expect(runtime.mmap == nil)
-        #expect(runtime.mach == nil)
         #expect(runtime.embed == nil)
         #expect(runtime.isActive == false)
     }
@@ -42,16 +40,9 @@ struct JangPressActivationTests {
         #expect(runtime.isActive == false)
     }
 
-    @Test("backend=.mach falls back to disabled with stderr warning")
-    func machBackendFallsBack() async throws {
-        let opts = JangPressLoadOptions(enabled: true, backend: .mach)
-        let runtime = JangPressActivation.activate(
-            bundleURL: URL(fileURLWithPath: "/nonexistent"),
-            options: opts)
-        // .mach is gated on the MLX-swift fork; falls back to .none
-        // until the MachCache.register path is wired.
-        #expect(runtime.isActive == false)
-    }
+    // (former backend=.mach test deleted in iter 26 — the .mach
+    //  backend was gated on a fork that never landed and the
+    //  JangPressMachCache implementation has been removed.)
 
     // MARK: - Enabled paths (synthetic bundle)
 
@@ -107,43 +98,27 @@ struct JangPressActivationTests {
         return dir
     }
 
-    @Test("enabled mmap backend returns active runtime with controller + tier")
+    @Test("enabled mmap backend returns active runtime with mmap probe")
     func enabledMmapReturnsActive() async throws {
         let bundle = try makeSyntheticBundle()
         defer { try? FileManager.default.removeItem(at: bundle) }
 
         let opts = JangPressLoadOptions(
-            enabled: true, compressPct: 70,
-            backend: .mmap, forceMode: .soft, enablePrefetch: true)
+            enabled: true, compressPct: 70, backend: .mmap)
         let runtime = JangPressActivation.activate(
             bundleURL: bundle, options: opts)
 
         #expect(runtime.isActive == true)
-        #expect(runtime.controller != nil)
         #expect(runtime.mmap != nil)
-        #expect(runtime.mach == nil)
         // embed-tier may be nil if the synthetic shard has no
         // embed_tokens key — that's fine, it's a non-fatal failure.
 
-        // Controller's stats should be reachable.
-        let stats = runtime.controller?.snapshot()
+        // The mmap probe's snapshot is the surviving useful API:
+        // it counts tile bytes per layer/expert without faulting in
+        // the data segment.
+        let stats = runtime.mmap?.snapshot()
         #expect(stats != nil)
 
-        // Disarm cleanly — no crash, no leak.
-        JangPressActivation.deactivate(runtime)
-    }
-
-    @Test("forceMode=.force is accepted (controller uses MS_INVALIDATE)")
-    func forceModeAccepted() async throws {
-        let bundle = try makeSyntheticBundle()
-        defer { try? FileManager.default.removeItem(at: bundle) }
-
-        let opts = JangPressLoadOptions(
-            enabled: true, compressPct: 100,
-            backend: .mmap, forceMode: .force, enablePrefetch: false)
-        let runtime = JangPressActivation.activate(
-            bundleURL: bundle, options: opts)
-        #expect(runtime.isActive == true)
         JangPressActivation.deactivate(runtime)
     }
 
@@ -153,34 +128,6 @@ struct JangPressActivationTests {
         #expect(opts1.compressPct == 0)
         let opts2 = JangPressLoadOptions(enabled: true, compressPct: 150)
         #expect(opts2.compressPct == 100)
-    }
-
-    @Test("inference brackets fire without crash on an active runtime")
-    func bracketHooks() async throws {
-        let bundle = try makeSyntheticBundle()
-        defer { try? FileManager.default.removeItem(at: bundle) }
-
-        let opts = JangPressLoadOptions(enabled: true, compressPct: 70)
-        let runtime = JangPressActivation.activate(
-            bundleURL: bundle, options: opts)
-        #expect(runtime.controller != nil)
-
-        // Simulate a single inference cycle.
-        runtime.controller?.willStartInference(layerExpertHints: [])
-        runtime.controller?.recordRoute(layer: 0, experts: [0])
-        runtime.controller?.didFinishInference()
-
-        // Repeat — no crash, stats accumulate.
-        for _ in 0 ..< 3 {
-            runtime.controller?.willStartInference()
-            runtime.controller?.recordRoute(layer: 0, experts: [0, 1])
-            runtime.controller?.didFinishInference()
-        }
-
-        let stats = runtime.controller?.snapshot()
-        #expect(stats?.totalRoutesObserved ?? 0 > 0)
-
-        JangPressActivation.deactivate(runtime)
     }
 
     @Test("idempotent deactivate — safe to call multiple times")

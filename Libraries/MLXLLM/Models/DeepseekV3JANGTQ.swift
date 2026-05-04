@@ -232,14 +232,16 @@ private struct AffineProjection: Encodable {
 /// (not MXTQ), so the `DeepseekV3MLP` used here is correct.
 final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
     let config: DeepseekV3Configuration
+    let layerIdx: Int
     let numExpertsPerTok: Int
 
     @ModuleInfo(key: "switch_mlp") var switchMLP: TurboQuantSwitchGLU
     var gate: MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV3MLP?
 
-    init(config: DeepseekV3Configuration, jangtq: DeepseekV3JANGTQConfiguration) {
+    init(config: DeepseekV3Configuration, jangtq: DeepseekV3JANGTQConfiguration, layerIdx: Int) {
         self.config = config
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok ?? 1
 
         _switchMLP.wrappedValue = TurboQuantSwitchGLU(
@@ -261,6 +263,7 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
 
@@ -292,7 +295,7 @@ final class DeepseekV3JANGTQDecoderLayer: Module {
             layerIdx >= config.firstKDenseReplace,
             layerIdx % config.moeLayerFreq == 0
         {
-            self.mlp = DeepseekV3JANGTQMoE(config: config, jangtq: jangtq)
+            self.mlp = DeepseekV3JANGTQMoE(config: config, jangtq: jangtq, layerIdx: layerIdx)
         } else {
             // Dense layer 0 (and any other non-MoE layer): standard
             // affine MLP. Per §1.3 these carry 8-bit QuantizedLinear
@@ -343,7 +346,8 @@ public class DeepseekV3JANGTQModelInner: Module {
         var h = embedTokens(x)
         let attentionMask = createAttentionMask(h: h, cache: cache?.first)
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: attentionMask, cache: cache?[i])
+            let layerCache = (cache != nil && i < cache!.count) ? cache![i] : nil
+            h = layer(h, mask: attentionMask, cache: layerCache)
         }
         return norm(h)
     }
@@ -362,6 +366,9 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
     public init(_ args: DeepseekV3JANGTQConfiguration) {
         self.jangtqConfig = args
         self.affineConfig = args.asAffine()
+        self.kvHeads = Array(
+            repeating: args.numKeyValueHeads,
+            count: args.numHiddenLayers)
         self.model = DeepseekV3JANGTQModelInner(
             config: self.affineConfig, jangtq: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
@@ -370,6 +377,16 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
         return lmHead(out)
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let count = affineConfig.numHiddenLayers
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0 ..< count).map { _ in
+                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
+        }
+        return (0 ..< count).map { _ in KVCacheSimple() }
     }
 
     /// Sanitize for the JANGTQ wire format. Three jobs, mirroring
@@ -474,13 +491,20 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
                     for kind in ["tq_packed", "tq_norms"] {
                         let first = "\(prefix).mlp.experts.0.\(projName).\(kind)"
                         guard newWeights[first] != nil else { continue }
+                        let target = "\(prefix).mlp.switch_mlp.\(projName).\(kind)"
+                        if newWeights[target] != nil {
+                            for e in 0 ..< (affineConfig.nRoutedExperts ?? 1) {
+                                newWeights.removeValue(
+                                    forKey: "\(prefix).mlp.experts.\(e).\(projName).\(kind)")
+                            }
+                            continue
+                        }
                         let stacked: [MLXArray] = (0 ..< (affineConfig.nRoutedExperts ?? 1)).map {
                             e in
                             newWeights.removeValue(
                                 forKey: "\(prefix).mlp.experts.\(e).\(projName).\(kind)")!
                         }
-                        newWeights["\(prefix).mlp.switch_mlp.\(projName).\(kind)"] =
-                            MLX.stacked(stacked)
+                        newWeights[target] = MLX.stacked(stacked)
                     }
                 }
             }

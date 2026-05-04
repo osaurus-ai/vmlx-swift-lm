@@ -23,11 +23,10 @@ public struct JangPressLoadOptions: Sendable, Equatable {
     public var compressPct: Int
 
     /// Backend selection. `.mmap` is the production default
-    /// (file-backed, page-cache shared with MLX, zero RAM doubling).
-    /// `.mach` is gated on the MLX-swift fork; doubles RAM at load
-    /// because it allocates fresh purgeable VM regions. `.none`
-    /// disables the routed-expert tier even if `enabled == true`
-    /// (still arms the embed/lm_head Zipfian tier).
+    /// (file-backed, page-cache shared with MLX, zero RAM doubling on
+    /// patched osaurus mlx-swift pins). `.none` disables the routed-
+    /// expert tier even if `enabled == true` (still arms the
+    /// embed/lm_head Zipfian tier).
     public var backend: Backend
 
     /// Eviction aggressiveness for the `.mmap` backend.
@@ -43,8 +42,26 @@ public struct JangPressLoadOptions: Sendable, Equatable {
     /// (see JANGPRESS-DEEP-TRACE Issue 5 for the full analysis).
     public var enablePrefetch: Bool
 
+    /// Enable router-aware canonical mmap advice. When true, routed-MoE
+    /// layers can report the exact expert ids selected during decode;
+    /// JangPress then issues `MADV_WILLNEED` for newly hot experts and
+    /// `MADV_DONTNEED` for older experts beyond the per-layer hot-set
+    /// budget. This is precise OS page advice for mmap-backed canonical
+    /// weights, not a custom compressed blob codec.
+    ///
+    /// Default is `false` because the first CPU-readback implementation
+    /// is correct but too slow for production decode. Set explicitly or
+    /// export `JANGPRESS_ROUTER_ADVICE=1` for experiments.
+    public var enableRouterAdvice: Bool
+
     public enum Backend: String, Sendable, Equatable {
-        case mmap, mach, none
+        /// File-backed mmap probe/status plus canonical MLX mmap advice
+        /// when the patched osaurus mlx-swift safetensors loader ABI is
+        /// present.
+        case mmap
+        /// Disable the routed-expert tier entirely (the embed tier may
+        /// still be co-instantiated).
+        case none
     }
 
     public enum ForceMode: String, Sendable, Equatable {
@@ -60,55 +77,63 @@ public struct JangPressLoadOptions: Sendable, Equatable {
         compressPct: Int = 70,
         backend: Backend = .mmap,
         forceMode: ForceMode = .soft,
-        enablePrefetch: Bool = true
+        enablePrefetch: Bool = true,
+        enableRouterAdvice: Bool = false
     ) {
         self.enabled = enabled
         self.compressPct = max(0, min(100, compressPct))
         self.backend = backend
         self.forceMode = forceMode
         self.enablePrefetch = enablePrefetch
+        self.enableRouterAdvice = enableRouterAdvice
     }
 }
 
 /// JangPress runtime handles attached to a `ModelContext` after
-/// `loadWeights(...)` instantiates the tiers. All four are nil when
-/// `JangPressLoadOptions.enabled == false` (the default). When
-/// enabled, exactly one of `mmap` / `mach` is non-nil per the
-/// configured backend; `controller` is always non-nil; `embed` is
-/// co-instantiated.
+/// `loadWeights(...)`.
 ///
-/// `BatchEngine` and `TokenIterator` use `controller` for the
-/// `willStartInference()` / `didFinishInference()` brackets that
-/// keep the failsafe state machine ticking.
+/// **State of play (2026-05-03)**: the original controller-driven
+/// `acquire/release` tier was deleted because it only advised a
+/// parallel probe mapping while MLX's canonical heap copies stayed
+/// resident. The production savings path is now the patched
+/// osaurus mlx-swift safetensors loader: canonical MLX arrays can be
+/// backed by mmap file pages, and vmlx can advise those exact routed
+/// expert ranges warm/cold through a C ABI.
 ///
-/// **Lifetime**: this struct STRONGLY OWNS its tiers. The caller
-/// holds the runtime alive for the duration of the model session
-/// — typically next to `ModelContext` — and the embedded
-/// `controller` / `mmap` / `mach` / `embed` references stay valid
-/// as long as the runtime does. On `JangPressActivation.deactivate(_:)`
-/// the controller is disarmed but the references remain (deinit
-/// runs when the runtime is dropped).
+/// What remains:
+///   * `mmap` — kept as a tile-classification probe/status utility.
+///     Canonical storage and reclaim happen in the patched MLX loader,
+///     not in this probe object.
+///   * `embed` — Zipfian embed/lm_head cache, orthogonal to the
+///     routed-expert tier and still useful on its own.
+///   * `JangPressCanonicalExpertAdvisor` — global decode-time policy
+///     that reports router-selected experts to the patched MLX mmap
+///     registry for `MADV_WILLNEED` / `MADV_DONTNEED`.
 public struct JangPressRuntime: Sendable {
     public var mmap: JangPressMmapTier?
-    public var mach: JangPressMachCache?
     public var embed: JangPressEmbedTier?
-    public var controller: JangPressController?
+
+    /// The options that produced this runtime. `nil` for `.none`.
+    /// Surfaced via ``JangPressStatus/coldFraction`` so settings UIs
+    /// can display the resolved configuration instead of just "—".
+    public var appliedOptions: JangPressLoadOptions?
 
     public init(
         mmap: JangPressMmapTier? = nil,
-        mach: JangPressMachCache? = nil,
         embed: JangPressEmbedTier? = nil,
-        controller: JangPressController? = nil
+        appliedOptions: JangPressLoadOptions? = nil
     ) {
         self.mmap = mmap
-        self.mach = mach
         self.embed = embed
-        self.controller = controller
+        self.appliedOptions = appliedOptions
     }
 
     public static let none = JangPressRuntime()
 
+    /// True iff at least one tier is attached. With the controller
+    /// gone, this is purely informational — no state machine is
+    /// driven by it.
     public var isActive: Bool {
-        controller != nil
+        mmap != nil || embed != nil
     }
 }

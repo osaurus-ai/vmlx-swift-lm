@@ -402,6 +402,7 @@ final class Qwen35Attention: Module {
 // MARK: - SparseMoeBlock
 
 final class Qwen35SparseMoeBlock: Module, UnaryLayer {
+    let layerIdx: Int
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
@@ -412,7 +413,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration) {
+    init(_ args: Qwen35TextConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
@@ -438,6 +440,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         let k = topK
         let kth = gates.dim(-1) - k
         let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var scores = MLX.takeAlong(gates, inds, axis: -1)
         if normTopkProb {
             scores = scores / scores.sum(axis: -1, keepDims: true)
@@ -476,7 +479,7 @@ final class Qwen35DecoderLayer: Module {
         }
 
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(args, layerIdx: layerIdx)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,

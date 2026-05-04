@@ -638,7 +638,10 @@ public struct JangLoader: Sendable {
         huggingFaceCacheRoot: URL? = nil,
         fileManager: FileManager = .default
     ) -> URL {
-        if hasTokenizerFiles(at: modelDirectory, fileManager: fileManager) {
+        if hasTokenizerFiles(at: modelDirectory, fileManager: fileManager),
+           !shouldPreferSourceTokenizer(
+                for: modelDirectory, fileManager: fileManager)
+        {
             return modelDirectory
         }
         guard isJangModel(at: modelDirectory) else { return modelDirectory }
@@ -689,6 +692,34 @@ public struct JangLoader: Sendable {
         return false
     }
 
+    private static func hasTokenizerJson(
+        at directory: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        fileManager.fileExists(
+            atPath: directory.appendingPathComponent("tokenizer.json").path)
+    }
+
+    private static func shouldPreferSourceTokenizer(
+        for directory: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        guard !hasTokenizerJson(at: directory, fileManager: fileManager) else {
+            return false
+        }
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard fileManager.fileExists(atPath: configURL.path),
+              let data = try? Data(contentsOf: configURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokenizerClass = json["tokenizer_class"] as? String
+        else {
+            return false
+        }
+        let trimmed = tokenizerClass.replacingOccurrences(of: "Fast", with: "")
+        return tokenizerClass == "TikTokenTokenizer"
+            || trimmed == "TikTokenTokenizer"
+    }
+
     // MARK: - tokenizer_class substitution
 
     /// swift-transformers 0.1.21's `knownTokenizers` doesn't include
@@ -711,6 +742,11 @@ public struct JangLoader: Sendable {
     /// models is functionally `Qwen2Tokenizer`.
     public static let defaultTokenizerClassSubstitutions: [String: String] = [
         "TokenizersBackend": "Qwen2Tokenizer",
+        // Kimi K2.x/K2.5/K2.6 bundles may ship a tiktoken.model plus a
+        // generated tokenizer.json. swift-transformers does not register
+        // TikTokenTokenizer as a class name, but the generated tokenizer
+        // is a standard byte-level BPE tokenizer.
+        "TikTokenTokenizer": "Qwen2Tokenizer",
     ]
 
     /// Like `resolveTokenizerDirectory(for:)` but also fixes
@@ -855,26 +891,7 @@ public struct JangLoader: Sendable {
             quantization = JangQuantization()
         }
 
-        let sourceModel: JangSourceModel
-        if let smDict = json["source_model"] as? [String: Any] {
-            let params: String
-            if let s = smDict["parameters"] as? String {
-                params = s
-            } else if let n = smDict["parameters"] as? Int {
-                params = String(n)
-            } else {
-                params = "0"
-            }
-            sourceModel = JangSourceModel(
-                name: smDict["name"] as? String ?? "",
-                org: smDict["org"] as? String ?? "",
-                architecture: smDict["architecture"] as? String ?? "",
-                dtype: smDict["dtype"] as? String ?? "bfloat16",
-                parameters: params
-            )
-        } else {
-            sourceModel = JangSourceModel()
-        }
+        let sourceModel = parseSourceModel(json["source_model"])
 
         let architecture: JangArchitecture
         if let aDict = json["architecture"] as? [String: Any] {
@@ -999,6 +1016,33 @@ public struct JangLoader: Sendable {
             modelFamily: modelFamily,
             chat: chat
         )
+    }
+
+    private static func parseSourceModel(_ raw: Any?) -> JangSourceModel {
+        if let smDict = raw as? [String: Any] {
+            let params: String
+            if let s = smDict["parameters"] as? String {
+                params = s
+            } else if let n = smDict["parameters"] as? Int {
+                params = String(n)
+            } else {
+                params = "0"
+            }
+            return JangSourceModel(
+                name: smDict["name"] as? String ?? "",
+                org: smDict["org"] as? String ?? "",
+                architecture: smDict["architecture"] as? String ?? "",
+                dtype: smDict["dtype"] as? String ?? "bfloat16",
+                parameters: params
+            )
+        }
+        guard let repo = raw as? String else { return JangSourceModel() }
+        let trimmed = repo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parts = trimmed.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true)
+        if parts.count == 2 {
+            return JangSourceModel(name: String(parts[1]), org: String(parts[0]))
+        }
+        return JangSourceModel(name: trimmed)
     }
 
     /// `reasoning_effort_levels` may contain `null` entries — the

@@ -34,6 +34,7 @@ import MLXNN
 
 final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
     let config: DeepseekV4Configuration
+    let layerIdx: Int
     let topK: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: TurboQuantSwitchGLU
     var gate: DeepseekV4MoEGate
@@ -42,6 +43,7 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
 
     init(config: DeepseekV4Configuration, layerIdx: Int, mxtqBits: Int, mxtqSeed: Int) {
         self.config = config
+        self.layerIdx = layerIdx
         self.topK = config.numExpertsPerTok
         self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
             inputDims: config.hiddenSize,
@@ -58,6 +60,7 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: currentInputIds)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
         y = y + sharedExperts(x)

@@ -242,12 +242,14 @@ class BailingMoeGate: Module, UnaryLayer {
 
 class BailingMoeSparseMoeBlock: Module, UnaryLayer {
     let args: BailingMoeConfiguration
+    let layerIdx: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "gate") var gate: BailingMoeGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: BailingMoeMLP?
 
-    init(_ args: BailingMoeConfiguration) {
+    init(_ args: BailingMoeConfiguration, layerIdx: Int) {
         self.args = args
+        self.layerIdx = layerIdx
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize, hiddenDims: args.moeIntermediateSize,
             numExperts: args.numExperts,
@@ -267,6 +269,7 @@ class BailingMoeSparseMoeBlock: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, weights) = gate.groupSelect(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         var out = switchMLP(x, inds)
         out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
         if let shared = sharedExperts {
@@ -295,7 +298,7 @@ class BailingMoeTransformerBlock: Module {
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
         if args.numExperts > 0 && layerIdx >= args.firstKDenseReplace {
-            _mlp.wrappedValue = BailingMoeSparseMoeBlock(args)
+            _mlp.wrappedValue = BailingMoeSparseMoeBlock(args, layerIdx: layerIdx)
         } else {
             _mlp.wrappedValue = BailingMoeMLP(args)
         }

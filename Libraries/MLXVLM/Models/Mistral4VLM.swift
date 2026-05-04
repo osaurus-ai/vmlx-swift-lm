@@ -225,10 +225,12 @@ private class M4MoEGate: Module {
 }
 
 private class M4MoE: Module, UnaryLayer {
+    let layerIndex: Int
     @ModuleInfo var gate: M4MoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: M4MLP?
-    init(_ config: Mistral4VLMConfiguration) {
+    init(_ config: Mistral4VLMConfiguration, layerIndex: Int) {
+        self.layerIndex = layerIndex
         gate = M4MoEGate(config)
         _switchMLP.wrappedValue = SwitchGLU(inputDims: config.textConfig.hiddenSize, hiddenDims: config.moeIntermediateSize, numExperts: config.nRoutedExperts, bias: false)
         if config.nSharedExperts > 0 {
@@ -238,6 +240,7 @@ private class M4MoE: Module, UnaryLayer {
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: inds)
         var y = switchMLP(x, inds)
         y = (y * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         if let se = sharedExperts { y = y + se(x) }
@@ -253,7 +256,7 @@ private class M4Layer: Module {
     init(_ config: Mistral4VLMConfiguration, idx: Int) {
         _attn.wrappedValue = M4Attention(config)
         let isMoE = config.nRoutedExperts > 0
-        if isMoE { _mlp.wrappedValue = M4MoE(config) }
+        if isMoE { _mlp.wrappedValue = M4MoE(config, layerIndex: idx) }
         else { _mlp.wrappedValue = M4MLP(hidden: config.textConfig.hiddenSize, inter: config.textConfig.intermediateSize) }
         _iLN.wrappedValue = RMSNorm(dimensions: config.textConfig.hiddenSize, eps: config.textConfig.rmsNormEps)
         _paLN.wrappedValue = RMSNorm(dimensions: config.textConfig.hiddenSize, eps: config.textConfig.rmsNormEps)

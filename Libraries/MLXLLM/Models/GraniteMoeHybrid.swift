@@ -287,16 +287,18 @@ class GraniteMoeHybridTopKGating: Module {
 }
 
 class GraniteMoeHybridMoE: Module, UnaryLayer {
+    let layerIdx: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     let router: GraniteMoeHybridTopKGating
 
-    init(_ args: GraniteMoeHybridConfiguration) {
+    init(_ args: GraniteMoeHybridConfiguration, layerIdx: Int) {
         guard let numExperts = args.numLocalExperts,
             let topK = args.numExpertsPerToken
         else {
             fatalError("GraniteMoeHybridMoE requires MoE parameters in the configuration")
         }
 
+        self.layerIdx = layerIdx
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.intermediateSize,
@@ -313,6 +315,7 @@ class GraniteMoeHybridMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, gates) = router(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         let expertOutputs = switchMLP(x, indices)
         return (expertOutputs * gates[.ellipsis, .newAxis]).sum(axis: -2)
     }
@@ -371,7 +374,7 @@ class GraniteMoeHybridLayer: Module {
     @ModuleInfo(key: "shared_mlp") var sharedMLP: GraniteMoeHybridSharedMLP?
     @ModuleInfo(key: "mlp") var mlp: GraniteMoeHybridMLP?
 
-    init(_ args: GraniteMoeHybridConfiguration, layerType: String) {
+    init(_ args: GraniteMoeHybridConfiguration, layerIdx: Int, layerType: String) {
         self.residualMultiplier = args.residualMultiplier
         self.useMoE = args.useMoE
 
@@ -392,7 +395,7 @@ class GraniteMoeHybridLayer: Module {
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
         if useMoE {
-            self._blockSparseMoE.wrappedValue = GraniteMoeHybridMoE(args)
+            self._blockSparseMoE.wrappedValue = GraniteMoeHybridMoE(args, layerIdx: layerIdx)
             self._sharedMLP.wrappedValue = GraniteMoeHybridSharedMLP(args)
         } else {
             self._mlp.wrappedValue = GraniteMoeHybridMLP(args)
@@ -448,7 +451,9 @@ public class GraniteMoeHybridModelInner: Module {
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-        self.layers = args.layerTypes.map { GraniteMoeHybridLayer(args, layerType: $0) }
+        self.layers = args.layerTypes.enumerated().map {
+            GraniteMoeHybridLayer(args, layerIdx: $0.offset, layerType: $0.element)
+        }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
         self.embeddingMultiplier = args.embeddingMultiplier

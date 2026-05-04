@@ -96,13 +96,15 @@ class MiniMaxAttention: Module {
 }
 
 class MiniMaxSparseMoeBlock: Module {
+    let layerIdx: Int
     let numExpertsPerTok: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
-    init(_ args: MiniMaxConfiguration) {
+    init(_ args: MiniMaxConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numLocalExperts, bias: false)
@@ -131,6 +133,7 @@ class MiniMaxSparseMoeBlock: Module {
 
         let k = numExpertsPerTok
         let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
         scores = takeAlong(originalScores, inds, axis: -1)
 
         scores = scores / (scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype))
@@ -148,9 +151,9 @@ class MiniMaxDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    init(_ args: MiniMaxConfiguration) {
+    init(_ args: MiniMaxConfiguration, layerIdx: Int) {
         _selfAttn.wrappedValue = MiniMaxAttention(args)
-        _blockSparseMoe.wrappedValue = MiniMaxSparseMoeBlock(args)
+        _blockSparseMoe.wrappedValue = MiniMaxSparseMoeBlock(args, layerIdx: layerIdx)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -178,7 +181,7 @@ public class MiniMaxModelInner: Module {
 
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-        self.layers = (0 ..< args.hiddenLayers).map { _ in MiniMaxDecoderLayer(args) }
+        self.layers = (0 ..< args.hiddenLayers).map { MiniMaxDecoderLayer(args, layerIdx: $0) }
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
     }
 

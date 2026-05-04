@@ -110,6 +110,7 @@ class PhiMoEAttention: Module {
 }
 
 class PhiMoESparseMoeBlock: Module {
+    let layerIdx: Int
     let hiddenDim: Int
     let ffnDim: Int
     let numExperts: Int
@@ -118,7 +119,8 @@ class PhiMoESparseMoeBlock: Module {
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
 
-    init(_ args: PhiMoEConfiguration) {
+    init(_ args: PhiMoEConfiguration, layerIdx: Int) {
+        self.layerIdx = layerIdx
         self.hiddenDim = args.hiddenSize
         self.ffnDim = args.intermediateSize
         self.numExperts = args.numLocalExperts
@@ -140,6 +142,7 @@ class PhiMoESparseMoeBlock: Module {
                 axis: -1
             )[.ellipsis, ..<k])
         let scores = MLX.softmax(MLX.takeAlong(gates, inds, axis: -1), axis: -1, precise: true)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
         let y = switchMLP(x, inds)
         return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
@@ -154,11 +157,11 @@ class PhiMoEDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: LayerNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: LayerNorm
 
-    init(_ args: PhiMoEConfiguration) {
+    init(_ args: PhiMoEConfiguration, layerIdx: Int) {
         self.hiddenSize = args.hiddenSize
 
         self._selfAttn.wrappedValue = PhiMoEAttention(args)
-        self._blockSparseMoe.wrappedValue = PhiMoESparseMoeBlock(args)
+        self._blockSparseMoe.wrappedValue = PhiMoESparseMoeBlock(args, layerIdx: layerIdx)
         self._inputLayerNorm.wrappedValue = LayerNorm(
             dimensions: args.hiddenSize, eps: args.rmsNormEps)
         self._postAttentionLayerNorm.wrappedValue = LayerNorm(
@@ -194,7 +197,7 @@ public class PhiMoEModelInner: Module {
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-        self.layers = (0 ..< args.hiddenLayers).map { _ in PhiMoEDecoderLayer(args) }
+        self.layers = (0 ..< args.hiddenLayers).map { PhiMoEDecoderLayer(args, layerIdx: $0) }
         self._norm.wrappedValue = LayerNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
     }
 

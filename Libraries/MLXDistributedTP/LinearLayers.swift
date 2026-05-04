@@ -14,10 +14,14 @@ import MLXRandom
 /// linear with the locally-shaped weight. The Python reference wraps
 /// the input in `sum_gradients(group)` for backward-pass aggregation
 /// — that's a no-op on the forward path so we omit it.
-open class AllToShardedLinear: Module, UnaryLayer {
+///
+/// Subclasses `Linear` so existing model code that declares
+/// `@ModuleInfo var x: Linear` accepts the TP variant via
+/// `Module.update(modules:)` (the runtime cast required by `@ModuleInfo`
+/// only succeeds when the new value is type-compatible with the
+/// declared property type — see `ShardingPlan.apply`).
+open class AllToShardedLinear: Linear {
 
-    public let weight: MLXArray
-    public let bias: MLXArray?
     public let group: Group
 
     /// Initialise from scratch with random weights, sharded across `group`.
@@ -35,14 +39,15 @@ open class AllToShardedLinear: Module, UnaryLayer {
         let scale = sqrt(1.0 / Float(inputDimensions))
         let perRankOut = outputDimensions / g.size
 
-        self.weight = MLXRandom.uniform(-scale ..< scale, [perRankOut, inputDimensions])
+        let w = MLXRandom.uniform(-scale ..< scale, [perRankOut, inputDimensions])
+        let b: MLXArray?
         if bias {
-            self.bias = MLXRandom.uniform(-scale ..< scale, [perRankOut])
+            b = MLXRandom.uniform(-scale ..< scale, [perRankOut])
         } else {
-            self.bias = nil
+            b = nil
         }
         self.group = g
-        super.init()
+        super.init(weight: w, bias: b)
     }
 
     /// Initialise from an existing dense Linear layer by sharding its
@@ -102,18 +107,14 @@ open class AllToShardedLinear: Module, UnaryLayer {
     /// Subclass-friendly init that takes already-sharded weights.
     /// Used by `from(_:group:segments:)`.
     public init(preShardedWeight: MLXArray, preShardedBias: MLXArray?, group: Group) {
-        self.weight = preShardedWeight
-        self.bias = preShardedBias
         self.group = group
-        super.init()
+        super.init(weight: preShardedWeight, bias: preShardedBias)
     }
 
-    open func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if let bias {
-            return addMM(bias, x, weight.T)
-        }
-        return matmul(x, weight.T)
-    }
+    // Forward inherits from `Linear`: y = x @ weight.T (+ bias). No
+    // collective fires here — gather is implicit at the next
+    // `ShardedToAllLinear` whose all-reduce reassembles the full hidden
+    // state.
 }
 
 /// Tensor-parallel linear layer: each rank holds a column-shard of
@@ -122,10 +123,10 @@ open class AllToShardedLinear: Module, UnaryLayer {
 /// group to produce the full output.
 ///
 /// Mirror of Python's `mlx.nn.layers.distributed.ShardedToAllLinear`.
-open class ShardedToAllLinear: Module, UnaryLayer {
+/// Subclasses `Linear` for the same reason as `AllToShardedLinear` —
+/// see that type's docstring.
+open class ShardedToAllLinear: Linear {
 
-    public let weight: MLXArray
-    public let bias: MLXArray?
     public let group: Group
 
     public init(
@@ -142,15 +143,16 @@ open class ShardedToAllLinear: Module, UnaryLayer {
         let scale = sqrt(1.0 / Float(inputDimensions))
         let perRankIn = inputDimensions / g.size
 
-        self.weight = MLXRandom.uniform(-scale ..< scale, [outputDimensions, perRankIn])
+        let w = MLXRandom.uniform(-scale ..< scale, [outputDimensions, perRankIn])
+        let b: MLXArray?
         if bias {
             // Bias is full-width and added once after the all-reduce.
-            self.bias = MLXRandom.uniform(-scale ..< scale, [outputDimensions])
+            b = MLXRandom.uniform(-scale ..< scale, [outputDimensions])
         } else {
-            self.bias = nil
+            b = nil
         }
         self.group = g
-        super.init()
+        super.init(weight: w, bias: b)
     }
 
     /// Build from a dense Linear by column-sharding its weight.
@@ -189,13 +191,11 @@ open class ShardedToAllLinear: Module, UnaryLayer {
 
     /// Subclass-friendly init for callers that already sharded weights.
     public init(preShardedWeight: MLXArray, bias: MLXArray?, group: Group) {
-        self.weight = preShardedWeight
-        self.bias = bias
         self.group = group
-        super.init()
+        super.init(weight: preShardedWeight, bias: bias)
     }
 
-    open func callAsFunction(_ x: MLXArray) -> MLXArray {
+    open override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let partial = matmul(x, weight.T)
         let summed = Collectives.allSum(partial, group: group)
         if let bias {

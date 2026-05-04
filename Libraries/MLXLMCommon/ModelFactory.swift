@@ -1,6 +1,13 @@
 // Copyright © 2024 Apple Inc.
 
 import Foundation
+import MLX
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// File patterns required to resolve a tokenizer without downloading model weights.
 package let tokenizerDownloadPatterns = ["*.json", "*.jinja"]
@@ -65,7 +72,7 @@ public enum ModelFactoryError: LocalizedError {
 ///
 /// See also ``ModelFactory/loadContainer(from:configuration:progressHandler:)`` and
 /// ``ModelContainer``.
-public struct ModelContext {
+public struct ModelContext: @unchecked Sendable {
     public var configuration: ModelConfiguration
     public var model: any LanguageModel
     public var processor: any UserInputProcessor
@@ -412,6 +419,176 @@ public func loadModelContainer(
     }
 }
 
+/// Load a model from a local directory using a typed ``LoadConfiguration``,
+/// returning a ``ModelContainer`` (the actor-isolated wrapper that
+/// osaurus uses).
+///
+/// This is the **recommended entry point for production hosts**. The
+/// returned `ModelContainer` already has the resulting
+/// ``JangPressRuntime`` stashed via `setJangPressRuntime` so callers
+/// can poll ``ModelContainer/jangPressStatus()`` from anywhere
+/// (settings panel, status bar, debug console).
+///
+/// Resolution order matches the `ModelContext`-returning sibling:
+///
+/// 1. ``LoadBundleFacts/inspect(bundleURL:)`` walks the bundle.
+/// 2. ``LoadConfiguration/jangPress`` resolves to a concrete
+///    ``JangPressLoadOptions``.
+/// 3. ``LoadConfiguration/maxResidentBytes`` is applied as
+///    `MLX.Memory.cacheLimit` for the duration of the load call.
+/// 4. ``LoadConfiguration/memoryLimit`` is applied as
+///    `MLX.Memory.memoryLimit` (clamped to
+///    `MLX.GPU.maxRecommendedWorkingSetBytes()` so the 847a8c7
+///    crash condition is impossible by construction).
+/// 5. The model is loaded normally and wrapped in `ModelContainer`.
+/// 6. JangPress tiers are activated per the resolved options.
+/// 7. The runtime is stashed on the container.
+///
+/// - Parameters:
+///   - directory: directory of configuration and weights
+///   - tokenizerLoader: the ``TokenizerLoader`` to use
+///   - loadConfiguration: typed JangPress + resident-cap policy.
+///     Defaults to ``LoadConfiguration/default`` (auto JangPress with
+///     env fallback, 70%-of-physical-RAM resident cap, 70%-clamped
+///     memory limit).
+/// - Returns: a `ModelContainer` whose `jangPressRuntime` reflects
+///   the activation result.
+public func loadModelContainer(
+    from directory: URL,
+    using tokenizerLoader: any TokenizerLoader,
+    loadConfiguration: LoadConfiguration
+) async throws -> ModelContainer {
+    let (context, runtime) = try await loadModel(
+        from: directory,
+        using: tokenizerLoader,
+        loadConfiguration: loadConfiguration)
+    let container = ModelContainer(context: context)
+    container.setJangPressRuntime(runtime)
+    return container
+}
+
+/// Load a model from a local directory using a typed ``LoadConfiguration``
+/// — the recommended entry point for hosts (osaurus, JANG Studio) that
+/// want to wire user-facing toggles to JangPress and resident-cap
+/// behavior without touching env vars.
+///
+/// Resolution order at entry:
+///
+/// 1. ``LoadBundleFacts/inspect(bundleURL:)`` walks the bundle for
+///    safetensors byte total + routed-MoE detection.
+/// 2. ``LoadConfiguration/jangPress`` is resolved to a concrete
+///    ``JangPressLoadOptions`` via ``JangPressPolicy/resolve(facts:)``.
+///    Precedence: explicit value > env (`JANGPRESS=...`) > `.auto`
+///    threshold (routed AND bundle > 0.5 × physical RAM).
+/// 3. ``LoadConfiguration/maxResidentBytes`` is applied as
+///    `MLX.Memory.cacheLimit` for the duration of the load call,
+///    restored on return.
+/// 4. The model is loaded normally.
+/// 5. JangPress tiers are activated per the resolved options (or
+///    skipped when the resolved options are ``JangPressLoadOptions/disabled``).
+///
+/// **Caller contract**: hold the returned `JangPressRuntime` alive for
+/// the model session. Pair it with the `ModelContext` in the caller's
+/// session struct. To shut JangPress down before model unload, call
+/// `JangPressActivation.deactivate(runtime)`.
+///
+/// - Parameters:
+///   - directory: directory of configuration and weights
+///   - tokenizerLoader: the ``TokenizerLoader`` to use for loading the tokenizer
+///   - loadConfiguration: typed JangPress + resident-cap policy.
+///     Defaults to ``LoadConfiguration/default`` (auto JangPress with
+///     env fallback, 70%-of-physical-RAM resident cap).
+/// - Returns: tuple of (`ModelContext`, `JangPressRuntime`)
+public func loadModel(
+    from directory: URL,
+    using tokenizerLoader: any TokenizerLoader,
+    loadConfiguration: LoadConfiguration
+) async throws -> (ModelContext, JangPressRuntime) {
+    // 1. Inspect bundle once.
+    let facts = LoadBundleFacts.inspect(bundleURL: directory)
+
+    // 2. Resolve JangPress policy → concrete options.
+    let resolvedOptions = loadConfiguration.jangPress.resolve(facts: facts)
+
+    // 3. Apply resident cap (allocator pool) for the duration of load.
+    //    Skipped when `.unlimited` so existing iter-25 in-loader cap
+    //    (1 GB during sanitize) is not overridden.
+    let priorCap: Int?
+    if let cap = loadConfiguration.maxResidentBytes
+        .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
+    {
+        priorCap = MLX.Memory.cacheLimit
+        MLX.Memory.cacheLimit = cap
+    } else {
+        priorCap = nil
+    }
+    defer {
+        if let priorCap {
+            MLX.Memory.cacheLimit = priorCap
+        }
+    }
+
+    // 3b. Apply MLX memory budget cap. This bounds the total MLX
+    //     allocation pool — calls to malloc wait on scheduled tasks if
+    //     the cap is hit. Persists for the process lifetime (no defer
+    //     restore) since the cap is a sensible default, not a load-only
+    //     override. Last-writer-wins across multiple loads — a future
+    //     refinement could compose via WiredMemoryManager tickets.
+    //
+    //     SAFETY: every cap is clamped to recommendedMaxWorkingSetBytes
+    //     so we never trip Apple's "limit larger than max working set
+    //     size" rejection (the original 847a8c7 crash condition). See
+    //     docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md.
+    if let rawCap = loadConfiguration.memoryLimit
+        .applyAsCacheLimitInt(physicalMemory: facts.physicalMemory)
+    {
+        let workingSetCap = MLX.GPU.maxRecommendedWorkingSetBytes() ?? Int.max
+        let safeCap = max(1 * 1024 * 1024 * 1024,  // never below 1 GB
+            min(rawCap, workingSetCap))
+        MLX.Memory.memoryLimit = safeCap
+    }
+
+    // 4. For per-expert JANGTQ bundles, build a streaming prestacked
+    //    safetensors overlay before MLX sees the weights. This avoids
+    //    model-specific sanitize() methods calling MLX.stacked(...) on
+    //    the entire routed expert bank, which would materialize tens of
+    //    GB into resident Metal buffers and defeat canonical mmap.
+    let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
+        originalURL: directory,
+        enabled: loadConfiguration.useMmapSafetensors
+            && resolvedOptions.enabled
+            && resolvedOptions.backend == .mmap)
+
+    // 5. Load the model normally. Patched osaurus mlx-swift pins honor
+    //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
+    //    making the canonical weight storage mmap-backed instead of a
+    //    pread() copy. Older pins ignore the env knob.
+    let useTensorMmapBuffers = loadConfiguration.useMmapSafetensors
+        && resolvedOptions.enabled
+        && resolvedOptions.backend == .mmap
+    let context = try await withMmapSafetensorsEnv(
+        enabled: loadConfiguration.useMmapSafetensors,
+        tensorBuffers: useTensorMmapBuffers
+    ) {
+        try await load {
+            try await $0.load(from: loadDirectory, using: tokenizerLoader)
+        }
+    }
+    _ = adviseCanonicalMmapRoutedExpertsIfAvailable(
+        options: resolvedOptions,
+        mmapEnabled: loadConfiguration.useMmapSafetensors)
+    JangPressCanonicalExpertAdvisor.shared.configure(
+        options: resolvedOptions,
+        mmapEnabled: loadConfiguration.useMmapSafetensors)
+
+    // 5. Activate JangPress per resolved options. `.disabled` short-
+    //    circuits inside `JangPressActivation.activate` and returns
+    //    `.none` so the caller still gets a uniform tuple shape.
+    let runtime = JangPressActivation.activate(
+        bundleURL: loadDirectory, options: resolvedOptions)
+    return (context, runtime)
+}
+
 private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
     let factories = ModelFactoryRegistry.shared.modelFactories()
     // Track all failures across factories. When multiple factories fail, the
@@ -450,6 +627,75 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
     } else {
         throw ModelFactoryError.noModelFactoryAvailable
     }
+}
+
+private func withMmapSafetensorsEnv<R>(
+    enabled: Bool,
+    tensorBuffers: Bool,
+    _ body: () async throws -> R
+) async throws -> R {
+#if canImport(Darwin) || canImport(Glibc)
+    let mmapKey = "MLX_SAFETENSORS_MMAP"
+    let tensorKey = "MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS"
+    let priorMmap = getenv(mmapKey).map { String(cString: $0) }
+    let priorTensor = getenv(tensorKey).map { String(cString: $0) }
+    if enabled {
+        setenv(mmapKey, "1", 1)
+        if tensorBuffers {
+            setenv(tensorKey, "1", 1)
+        }
+    } else {
+        unsetenv(mmapKey)
+        unsetenv(tensorKey)
+    }
+    defer {
+        if let priorMmap {
+            setenv(mmapKey, priorMmap, 1)
+        } else {
+            unsetenv(mmapKey)
+        }
+        if let priorTensor {
+            setenv(tensorKey, priorTensor, 1)
+        } else {
+            unsetenv(tensorKey)
+        }
+    }
+#endif
+    return try await body()
+}
+
+@discardableResult
+private func adviseCanonicalMmapRoutedExpertsIfAvailable(
+    options: JangPressLoadOptions,
+    mmapEnabled: Bool
+) -> Int64? {
+    guard mmapEnabled,
+          options.enabled,
+          options.backend == .mmap,
+          options.compressPct > 0
+    else { return nil }
+
+#if canImport(Darwin) || canImport(Glibc)
+    typealias AdviseFn = @convention(c) (Int32, Int32) -> Int64
+    guard let handle = dlopen(nil, RTLD_NOW),
+          let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_routed")
+    else { return nil }
+    let advise = unsafeBitCast(symbol, to: AdviseFn.self)
+    let advised = advise(
+        0,  // 0 = MADV_DONTNEED/cold in the osaurus mlx-swift fork ABI.
+        Int32(max(0, min(100, options.compressPct))))
+
+    let env = ProcessInfo.processInfo.environment
+    if advised > 0,
+       (env["JANGPRESS_DEBUG"] == "1" || env["MLX_SAFETENSORS_MMAP_DEBUG"] == "1")
+    {
+        FileHandle.standardError.write(Data(
+            "[JangPress] advised \(advised) canonical mmap routed bytes cold (pct=\(options.compressPct))\n".utf8))
+    }
+    return advised
+#else
+    return nil
+#endif
 }
 
 /// Protocol for types that can provide ModelFactory instances.

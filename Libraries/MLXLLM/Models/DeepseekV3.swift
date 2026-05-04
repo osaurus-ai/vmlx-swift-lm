@@ -301,13 +301,15 @@ class MoEGate: Module {
 
 class DeepseekV3MoE: Module, UnaryLayer {
     var config: DeepseekV3Configuration
+    let layerIdx: Int
     var numExpertsPerTok: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     var gate: MoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV3MLP?
 
-    init(config: DeepseekV3Configuration) {
+    init(config: DeepseekV3Configuration, layerIdx: Int) {
         self.config = config
+        self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok ?? 1
 
         self._switchMLP.wrappedValue = SwitchGLU(
@@ -328,6 +330,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
+        JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
         var y = switchMLP(x, indices)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
 
@@ -351,7 +354,7 @@ class DeepseekV3DecoderLayer: Module {
             layerIdx >= config.firstKDenseReplace,
             layerIdx % config.moeLayerFreq == 0
         {
-            self.mlp = DeepseekV3MoE(config: config)
+            self.mlp = DeepseekV3MoE(config: config, layerIdx: layerIdx)
         } else {
             self.mlp = DeepseekV3MLP(config: config)
         }
@@ -406,7 +409,8 @@ public class DeepseekV3ModelInner: Module {
         let attentionMask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: attentionMask, cache: cache?[i])
+            let layerCache = (cache != nil && i < cache!.count) ? cache![i] : nil
+            h = layer(h, mask: attentionMask, cache: layerCache)
         }
 
         return norm(h)
@@ -422,6 +426,9 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     init(_ args: DeepseekV3Configuration) {
         self.args = args
+        self.kvHeads = Array(
+            repeating: args.numKeyValueHeads,
+            count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -429,6 +436,16 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let out = model(inputs, cache: cache)
         return lmHead(out)
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let count = args.numHiddenLayers
+        if let maxKVSize = parameters?.maxKVSize {
+            return (0 ..< count).map { _ in
+                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
+        }
+        return (0 ..< count).map { _ in KVCacheSimple() }
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

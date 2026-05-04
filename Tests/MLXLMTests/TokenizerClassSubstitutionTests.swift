@@ -109,6 +109,17 @@ final class TokenizerClassSubstitutionTests: XCTestCase {
             "TokenizersBackend must rewrite to Qwen2Tokenizer.")
     }
 
+    func testTikTokenTokenizerRewriteToQwen2Tokenizer() throws {
+        let dir = try writeFakeTokenizerDir(class: "TikTokenTokenizer")
+        let shim = JangLoader.resolveTokenizerClassSubstitution(for: dir)
+
+        XCTAssertNotEqual(
+            shim.standardizedFileURL.path,
+            dir.standardizedFileURL.path,
+            "TikTokenTokenizer should produce a shim for swift-transformers.")
+        XCTAssertEqual(readClass(from: shim), "Qwen2Tokenizer")
+    }
+
     /// Every other file in the original dir must be reachable via the
     /// shim — they're symlinked, not copied.
     func testShimSymlinksOtherFiles() throws {

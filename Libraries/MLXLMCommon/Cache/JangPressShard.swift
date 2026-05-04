@@ -166,7 +166,7 @@ public final class JangPressShard: @unchecked Sendable {
             guard
                 let entry = value as? [String: Any],
                 let dtype = entry["dtype"] as? String,
-                let shape = entry["shape"] as? [Int],
+                let shape = Self.parseShape(entry["shape"]),
                 let offsets = entry["data_offsets"] as? [Any],
                 offsets.count == 2,
                 let startNum = (offsets[0] as? NSNumber)?.uint64Value,
@@ -183,6 +183,30 @@ public final class JangPressShard: @unchecked Sendable {
             )
         }
         self.tensors = byName
+    }
+
+    private static func parseShape(_ raw: Any?) -> [Int]? {
+        if let shape = raw as? [Int] {
+            return shape
+        }
+        guard let values = raw as? [Any] else {
+            return nil
+        }
+        var shape: [Int] = []
+        shape.reserveCapacity(values.count)
+        for value in values {
+            if let intValue = value as? Int {
+                guard intValue >= 0 else { return nil }
+                shape.append(intValue)
+            } else if let number = value as? NSNumber {
+                let intValue = number.intValue
+                guard intValue >= 0 else { return nil }
+                shape.append(intValue)
+            } else {
+                return nil
+            }
+        }
+        return shape
     }
 
     deinit {

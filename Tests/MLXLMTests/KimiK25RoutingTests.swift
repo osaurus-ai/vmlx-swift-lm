@@ -171,6 +171,10 @@ final class KimiK25RoutingTests: XCTestCase {
                 XCTAssertTrue(
                     model is DeepseekV3JANGTQModel,
                     "model_type=\(modelType) with weight_format=mxtq must instantiate DeepseekV3JANGTQModel, got \(type(of: model))")
+                if let model = model as? DeepseekV3JANGTQModel {
+                    XCTAssertEqual(model.kvHeads, [2, 2])
+                    XCTAssertEqual(model.newCache(parameters: nil).count, 2)
+                }
             } catch let err as ModelFactoryError {
                 if case .unsupportedModelType(let mt) = err {
                     XCTFail("model_type '\(mt)' unexpectedly not registered")
@@ -295,6 +299,10 @@ final class KimiK25RoutingTests: XCTestCase {
             XCTAssertTrue(
                 model is DeepseekV3Model && !(model is DeepseekV3JANGTQModel),
                 "Affine kimi_k25 (no weight_format) must instantiate DeepseekV3Model, got \(type(of: model))")
+            if let model = model as? DeepseekV3Model {
+                XCTAssertEqual(model.kvHeads, [2, 2])
+                XCTAssertEqual(model.newCache(parameters: nil).count, 2)
+            }
         } catch {
             // Config decode complaint acceptable — we're probing
             // dispatch, not full instantiation.
