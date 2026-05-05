@@ -146,13 +146,28 @@ public struct LoadConfiguration: Sendable, Equatable {
     /// strict pre-mmap loader parity.
     public var useMmapSafetensors: Bool
 
-    /// Production default — `.auto` JangPress with env fallback on,
-    /// `.fraction(0.70)` cache limit, `.fraction(0.70)` memory limit,
-    /// mmap-backed safetensors enabled.
+    /// Production default — JangPress `.disabled` (opt-in), 70% cache +
+    /// memory caps, mmap-backed safetensors enabled. Osaurus and other
+    /// host integrators get spike-survival memory caps and the patched
+    /// mmap loader without engaging the experimental routed-expert
+    /// cold-tier. Callers that have validated JangPress for a specific
+    /// bundle family should pass an explicit `.enabled(coldFraction:)`
+    /// or `.auto(envFallback:)` policy.
     public static let `default` = LoadConfiguration()
 
+    /// Opt-in JangPress with auto-detection (`.auto(envFallback: true)`).
+    /// Use this when the host has validated JangPress for the bundles it
+    /// serves AND wants the iter-26 routed-MoE cold-tier on bundles
+    /// whose total weight bytes exceed half of physical RAM.
+    /// `JANGPRESS=N` (0–95) and `JANGPRESS=off` env overrides honored.
+    public static let experimentalJangPressAuto = LoadConfiguration(
+        jangPress: .auto(envFallback: true),
+        maxResidentBytes: .default,
+        memoryLimit: .default,
+        useMmapSafetensors: true)
+
     /// Everything off — strict byte-compat with pre-iter-23 behavior.
-    /// JangPress disabled, no caps.
+    /// JangPress disabled, no caps, no mmap loader.
     public static let off = LoadConfiguration(
         jangPress: .disabled,
         maxResidentBytes: .unlimited,
@@ -160,7 +175,7 @@ public struct LoadConfiguration: Sendable, Equatable {
         useMmapSafetensors: false)
 
     public init(
-        jangPress: JangPressPolicy = .default,
+        jangPress: JangPressPolicy = .disabled,
         maxResidentBytes: ResidentCap = .default,
         memoryLimit: ResidentCap = .default,
         useMmapSafetensors: Bool = true

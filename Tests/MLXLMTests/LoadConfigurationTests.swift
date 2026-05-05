@@ -176,9 +176,18 @@ struct LoadConfigurationTests {
 
     // MARK: - LoadConfiguration default + off
 
-    @Test("LoadConfiguration.default = auto JangPress + 70% cache + 70% memory")
+    @Test("LoadConfiguration.default = JangPress disabled (opt-in), 70% caps, mmap on")
     func defaultConfig() {
         let cfg = LoadConfiguration.default
+        #expect(cfg.jangPress == .disabled)
+        #expect(cfg.maxResidentBytes == .fraction(0.70))
+        #expect(cfg.memoryLimit == .fraction(0.70))
+        #expect(cfg.useMmapSafetensors == true)
+    }
+
+    @Test("LoadConfiguration.experimentalJangPressAuto = .auto + 70% caps + mmap on")
+    func experimentalAutoConfig() {
+        let cfg = LoadConfiguration.experimentalJangPressAuto
         #expect(cfg.jangPress == .auto(envFallback: true))
         #expect(cfg.maxResidentBytes == .fraction(0.70))
         #expect(cfg.memoryLimit == .fraction(0.70))
