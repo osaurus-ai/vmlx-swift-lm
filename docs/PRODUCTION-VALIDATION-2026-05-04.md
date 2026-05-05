@@ -36,7 +36,7 @@ cited inline.
 | 1 | **GPT-OSS Harmony marker leak** | High | All `gpt_oss*` model_types | **FIXED in `52eb4d4`** |
 | 2 | **`bailing_hybrid` (Ling-2.6-flash, BailingMoeV2_5)** factory entry missing | High | Ling family | Open — needs new model port (MLA + linear attention + MTP, NOT a config-only fix) |
 | 3 | **`CacheList` marked `.skip` on disk serialize** (`TQDiskSerializer.swift:243-245`) | High | FalconH1, BaichuanM1 (any model with `CacheList(MambaCache, KVCacheSimple)` per layer) | Open — multi-turn disk-cache reuse falls back to full re-prefill |
-| 4 | **DSV4-Flash silent-empty-output** under `BENCH_COHERENT` chat mode | High | DSV4-Flash | Open — investigation in progress; template matches Python encoder, runtime path unclear |
+| 4 | **DSV4-Flash chat-mode silent-empty-output** | High | DSV4-Flash | **FIXED in `2fd67a0`** — root-caused via Python's `server.py` "DSV4 force-thinking override" comment: the shipping bundle is **fundamentally broken in chat-mode** (`enable_thinking=False`). With `</think>`-only tail the model regurgitates training-data artifacts (spam URLs, `[URL REMOVED BY BROTS]` markers, mixed-language instruction annotations). Fix: `DSV4Minimal.jinja` + matching Swift constant always emit `<think>` (open) at assistant tail, mirroring Python's force-flip. Re-validation gated on RAM-safe DSV4 reload. |
 | 5 | **Mistral 4 chat-mode force-flip absent** (per `~/vmlx/docs/AUDIT-RELEASE-READINESS.md:111`) | Medium | Mistral 4 | Open |
 | 6 | **MiniMax-Small thinking-on loop @ 1024 tokens** | Medium | MiniMax-Small specifically (not -M2) | Open — suspected vmlx-side, not yet root-caused |
 
@@ -124,6 +124,8 @@ JANG bundles override via `jang_config.json:capabilities.reasoningParser`.
 ## Pushed commits in this validation pass
 
 ```
+2fd67a0 fix(dsv4): force-thinking override in DSV4Minimal — bundle is broken in chat-mode
+fe47ca8 docs(validation): comprehensive M5 validation pass + audit findings
 52eb4d4 fix(reasoning): GPT-OSS gets harmony stamp (was none)
 f5acbeb docs(osaurus): record build-fix details + new known-flake list in handoff
 f454cf8 fix(build): unblock package build — revert mlx-swift pin, loosen crypto, vendor C ABI
