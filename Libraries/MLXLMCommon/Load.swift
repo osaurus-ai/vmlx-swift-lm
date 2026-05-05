@@ -46,12 +46,32 @@ public func loadWeights(
         // tensor shapes inconsistent and producing nonsense per-layer
         // quant inferences (the JANG_2L "uint32 vs bfloat16" fatal in
         // quantized_matmul). Detect and surface explicitly.
+        // VMLX_DSV4_SKIP_SIDECAR=1 deliberately skips the prestacked
+        // routed-expert overlay `jangtq_stacked.safetensors` even when
+        // it's present in the bundle. Use this to validate the
+        // sidecar-free load path (DSV4 bundles rebuilt with
+        // `routed_expert_layout: prestacked` ship the stacked tensors
+        // directly in the main model shards — the sidecar becomes
+        // redundant). Cost when set: zero — the loader skips one file.
+        // Benefit: proves the new bundle layout works before we drop
+        // the sidecar entirely from HF releases. Phase B of the
+        // sidecar-deprecation plan in
+        // docs/OSAURUS-DSV4-INTEGRATION.md.
+        let skipDSV4Sidecar =
+            ProcessInfo.processInfo.environment["VMLX_DSV4_SKIP_SIDECAR"] == "1"
         var allShardURLs: [URL] = []
         let enumerator = FileManager.default.enumerator(
             at: modelDirectory, includingPropertiesForKeys: nil)!
         for case let url as URL in enumerator {
             guard url.pathExtension == "safetensors" else { continue }
             if url.lastPathComponent == "jangtq_runtime.safetensors" { continue }
+            if skipDSV4Sidecar
+                && url.lastPathComponent == "jangtq_stacked.safetensors"
+            {
+                FileHandle.standardError.write(Data(
+                    "[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors\n".utf8))
+                continue
+            }
             allShardURLs.append(url)
         }
         // Detect mixed `model-NNNNN-of-MMMMM.safetensors` sets: parse

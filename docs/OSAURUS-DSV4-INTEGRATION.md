@@ -50,10 +50,43 @@ A DSV4-Flash JANGTQ bundle must ship:
 | `config.json` | yes | `model_type = "deepseek_v4"` |
 | `jang_config.json` | yes | `weight_format`, `profile`, `mxtq_seed`, `mxtq_bits` (or `routed_expert_bits`) |
 | `tokenizer.json` / `tokenizer_config.json` / `chat_template` | yes | the chat template MUST be present; missing template breaks chat at runtime |
-| `model-*.safetensors` shards | yes | per-expert weights (or pre-stacked overlay) |
+| `model-*.safetensors` shards | yes | per-expert weights OR prestacked routed-expert tensors directly at `switch_mlp.{gate,up,down}_proj.{tq_packed,tq_norms}` (`routed_expert_layout: prestacked`) |
 | `jangtq_runtime.safetensors` | yes (JANGTQ) | sidecar with codebook + Hadamard signs |
-| `jangtq_stacked.safetensors` | optional | pre-stacked routed-expert overlay; the loader recognizes both `tq_packed`/`tq_norms` and the un-prefixed `packed`/`norms` aliases |
+| `jangtq_stacked.safetensors` | **deprecated, optional** | pre-stacked routed-expert overlay. The loader recognizes both `tq_packed`/`tq_norms` and the un-prefixed `packed`/`norms` aliases. Bundles built with `routed_expert_layout: prestacked` ship the same tensors directly in the main shards — the sidecar is redundant. See **§ Sidecar deprecation** below. |
 | `model.safetensors.index.json` | optional | speeds up weight discovery |
+
+### Sidecar deprecation
+
+`jangtq_stacked.safetensors` was added when DSV4 bundles still stored
+routed-expert weights per-expert (`mlp.experts.{E}.gate_proj.…`) and
+the loader had to call `MLX.stacked(...)` at load time to materialize
+the `(n_experts, …)` tensors the runtime expects. The sidecar
+pre-computed those stacked tensors so loading was fast AND mmap-friendly.
+
+Newer bundles ship with `routed_expert_layout: prestacked` —
+the routed-expert weights live directly at
+`model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.{tq_packed,tq_norms}`
+inside the main `model-*.safetensors` shards. Same MXTQ codec, same
+seed, same Hadamard rotation — just relayouted on disk so the loader
+doesn't have to restack. **In this layout the sidecar is fully
+redundant** and shipping it doubles bundle disk size (~65 GB on
+JANGTQ_K).
+
+The Swift loader supports BOTH layouts today (commit `2534e88`'s
+`packed` → `tq_packed` alias rewriter handles whichever file the
+keys come from). Migration plan:
+
+| Phase | Bundle action | Loader behavior |
+|---|---|---|
+| **A (current)** | Sidecar shipped + prestacked-in-shards | Both files loaded; main shard wins on key collision |
+| **B (validation)** | Sidecar shipped + prestacked-in-shards | Set `VMLX_DSV4_SKIP_SIDECAR=1` to deliberately skip the sidecar at load. Validates the sidecar-free path works without rebuilding the bundle. |
+| **C (deprecation)** | Sidecar removed from HF release | Old Swift loaders (pre-`2534e88`) fail; new loaders work. Bundle disk usage drops ~65 GB. |
+| **D (cleanup)** | Sidecar gone everywhere | Drop the alias rewriter at `DeepseekV4.swift:1086-1096` and the per-expert stacking path at `1098-1149`; bundles use canonical `tq_packed`/`tq_norms` natively. |
+
+Hosts that want to validate Phase C against the current bundle
+(without rebuilding) can run any DSV4 bench with
+`VMLX_DSV4_SKIP_SIDECAR=1` set. The skip is logged to stderr as
+`[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors`.
 
 Audit a bundle from Python with the codex kit:
 
