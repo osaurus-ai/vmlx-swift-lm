@@ -7,14 +7,27 @@ correctness, chat templates / reasoning, and hybrid-SSM warm-pass.
 
 ## Real-bundle smokes — VERIFIED on M5 Max
 
-| Bundle | Family | Attention | Result |
+| Bundle | Family | Quant | Result |
 |---|---|---|---|
-| Laguna-XS.2-JANGTQ (9.4 GB) | Laguna | dense | ✅ 3-turn coherent (compile ON), recalls "blue" |
-| MiniMax-SLURPY-JANGTQ | MiniMax-M2 | dense | ✅ MiniMaxM2Minimal auto-engage, thinking probe PASS, TQ disk round-trip PASS |
-| Qwen3.6-35B-A3B-JANGTQ-CRACK (11 GB) | Qwen3.6 MoE | dense MoE | ✅ Both compile passes 3/3 turns coherent |
-| Qwen3.6-35B-A3B + JangPress force-on | Qwen3.6 MoE | dense MoE | ✅ JangPress mmap tier engaged (10240 tiles, 7.5 GB routed), TQ disk round-trip PASS |
-| Nemotron-Omni-Nano-JANGTQ-CRACK (12 GB) | NemotronH | hybrid SSM (Mamba+attn) | ✅ Both compile passes 3/3 turns coherent, multi-turn cache reuse working |
-| Gemma-4-26B-A4B-it-JANG_4M-CRACK (15 GB) | Gemma4 | SWA | ✅ Both compile passes 3/3 turns coherent, harmony parser handles output cleanly |
+| Laguna-XS.2-JANGTQ (9.4 GB) | Laguna dense | JANGTQ | ✅ 3-turn coherent (compile ON), recalls "blue" |
+| MiniMax-SLURPY-JANGTQ | MiniMax-M2 | JANGTQ | ✅ MiniMaxM2Minimal auto-engage, thinking probe PASS, TQ disk round-trip PASS |
+| Qwen3.6-35B-A3B-JANGTQ-CRACK (11 GB) | Qwen3.6 MoE | JANGTQ | ✅ Both compile passes 3/3 turns coherent |
+| Qwen3.6-27B-MXFP4-CRACK (14 GB) | Qwen3.6 dense | MXFP4 | ✅ Both compile passes 3/3 turns coherent |
+| Qwen3.6-27B-JANG_4M-CRACK (16 GB) | Qwen3.6 dense | JANG_4M | ✅ Both compile passes 3/3 turns coherent |
+| Nemotron-Omni-Nano-JANGTQ-CRACK (12 GB) | NemotronH hybrid SSM | JANGTQ | ✅ Both compile passes 3/3 turns coherent, multi-turn cache reuse |
+| Nemotron-Omni-Nano-JANGTQ4-CRACK (19 GB) | NemotronH hybrid SSM | JANGTQ4 | ✅ Both compile passes 3/3 turns coherent |
+| Nemotron-Omni-Nano-MXFP4-CRACK (21 GB) | NemotronH hybrid SSM | MXFP4 | ✅ Both compile passes 3/3 turns coherent, visible CHUNK content too |
+| Gemma-4-26B-A4B-it-JANG_4M-CRACK (15 GB) | Gemma4 SWA + MoE | JANG_4M | ✅ Both compile passes 3/3 turns coherent, harmony parser clean |
+| MiniMax-M2.7-Small-JANGTQ (37 GB) | MiniMax-M2.7 MoE | JANGTQ | ✅ Both compile passes 3/3 turns coherent, no looping at maxTokens=300 |
+
+### JangPress force-on smokes (`BENCH_JPREG_FORCE=1`)
+
+| Bundle | Cold-tier result | Decode |
+|---|---|---|
+| Qwen3.6-35B-A3B-JANGTQ-CRACK | ✅ mmap, 10240 tiles, 7.5 GB routed | ✅ TQ disk round-trip PASS, 3-turn coherent |
+| Nemotron-Omni-Nano-JANGTQ-CRACK | ✅ mmap, 2944 tiles, 6.8 GB routed (prestacker generated overlay in cache dir, NOT bundle dir) | ✅ TQ disk round-trip PASS, 3-turn coherent |
+| MiniMax-M2.7-Small-JANGTQ | ✅ mmap, 9920 tiles, 32.7 GB routed (largest cold-tier observed) | ✅ TQ disk round-trip PASS, 3-turn coherent |
+| Gemma-4-26B-A4B-it-JANG_4M-CRACK | ⚠️ mmap engaged but 0 tiles — JANG_4M bundle uses non-`tq_packed`/`tq_norms` keys; mmap probe doesn't recognize them | ✅ Decode 3-turn coherent (no JangPress acceleration but no harm) |
 
 ## Real-bundle smokes — DEFERRED (RAM safety)
 
@@ -37,7 +50,7 @@ cited inline.
 | 2 | **`bailing_hybrid` (Ling-2.6-flash, BailingMoeV2_5)** factory entry missing | High | Ling family | Open — needs new model port (MLA + linear attention + MTP, NOT a config-only fix) |
 | 3 | **`CacheList` marked `.skip` on disk serialize** (`TQDiskSerializer.swift:243-245`) | High | FalconH1, BaichuanM1 (any model with `CacheList(MambaCache, KVCacheSimple)` per layer) | Open — multi-turn disk-cache reuse falls back to full re-prefill |
 | 4 | **DSV4-Flash chat-mode silent-empty-output** | High | DSV4-Flash | **FIXED in `2fd67a0`** — root-caused via Python's `server.py` "DSV4 force-thinking override" comment: the shipping bundle is **fundamentally broken in chat-mode** (`enable_thinking=False`). With `</think>`-only tail the model regurgitates training-data artifacts (spam URLs, `[URL REMOVED BY BROTS]` markers, mixed-language instruction annotations). Fix: `DSV4Minimal.jinja` + matching Swift constant always emit `<think>` (open) at assistant tail, mirroring Python's force-flip. Re-validation gated on RAM-safe DSV4 reload. |
-| 5 | **Mistral 4 chat-mode force-flip absent** (per `~/vmlx/docs/AUDIT-RELEASE-READINESS.md:111`) | Medium | Mistral 4 | Open |
+| 5 | **Mistral 4 effort coercion absent** (per `~/vmlx/docs/AUDIT-RELEASE-READINESS.md:111`) | Medium | Mistral 4 | **FIXED in `5f0b325`** — auto-map `enable_thinking → reasoning_effort` in `HuggingFaceIntegrationMacros.swift` when tokenizer carries `[MODEL_SETTINGS]` sentinel. Mirrors Python `server.py:3216-3225`. |
 | 6 | **MiniMax-Small thinking-on loop @ 1024 tokens** | Medium | MiniMax-Small specifically (not -M2) | Open — suspected vmlx-side, not yet root-caused |
 
 ### Lower-priority observations
@@ -124,6 +137,8 @@ JANG bundles override via `jang_config.json:capabilities.reasoningParser`.
 ## Pushed commits in this validation pass
 
 ```
+5f0b325 fix(mistral4): auto-map enable_thinking → reasoning_effort
+4c79b39 docs(validation): record DSV4 chat-mode fix + root cause
 2fd67a0 fix(dsv4): force-thinking override in DSV4Minimal — bundle is broken in chat-mode
 fe47ca8 docs(validation): comprehensive M5 validation pass + audit findings
 52eb4d4 fix(reasoning): GPT-OSS gets harmony stamp (was none)
