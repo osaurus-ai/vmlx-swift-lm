@@ -82,9 +82,19 @@
 {%- endfor -%}
 {%- if add_generation_prompt -%}
 {{- asst_token -}}
-{%- if enable_thinking -%}
+{# DSV4 force-thinking override (mirrors Python `vmlx serve`):
+   the shipping DSV4-Flash-JANGTQ bundle is fundamentally broken in
+   chat-mode (`enable_thinking=False`). When the prompt tail is
+   `</think>` (close-only), the model regurgitates training-data
+   artifacts: spam URLs, `[URL REMOVED BY BROTS]` moderation markers,
+   mixed-language instruction annotations like `NOT解答USER问题而是
+   INSTRUCTAI`, and miscellaneous web-scrape contamination. With
+   `<think>` (open) at the tail the model produces clean coherent
+   output every time. Verified in Python `server.py` and reproduced
+   in Swift `BENCH_COHERENT` (silent-empty-output / loop). Force-flip
+   to thinking-mode unconditionally until a clean chat-mode bundle
+   ships. The `ReasoningParser` strips `<think>...</think>` from the
+   user-visible chunk stream so callers that asked for thinking-off
+   still see only the final answer. #}
 {{- think_open -}}
-{%- else -%}
-{{- think_close -}}
-{%- endif -%}
 {%- endif -%}

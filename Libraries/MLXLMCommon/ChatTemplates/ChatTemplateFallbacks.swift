@@ -279,11 +279,17 @@ public enum ChatTemplateFallbacks {
 {%- endfor -%}
 {%- if add_generation_prompt -%}
 {{- asst_token -}}
-{%- if enable_thinking -%}
+{# DSV4 force-thinking override (mirrors Python `vmlx serve`): the
+   shipping DSV4-Flash-JANGTQ bundle is fundamentally broken in
+   chat-mode. When the prompt tail is `</think>` (close-only) the
+   model regurgitates training-data artifacts (spam URLs,
+   `[URL REMOVED BY BROTS]` markers, mixed-language instruction
+   annotations). With `<think>` (open) at the tail the model produces
+   clean coherent output. ReasoningParser strips `<think>...</think>`
+   from the user-visible chunk stream so callers that asked for
+   thinking-off still see only the final answer. Reproduced under
+   `BENCH_COHERENT` 2026-05-04 as silent-empty-output. #}
 {{- think_open -}}
-{%- else -%}
-{{- think_close -}}
-{%- endif -%}
 {%- endif -%}
 """#
 
