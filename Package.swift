@@ -48,16 +48,22 @@ let package = Package(
             targets: ["MLXDistributedTP"]),
     ],
     dependencies: [
-        // Bumped 2026-05-02: a21d2af = backport of ml-explore/mlx#3462
-        // (retain bound buffers under MTLResourceHazardTrackingModeUntracked
-        // + commandBufferWithUnretainedReferences). Fixes Invalid Resource
-        // crashes at TurboQuant decode B≥16 on M5 Max. Submodule layered:
-        //   7086ba37 backport: Retain bound buffers (#3462)
-        //   96aa27a5 trace(metal): mx::malloc tracer
-        //   f58e52da trace(custom_kernel): clear_library trace
-        //   fa3a9616 fix(metal): keep MTLComputePipelineState alive
-        // Env knob MLX_METAL_RETAIN_BOUND_BUFFERS=0 reverts to old behaviour.
-        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "a21d2afd96912f992a03f5cae3216b065f97929a"),
+        // 2026-05-04 reverted to 0a56f90 (was a21d2af). The advance to
+        // a21d2af pinned `osaurus-ai/mlx@7086ba37`, an INCOMPLETE backport
+        // of upstream ml-explore/mlx#3462: `mlx/backend/metal/eval.cpp:62`
+        // calls `encoder.take_retained_buffers()` but the corresponding
+        // `auto& encoder = metal::get_command_encoder(s);` declaration was
+        // not carried over. The package no longer builds at HEAD with the
+        // a21d2af pin; a corrected version of the backport exists at
+        // `osaurus-ai/mlx@e577ca02` (refs/heads/backport/3462-retain-bound-buffers)
+        // but no mlx-swift branch advances the submodule pointer there yet.
+        //
+        // 0a56f90 is the last green pin (submodule mlx@96aa27a5,
+        // mx::malloc tracer + Bug-1 fix layered on upstream
+        // `ce45c525`). Reverting drops the perf-oriented buffer-retain
+        // optimization but restores correctness. Re-introduce when the
+        // mlx-swift backport branch points at `e577ca02` or later.
+        .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         // swift-jinja: pinned to osaurus-ai fork at 58d21aa which
         // contains a 1-line parser fix lifting the for-loop iterable
@@ -84,9 +90,14 @@ let package = Package(
         // swift-certificates for self-signed cert generation in
         // MLXDistributedTransport (TLS-PP transport). swift-asn1 is
         // transitive; we declare swift-crypto explicitly so we can
-        // consume its Crypto product directly.
+        // consume its Crypto product directly. The version range is
+        // intentionally permissive (3.x-4.x) because the only APIs
+        // touched (`SHA256.hash`, `P256.Signing.PrivateKey()`) are
+        // stable across major versions, and host apps that pin
+        // `apple/containerization` (still on swift-crypto 3.x as of
+        // 0.32.0) need the 3.x branch to resolve cleanly.
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"5.0.0"),
     ],
     targets: [
         .target(
@@ -189,6 +200,19 @@ let package = Package(
             cSettings: [
                 // mlx-c headers needed by the shim.
                 .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+            ],
+            // The two MlxC*.cpp files are vendored verbatim from the mlx-swift
+            // checkout (`Source/Cmlx/mlx-c/mlx/c/distributed.cpp` and
+            // `distributed_group.cpp`). The mlx-swift Package.swift excludes
+            // these from the Cmlx target, so we compile them ourselves to
+            // satisfy the `_mlx_distributed_*` symbols our C shim references.
+            // Re-vendor these files when bumping the mlx-swift pin if the
+            // upstream C ABI changes.
+            cxxSettings: [
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/json/single_include/nlohmann"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/fmt/include"),
             ]
         ),
         .target(
@@ -319,7 +343,12 @@ let package = Package(
             ],
             path: "Libraries/MLXHuggingFace"
         ),
-    ]
+    ],
+    // C++20 needed by the vendored mlx-c distributed C ABI shim files in
+    // CmlxDistributedShim (they include `mlx/distributed/ops.h` which uses
+    // `std::is_same_v` / `std::is_convertible_v` and other C++17/20-only
+    // type traits). All other C++ targets compile fine at C++20 too.
+    cxxLanguageStandard: .gnucxx20
 )
 
 if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
