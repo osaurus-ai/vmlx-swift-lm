@@ -342,15 +342,18 @@ public enum LLMTypeRegistry {
             let stampBits: Int? = {
                 switch weightFormat {
                 case "jangtq4": return 4
-                case "jangtq3": return 3
                 case "jangtq2", "mxtq": return 2
                 default: return nil
                 }
             }()
-            // Codebook bit-widths the runtime knows how to dispatch.
-            // 2026-05-04: 3-bit added for the JANGTQ3 family (8-entry
-            // codebook). Centralized so all bit filters stay in sync.
-            let validRoutedBits: Set<Int> = [2, 3, 4]
+            // Codebook bit-widths the runtime kernels currently support.
+            // Centralized so all bit filters in this routing block stay
+            // in sync. Extend ONLY when the corresponding converter
+            // packing convention is verified end-to-end; the Metal
+            // kernel's `vals_per_u32 = 32 / bits` math is generic but
+            // the converter side has to match (e.g., JANGTQ3 / 3-bit
+            // packing is NOT shipped — leave it out).
+            let validRoutedBits: Set<Int> = [2, 4]
             let configBits: Int? = {
                 guard let b = check?.quantization?.bits, validRoutedBits.contains(b)
                 else { return nil }
