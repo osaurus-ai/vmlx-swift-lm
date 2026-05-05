@@ -150,17 +150,46 @@ A host can override per call via env: `JANGPRESS=70` to force it on at
 
 For full multi-turn rules see `OSAURUS-CACHE-CONTRACT.md`.
 
-## Verified state (M5 Max, 2026-05-04)
+## Verified state (M5 Max, 2026-05-04 @ commit `f454cf8`)
 
 | Surface | Status |
 |---|---|
-| `swift build -c release --target MLXLMCommon` | clean (35.6s) |
-| `swift build -c release --target MLXHuggingFaceMacros` | clean (123s) |
-| `swift build -c release --target MLXLLM` | clean (18.5s) |
-| `swift test --filter LoadConfigurationTests` | 25/25 (one transient setenv-race flake on rerun, pre-existing — not a regression) |
-| SSH push to `osaurus-ai/vmlx-swift-lm` main | verified `Hi jjang-ai!` + `1bc6e6b..2d0d63d  main -> main` |
+| `swift build -c release` (full package, all targets) | clean — 26.84s |
+| `swift test --filter "LoadConfigurationTests\|ShardingPlanTests"` | 28/28 |
+| Real-bundle smoke: Laguna-XS.2-JANGTQ 3-turn coherent | PASS — recalls "blue" across turns |
+| Real-bundle smoke: MiniMax-SLURPY-JANGTQ `BENCH_JPREG=1` | PASS — `MiniMaxM2Minimal` auto-engage logged; thinking probe off=0c on=772c; TQ disk round-trip PASS; 3/3 turns coherent |
+| SSH push to `osaurus-ai/vmlx-swift-lm` main | verified `Hi jjang-ai!` |
 
 For the broader bundle sweep see `JANGPRESS-VALIDATION-MATRIX-2026-05-04.md`.
+
+### Build prerequisites that this rev unblocks
+
+The previous rev (`78c91aa`) shipped with two build blockers found in
+osaurus-side review:
+
+1. **swift-crypto 4.x lower bound** conflicted with hosts pinning
+   `apple/containerization` (still on swift-crypto 3.x as of 0.32.0).
+   Loosened to `"3.0.0"..<"5.0.0"` — the only crypto APIs touched by
+   `MLXDistributedTransport` are `SHA256.hash` + `P256.Signing.PrivateKey()`,
+   stable since 1.x.
+2. **mlx-swift pin `a21d2af`** advanced the `osaurus-ai/mlx`
+   submodule to `7086ba37`, an incomplete backport of upstream
+   ml-explore/mlx#3462. `mlx/backend/metal/eval.cpp:62` calls
+   `encoder.take_retained_buffers()` but the corresponding
+   `auto& encoder = metal::get_command_encoder(s);` declaration was
+   not carried over. Reverted to `0a56f90` (last green pin —
+   submodule at `mlx@96aa27a5`). The cost is the buffer-retain
+   optimization for large-batch TurboQuant decode (B≥16). Re-introduce
+   when an `osaurus-ai/mlx-swift` branch advances the submodule
+   pointer to the corrected `osaurus-ai/mlx@e577ca02`.
+3. **`CmlxDistributedShim` linker errors** (`_mlx_distributed_*`).
+   The mlx-swift Package.swift excludes
+   `mlx-c/mlx/c/distributed{,_group}.cpp` from the Cmlx target;
+   without them our C ABI shim has no implementation to bind to.
+   Vendored both files byte-identically into `CmlxDistributedShim`
+   as `MlxCDistributed.cpp` / `MlxCDistributedGroup.cpp` and added
+   `cxxLanguageStandard: .gnucxx20` plus the matching header search
+   paths so the package builds cleanly end-to-end.
 
 ## Known issues NOT covered by this rev
 
@@ -193,6 +222,29 @@ inside MLX's lazy-graph materialization. See
 state and four candidate next-step paths (jaccl loopback, mpi
 backend, hand-rolled all_sum, switch to PP-over-NIO).
 
+The package builds clean now (`f454cf8`) — TPRankWorker links
+against the vendored C ABI — but the runtime hang remains a
+separate, upstream issue.
+
+### Test-harness flakes (NOT regressions in this rev)
+
+Two pre-existing classes of test failure surface under the reverted
+mlx-swift pin. Neither is introduced by this work; both are tracked
+for follow-up.
+
+- **`EvalTests/testConcurrentSampling` and `testRandomStateIsolation`**
+  crash with a Metal command-encoder coalescing assertion. These
+  are exactly the symptoms the `a21d2af` buffer-retain backport
+  addressed. They will re-pass once the corrected backport
+  (`osaurus-ai/mlx@e577ca02`) is reachable through an `mlx-swift`
+  branch and the pin can advance again.
+- **`LoadConfigurationTests.autoFallsThroughOnBadEnv`** flakes under
+  parallel xctest because the test helper `withEnvironmentValue`
+  uses process-global `setenv`, which races with sibling tests
+  reading `JANGPRESS`. Failure rate ~5% on a 25-test rerun. Fix is
+  to swap the helper for a `TaskLocal`-based env injection; out of
+  scope for this rev.
+
 ### INTELLECT-3.1 bundle (#10 from M4 sweep)
 
 Never tested in the 2026-05-04 sweep. Not blocking; flag if it lands
@@ -200,7 +252,12 @@ in production traffic.
 
 ## Migration checklist for the next osaurus release
 
-1. **Pin to `osaurus-ai/vmlx-swift-lm` main @ `2d0d63d` or later.**
+1. **Pin to `osaurus-ai/vmlx-swift-lm` main @ `f454cf8` or later.**
+   Earlier commits (`78c91aa`, `2d0d63d`, `85c0893`) ship the
+   correctness fixes but do NOT build cleanly on hosts that pin
+   `apple/containerization` (swift-crypto 3.x conflict) AND fail to
+   link `TPRankWorker` (incomplete mlx submodule backport). `f454cf8`
+   resolves both blockers — see § "Build prerequisites".
 2. **Stop relying on env-only JangPress activation.** If you want
    JangPress in production, switch the call site from
    `LoadConfiguration.default` to `LoadConfiguration.experimentalJangPressAuto`
