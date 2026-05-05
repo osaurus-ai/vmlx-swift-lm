@@ -127,9 +127,49 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             do {
                                 return try upstream.applyChatTemplate(
                                     messages: messages,
-                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(src))
+                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(src),
+                                    addGenerationPrompt: true,
+                                    truncation: false,
+                                    maxLength: nil,
+                                    tools: tools,
+                                    additionalContext: additionalContext)
                             } catch Tokenizers.TokenizerError.missingChatTemplate {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
+                            }
+                        }
+                        // MiniMax-M2 native template auto-correction: every shipping
+                        // MiniMax-M2 / M2.7 chat_template.jinja unconditionally prefills
+                        // <think> at the assistant tail and ignores enable_thinking.
+                        // Direct-answer (thinking-off) callers therefore see all output
+                        // trapped in Generation.reasoning. When (a) additionalContext sets
+                        // enable_thinking=false, (b) the tokenizer carries the MiniMax-
+                        // specific ]~b] / [e~[ special tokens, and (c) no env override
+                        // is set, force the corrected MiniMaxM2Minimal fallback first.
+                        // Auto-engage is one-way: thinking-on requests fall through to
+                        // the native template untouched.
+                        if let ctx = additionalContext,
+                           let enableThinking = ctx["enable_thinking"] as? Bool,
+                           enableThinking == false,
+                           upstream.convertTokenToId("]~b]") != nil,
+                           upstream.convertTokenToId("[e~[") != nil {
+                            do {
+                                if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                    FileHandle.standardError.write(
+                                        "[vmlx] chat-template auto-correction engaged: MiniMaxM2Minimal (enable_thinking=false)\\n"
+                                            .data(using: .utf8)!)
+                                }
+                                return try upstream.applyChatTemplate(
+                                    messages: messages,
+                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                        MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
+                                    addGenerationPrompt: true,
+                                    truncation: false,
+                                    maxLength: nil,
+                                    tools: tools,
+                                    additionalContext: additionalContext)
+                            } catch {
+                                // Fall through to native template if our corrected
+                                // version trips a Jinja runtime issue.
                             }
                         }
                         do {
@@ -159,7 +199,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 return try upstream.applyChatTemplate(
                                     messages: messages,
                                     chatTemplate: Tokenizers.ChatTemplateArgument.literal(
-                                        MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal))
+                                        MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
+                                    addGenerationPrompt: true,
+                                    truncation: false,
+                                    maxLength: nil,
+                                    tools: tools,
+                                    additionalContext: additionalContext)
                             }
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         } catch {
@@ -228,7 +273,12 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 do {
                                     let ids = try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(template))
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(template),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                         FileHandle.standardError.write(
                                             "[vmlx] chat-template fallback engaged: \\(label) (original error: \\(error))\\n"

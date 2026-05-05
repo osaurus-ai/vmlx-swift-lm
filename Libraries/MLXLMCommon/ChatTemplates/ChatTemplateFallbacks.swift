@@ -461,6 +461,114 @@ public enum ChatTemplateFallbacks {
 {%- endfor -%}
 """#
 
+    /// MiniMax-M2 minimal chat template that honors `enable_thinking`.
+    /// The bundle-shipped native template ignores the flag and always
+    /// prefills `<think>\n` at the assistant tail. That makes the model
+    /// emit reasoning forever in thinking-off chat workloads (and break
+    /// loop detection because the parser routes everything to
+    /// `Generation.reasoning` when no `</think>` ever arrives).
+    /// This template mirrors the native structure but gates the
+    /// trailing prefill on `enable_thinking`. When the flag is false we
+    /// emit a closed empty block (`<think>\n</think>\n\n`) so the model
+    /// produces direct content. When the flag is true (or unset) the
+    /// behaviour matches the native template.
+    public static let minimaxM2Minimal: String = #"""
+{# MiniMax-M2 minimal chat template with enable_thinking honored.
+   Mirrors the bundle-shipped native template structurally, but the
+   trailing assistant prefill is gated on `enable_thinking` so callers
+   that explicitly opt out of CoT get a clean direct-answer path.
+   When enable_thinking is unset, defaults to true to preserve the
+   model's training-time bias. #}
+{%- set toolcall_begin_token = '<minimax:tool_call>' -%}
+{%- set toolcall_end_token   = '</minimax:tool_call>' -%}
+{%- set _enable_thinking = enable_thinking | default(true) -%}
+
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}{{ content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}{{- item.text }}
+            {%- elif item is string -%}{{- item }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}{{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro build_system_message(system_message) -%}
+    {%- if system_message and system_message.content -%}
+        {{- visible_text(system_message.content) }}
+    {%- else -%}
+        {%- if model_identity is not defined -%}
+            {%- set model_identity = "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax." -%}
+        {%- endif -%}
+        {{- model_identity }}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- set system_message = none -%}
+{%- set conversation_messages = messages -%}
+{%- if messages and messages[0].role == "system" -%}
+    {%- set system_message = messages[0] -%}
+    {%- set conversation_messages = messages[1:] -%}
+{%- endif -%}
+
+{%- set ns = namespace(last_user_index=-1) %}
+{% for m in conversation_messages %}
+    {%- if m.role == 'user' %}
+        {% set ns.last_user_index = loop.index0 -%}
+    {%- endif %}
+{%- endfor %}
+
+{{- ']~!b[' ~ ']~b]system' ~ '\n' }}
+{{- build_system_message(system_message) }}
+
+{%- if tools -%}
+    {{- '\n\n' ~ '# Tools' ~ '\n' ~ 'You may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:' ~ '\n' }}
+    {{- '\n' ~ '<tools>' ~ '\n' }}
+    {%- for tool in tools -%}
+        <tool>{{ tool.function | tojson(ensure_ascii=False) }}</tool>
+    {% endfor -%}
+    {{- '</tools>' ~ '\n' }}
+{%- endif -%}
+{{- '[e~[\n' }}
+
+{%- set last_tool_call = namespace(name=none) -%}
+{%- for message in conversation_messages -%}
+    {%- if message.role == 'assistant' -%}
+        {{- ']~b]ai' ~ '\n' }}
+        {%- set reasoning_content = '' %}
+        {%- set content = visible_text(message.content) %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- else %}
+            {%- if '</think>' in content %}
+                {%- set reasoning_content = content.split('</think>')[0].strip('\n').split('<think>')[-1].strip('\n') %}
+                {%- set content = content.split('</think>')[-1].strip('\n') %}
+            {%- endif %}
+        {%- endif %}
+        {%- if reasoning_content and loop.index0 > ns.last_user_index -%}
+            {{- '<think>' ~ '\n' ~ reasoning_content ~ '\n' ~ '</think>' ~ '\n\n' }}
+        {%- endif -%}
+        {%- if content -%}{{- content }}{%- endif -%}
+        {{- '[e~[' ~ '\n' }}
+    {%- elif message.role == 'user' -%}
+        {{- ']~b]user' ~ '\n' }}
+        {{- visible_text(message.content) }}
+        {{- '[e~[' ~ '\n' }}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- ']~b]ai' ~ '\n' }}
+    {%- if _enable_thinking -%}
+        {{- '<think>' ~ '\n' }}
+    {%- else -%}
+        {{- '<think>\n</think>\n\n' }}
+    {%- endif -%}
+{%- endif -%}
+"""#
+
     /// Ordered list of (label, template) fallbacks used when the
     /// model's native template throws. Order matters: `gemma4WithTools`
     /// comes first because (a) it subsumes `gemma4Minimal` when no
