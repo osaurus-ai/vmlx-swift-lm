@@ -474,6 +474,16 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         return "harmony"
     }
 
+    // GPT-OSS native Harmony envelope (`<|start|>`, `<|channel|>`,
+    // `<|end|>`, `<|return|>`, `<|message|>`). Without this stamp the
+    // markers leak into the user-visible chunk stream because the
+    // default parser treats them as content. Documented in
+    // docs/OSAURUS-PRODUCTION-HANDOFF-2026-05-04.md as the gpt_oss
+    // Harmony marker leak.
+    if t.hasPrefix("gpt_oss") {
+        return "harmony"
+    }
+
     // Explicit allowlist of model families that emit `<think>` /
     // `</think>` in their native chat template. These all resolve
     // via `ReasoningParser.fromCapabilityName` to the think_xml

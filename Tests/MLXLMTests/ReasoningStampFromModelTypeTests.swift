@@ -41,7 +41,7 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
             "phi", "phi3", "phimoe",
             "gemma", "gemma2", "gemma3", "gemma3_text", "gemma3n",
             "starcoder2", "cohere", "openelm", "internlm2", "granite",
-            "granitemoehybrid", "gpt_oss", "mimo", "mimo_v2_flash",
+            "granitemoehybrid", "mimo", "mimo_v2_flash",
             "minicpm", "nanochat", "olmoe", "olmo2", "olmo3",
             "bailing_moe", "smollm3", "ernie4_5", "baichuan_m1",
             "exaone4", "lille-130m", "apertus", "jamba_3b",
@@ -113,6 +113,15 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         // Gemma-4 uses the `<|channel>thought\n…<channel|>` envelope,
         // NOT `<think>`. Must resolve to the harmony stamp.
         for modelType in ["gemma4", "gemma4_text"] {
+            XCTAssertEqual(reasoningStampFromModelType(modelType), "harmony")
+        }
+    }
+
+    func testGptOssGetsHarmony() {
+        // GPT-OSS emits the native Harmony envelope (`<|start|>`,
+        // `<|channel|>`, `<|end|>`, etc.). Without the harmony stamp
+        // the markers leak into the user-visible chunk stream.
+        for modelType in ["gpt_oss", "gpt_oss_120b", "gpt_oss_20b"] {
             XCTAssertEqual(reasoningStampFromModelType(modelType), "harmony")
         }
     }
