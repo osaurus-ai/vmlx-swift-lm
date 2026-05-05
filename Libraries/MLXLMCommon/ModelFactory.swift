@@ -553,11 +553,23 @@ public func loadModel(
     //    model-specific sanitize() methods calling MLX.stacked(...) on
     //    the entire routed expert bank, which would materialize tens of
     //    GB into resident Metal buffers and defeat canonical mmap.
+    //
+    // 2026-05-04 OOM fix: the gate previously required JangPress to be
+    // enabled (`resolvedOptions.enabled && backend == .mmap`), which
+    // meant `LoadConfiguration.default` (JangPress disabled by safety
+    // commit 85c0893) skipped the prestacker entirely. JANGTQ bundles
+    // with many per-expert routed keys (Ling-2.6-flash legacy: 256 ×
+    // 32 × 9 = 73,728 tensors) then fell through to the in-memory
+    // stacker in the model's sanitize() and overflowed RAM at 100+ GB
+    // on a 29 GB bundle. The prestacker is purely a disk-layout
+    // optimizer — orthogonal to JangPress's cold-page reclaim. Run it
+    // unconditionally when an mmap-capable loader is available; the
+    // helper INTERNALLY checks for `jangtq_runtime.safetensors` and
+    // self-skips for non-JANGTQ bundles, so this is safe for every
+    // family. The `JANGPRESS_PRESTACK=0` env override still disables.
     let loadDirectory = try JangPressPrestacker.prepareBundleIfNeeded(
         originalURL: directory,
-        enabled: loadConfiguration.useMmapSafetensors
-            && resolvedOptions.enabled
-            && resolvedOptions.backend == .mmap)
+        enabled: loadConfiguration.useMmapSafetensors)
 
     // 5. Load the model normally. Patched osaurus mlx-swift pins honor
     //    MLX_SAFETENSORS_MMAP=1 inside loadArraysAndMetadata(url:),
