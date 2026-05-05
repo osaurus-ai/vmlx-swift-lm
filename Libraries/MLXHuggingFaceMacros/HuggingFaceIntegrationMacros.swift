@@ -172,9 +172,32 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 // version trips a Jinja runtime issue.
                             }
                         }
+                        // Mistral 4 effort coercion (mirrors Python
+                        // `vmlx serve` server.py:3216-3225). The Mistral 4
+                        // chat template renders a [MODEL_SETTINGS]
+                        // {"reasoning_effort":"high"|"none"|"max"} block
+                        // gated on this field. Python auto-maps
+                        // enable_thinking → reasoning_effort so callers
+                        // don't have to pass both. Mirror that mapping here
+                        // when (a) tokenizer carries the [MODEL_SETTINGS]
+                        // sentinel that all Mistral 4 variants ship, and
+                        // (b) the caller did NOT already provide an
+                        // explicit reasoning_effort. Without this Swift
+                        // emits "none" even when enable_thinking=True,
+                        // breaking inference-cost + token-count parity vs
+                        // Python (~/vmlx/docs/AUDIT-RELEASE-READINESS.md:
+                        // "Mistral 4 effort not normalized").
+                        var mistral4AdjustedContext = additionalContext
+                        if mistral4AdjustedContext?["reasoning_effort"] == nil,
+                           upstream.convertTokenToId("[MODEL_SETTINGS]") != nil,
+                           let enableThinking = mistral4AdjustedContext?["enable_thinking"] as? Bool {
+                            var ctx = mistral4AdjustedContext ?? [:]
+                            ctx["reasoning_effort"] = enableThinking ? "high" : "none"
+                            mistral4AdjustedContext = ctx
+                        }
                         do {
                             return try upstream.applyChatTemplate(
-                                messages: messages, tools: tools, additionalContext: additionalContext)
+                                messages: messages, tools: tools, additionalContext: mistral4AdjustedContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
                             // DSV4-Flash family: bundles ship NO chat_template
                             // (the stock distribution carries an external
