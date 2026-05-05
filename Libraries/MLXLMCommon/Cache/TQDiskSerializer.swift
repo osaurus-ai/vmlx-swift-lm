@@ -106,6 +106,15 @@ public enum TQDiskSerializer {
         /// keep the long-context summary across turns instead of
         /// re-deriving it from prompt tokens every turn.
         case deepseekV4 = 7
+        /// `CacheList` composite — wraps multiple sub-caches per layer.
+        /// Used by BaichuanM1 (`CacheList(RotatingKVCache, MambaCache)`)
+        /// and FalconH1 (`CacheList(MambaCache, KVCacheSimple)`). Pre-2026-05-04
+        /// this kind was missing and CacheList layers landed on `.skip`,
+        /// dropping multi-turn disk-cache reuse for these families. Each
+        /// sub-cache is tagged independently via
+        /// `__cache_list_{i}_sub_{j}_kind__` and serialized under a sub-keyed
+        /// prefix (`mamba_{i}_sub_{j}_state0`, `kv_{i}_sub_{j}_keys`, etc.).
+        case cacheList = 8
         /// Cache type we don't know how to persist. On restore, treated as
         /// a forced miss for the affected layer only.
         case skip = 4
@@ -239,9 +248,17 @@ public enum TQDiskSerializer {
                     // restore knows not to fall through to KV decode.
                     result[kindKey(for: i)] = kindArray(.skip)
                 }
+            } else if let list = layer as? CacheList {
+                // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
+                // hybrid stacks). Pre-2026-05-04 this fell through to
+                // `.skip` and dropped multi-turn disk-cache reuse.
+                // serializeCacheListLayer sets the kind tag itself
+                // (either `.cacheList` or `.skip` if no sub-cache had
+                // any persistable state).
+                serializeCacheListLayer(list, index: i, into: &result)
             } else {
-                // QuantizedKVCache, CacheList, unknown. Record an explicit
-                // skip so restore doesn't silently fall through to KV.
+                // Unknown cache type. Record an explicit skip so restore
+                // doesn't silently fall through to KV.
                 result[kindKey(for: i)] = kindArray(.skip)
             }
         }
@@ -353,6 +370,119 @@ public enum TQDiskSerializer {
             result[kindKey(for: i)] = kindArray(.rotating)
         } else {
             // metaState shape changed unexpectedly — refuse to persist.
+            result[kindKey(for: i)] = kindArray(.skip)
+        }
+    }
+
+    /// Sub-cache kind tag inside a CacheList composite. Sub-caches use
+    /// `__cache_list_{i}_sub_{j}_kind__` to identify themselves; reuse
+    /// the same `LayerKind` enum so restore can dispatch identically to
+    /// the top-level path.
+    private static func subKindKey(layer i: Int, sub j: Int) -> String {
+        "__cache_list_\(i)_sub_\(j)_kind__"
+    }
+
+    /// Serialize a `CacheList` composite layer. Walks each sub-cache and
+    /// dispatches to a per-type serializer that uses sub-keyed prefixes
+    /// (`mamba_{i}_sub_{j}_state0`, `kv_{i}_sub_{j}_keys`, etc.) so
+    /// keys never collide with the top-level layer's own keys (top-level
+    /// kind for a CacheList layer is `.cacheList`, not `.mamba`/`.kv`).
+    ///
+    /// Sets `__layer_kind_{i}__` to `.cacheList` if at least one sub-cache
+    /// had persistable state, or `.skip` if the entire composite was
+    /// pre-prefill / empty.
+    ///
+    /// Currently supports sub-caches of: `MambaCache`, `RotatingKVCache`,
+    /// `RotatingKVCacheWrapper` (unwrapped to inner rotating),
+    /// `KVCacheSimple`, `TurboQuantKVCache` (fill phase only — compressed
+    /// TQ inside CacheList is unusual; recorded as `.skip`). Other sub-cache
+    /// types are recorded as `.skip` for that sub-slot only — restore
+    /// re-prefills just that slot.
+    private static func serializeCacheListLayer(
+        _ list: CacheList,
+        index i: Int,
+        into result: inout [String: MLXArray]
+    ) {
+        let count = list.count
+        guard count > 0 else {
+            result[kindKey(for: i)] = kindArray(.skip)
+            return
+        }
+        var anyPersisted = false
+
+        for j in 0..<count {
+            let sub = list[j]
+
+            if let mamba = sub as? MambaCache {
+                let state = mamba.state
+                if state.count >= 2 {
+                    result["mamba_\(i)_sub_\(j)_state0"] = state[0]
+                    result["mamba_\(i)_sub_\(j)_state1"] = state[1]
+                    result["__mamba_\(i)_sub_\(j)_offset__"] =
+                        metaInt32(Int32(mamba.offset))
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.mamba)
+                    anyPersisted = true
+                } else {
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
+                }
+                continue
+            }
+
+            // Unwrap RotatingKVCacheWrapper to its inner rotating cache —
+            // matches the top-level dispatch's behavior at line 220.
+            let rotCandidate: RotatingKVCache?
+            if let rot = sub as? RotatingKVCache {
+                rotCandidate = rot
+            } else if let wrapper = sub as? RotatingKVCacheWrapper {
+                rotCandidate = wrapper.rotating
+            } else {
+                rotCandidate = nil
+            }
+            if let rot = rotCandidate {
+                let state = rot.state
+                let meta = rot.metaState
+                if state.count == 2,
+                   meta.count == 5,
+                   let keep = Int32(meta[0]),
+                   let maxSize = Int32(meta[1]),
+                   let step = Int32(meta[2]),
+                   let offset = Int32(meta[3]),
+                   let idx = Int32(meta[4])
+                {
+                    result["rot_\(i)_sub_\(j)_keys"] = state[0]
+                    result["rot_\(i)_sub_\(j)_values"] = state[1]
+                    result["__rot_\(i)_sub_\(j)_meta__"] =
+                        MLXArray([keep, maxSize, step, offset, idx])
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.rotating)
+                    anyPersisted = true
+                } else {
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
+                }
+                continue
+            }
+
+            if sub is KVCacheSimple || sub is TurboQuantKVCache {
+                let state = sub.state
+                if state.count >= 2 {
+                    result["kv_\(i)_sub_\(j)_keys"] = state[0]
+                    result["kv_\(i)_sub_\(j)_values"] = state[1]
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.kv)
+                    anyPersisted = true
+                } else {
+                    result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
+                }
+                continue
+            }
+
+            // Unknown sub-cache type. Skip just this slot.
+            result[subKindKey(layer: i, sub: j)] = kindArray(.skip)
+        }
+
+        if anyPersisted {
+            result["__cache_list_\(i)_count__"] = metaInt32(Int32(count))
+            result[kindKey(for: i)] = kindArray(.cacheList)
+        } else {
+            // Composite has no persistable sub-cache state. Tag as skip.
             result[kindKey(for: i)] = kindArray(.skip)
         }
     }
@@ -524,13 +654,20 @@ public enum TQDiskSerializer {
     }
 
     /// Result of deserializing one cache layer from a dict.
-    public enum LayerData {
+    public indirect enum LayerData {
         case tq(TQLayerComponents)
         case standard(KVLayerComponents)
         case mamba(MambaLayerComponents)
         case qkv(QKVLayerComponents)
         case rotating(RotatingLayerComponents)
         case deepseekV4(DeepseekV4LayerComponents)
+        /// `CacheList` composite: ordered per-sub-cache LayerData. Each
+        /// sub-element carries its own kind (`.standard`, `.mamba`,
+        /// `.rotating`, etc.). Restore walks the array and dispatches
+        /// each sub-LayerData via the existing helpers using the FULL
+        /// CacheList as `into:` — the helpers already introspect
+        /// CacheList sub-caches by type to find the right slot.
+        case cacheList([LayerData])
         /// Layer was serialized as `.skip` (cache type we don't persist).
         case skip
     }
@@ -669,6 +806,13 @@ public enum TQDiskSerializer {
                     out.append(IndexedLayerData(index: i, data: .deepseekV4(comp)))
                 } else {
                     out.append(IndexedLayerData(index: i, data: .skip))
+                }
+            case .cacheList:
+                let subs = deserializeCacheListLayer(index: i, from: arrays)
+                if subs.isEmpty {
+                    out.append(IndexedLayerData(index: i, data: .skip))
+                } else {
+                    out.append(IndexedLayerData(index: i, data: .cacheList(subs)))
                 }
             case .skip, .unknown:
                 out.append(IndexedLayerData(index: i, data: .skip))
@@ -852,6 +996,96 @@ public enum TQDiskSerializer {
             offset: Int(m[3]),
             idx: Int(m[4])
         )
+    }
+
+    /// Deserialize a `CacheList` composite. Reads
+    /// `__cache_list_{i}_count__` then iterates each sub-cache by its
+    /// own `__cache_list_{i}_sub_{j}_kind__` tag, dispatching to the
+    /// matching per-type deserializer using sub-keyed prefixes.
+    /// Returns the per-sub `LayerData` array in original order so the
+    /// restore path can dispatch each into the correct sub-cache slot.
+    /// Returns an empty array if the count metadata is missing or 0 —
+    /// the caller treats empty as `.skip`.
+    private static func deserializeCacheListLayer(
+        index i: Int,
+        from arrays: [String: MLXArray]
+    ) -> [LayerData] {
+        guard let countArr = arrays["__cache_list_\(i)_count__"] else {
+            return []
+        }
+        let count = Int(readMetaInt32(countArr))
+        guard count > 0 else { return [] }
+
+        var subs: [LayerData] = []
+        subs.reserveCapacity(count)
+        for j in 0..<count {
+            let kindKey = "__cache_list_\(i)_sub_\(j)_kind__"
+            guard let kindArr = arrays[kindKey],
+                  let kind = LayerKind(rawValue: readMetaInt32(kindArr))
+            else {
+                subs.append(.skip)
+                continue
+            }
+            switch kind {
+            case .kv:
+                if let k = arrays["kv_\(i)_sub_\(j)_keys"],
+                   let v = arrays["kv_\(i)_sub_\(j)_values"]
+                {
+                    subs.append(.standard(KVLayerComponents(keys: k, values: v)))
+                } else {
+                    subs.append(.skip)
+                }
+            case .mamba:
+                if let s0 = arrays["mamba_\(i)_sub_\(j)_state0"],
+                   let s1 = arrays["mamba_\(i)_sub_\(j)_state1"]
+                {
+                    let off: Int
+                    if let oa = arrays["__mamba_\(i)_sub_\(j)_offset__"] {
+                        off = Int(readMetaInt32(oa))
+                    } else {
+                        off = 0
+                    }
+                    subs.append(
+                        .mamba(MambaLayerComponents(state0: s0, state1: s1, offset: off)))
+                } else {
+                    subs.append(.skip)
+                }
+            case .rotating:
+                if let k = arrays["rot_\(i)_sub_\(j)_keys"],
+                   let v = arrays["rot_\(i)_sub_\(j)_values"],
+                   let metaArr = arrays["__rot_\(i)_sub_\(j)_meta__"],
+                   !metaArr.shape.isEmpty, metaArr.shape[0] == 5
+                {
+                    let m = metaArr.asArray(Int32.self)
+                    if m.count == 5 {
+                        subs.append(
+                            .rotating(
+                                RotatingLayerComponents(
+                                    keys: k,
+                                    values: v,
+                                    keep: Int(m[0]),
+                                    maxSize: Int(m[1]),
+                                    step: Int(m[2]),
+                                    offset: Int(m[3]),
+                                    idx: Int(m[4]))))
+                    } else {
+                        subs.append(.skip)
+                    }
+                } else {
+                    subs.append(.skip)
+                }
+            case .skip, .unknown:
+                subs.append(.skip)
+            case .tq, .qkv, .deepseekV4, .cacheList:
+                // Not currently emitted as sub-cache types — see
+                // serializeCacheListLayer. If a future bundle ships
+                // these we'll need to extend serialize too. Skip for
+                // now so old readers don't crash on a tag they can't
+                // round-trip.
+                subs.append(.skip)
+            }
+        }
+        return subs
     }
 
     /// 2026-05-04: Deserialize a single `DeepseekV4Cache` layer.

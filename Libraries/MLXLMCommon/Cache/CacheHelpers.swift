@@ -405,6 +405,53 @@ private func restoreFromV2Arrays(
                 totalTokens = comp.offset
             }
 
+        case .cacheList(let subLayers):
+            // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
+            // hybrid stacks). Dispatch each sub-LayerData via the
+            // existing per-type helpers using the FULL CacheList
+            // (`cache[i]`) as `into:` — restore* helpers already
+            // introspect CacheList sub-caches by type and find the
+            // matching sub-slot.
+            //
+            // Sub-layer ORDER on disk does NOT have to match the
+            // runtime CacheList's internal order — type matching does
+            // the dispatch. This is the same convention SSM state
+            // restoration in extractSSMStates uses.
+            for subData in subLayers {
+                switch subData {
+                case .standard(let kv):
+                    var keys = kv.keys
+                    var values = kv.values
+                    if keys.dtype == .float16 {
+                        keys = keys.asType(.bfloat16)
+                        values = values.asType(.bfloat16)
+                    }
+                    guard keys.shape.count >= 3, values.shape.count >= 3 else {
+                        continue
+                    }
+                    if totalTokens == 0 {
+                        totalTokens = keys.dim(2)
+                    }
+                    restoreKVLayer(keys: keys, values: values, into: cache[i])
+
+                case .mamba(let comp):
+                    restoreMambaLayer(comp, into: cache[i])
+
+                case .rotating(let comp):
+                    restoreRotatingLayer(comp, into: cache[i])
+                    if totalTokens == 0 {
+                        totalTokens = comp.offset
+                    }
+
+                case .tq, .qkv, .deepseekV4, .cacheList, .skip:
+                    // .skip is a per-sub no-op (sub-cache had no
+                    // persistable state). The other cases are not
+                    // currently emitted as sub-cache kinds — see
+                    // TQDiskSerializer.deserializeCacheListLayer.
+                    continue
+                }
+            }
+
         case .skip:
             // Cache type we don't know how to persist. No-op.
             continue

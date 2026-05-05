@@ -275,3 +275,187 @@ func testUnknownCacheTypeIsTaggedSkip() async throws {
     let kind = dict["__layer_kind_0__"]!.item(Int32.self)
     #expect(kind == TQDiskSerializer.LayerKind.skip.rawValue)
 }
+
+// MARK: - Layer kind: CacheList composite (BaichuanM1, FalconH1)
+
+// Serialize them as a serialized suite so MLXArray operations don't
+// race the Metal command-encoder coalescer (same approach as
+// DSV4ModelSmokeTests.swift's `.serialized` suite).
+@Suite("TQDiskSerializer CacheList", .serialized)
+struct TQDiskSerializerCacheListTests {
+
+@Test
+func testRoundTripCacheListMambaPlusKV() async throws {
+    // FalconH1 layout: CacheList(MambaCache, KVCacheSimple). Pre-fix this
+    // landed on .skip and dropped multi-turn disk-cache reuse for
+    // FalconH1. Verify both sub-caches round-trip through the new
+    // .cacheList LayerKind.
+    let mamba = MambaCache()
+    let mambaArrays: ArraysCache = mamba
+    mambaArrays[0] = MLXArray.ones([1, 8, 4], dtype: .float32)
+    mambaArrays[1] = MLXArray.ones([1, 8, 16], dtype: .float32) * Float(0.25)
+    let kv = KVCacheSimple()
+    let (k, v) = smallKV(seqLen: 12)
+    _ = kv.update(keys: k, values: v)
+
+    let composite = CacheList(mamba, kv)
+    let cache: [any KVCache] = [composite]
+
+    let dict = TQDiskSerializer.serialize(cache: cache)
+
+    // Composite kind tag.
+    #expect(dict.keys.contains("__layer_kind_0__"))
+    let kind = dict["__layer_kind_0__"]!.item(Int32.self)
+    #expect(kind == TQDiskSerializer.LayerKind.cacheList.rawValue)
+
+    // Sub-cache count.
+    #expect(dict.keys.contains("__cache_list_0_count__"))
+    #expect(dict["__cache_list_0_count__"]!.item(Int32.self) == 2)
+
+    // Per-sub kind tags.
+    #expect(dict.keys.contains("__cache_list_0_sub_0_kind__"))
+    #expect(dict.keys.contains("__cache_list_0_sub_1_kind__"))
+    #expect(dict["__cache_list_0_sub_0_kind__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.mamba.rawValue)
+    #expect(dict["__cache_list_0_sub_1_kind__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.kv.rawValue)
+
+    // Sub-keyed payload keys present.
+    #expect(dict.keys.contains("mamba_0_sub_0_state0"))
+    #expect(dict.keys.contains("mamba_0_sub_0_state1"))
+    #expect(dict.keys.contains("__mamba_0_sub_0_offset__"))
+    #expect(dict.keys.contains("kv_0_sub_1_keys"))
+    #expect(dict.keys.contains("kv_0_sub_1_values"))
+
+    // No collision with top-level layer-0 keys.
+    #expect(!dict.keys.contains("mamba_0_state0"))
+    #expect(!dict.keys.contains("kv_0_keys"))
+
+    // Restore round-trip: build a fresh composite and verify both
+    // sub-caches received their data.
+    let restoredMamba = MambaCache()
+    let restoredKV = KVCacheSimple()
+    let restored: [any KVCache] = [CacheList(restoredMamba, restoredKV)]
+    _ = restoreFromDiskArrays(dict, into: restored)
+
+    #expect(restoredMamba.state.count == 2)
+    #expect(restoredMamba.state[0].size > 0)
+    #expect(restoredMamba.state[1].size > 0)
+    #expect(restoredKV.state.count == 2)
+    #expect(restoredKV.offset == kv.offset)
+}
+
+@Test
+func testRoundTripCacheListRotatingPlusMamba() async throws {
+    // BaichuanM1 layout: CacheList(RotatingKVCache, MambaCache). Sub-0
+    // is a sliding-window attention; sub-1 is SSM. Verify both
+    // round-trip through the new .cacheList LayerKind.
+    let rot = RotatingKVCache(maxSize: 32, keep: 0)
+    let (k, v) = smallKV(seqLen: 12)
+    _ = rot.update(keys: k, values: v)
+
+    let mamba = MambaCache()
+    let mambaArrays: ArraysCache = mamba
+    mambaArrays[0] = MLXArray.ones([1, 8, 4], dtype: .float32) * Float(0.5)
+    mambaArrays[1] = MLXArray.ones([1, 8, 16], dtype: .float32) * Float(0.75)
+
+    let composite = CacheList(rot, mamba)
+    let cache: [any KVCache] = [composite]
+
+    let dict = TQDiskSerializer.serialize(cache: cache)
+
+    #expect(dict["__layer_kind_0__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.cacheList.rawValue)
+    #expect(dict["__cache_list_0_sub_0_kind__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.rotating.rawValue)
+    #expect(dict["__cache_list_0_sub_1_kind__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.mamba.rawValue)
+
+    // Rotating sub-cache: keys, values, and 5-tuple meta.
+    #expect(dict.keys.contains("rot_0_sub_0_keys"))
+    #expect(dict.keys.contains("rot_0_sub_0_values"))
+    #expect(dict.keys.contains("__rot_0_sub_0_meta__"))
+
+    // Mamba sub-cache.
+    #expect(dict.keys.contains("mamba_0_sub_1_state0"))
+    #expect(dict.keys.contains("mamba_0_sub_1_state1"))
+
+    // Restore.
+    let restoredRot = RotatingKVCache(maxSize: 32, keep: 0)
+    let restoredMamba = MambaCache()
+    let restored: [any KVCache] = [CacheList(restoredRot, restoredMamba)]
+    _ = restoreFromDiskArrays(dict, into: restored)
+
+    #expect(restoredRot.state.count == 2)
+    #expect(restoredMamba.state.count == 2)
+    #expect(restoredMamba.state[0].size > 0)
+}
+
+@Test
+func testCacheListEmptyTagsAsSkip() async throws {
+    // CacheList with no populated sub-caches → composite tags as .skip.
+    // Restore is a no-op (no per-sub data was written).
+    let composite = CacheList(MambaCache(), KVCacheSimple())
+    let cache: [any KVCache] = [composite]
+    // Don't update either sub-cache — both have empty state.
+
+    let dict = TQDiskSerializer.serialize(cache: cache)
+
+    #expect(dict.keys.contains("__layer_kind_0__"))
+    let kind = dict["__layer_kind_0__"]!.item(Int32.self)
+    #expect(kind == TQDiskSerializer.LayerKind.skip.rawValue)
+    // Composite count should not have been written when nothing persisted.
+    #expect(!dict.keys.contains("__cache_list_0_count__"))
+}
+
+@Test
+func testCacheListSurvivesAlongsidePlainLayers() async throws {
+    // Mixed layout: layer 0 = plain KV, layer 1 = CacheList(Mamba, KV),
+    // layer 2 = plain Mamba. Verify all three round-trip independently
+    // and the kind tags don't collide.
+    let plainKV = KVCacheSimple()
+    let (k0, v0) = smallKV(seqLen: 6)
+    _ = plainKV.update(keys: k0, values: v0)
+
+    let listMamba = MambaCache()
+    let listMambaArrays: ArraysCache = listMamba
+    listMambaArrays[0] = MLXArray.ones([1, 8, 4], dtype: .float32)
+    listMambaArrays[1] = MLXArray.ones([1, 8, 16], dtype: .float32) * Float(0.5)
+    let listKV = KVCacheSimple()
+    let (k1, v1) = smallKV(seqLen: 8)
+    _ = listKV.update(keys: k1, values: v1)
+    let composite = CacheList(listMamba, listKV)
+
+    let plainMamba = MambaCache()
+    let plainArrays: ArraysCache = plainMamba
+    plainArrays[0] = MLXArray.ones([1, 8, 4], dtype: .float32) * Float(0.25)
+    plainArrays[1] = MLXArray.ones([1, 8, 16], dtype: .float32) * Float(0.75)
+
+    let cache: [any KVCache] = [plainKV, composite, plainMamba]
+    let dict = TQDiskSerializer.serialize(cache: cache)
+
+    #expect(dict["__layer_kind_0__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.kv.rawValue)
+    #expect(dict["__layer_kind_1__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.cacheList.rawValue)
+    #expect(dict["__layer_kind_2__"]!.item(Int32.self)
+        == TQDiskSerializer.LayerKind.mamba.rawValue)
+
+    // Sub-keyed keys for layer 1's composite must NOT collide with
+    // top-level layer 0's `kv_0_*` or layer 2's `mamba_2_*`.
+    #expect(dict.keys.contains("kv_0_keys"))
+    #expect(dict.keys.contains("kv_1_sub_1_keys"))
+    #expect(dict.keys.contains("mamba_2_state0"))
+    #expect(dict.keys.contains("mamba_1_sub_0_state0"))
+
+    // Restore into matching topology.
+    let restored: [any KVCache] = [
+        KVCacheSimple(),
+        CacheList(MambaCache(), KVCacheSimple()),
+        MambaCache(),
+    ]
+    let totalTokens = restoreFromDiskArrays(dict, into: restored)
+    #expect(totalTokens > 0)  // attention layers contributed
+}
+
+}
