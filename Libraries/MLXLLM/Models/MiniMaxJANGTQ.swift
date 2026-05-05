@@ -108,11 +108,17 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
         self.numExpertsPerTok = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numLocalExperts, bias: false)
+        // Per-projection bits (JANGTQ_K) — fall back to uniform mxtqBits
+        // when the config didn't ship per-projection overrides. Same
+        // result as the pre-2026-05-04 uniform-bit constructor.
+        let gateUpBits = args.mxtqGateUpBits ?? args.mxtqBits
+        let downBits = args.mxtqDownBits ?? args.mxtqBits
         _switchMLP.wrappedValue = TurboQuantSwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.intermediateSize,
             numExperts: args.numLocalExperts,
-            bits: args.mxtqBits,
+            gateUpBits: gateUpBits,
+            downBits: downBits,
             seed: args.mxtqSeed
         )
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([args.numLocalExperts])
@@ -309,6 +315,16 @@ public struct MiniMaxJANGTQConfiguration: Codable, Sendable {
     public var weightFormat: String = "mxtq"
     public var mxtqBits: Int = 2
     public var mxtqSeed: Int = 42
+    /// Per-projection bit widths (JANGTQ_K profile). When absent in
+    /// config.json (uniform JANGTQ2 / JANGTQ4 bundles) both default to
+    /// `mxtqBits` — bit-for-bit identical to the legacy uniform path.
+    /// Surfaced separately so the model can construct the routed-MoE
+    /// `TurboQuantSwitchGLU` with `gateUpBits != downBits` for
+    /// MiniMax-M2.7-JANGTQ_K (gate=2 / up=2 / down=4). LLMModelFactory
+    /// merges these from `jang_config.json:mxtq_bits.routed_expert`
+    /// when the latter is a per-projection dict.
+    public var mxtqGateUpBits: Int?
+    public var mxtqDownBits: Int?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -332,6 +348,8 @@ public struct MiniMaxJANGTQConfiguration: Codable, Sendable {
         case weightFormat = "weight_format"
         case mxtqBits = "mxtq_bits"
         case mxtqSeed = "mxtq_seed"
+        case mxtqGateUpBits = "mxtq_gate_up_bits"
+        case mxtqDownBits = "mxtq_down_bits"
     }
 }
 

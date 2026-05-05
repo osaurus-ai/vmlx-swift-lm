@@ -1008,9 +1008,19 @@ public class BailingHybridLanguageModel: Module {
         let attnMask = createAttentionMask(h: h, cache: firstGlobalCache)
         let offset = firstGlobalCache?.offset ?? 0
 
+        // Memory-bounded forward: force MLX.eval(h) after each decoder
+        // layer so the lazy graph doesn't accumulate 32 layers worth of
+        // deferred ops (28 of which are recurrent GLA loops with O(L)
+        // dispatches each, plus 31 MoE layers with K=8 expert dispatches
+        // per token). Without per-layer eval the cumulative lazy ops
+        // overflow MLX's buffer cache and OOM at 100+ GB on Ling-2.6-flash
+        // even on small (20-token) prompts. Per-layer eval bounds peak
+        // resident memory to a single layer's worth of intermediates
+        // (~5 GB) at the cost of a Metal dispatch sync per layer.
         for (i, layer) in layers.enumerated() {
             let layerCache = (cache != nil && i < cache!.count) ? cache![i] : nil
             h = layer(h, attnMask: attnMask, cache: layerCache, offset: offset)
+            MLX.eval(h)
         }
         return norm(h)
     }

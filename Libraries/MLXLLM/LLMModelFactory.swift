@@ -961,13 +961,59 @@ public final class LLMModelFactory: ModelFactory {
                     configDict[key] = v
                 }
             }
-            // mxtq_bits is a dict {attention, routed_expert, ...} — pull the
-            // routed_expert bit width out as the scalar the Swift config wants.
-            if configDict["mxtq_bits"] == nil,
-                let bitsMap = jangDict["mxtq_bits"] as? [String: Any],
-                let routed = bitsMap["routed_expert"] as? Int
-            {
-                configDict["mxtq_bits"] = routed
+            // mxtq_bits resolution (2026-05-04 JANGTQ_K extension).
+            // Bundles ship `mxtq_bits` in three shapes:
+            //   1. Flat Int — uniform bit width across all roles
+            //   2. Per-role dict like
+            //        {"routed_expert": 2, "attention": 8, ...}
+            //      → use routed_expert as the scalar.
+            //   3. Per-PROJECTION nested dict (JANGTQ_K) like
+            //        {"routed_expert": {"gate_proj": 2, "down_proj": 4,
+            //                           "up_proj": 2},
+            //         "attention": 8, ...}
+            //      → emit separate `mxtq_gate_up_bits` /
+            //        `mxtq_down_bits` keys for model configs that opt
+            //        in (MiniMaxJANGTQ etc.); the legacy `mxtq_bits`
+            //        Int is also overwritten with the gate_up width so
+            //        callers that only know about uniform-bit configs
+            //        keep working.
+            //
+            // Either `config.json` or `jang_config.json` may carry the
+            // nested dict — try both. Always REPLACE configDict's
+            // `mxtq_bits` with the resolved Int so the downstream
+            // Codable decoders (which expect Int) don't see a dict.
+            let bitsMaps: [[String: Any]] = [
+                configDict["mxtq_bits"] as? [String: Any],
+                jangDict["mxtq_bits"] as? [String: Any],
+            ].compactMap { $0 }
+            for bitsMap in bitsMaps {
+                let routedAny = bitsMap["routed_expert"]
+                if let routedInt = routedAny as? Int {
+                    configDict["mxtq_bits"] = routedInt
+                    break
+                } else if let routedDict = routedAny as? [String: Int] {
+                    let gate = routedDict["gate_proj"]
+                    let up = routedDict["up_proj"]
+                    let down = routedDict["down_proj"]
+                    // gate and up MUST share a width — the fused gate+up
+                    // Metal kernel takes a single `bits` parameter.
+                    if let g = gate, let u = up, g == u {
+                        configDict["mxtq_bits"] = g
+                        configDict["mxtq_gate_up_bits"] = g
+                        if let d = down {
+                            configDict["mxtq_down_bits"] = d
+                        }
+                        break
+                    } else if let g = gate {
+                        // Mismatched gate/up — fall back to gate width
+                        // and warn. The model class will reject the
+                        // bundle on a same-bits assertion.
+                        configDict["mxtq_bits"] = g
+                        FileHandle.standardError.write(Data(
+                            "[Load] WARNING: mxtq_bits.routed_expert has gate_proj != up_proj; the fused gate+up Metal kernel cannot dispatch mismatched bit widths\n".utf8))
+                        break
+                    }
+                }
             }
             // 2026-04-26 robustness: bundles in the wild ship inconsistent
             // routed-bits fields (some have `mxtq_bits` Int, some

@@ -108,7 +108,22 @@ public class TurboQuantSwitchGLU: Module {
     public let inputDims: Int
     public let hiddenDims: Int
     public let numExperts: Int
-    public let bits: Int
+    /// Legacy "all projections same bits" view. For uniform configs
+    /// (JANGTQ2 = 2-bit everywhere, JANGTQ4 = 4-bit everywhere) this
+    /// equals `gateUpBits == downBits`. For mixed-precision configs
+    /// (JANGTQ_K, e.g. MiniMax-M2.7-JANGTQ_K with gate=2/up=2/down=4)
+    /// this returns the gate+up width; callers needing the down width
+    /// should read `downBits` directly.
+    public var bits: Int { gateUpBits }
+    /// Codebook bit width shared by gate_proj and up_proj. They MUST
+    /// match because the fused `fusedGateUpSwiGLU` Metal kernel uses a
+    /// single `bits` parameter for both. Bundles where gate ≠ up are
+    /// not currently supported.
+    public let gateUpBits: Int
+    /// Codebook bit width for down_proj. Independent of gate/up. The
+    /// `gatherTQ` Metal kernel takes this as its `bits` parameter on
+    /// the down dispatch.
+    public let downBits: Int
     public let mxtqSeed: Int
     /// 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
     /// SwiGLU clamp magnitude. `0.0` (default) preserves ordinary SwiGLU
@@ -119,28 +134,48 @@ public class TurboQuantSwitchGLU: Module {
     /// the codex_dsv4_fixkit Python runtime patch installs.
     public let swigluLimit: Float
 
-    public init(
+    /// Convenience constructor — every projection at the same bit
+    /// width. Backwards-compatible with all existing JANGTQ2 / JANGTQ4
+    /// callers (Qwen35JANGTQ, MiniMaxJANGTQ-2bit, DSV4JANGTQ uniform,
+    /// NemotronH JANGTQ, etc.).
+    public convenience init(
         inputDims: Int, hiddenDims: Int, numExperts: Int,
         bits: Int = 2, seed: Int = 42,
+        swigluLimit: Float = 0.0
+    ) {
+        self.init(
+            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
+            gateUpBits: bits, downBits: bits, seed: seed, swigluLimit: swigluLimit)
+    }
+
+    /// Per-projection-bits constructor — for mixed-precision configs
+    /// like JANGTQ_K (gate=2 / up=2 / down=4). gate and up MUST share
+    /// a width because the fused gate+up Metal kernel takes a single
+    /// `bits` parameter; bundles where gate ≠ up are rejected at
+    /// model-load time.
+    public init(
+        inputDims: Int, hiddenDims: Int, numExperts: Int,
+        gateUpBits: Int, downBits: Int, seed: Int = 42,
         swigluLimit: Float = 0.0
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
-        self.bits = bits
+        self.gateUpBits = gateUpBits
+        self.downBits = downBits
         self.mxtqSeed = seed
         self.swigluLimit = swigluLimit
         self._gateProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: bits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed
         )
         self._upProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: inputDims, outFeatures: hiddenDims,
-            numExperts: numExperts, bits: bits, seed: seed
+            numExperts: numExperts, bits: gateUpBits, seed: seed
         )
         self._downProj.wrappedValue = TurboQuantSwitchLinear(
             inFeatures: hiddenDims, outFeatures: inputDims,
-            numExperts: numExperts, bits: bits, seed: seed
+            numExperts: numExperts, bits: downBits, seed: seed
         )
         super.init()
     }
@@ -150,10 +185,14 @@ public class TurboQuantSwitchGLU: Module {
     /// Returns `(batch, seq, K, hidden)` to match `SwitchGLU` semantics —
     /// caller multiplies by router scores and sums over the K dim.
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        // Codebook lookup uses PER-PROJECTION bit widths so JANGTQ_K
+        // (gate=2 / up=2 / down=4) loads the right table for each
+        // dispatch. Uniform-bit bundles fall through with
+        // gateUpBits == downBits, matching the legacy single-bits path.
         guard let signsIn = JANGTQRuntimeCache.shared.signs(inFeatures: inputDims, seed: mxtqSeed),
               let signsDn = JANGTQRuntimeCache.shared.signs(inFeatures: hiddenDims, seed: mxtqSeed),
-              let cbGate  = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: bits),
-              let cbDown  = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: bits)
+              let cbGate  = JANGTQRuntimeCache.shared.codebook(inFeatures: inputDims, bits: gateUpBits),
+              let cbDown  = JANGTQRuntimeCache.shared.codebook(inFeatures: hiddenDims, bits: downBits)
         else {
             fatalError("JANGTQ runtime sidecar not loaded — call JANGTQRuntimeCache.shared.loadSidecar(...) first")
         }
@@ -184,7 +223,7 @@ public class TurboQuantSwitchGLU: Module {
             packedUp: upProj.packed, normsUp: upProj.norms,
             codebook: cbGate, rhsIndices: idxFlat,
             batchTokens: batchTokens, K: K,
-            inFeatures: inputDims, outFeatures: hiddenDims, bits: bits,
+            inFeatures: inputDims, outFeatures: hiddenDims, bits: gateUpBits,
             swigluLimit: swigluLimit
         )
         // xAct shape: (batchTokens * K, hidden_dims)
@@ -198,7 +237,7 @@ public class TurboQuantSwitchGLU: Module {
             packed: downProj.packed, norms: downProj.norms,
             codebook: cbDown, rhsIndices: idxFlat,
             nRows: batchTokens * K,
-            inFeatures: hiddenDims, outFeatures: inputDims, bits: bits
+            inFeatures: hiddenDims, outFeatures: inputDims, bits: downBits
         )
         // y shape: (batchTokens * K, inputDims)
 
