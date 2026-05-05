@@ -320,7 +320,15 @@ extension Qwen35JANGTQTextConfiguration {
         }
         guard let q = try? outer.decodeIfPresent(QuantPeek.self, forKey: .quantization)
         else { return nil }
-        return q.bits
+        // 2026-05-04: filter to known routed-MoE codebook widths {2, 3, 4}.
+        // The new JANGTQ bundle metadata convention puts the affine
+        // (non-routed) default at `quantization.bits = 8` and the
+        // routed-expert width at `routed_expert_bits` / `mxtq_bits.
+        // routed_expert`. Without this filter we'd pick up 8 as the
+        // routed bit-width and load the wrong codebook → degenerate
+        // output. JANGTQ3 (3-bit routed) added 2026-05-04.
+        guard let b = q.bits, b == 2 || b == 3 || b == 4 else { return nil }
+        return b
     }
 }
 

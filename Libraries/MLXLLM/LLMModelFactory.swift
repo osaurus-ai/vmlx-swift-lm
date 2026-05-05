@@ -342,12 +342,17 @@ public enum LLMTypeRegistry {
             let stampBits: Int? = {
                 switch weightFormat {
                 case "jangtq4": return 4
+                case "jangtq3": return 3
                 case "jangtq2", "mxtq": return 2
                 default: return nil
                 }
             }()
+            // Codebook bit-widths the runtime knows how to dispatch.
+            // 2026-05-04: 3-bit added for the JANGTQ3 family (8-entry
+            // codebook). Centralized so all bit filters stay in sync.
+            let validRoutedBits: Set<Int> = [2, 3, 4]
             let configBits: Int? = {
-                guard let b = check?.quantization?.bits, b == 2 || b == 4
+                guard let b = check?.quantization?.bits, validRoutedBits.contains(b)
                 else { return nil }
                 return b
             }()
@@ -365,7 +370,7 @@ public enum LLMTypeRegistry {
             let routedBits: Int? = {
                 guard let r = (try? JSONDecoder.json5().decode(
                     RoutedBitsCheck.self, from: data))?.routedExpertBits,
-                    r == 2 || r == 4
+                    validRoutedBits.contains(r)
                 else { return nil }
                 return r
             }()
