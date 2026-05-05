@@ -388,7 +388,18 @@ func recurrentGLA(
     h: MLXArray?
 ) -> (MLXArray, MLXArray) {
     let L = q.shape[2]
-    var state: MLXArray? = h
+    // 2026-05-04 fp16-overflow fix (mirror of Python upstream patch
+    // applied to `mlx_lm.models.bailing_hybrid.recurrent_gla`):
+    // promote q/k/v/h to fp32 internally and keep output in fp32.
+    // Without this, on prompts ~80+ tokens the `k_t.T @ v_t` outer
+    // products and accumulated `S * exp(g) + ...` exceeded fp16 max
+    // (65504), producing inf → NaN logits ("Answer: " then garbage).
+    // Verified upstream returns "Answer: C" correctly on the
+    // 93-token MMLU prompt after the fp32 promotion.
+    let qF = q.asType(.float32) * scale
+    let kF = k.asType(.float32)
+    let vF = v.asType(.float32)
+    var state: MLXArray? = h?.asType(.float32)
     var outputs: [MLXArray] = []
     outputs.reserveCapacity(L)
     // Python: `mx.exp(g)[:, None, None]` keeps the head axis and adds
@@ -396,12 +407,20 @@ func recurrentGLA(
     // state [B, H, K, K] correctly. Swift's `[.newAxis, .newAxis]`
     // PREPENDS axes → wrong shape. Use `[0..., .newAxis, .newAxis]`
     // to keep the existing head dim and add trailing.
-    let expG = exp(g)[0..., .newAxis, .newAxis].asType(q.dtype)
-    let qScaled = q * scale
+    let expG = exp(g.asType(.float32))[0..., .newAxis, .newAxis]
+    // Force-evaluate every CHUNK timesteps so the lazy graph doesn't
+    // accumulate L * (matmul + scale-add + matmul) deferred ops per
+    // layer per token. Without this, prefill of a 100+ token prompt
+    // across 28 linear-attn layers builds up gigabytes of unevaluated
+    // intermediates and overflows RAM (observed as SIGKILL on
+    // Ling-2.6-flash Turn 2 prompt encoding). 16 timesteps per chunk
+    // is small enough to keep peak memory bounded but large enough
+    // that the per-eval Metal dispatch overhead amortizes.
+    let chunkStep = 16
     for t in 0..<L {
-        let qT = qScaled[0..., 0..., t..<(t + 1), 0...]
-        let kT = k[0..., 0..., t..<(t + 1), 0...]
-        let vT = v[0..., 0..., t..<(t + 1), 0...]
+        let qT = qF[0..., 0..., t..<(t + 1), 0...]
+        let kT = kF[0..., 0..., t..<(t + 1), 0...]
+        let vT = vF[0..., 0..., t..<(t + 1), 0...]
         // [B, H, 1, K].T @ [B, H, 1, K] doesn't work directly — use
         // explicit transpose to get [B, H, K, 1] @ [B, H, 1, K] = [B, H, K, K]
         let kTrans = kT.transposed(0, 1, 3, 2)
@@ -416,15 +435,13 @@ func recurrentGLA(
         // q_t @ S → [B, H, 1, K] @ [B, H, K, K] = [B, H, 1, K]
         let oT = matmul(qT, newState)
         outputs.append(oT)
+        // Periodic in-loop eval — bound the lazy graph depth.
+        if (t + 1) % chunkStep == 0 || t == L - 1 {
+            MLX.eval(state!, oT)
+        }
     }
     let out = concatenated(outputs, axis: 2)
     let finalState = state!
-    // Force materialize the L-step chain so the lazy graph doesn't
-    // accumulate L * (matmul + scale-add + matmul) deferred ops per
-    // layer per token. Without this, prefill on long prompts overflows
-    // the lazy-graph tracker (observed as SIGKILL on Ling-2.6-flash
-    // Turn 2 prompt encoding). After materialization the result + state
-    // are concrete tensors and the next layer/turn starts fresh.
     MLX.eval(out, finalState)
     return (out, finalState)
 }
@@ -1069,14 +1086,29 @@ public class BailingHybridModel:
         // model.layers.{numHiddenLayers}.* and we don't currently load
         // the MTP layer either way).
         let numTotal = args.numHiddenLayers + args.numNextnPredictLayers
+        // Memory-safe per-expert stacking strategy. Ling-2.6-flash ships
+        // 73,728 per-expert keys (256 experts × 32 layers × 3 projections
+        // × 3 keys each). Naïve `out[stackedKey] = stacked(tensors)` queues
+        // a lazy op that keeps the per-expert MLX backing storage alive
+        // even after we `removeValue` the dict entries — the lazy graph
+        // still references them. Result: peak resident memory blows past
+        // 100 GB on a 29 GB bundle. Fix: after stacking each layer's
+        // worth of routed-expert tensors, force `MLX.eval` on the new
+        // stacked arrays AND clear the allocator cache. That materializes
+        // the stacks, drops the per-expert references, and releases the
+        // intermediate buffers back to the OS before moving to the next
+        // layer.
+        var perLayerStacked: [MLXArray] = []
         for L in 0..<numTotal {
             let prefix = "model.layers.\(L)"
             guard L >= args.firstKDenseReplace else { continue }
+            perLayerStacked.removeAll(keepingCapacity: true)
             for proj in ["gate_proj", "down_proj", "up_proj"] {
                 for key in ["weight", "scales", "biases", "tq_packed", "tq_norms"] {
                     let first = "\(prefix).mlp.experts.0.\(proj).\(key)"
                     guard out[first] != nil else { continue }
                     var tensors: [MLXArray] = []
+                    tensors.reserveCapacity(args.numExperts)
                     for e in 0..<args.numExperts {
                         let k = "\(prefix).mlp.experts.\(e).\(proj).\(key)"
                         guard let t = out[k] else { tensors = []; break }
@@ -1086,7 +1118,9 @@ public class BailingHybridModel:
                         let stackedKey =
                             "\(prefix).mlp.switch_mlp.\(proj).\(key)"
                         if out[stackedKey] == nil {
-                            out[stackedKey] = stacked(tensors)
+                            let s = stacked(tensors)
+                            out[stackedKey] = s
+                            perLayerStacked.append(s)
                         }
                         for e in 0..<args.numExperts {
                             out.removeValue(
@@ -1094,14 +1128,23 @@ public class BailingHybridModel:
                         }
                     }
                 }
-                // Drop per-expert tq_bits scalars — TurboQuantSwitchLinear
-                // takes the bit-width from the BailingHybridConfiguration
-                // (mxtqBits), not per-tensor metadata. Mirror of
-                // DeepseekV4.swift:1145-1148.
+                // Drop per-expert + prestacked-switch_mlp tq_bits scalars
+                // — TurboQuantSwitchLinear takes the bit-width from the
+                // BailingHybridConfiguration (mxtqBits), not per-tensor
+                // metadata. The legacy per-expert layout ships
+                // `mlp.experts.{e}.{proj}.tq_bits`; the prestacked
+                // layout ships a single `mlp.switch_mlp.{proj}.tq_bits`.
+                // Drop both regardless of which layout this bundle uses.
                 for e in 0..<args.numExperts {
                     out.removeValue(
                         forKey: "\(prefix).mlp.experts.\(e).\(proj).tq_bits")
                 }
+                out.removeValue(
+                    forKey: "\(prefix).mlp.switch_mlp.\(proj).tq_bits")
+            }
+            if !perLayerStacked.isEmpty {
+                MLX.eval(perLayerStacked)
+                MLX.Memory.clearCache()
             }
 
             // Spec §5: the gate router projection name in the bundle is
