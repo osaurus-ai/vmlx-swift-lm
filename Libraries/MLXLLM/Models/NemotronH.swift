@@ -68,7 +68,7 @@ internal protocol NemotronHSwitchMLPLayer: Module {
 
 /// Squared ReLU activation: relu(x)^2
 internal func relu2(_ x: MLXArray) -> MLXArray {
-    let y = MLX.maximum(x, MLXArray(0))
+    let y = MLX.maximum(x, MLXArray(0, dtype: x.dtype))
     return y * y
 }
 
@@ -549,13 +549,23 @@ internal class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
                 latentSize, args.hiddenSize, bias: false)
         }
         if let jangtq {
-            self._switchMLP.wrappedValue = NemotronHJANGTQSwitchMLP(
-                inputDims: expertInputDims,
-                hiddenDims: args.moeIntermediateSize,
-                numExperts: args.nRoutedExperts,
-                bits: jangtq.bits,
-                mxtqSeed: jangtq.mxtqSeed
-            )
+            if JANGTQStreamingExperts.isEnabled {
+                self._switchMLP.wrappedValue = StreamingTurboQuantSwitchReLUSquaredMLP(
+                    inputDims: expertInputDims,
+                    hiddenDims: args.moeIntermediateSize,
+                    numExperts: args.nRoutedExperts,
+                    bits: jangtq.bits,
+                    seed: jangtq.mxtqSeed,
+                    layerIdx: layerIdx)
+            } else {
+                self._switchMLP.wrappedValue = NemotronHJANGTQSwitchMLP(
+                    inputDims: expertInputDims,
+                    hiddenDims: args.moeIntermediateSize,
+                    numExperts: args.nRoutedExperts,
+                    bits: jangtq.bits,
+                    mxtqSeed: jangtq.mxtqSeed
+                )
+            }
         } else {
             self._switchMLP.wrappedValue = NemotronHSwitchMLP(
                 inputDims: expertInputDims,
@@ -886,6 +896,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             if key.hasPrefix("mtp.") || key.hasSuffix(".importance") {
                 continue
             }
+            if key.hasPrefix("vision_model.")
+                || key.hasPrefix("sound_encoder.")
+                || key.hasPrefix("sound_projection.")
+                || key.hasPrefix("mlp1.")
+            {
+                continue
+            }
 
             var finalValue = value
 
@@ -939,7 +956,8 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                         sanitized.removeValue(forKey: "\(prefix).experts.\(e).\(m).weight")
                     }
                     if !toJoin.isEmpty {
-                        sanitized["\(prefix).switch_mlp.\(n).weight"] = MLX.stacked(toJoin)
+                        sanitized["\(prefix).switch_mlp.\(n).weight"] =
+                            loadTimeMaterializedStacked(toJoin)
                     }
                 }
             }
@@ -963,6 +981,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 guard sanitized[probe] != nil else { continue }
                 for kind in ["tq_packed", "tq_norms"] {
                     let target = "\(prefix).switch_mlp.\(fc).\(kind)"
+                    if JANGTQStreamingExperts.isEnabled {
+                        for e in 0 ..< configuration.nRoutedExperts {
+                            sanitized.removeValue(
+                                forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
+                        }
+                        continue
+                    }
                     if sanitized[target] != nil {
                         for e in 0 ..< configuration.nRoutedExperts {
                             sanitized.removeValue(
@@ -975,7 +1000,7 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                             forKey: "\(prefix).experts.\(e).\(proj).\(kind)")
                     }
                     if !stacked.isEmpty {
-                        sanitized[target] = MLX.stacked(stacked)
+                        sanitized[target] = loadTimeMaterializedStacked(stacked)
                         tqStackedCount += 1
                     }
                 }
@@ -1082,8 +1107,13 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case timeStepLimitMax = "time_step_limit_max"
     }
 
+    private enum RawCodingKeys: String, CodingKey {
+        case timeStepLimit = "time_step_limit"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawContainer = try decoder.container(keyedBy: RawCodingKeys.self)
 
         modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "nemotron_h"
         vocabSize = try container.decode(Int.self, forKey: .vocabSize)
@@ -1134,14 +1164,17 @@ public struct NemotronHConfiguration: Codable, Sendable {
                 debugDescription: "hybrid_override_pattern must be string or array of strings")
         }
 
-        // Handle time_step_limit - can be array [min, max] or separate fields
-        if let limits = try? container.decode([Float].self, forKey: .timeStepLimitMin) {
-            // Actually this is time_step_limit as array
-            timeStepLimitMin = limits[0]
-            timeStepLimitMax = limits.count > 1 ? limits[1] : limits[0]
+        // mlx-lm stores Nemotron-H as `time_step_limit: [min, max]`.
+        // A lower bound of 0.0 is normalized to 0.001 upstream before the
+        // selective-scan dt clamp. Keep Swift decode and update passes aligned.
+        if let limits = try? rawContainer.decode([Float].self, forKey: .timeStepLimit),
+           let first = limits.first
+        {
+            timeStepLimitMin = first <= 0 ? 0.001 : first
+            timeStepLimitMax = limits.count > 1 ? limits[1] : first
         } else {
-            timeStepLimitMin =
-                try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) ?? 0.0
+            let decodedMin = try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMin) ?? 0.001
+            timeStepLimitMin = decodedMin <= 0 ? 0.001 : decodedMin
             timeStepLimitMax =
                 try container.decodeIfPresent(Float.self, forKey: .timeStepLimitMax)
                 ?? Float.infinity

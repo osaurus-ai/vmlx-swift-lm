@@ -6,6 +6,24 @@ import MLX
 import MLXNN
 import os
 
+private final class BatchStreamTerminationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+
+    func markCompleted() {
+        lock.lock()
+        completed = true
+        lock.unlock()
+    }
+
+    func shouldCancelOnTermination() -> Bool {
+        lock.lock()
+        let shouldCancel = !completed
+        lock.unlock()
+        return shouldCancel
+    }
+}
+
 // MARK: - BatchEngine
 
 /// Continuous batching inference engine for mlx-swift-lm.
@@ -202,6 +220,9 @@ public actor BatchEngine {
         input: consuming sending LMInput,
         parameters: GenerateParameters
     ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
+        context.jangPressRuntime.recordPromptTokenActivity(
+            input.text.tokens.reshaped(-1).asArray(Int.self))
+
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let request = BatchPendingRequest(
             input: input,
@@ -301,6 +322,7 @@ public actor BatchEngine {
         // which halts upstream generation on substring match.
         let (outStream, continuation) = AsyncStream<Generation>.makeStream()
         let engineRef = self
+        let terminationState = BatchStreamTerminationState()
 
         // Reap the slot when the consumer stops iterating (cancellation,
         // explicit break, or task drop). Without this, an orphan slot
@@ -311,15 +333,17 @@ public actor BatchEngine {
         // `Device::clear_library` →
         // `notifyExternalReferencesNonZeroOnDealloc`.
         //
-        // `cancel(_:)` is idempotent — if the slot already completed
-        // naturally (consumer drained the full stream), the cancel is
-        // a no-op because the slot was removed from `activeSlots` at
-        // `finishSlot()` time. So this handler is safe in both the
-        // normal-completion path and the consumer-cancelled path.
+        // Only run this on early consumer termination. Scheduling the
+        // cancellation task after a normal completion can keep the
+        // engine/model context alive until process teardown; JANGTQ
+        // models with compiled helper state can then race MLX's global
+        // compiler-cache finalizer on exit.
         //
         // Reported 2026-04-27 by osaurus integrator with the smoking-gun
         // diagnosis pointing at this exact missing handler.
-        continuation.onTermination = { @Sendable [requestId, engineRef] _ in
+        continuation.onTermination = {
+            @Sendable [requestId, engineRef, terminationState] _ in
+            guard terminationState.shouldCancelOnTermination() else { return }
             Task {
                 await engineRef.cancel(requestId)
             }
@@ -456,9 +480,11 @@ public actor BatchEngine {
                         generationTime: info.generateTime,
                         stopReason: finalStop,
                         unclosedReasoning: unclosed)
+                    terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
                 }
             }
+            terminationState.markCompleted()
             continuation.finish()
         }
         return outStream
@@ -638,6 +664,19 @@ public actor BatchEngine {
             )
 
             let cache = context.model.newCache(parameters: request.parameters)
+            let hasHybridPool = cache.contains { $0 is HybridPoolCache }
+
+            // DSV4's cache is a composite local-window + compressor/indexer
+            // pool. Keep it serialized even when the engine was constructed
+            // with maxBatchSize > 1; the transient BatchKVCache wrapper only
+            // models ordinary per-token KV and cannot batch the pool branches.
+            if hasHybridPool && !activeSlots.isEmpty {
+                waitQueue.insert(request, at: 0)
+                Self.logger.info(
+                    "Slot \(request.id.description, privacy: .public): deferred hybrid-pool request until active DSV4 slot drains"
+                )
+                break
+            }
 
             // Iter 57: auto-detect hybrid models at admission so SSM
             // companion states round-trip through the coordinator.
@@ -677,7 +716,6 @@ public actor BatchEngine {
             // tier of the lookup that would actually hit). Idempotent —
             // safe to run on every admission.
             if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
-                let hasHybridPool = cache.contains { $0 is HybridPoolCache }
                 if hasHybridPool {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
@@ -689,6 +727,21 @@ public actor BatchEngine {
             let slot = BatchSlot(from: request, cache: cache, stopTokenIDs: stopTokenIDs)
             activeSlots.append(slot)
         }
+    }
+
+    /// DSV4's HybridPoolCache has mutable compressor/indexer pools that must
+    /// be built in one forward for a prompt segment. Chunked prefill is still
+    /// correct for ordinary KV and hybrid SSM models; restrict the override to
+    /// the hybrid-pool cache family.
+    private func effectivePrefillWindow(
+        requested: Int,
+        input: LMInput,
+        cache: [KVCache]
+    ) -> Int {
+        guard cache.contains(where: { $0 is HybridPoolCache }) else {
+            return requested
+        }
+        return Swift.max(requested, input.text.tokens.size)
     }
 
     // MARK: - Step Logic
@@ -756,6 +809,7 @@ public actor BatchEngine {
                 var restored = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: slot.cache)
+                    coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: slot.cache)
@@ -932,7 +986,12 @@ public actor BatchEngine {
         let prepareResult: PrepareResult
         do {
             prepareResult = try context.model.prepare(
-                inputForPrepare, cache: slot.cache, windowSize: slot.prefillStepSize)
+                inputForPrepare,
+                cache: slot.cache,
+                windowSize: effectivePrefillWindow(
+                    requested: slot.prefillStepSize,
+                    input: inputForPrepare,
+                    cache: slot.cache))
         } catch {
             // Prefill failed (e.g., invalid input) — finish with cancellation
             finishSlot(slot, reason: .cancelled)
@@ -963,67 +1022,16 @@ public actor BatchEngine {
             firstToken = slot.sampleToken(from: logits)
         }
 
+        // Capture the cache exactly at the prompt boundary. The first sampled
+        // token has not been fed back into the model yet, so this snapshot is
+        // safe for paged and L2 disk storage under the prompt-token key.
+        slot.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: slot.cache)
+
         let tokenID = firstToken.item(Int.self)
 
         slot.phase = .decode
         slot.decodeStartTime = Date()
         slot.pendingTokens = MLXArray([Int32]()) // clear
-
-        // Hybrid-SSM cross-turn cache seed: after prefill completes for
-        // a hybrid-SSM slot, snapshot the SSM companion state keyed by
-        // the prompt length and store it into the coordinator's
-        // ``SSMStateCache``. On the next turn where a paged KV cache
-        // hit covers a prefix ending at this same boundary, the
-        // coordinator fetches the SSM state alongside the KV blocks,
-        // and the partial-hit-rollback is no longer needed.
-        //
-        // Runs INLINE on the BatchEngine actor after MLX eval has
-        // already completed — no detached Task, no cross-actor MLX
-        // submission. Safe under strict concurrency and Metal
-        // command-encoder lifetime (unlike the earlier SSMReDeriver
-        // attempt; see TOOL-CALL-STRUCTURED-CONTRACT.md for the
-        // regression + revert history).
-        //
-        // Heuristic gate: only emit the seed when the slot cache
-        // contains a Mamba or ArraysCache layer. Pure-attention
-        // models carry no SSM companion state; emitting a zero-array
-        // entry would needlessly cost LRU budget.
-        if let coordinator = cacheCoordinator, coordinator.isHybrid {
-            let hasSSM = slot.cache.contains {
-                $0 is MambaCache || $0 is ArraysCache
-            }
-            if hasSSM {
-                let promptTokens = slot.originalInput.text.tokens
-                    .asArray(Int.self)
-                let ssmStates = extractSSMStates(from: slot.cache)
-                if !ssmStates.isEmpty {
-                    coordinator.ssmStateCache.store(
-                        ssmStates: ssmStates,
-                        tokens: promptTokens,
-                        boundary: promptTokens.count
-                    )
-                    Self.logger.debug(
-                        "Slot \(slot.id.description, privacy: .public): stored SSM seed at boundary=\(promptTokens.count) (\(ssmStates.count) state arrays)"
-                    )
-                }
-            }
-        }
-
-        // Stage 0: KV-quant compression hook. For requests with
-        // `kvMode: .turboQuant(...)`, this swaps `KVCacheSimple` layers for
-        // `TurboQuantKVCache` once the first KV layer's offset exceeds the
-        // TQ minimum threshold (quantizedKVStart + 8). Prefill has just
-        // populated the cache, so typical prompts >8 tokens compress here.
-        // Shorter prompts will continue running float until the per-step
-        // hook in `stepBatchDecode` crosses the threshold. Affine / kvBits
-        // modes are currently no-ops (warning logged at admission).
-        BatchQuantize.maybeCompress(
-            cache: &slot.cache,
-            parameters: slot.parameters
-        )
-
-        // Stage 1B.3: compile-decode promotion hook.
-        self.maybePromoteToCompiledDecode(slot: &slot)
 
         // Check EOS on first generated token before yielding
         if stopTokenIDs.contains(tokenID) {
@@ -1038,6 +1046,49 @@ public actor BatchEngine {
                 finishSlot(slot, reason: .length)
                 slot.isFinished = true
             }
+        }
+
+        if !slot.isFinished {
+            // Hybrid-SSM cross-turn cache seed: after prefill completes for
+            // a hybrid-SSM slot, snapshot the SSM companion state keyed by
+            // the prompt length and store it into the coordinator's
+            // ``SSMStateCache``. This runs after the first token has been
+            // yielded so TTFT does not pay the prompt-boundary bookkeeping.
+            if let coordinator = cacheCoordinator, coordinator.isHybrid {
+                let hasSSM = slot.cache.contains {
+                    $0 is MambaCache || $0 is ArraysCache
+                }
+                if hasSSM {
+                    let promptTokens = slot.originalInput.text.tokens
+                        .asArray(Int.self)
+                    let ssmStates = extractSSMStates(from: slot.cache)
+                    if !ssmStates.isEmpty {
+                        coordinator.ssmStateCache.store(
+                            ssmStates: ssmStates,
+                            tokens: promptTokens,
+                            boundary: promptTokens.count,
+                            mediaSalt: slot.mediaSalt
+                        )
+                        Self.logger.debug(
+                            "Slot \(slot.id.description, privacy: .public): stored SSM seed at boundary=\(promptTokens.count) (\(ssmStates.count) state arrays)"
+                        )
+                    }
+                }
+            }
+
+            // Stage 0: KV-quant compression hook. For requests with
+            // `kvMode: .turboQuant(...)`, this swaps `KVCacheSimple` layers for
+            // `TurboQuantKVCache` once the first KV layer's offset exceeds the
+            // TQ minimum threshold. Running after `yield(.token)` keeps TQ's
+            // one-time encode/decode cost out of first-token latency while
+            // preserving the compressed path for sustained decode.
+            BatchQuantize.maybeCompress(
+                cache: &slot.cache,
+                parameters: slot.parameters
+            )
+
+            // Stage 1B.3: compile-decode promotion hook.
+            self.maybePromoteToCompiledDecode(slot: &slot)
         }
 
         activeSlots[slotIndex] = slot
@@ -1503,14 +1554,40 @@ public actor BatchEngine {
         // the next fetch will look for (VL multi-turn cache hits).
         if reason != .cancelled, let coordinator = cacheCoordinator {
             let promptTokens = slot.originalInput.text.tokens.asArray(Int.self)
-            let perLayerData = extractLayerData(from: slot.cache)
+            let hasHybridPool = slot.cache.contains { $0 is HybridPoolCache }
+            guard let promptCacheSnapshot = slot.promptCacheSnapshot
+                ?? (hasHybridPool ? nil : makePromptBoundaryCacheSnapshot(from: slot.cache))
+            else {
+                Self.logger.error(
+                    "Slot \(slot.id.description, privacy: .public): skipped cache store because no prompt-boundary snapshot exists for hybrid-pool cache"
+                )
+                slot.continuation.yield(.info(GenerateCompletionInfo(
+                    promptTokenCount: slot.promptTokenCount,
+                    generationTokenCount: slot.generatedTokenCount,
+                    promptTime: prefillTime,
+                    generationTime: decodeTime,
+                    stopReason: reason
+                )))
+                slot.continuation.finish()
+                return
+            }
+            let perLayerData = extractLayerData(from: promptCacheSnapshot)
             let ssmStates: [MLXArray]? = coordinator.isHybrid
-                ? extractSSMStates(from: slot.cache) : nil
+                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                    coordinator: coordinator,
+                    model: context.model,
+                    promptTokenIds: promptTokens,
+                    mediaSalt: slot.mediaSalt,
+                    prefillStepSize: slot.parameters.prefillStepSize)
+                : nil
+            let diskStoreCache = makeDiskStoreCache(
+                fromPromptBoundary: promptCacheSnapshot,
+                parameters: slot.parameters)
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokens,
                 perLayerData: perLayerData,
                 ssmStates: ssmStates,
-                cache: slot.cache,
+                cache: diskStoreCache,
                 mediaSalt: slot.mediaSalt
             )
             Self.logger.debug(

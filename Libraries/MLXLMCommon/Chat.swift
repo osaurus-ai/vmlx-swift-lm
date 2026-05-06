@@ -289,7 +289,7 @@ private func toolCallDict(call: ToolCall, index: Int) -> [String: any Sendable] 
     let name = call.function.name
     // Convert JSONValue arguments to a plain `[String: any Sendable]`
     // so the Jinja renderer sees native dicts on `.items()`.
-    let args = call.function.arguments.mapValues { $0.anyValue as! any Sendable }
+    let args = call.function.arguments.mapValues { $0.sendableValue }
 
     return [
         // Synthesized unique id per message (OpenAI requires one; when

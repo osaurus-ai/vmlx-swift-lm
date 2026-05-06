@@ -15,10 +15,10 @@ import MLXNN
 /// keys = applyRotaryPosition(rope, to: keys, cache: cache)
 /// ```
 ///
-/// When the cache is a `CompilableKVCache`, the offset is passed as an `MLXArray`
-/// (via `offsetArray`) so the compile tracer can track it through the graph without
-/// triggering a synchronous GPU readback. For all other cache types, the standard
-/// `Int`-based offset path is used.
+/// When the cache exposes an `offsetArray`, the offset is passed as an `MLXArray`
+/// so the compile tracer can track it through the graph without triggering a
+/// synchronous GPU readback. For all other cache types, the standard `Int`-based
+/// offset path is used.
 ///
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
@@ -28,23 +28,31 @@ import MLXNN
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
-    if let compilable = cache as? CompilableKVCache {
-        return rope(x, offset: compilable.offsetArray)
-    }
-    // Iter 21 fix: CompilableTurboQuantKVCache and CompilableRotatingKVCache
-    // also expose MLXArray offset counters. Without routing through those,
-    // the Int `cache.offset` gets captured at compile trace-build and every
-    // compiled decode step uses the same RoPE position — the Stage 2 v2
-    // drift root cause.
-    if let compilableTQ = cache as? CompilableTurboQuantKVCache {
-        return rope(x, offset: compilableTQ.offsetArray)
-    }
-    if let compilableRot = cache as? CompilableRotatingKVCache {
-        return rope(x, offset: compilableRot.offsetArray)
-    }
-    // Batched decode: use per-sequence [B]-shaped offsets for correct positional encoding.
-    if let batchCache = cache as? BatchKVCache {
-        return rope(x, offset: batchCache.offsetArray)
+    if let offsetArray = graphOffsetArray(for: cache) {
+        return rope(x, offset: offsetArray)
     }
     return rope(x, offset: cache?.offset ?? 0)
+}
+
+/// Returns a graph-visible cache offset when the cache exposes one.
+///
+/// `KVCache.offset` is an `Int` API for compatibility with upstream model
+/// ports. Compile-safe caches keep the offset as an `MLXArray` so the value
+/// can flow through `compile()` without an `.item()` readback. Model-side
+/// helpers that need positions outside `applyRotaryPosition` should call this
+/// before falling back to `cache.offset`.
+public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
+    if let compilable = cache as? CompilableKVCache {
+        return compilable.offsetArray
+    }
+    if let compilableTQ = cache as? CompilableTurboQuantKVCache {
+        return compilableTQ.offsetArray
+    }
+    if let compilableRot = cache as? CompilableRotatingKVCache {
+        return compilableRot.offsetArray
+    }
+    if let batchCache = cache as? BatchKVCache {
+        return batchCache.offsetArray
+    }
+    return nil
 }

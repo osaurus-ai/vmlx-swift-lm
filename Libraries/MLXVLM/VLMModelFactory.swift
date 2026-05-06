@@ -455,6 +455,9 @@ public final class VLMModelFactory: ModelFactory {
         {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
+        if baseConfig.modelType == "deepseek_v4" {
+            eosTokenIds.formUnion([1, 128803, 128804])
+        }
 
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds

@@ -182,6 +182,15 @@ public class SwitchGLU: Module {
             return
         }
 
+        let fusedBytes =
+            g.weight.nbytes + u.weight.nbytes
+            + g.scales.nbytes + u.scales.nbytes
+            + (g.biases?.nbytes ?? 0) + (u.biases?.nbytes ?? 0)
+        let cacheLimit = fusedGateUpCacheByteLimit()
+        if cacheLimit >= 0 && fusedBytes > cacheLimit {
+            return
+        }
+
         // Concatenate along output axis. Quantized SwitchLinear weights are
         // shaped `[E, out, in_packed]`, so axis -2 stacks gate and up along
         // the output dimension, giving `[E, 2*hidden, in_packed]`. scales
@@ -205,6 +214,25 @@ public class SwitchGLU: Module {
         self.fusedGroupSize = g.groupSize
         self.fusedBits = g.bits
         self.fusedMode = g.mode
+    }
+
+    private func fusedGateUpCacheByteLimit() -> Int {
+        let env = ProcessInfo.processInfo.environment
+        if let raw = env["VMLX_FUSED_GATE_UP_CACHE_LIMIT_BYTES"],
+            let bytes = Int(raw)
+        {
+            return bytes
+        }
+        if let raw = env["VMLX_FUSED_GATE_UP_CACHE_LIMIT_MB"],
+            let mb = Int(raw)
+        {
+            return mb < 0 ? -1 : mb * 1024 * 1024
+        }
+        // Keep the decode micro-fusion for normal-sized MoE layers, but do
+        // not let it duplicate giant routed expert banks. Ling MXFP4's fused
+        // gate+up tensor is ~1 GiB per layer, which doubled production
+        // footprint without being required for correctness.
+        return 512 * 1024 * 1024
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -378,6 +406,39 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
             weight: quantizedWeight, bias: other.bias)
 
+        self.freeze()
+    }
+
+    /// Initializer for already-quantized checkpoint tensors.
+    ///
+    /// Loading a pre-quantized safetensors bundle should not quantize the
+    /// randomly initialized `SwitchLinear` placeholder just to replace it
+    /// with file weights a few lines later. This initializer lets the loader
+    /// swap in the quantized module using the real checkpoint arrays
+    /// immediately, which avoids a full throwaway routed-MoE allocation.
+    public init(
+        inputDims: Int,
+        outputDims: Int,
+        numExperts: Int,
+        weight: MLXArray,
+        bias: MLXArray? = nil,
+        scales: MLXArray,
+        biases: MLXArray?,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode = .affine
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+        super.init(
+            inputDims: inputDims,
+            outputDims: outputDims,
+            numExperts: numExperts,
+            weight: weight,
+            bias: bias)
         self.freeze()
     }
 

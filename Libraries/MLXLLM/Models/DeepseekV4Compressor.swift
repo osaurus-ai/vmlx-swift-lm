@@ -198,7 +198,8 @@ public final class DeepseekV4Cache: HybridPoolCache {
         // checkpoint multi-turn state lost the long-context summary.
         let dup = DeepseekV4Cache(slidingWindow: slidingWindow,
                                    compressRatio: compressRatio)
-        dup.state = self.state
+        dup.state = self.state.map { $0[.ellipsis] }
+        dup.metaState = self.metaState
         return dup
     }
 

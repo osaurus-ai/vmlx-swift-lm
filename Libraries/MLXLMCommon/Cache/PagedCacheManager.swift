@@ -101,8 +101,17 @@ public final class PagedCacheManager: @unchecked Sendable {
     }
 
     /// Internal allocate (caller must hold the lock).
+    ///
+    /// Cached blocks live in the free queue at `refCount == 0` after
+    /// `storeTokenSequence` registers them. If allocation reuses one,
+    /// remove its old hash before reset so future prefix probes do not
+    /// return stale tensors.
     private func _allocateBlock() -> CacheBlock? {
         guard let block = freeQueue.popFirst() else { return nil }
+        if block.blockHash != nil {
+            hashMap.remove(block)
+            stats.evictions += 1
+        }
         block.reset()
         block.incrementRef()
         stats.allocatedBlocks += 1
@@ -124,13 +133,18 @@ public final class PagedCacheManager: @unchecked Sendable {
 
     /// Internal free (caller must hold the lock).
     private func _freeBlock(_ block: CacheBlock) {
+        let wasReferenced = block.refCount > 0
         block.decrementRef()
         if block.refCount == 0 {
-            hashMap.remove(block)
-            block.reset()
+            if block.blockHash == nil || block.cacheData == nil || block.tokenIds.isEmpty {
+                hashMap.remove(block)
+                block.reset()
+            }
             freeQueue.append(block)
-            stats.allocatedBlocks -= 1
-            stats.freeBlocks += 1
+            if wasReferenced {
+                stats.allocatedBlocks -= 1
+                stats.freeBlocks += 1
+            }
         }
     }
 
@@ -217,8 +231,9 @@ public final class PagedCacheManager: @unchecked Sendable {
         var chunkIndex = 0
         var offset = 0
 
-        while offset + blockSize <= tokens.count {
-            let chunk = Array(tokens[offset..<(offset + blockSize)])
+        while offset < tokens.count {
+            let end = min(offset + blockSize, tokens.count)
+            let chunk = Array(tokens[offset..<end])
             let hash = CacheBlock.computeBlockHash(
                 parentHash: parentHash, tokenIds: chunk,
                 modelKey: modelKey, mediaSalt: mediaSalt)
@@ -226,24 +241,38 @@ public final class PagedCacheManager: @unchecked Sendable {
             // Skip if this block already exists in the cache.
             if hashMap.find(hash: hash) != nil {
                 parentHash = hash
-                offset += blockSize
+                offset = end
                 chunkIndex += 1
                 continue
+            }
+
+            // Do not register empty payload blocks. Some cache topologies
+            // are represented by another tier (for example hybrid-pool
+            // DSV4 state); registering a token-only block would create a
+            // false paged hit that restores no cache data.
+            guard chunkIndex < layerData.count, !layerData[chunkIndex].isEmpty else {
+                break
             }
 
             // Allocate a new block.
             guard let block = _allocateBlock() else { break }
 
             block.tokenIds = chunk
-            if chunkIndex < layerData.count {
-                block.cacheData = layerData[chunkIndex].map { Optional($0) }
-            }
+            block.cacheData = layerData[chunkIndex].map { Optional($0) }
 
             block.blockHash = hash
             hashMap.insert(block)
 
+            // The stored block is now available for future prefix hits,
+            // but no live generation owns it. Drop the store-time ref and
+            // re-enqueue it so the pool remains reusable under pressure.
+            block.decrementRef()
+            stats.allocatedBlocks -= 1
+            stats.freeBlocks += 1
+            freeQueue.append(block)
+
             parentHash = hash
-            offset += blockSize
+            offset = end
             chunkIndex += 1
         }
     }
@@ -264,16 +293,26 @@ public final class PagedCacheManager: @unchecked Sendable {
         var matchedBlocks: [CacheBlock] = []
         var offset = 0
 
-        while offset + blockSize <= tokens.count {
-            let chunk = Array(tokens[offset..<(offset + blockSize)])
+        while offset < tokens.count {
+            let end = min(offset + blockSize, tokens.count)
+            let chunk = Array(tokens[offset..<end])
             let hash = CacheBlock.computeBlockHash(
                 parentHash: parentHash, tokenIds: chunk,
                 modelKey: modelKey, mediaSalt: mediaSalt)
 
             if let block = _findCachedBlock(hash: hash) {
+                // Pin the cached-free block while the caller restores KV.
+                // If it remains in the free queue, a concurrent allocator
+                // could pop and reset it while restore reads `cacheData`.
+                if block.refCount == 0 {
+                    _ = freeQueue.remove(block)
+                    stats.allocatedBlocks += 1
+                    stats.freeBlocks -= 1
+                }
+                block.incrementRef()
                 matchedBlocks.append(block)
                 parentHash = hash
-                offset += blockSize
+                offset = end
             } else {
                 break
             }
@@ -281,7 +320,7 @@ public final class PagedCacheManager: @unchecked Sendable {
 
         guard !matchedBlocks.isEmpty else { return nil }
 
-        let matchedTokens = matchedBlocks.count * blockSize
+        let matchedTokens = matchedBlocks.reduce(0) { $0 + $1.tokenCount }
         let remainingTokens = Array(tokens[offset...])
 
         return PrefixFetchResult(

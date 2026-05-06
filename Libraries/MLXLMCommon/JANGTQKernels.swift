@@ -637,4 +637,37 @@ public enum JANGTQKernels {
         )
         return arr[0]
     }
+
+    /// Gather TQ matmul in top-k mode. `xRot` has one row per token while
+    /// `rhsIndices` has `batchTokens * K` expert ids. The Metal kernel uses
+    /// `token_idx = dispatch_idx / K`, so the same rotated token row is reused
+    /// for each selected expert without broadcasting the input K times.
+    public static func gatherTQTopK(
+        xRot: MLXArray,
+        packed: MLXArray, norms: MLXArray,
+        codebook: MLXArray, rhsIndices: MLXArray,
+        batchTokens: Int, K: Int,
+        inFeatures: Int, outFeatures: Int, bits: Int = 2
+    ) -> MLXArray {
+        let valsPerU32 = 32 / bits
+        let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
+        let nDispatches = batchTokens * K
+        let meta = MLXArray([
+            UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
+            UInt32(packedCols), UInt32(bits),
+        ])
+        let opt = 20
+        let outGroups = (outFeatures + opt - 1) / opt
+        let gridX = outGroups * 32
+        let tgX = min(gridX, 256)
+        let arr = JANGTQKernelLibrary.gatherTQ(
+            [xRot, packed, norms, codebook, rhsIndices, meta],
+            template: nil,
+            grid: (gridX, nDispatches, 1),
+            threadGroup: (tgX, 1, 1),
+            outputShapes: [[nDispatches, outFeatures]],
+            outputDTypes: [.float32]
+        )
+        return arr[0]
+    }
 }

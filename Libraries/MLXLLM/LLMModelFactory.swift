@@ -210,7 +210,7 @@ public enum LLMTypeRegistry {
             "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
             "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
-            "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
+            "nemotron_h": dispatchNemotronH,
             "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
             "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
             "mistral3": dispatchMistral3LLM,
@@ -238,6 +238,42 @@ public enum LLMTypeRegistry {
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
         ]
+    }
+
+    private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
+        struct Probe: Codable {
+            let weightFormat: String?
+            let mxtqBits: Int?
+            let routedExpertBits: Int?
+            let mxtqSeed: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case mxtqBits = "mxtq_bits"
+                case routedExpertBits = "routed_expert_bits"
+                case mxtqSeed = "mxtq_seed"
+            }
+        }
+
+        let config = try JSONDecoder.json5().decode(NemotronHConfiguration.self, from: data)
+        let probe = try? JSONDecoder.json5().decode(Probe.self, from: data)
+        let weightFormat = probe?.weightFormat?.lowercased()
+        let isJANGTQ =
+            weightFormat == "mxtq"
+            || weightFormat == "jangtq2"
+            || weightFormat == "jangtq4"
+            || probe?.mxtqBits != nil
+            || probe?.routedExpertBits != nil
+
+        guard isJANGTQ else {
+            return NemotronHModel(config)
+        }
+
+        return NemotronHModel(
+            jangtqContext: NemotronHJANGTQContext(
+                bits: probe?.mxtqBits ?? probe?.routedExpertBits ?? 2,
+                mxtqSeed: probe?.mxtqSeed ?? 42),
+            configuration: config)
     }
 
     /// Dispatcher for the DeepSeek-V3 family (deepseek_v3, kimi_k25,
@@ -1178,6 +1214,14 @@ public final class LLMModelFactory: ModelFactory {
             let genEosIds = generationConfig.eosTokenIds?.values
         {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
+        }
+        if baseConfig.modelType == "deepseek_v4" {
+            // DSV4's Python runtime treats EOS plus both role-boundary
+            // sentinels as hard stops: {1, 128803, 128804}. The public
+            // bundle's config/generation_config omit 128804
+            // (`<｜Assistant｜>`), which lets role tokens leak into decode
+            // instead of terminating cleanly.
+            eosTokenIds.formUnion([1, 128803, 128804])
         }
 
         // Detect JANG model — if jang_config.json exists, load it for per-layer quantization.

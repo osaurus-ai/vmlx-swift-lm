@@ -244,13 +244,24 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
         self.layerIdx = layerIdx
         self.numExpertsPerTok = config.numExpertsPerTok ?? 1
 
-        _switchMLP.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: config.hiddenSize,
-            hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts ?? 1,
-            bits: jangtq.mxtqBits,
-            seed: jangtq.mxtqSeed
-        )
+        if JANGTQStreamingExperts.isEnabled {
+            _switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts ?? 1,
+                gateUpBits: jangtq.mxtqBits,
+                downBits: jangtq.mxtqBits,
+                seed: jangtq.mxtqSeed,
+                layerIdx: layerIdx)
+        } else {
+            _switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts ?? 1,
+                bits: jangtq.mxtqBits,
+                seed: jangtq.mxtqSeed
+            )
+        }
 
         self.gate = MoEGate(config: config)
 
@@ -264,8 +275,13 @@ final class DeepseekV3JANGTQMoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
-        var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        var y: MLXArray
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            y = streaming.reduced(x, indices: indices, scores: scores)
+        } else {
+            y = switchMLP(x, indices)
+            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        }
 
         if let shared = sharedExperts {
             y = y + shared(x)
@@ -491,6 +507,13 @@ public class DeepseekV3JANGTQModel: Module, LLMModel, KVCacheDimensionProvider, 
                     for kind in ["tq_packed", "tq_norms"] {
                         let first = "\(prefix).mlp.experts.0.\(projName).\(kind)"
                         guard newWeights[first] != nil else { continue }
+                        if JANGTQStreamingExperts.isEnabled {
+                            for e in 0 ..< (affineConfig.nRoutedExperts ?? 1) {
+                                newWeights.removeValue(
+                                    forKey: "\(prefix).mlp.experts.\(e).\(projName).\(kind)")
+                            }
+                            continue
+                        }
                         let target = "\(prefix).mlp.switch_mlp.\(projName).\(kind)"
                         if newWeights[target] != nil {
                             for e in 0 ..< (affineConfig.nRoutedExperts ?? 1) {

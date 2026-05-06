@@ -55,8 +55,13 @@ public class TurboQuantSwitchLinear: Module {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         // Initialize with zeros — the loader will overwrite with real data.
-        self._packed.wrappedValue = MLXArray.zeros([numExperts, outFeatures, packedCols], dtype: .uint32)
-        self._norms.wrappedValue  = MLXArray.zeros([numExperts, outFeatures], dtype: .float16)
+        if JANGTQStreamingExperts.isEnabled {
+            self._packed.wrappedValue = MLXArray.zeros([1, 1, 1], dtype: .uint32)
+            self._norms.wrappedValue  = MLXArray.zeros([1, 1], dtype: .float16)
+        } else {
+            self._packed.wrappedValue = MLXArray.zeros([numExperts, outFeatures, packedCols], dtype: .uint32)
+            self._norms.wrappedValue  = MLXArray.zeros([numExperts, outFeatures], dtype: .float16)
+        }
         super.init()
     }
 
@@ -85,15 +90,13 @@ public class TurboQuantSwitchLinear: Module {
         let K = indices.dim(-1)
         let idxFlat = indices.reshaped([-1]).asType(.uint32)
 
-        // Use the gather kernel for the single matmul case (per-row mode).
-        let y = JANGTQKernels.gatherTQ(
+        let y = JANGTQKernels.gatherTQTopK(
             xRot: xFlat, packed: packed, norms: norms,
             codebook: codebook, rhsIndices: idxFlat,
-            nRows: batch * K, inFeatures: inFeatures, outFeatures: outFeatures, bits: bits
+            batchTokens: batch, K: K,
+            inFeatures: inFeatures, outFeatures: outFeatures, bits: bits
         )
-        // Reshape output to match gather_qmm's `(..., K, 1, out_features)` shape
-        // expected by callers (broadcast K).
-        return y.reshaped(indices.shape + [1, outFeatures])
+        return y.reshaped(indices.shape + [outFeatures])
     }
 }
 
@@ -180,6 +183,26 @@ public class TurboQuantSwitchGLU: Module {
         super.init()
     }
 
+    /// Decode fast-path cache keyed by `(batchTokens, K, projection bits,
+    /// swigluLimit)`. The compiled body runs the full
+    /// rotate -> fused gate/up SwiGLU -> rotate -> down gather chain as
+    /// one MLX graph, matching the Python `load_jangtq` compile island
+    /// and the production `../vmlx` Swift path. Large prefill batches
+    /// intentionally stay on the plain path to keep TTFT predictable.
+    private var compiledCache: [String: ([MLXArray]) -> [MLXArray]] = [:]
+
+    private static let compiledFastPathEnabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_TQ_SWITCH_GLU_COMPILE"]?
+            .lowercased()
+        return HardwareInfo.isCompiledDecodeSupported
+            && !(raw == "0" || raw == "false" || raw == "off" || raw == "no")
+    }()
+
+    private static let compiledFastPathThreshold: Int = {
+        let env = ProcessInfo.processInfo.environment
+        return Int(env["VMLX_TQ_SWITCH_GLU_COMPILE_THRESHOLD"] ?? "128") ?? 128
+    }()
+
     /// Forward through the JANGTQ MoE MLP fast path.
     /// `x` shape: `(batch, seq, hidden)`. `indices` shape: `(batch, seq, K)`.
     /// Returns `(batch, seq, K, hidden)` to match `SwitchGLU` semantics —
@@ -207,6 +230,66 @@ public class TurboQuantSwitchGLU: Module {
 
         let K = indices.dim(-1)
         let idxFlat = indices.reshaped([-1]).asType(.uint32)
+
+        let useCompiledFastPath = Self.compiledFastPathEnabled
+            && Self.compiledFastPathThreshold > 0
+            && indices.size <= Self.compiledFastPathThreshold
+        if useCompiledFastPath {
+            let limitKey = Int((swigluLimit * 1000).rounded())
+            let cacheKey = "bt\(batchTokens).K\(K).gb\(gateUpBits).db\(downBits).lim\(limitKey)"
+            if compiledCache[cacheKey] == nil {
+                let inDim = self.inputDims
+                let outDim = self.hiddenDims
+                let gateBitsLocal = self.gateUpBits
+                let downBitsLocal = self.downBits
+                let bt = batchTokens
+                let kLocal = K
+                let swigluLimitLocal = self.swigluLimit
+                let body: ([MLXArray]) -> [MLXArray] = { args in
+                    let xR = JANGTQKernels.hadamardRotate(
+                        args[0], signs: args[7], dim: inDim)
+                    let xAct_ = JANGTQKernels.fusedGateUpSwiGLU(
+                        xRot: xR,
+                        packedGate: args[1], normsGate: args[2],
+                        packedUp: args[3], normsUp: args[4],
+                        codebook: args[9], rhsIndices: args[11],
+                        batchTokens: bt, K: kLocal,
+                        inFeatures: inDim, outFeatures: outDim,
+                        bits: gateBitsLocal,
+                        swigluLimit: swigluLimitLocal)
+                    let xActR = JANGTQKernels.hadamardRotate(
+                        xAct_, signs: args[8], dim: outDim)
+                    let yLocal = JANGTQKernels.gatherTQ(
+                        xRot: xActR,
+                        packed: args[5], norms: args[6],
+                        codebook: args[10], rhsIndices: args[11],
+                        nRows: bt * kLocal,
+                        inFeatures: outDim, outFeatures: inDim,
+                        bits: downBitsLocal)
+                    return [yLocal]
+                }
+                // Shape-specific compile is intentional here. MLX's
+                // `CustomKernel` primitive in the current osaurus pin
+                // does not implement `output_shapes`, so shapeless
+                // compile traps when it tries to infer shapes for the
+                // JANGTQ Metal kernels. We key by exact decode shape
+                // above, so the shape-specific trace is the right fit.
+                compiledCache[cacheKey] = compile(shapeless: false, body)
+            }
+            let compiled = compiledCache[cacheKey]!
+            let outputs = compiled([
+                xFlat,
+                gateProj.packed, gateProj.norms,
+                upProj.packed, upProj.norms,
+                downProj.packed, downProj.norms,
+                signsIn, signsDn,
+                cbGate, cbDown,
+                idxFlat,
+            ])
+            var outShape = indices.shape
+            outShape.append(inputDims)
+            return outputs[0].reshaped(outShape).asType(x.dtype)
+        }
 
         // 1. Rotate input
         let xRot = JANGTQKernels.hadamardRotate(xFlat, signs: signsIn, dim: inputDims)

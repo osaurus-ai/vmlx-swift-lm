@@ -116,7 +116,19 @@ public final class CacheCoordinator: @unchecked Sendable {
             self.diskCache = nil
         }
 
-        self.ssmStateCache = SSMStateCache(maxEntries: config.ssmMaxEntries)
+        self.ssmStateCache = SSMStateCache(
+            maxEntries: config.ssmMaxEntries,
+            modelKey: config.modelKey)
+
+        if config.enableDiskCache {
+            let baseDir = config.diskCacheDir
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("vmlx_disk_cache")
+            let ssmDir = baseDir.appendingPathComponent("ssm_companion")
+            self.ssmStateCache.diskStore = try? SSMCompanionDiskStore(
+                cacheDir: ssmDir,
+                modelKey: config.modelKey)
+        }
     }
 
     // MARK: - Hybrid Flag
@@ -150,6 +162,19 @@ public final class CacheCoordinator: @unchecked Sendable {
         lock.withLock { _isPagedIncompatible }
     }
 
+    /// Release paged-cache blocks returned by ``fetch(tokens:mediaSalt:)``.
+    ///
+    /// Paged hits pin blocks while restore reads `cacheData`; callers must
+    /// release those pins as soon as restore has copied tensors into the
+    /// live model cache. Disk hits return an empty block list, so this is
+    /// a no-op for non-paged tiers.
+    public func release(blocks: [CacheBlock]) {
+        guard let pagedCache, !blocks.isEmpty else { return }
+        for block in blocks {
+            pagedCache.freeBlock(block)
+        }
+    }
+
     // MARK: - Fetch
 
     /// Perform a tiered cache lookup for the given token sequence.
@@ -172,6 +197,10 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
     public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
+        func hasRequiredHybridSSM(_ states: [MLXArray]?) -> Bool {
+            !isHybrid || !(states?.isEmpty ?? true)
+        }
+
         // 2026-05-04: skip the paged tier entirely for paged-incompatible
         // models (DSV4 hybrid pool caches). Without this short-circuit,
         // paged would report a hit on the token-id hash but `restoreLayerData`
@@ -186,51 +215,44 @@ public final class CacheCoordinator: @unchecked Sendable {
            let result = pagedCache.fetchPrefix(tokens: tokens, mediaSalt: mediaSalt)
         {
             var ssmStates: [MLXArray]? = nil
+            var canUsePagedHit = true
 
             if isHybrid {
                 ssmStates = ssmStateCache.fetch(
                     tokens: tokens,
-                    boundary: result.matchedTokens
+                    boundary: result.matchedTokens,
+                    mediaSalt: mediaSalt
                 )
+                if ssmStates?.isEmpty ?? true {
+                    release(blocks: result.blocks)
+                    canUsePagedHit = false
+                }
             }
 
-            return .hit(
-                matchedTokens: result.matchedTokens,
-                remainingTokens: result.remainingTokens,
-                detail: .paged,
-                blocks: result.blocks,
-                ssmStates: ssmStates,
-                diskArrays: nil
-            )
+            if canUsePagedHit {
+                return .hit(
+                    matchedTokens: result.matchedTokens,
+                    remainingTokens: result.remainingTokens,
+                    detail: .paged,
+                    blocks: result.blocks,
+                    ssmStates: ssmStates,
+                    diskArrays: nil
+                )
+            }
         }
 
         // Tier 2: Disk cache (exact match, then one-shorter fallback)
         if let diskCache {
             if let arrays = diskCache.fetch(tokens: tokens, mediaSalt: mediaSalt) {
-                var ssmStates: [MLXArray]? = nil
-                if isHybrid {
-                    ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: tokens.count)
-                }
-                return .hit(
-                    matchedTokens: tokens.count,
-                    remainingTokens: [],
-                    detail: .disk,
-                    blocks: [],
-                    ssmStates: ssmStates,
-                    diskArrays: arrays
-                )
-            }
-
-            if tokens.count > 1 {
-                let shorter = Array(tokens.dropLast())
-                if let arrays = diskCache.fetch(tokens: shorter, mediaSalt: mediaSalt) {
-                    var ssmStates: [MLXArray]? = nil
-                    if isHybrid {
-                        ssmStates = ssmStateCache.fetch(tokens: tokens, boundary: shorter.count)
-                    }
+                let ssmStates = resolveSSMStates(
+                    forTokens: tokens,
+                    boundary: tokens.count,
+                    diskArrays: arrays,
+                    mediaSalt: mediaSalt)
+                if hasRequiredHybridSSM(ssmStates) {
                     return .hit(
-                        matchedTokens: shorter.count,
-                        remainingTokens: [tokens.last!],
+                        matchedTokens: tokens.count,
+                        remainingTokens: [],
                         detail: .disk,
                         blocks: [],
                         ssmStates: ssmStates,
@@ -238,10 +260,61 @@ public final class CacheCoordinator: @unchecked Sendable {
                     )
                 }
             }
+
+            if tokens.count > 1 {
+                let shorter = Array(tokens.dropLast())
+                if let arrays = diskCache.fetch(tokens: shorter, mediaSalt: mediaSalt) {
+                    let ssmStates = resolveSSMStates(
+                        forTokens: shorter,
+                        boundary: shorter.count,
+                        diskArrays: arrays,
+                        mediaSalt: mediaSalt)
+                    if hasRequiredHybridSSM(ssmStates) {
+                        return .hit(
+                            matchedTokens: shorter.count,
+                            remainingTokens: [tokens.last!],
+                            detail: .disk,
+                            blocks: [],
+                            ssmStates: ssmStates,
+                            diskArrays: arrays
+                        )
+                    }
+                }
+            }
         }
 
         // All tiers missed
         return .miss
+    }
+
+    /// Resolve SSM companion state for a disk-cache hit on a hybrid model.
+    ///
+    /// The in-memory SSM cache is tried first. If it misses, the unified
+    /// disk payload may carry folded `__ssm_count__` / `ssm_N` entries;
+    /// those are rehydrated and written back into the L1 SSM cache.
+    private func resolveSSMStates(
+        forTokens tokens: [Int],
+        boundary: Int,
+        diskArrays: [String: MLXArray],
+        mediaSalt: String? = nil
+    ) -> [MLXArray]? {
+        guard isHybrid else { return nil }
+        if let l1 = ssmStateCache.fetch(
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt)
+        {
+            return l1
+        }
+        guard let folded = TQDiskSerializer.ssmStates(from: diskArrays) else {
+            return nil
+        }
+        ssmStateCache.store(
+            ssmStates: folded,
+            tokens: tokens,
+            boundary: boundary,
+            mediaSalt: mediaSalt)
+        return folded
     }
 
     // MARK: - Store
@@ -305,7 +378,9 @@ public final class CacheCoordinator: @unchecked Sendable {
         // Qwen3.5-VL inherited sliding layers).
         if let diskCache {
             if let cache {
-                let arrays = TQDiskSerializer.serialize(cache: cache)
+                let arrays = TQDiskSerializer.serialize(
+                    cache: cache,
+                    ssmStates: isHybrid ? ssmStates : nil)
                 if !arrays.isEmpty {
                     diskCache.store(
                         tokens: promptTokens, arrays: arrays, mediaSalt: mediaSalt)
@@ -332,11 +407,12 @@ public final class CacheCoordinator: @unchecked Sendable {
 
         // Store SSM companion states for hybrid models
         if isHybrid, let ssmStates, !ssmStates.isEmpty {
-            let boundary = min(totalTokens, blockLayerData.count * blockSize)
+            let boundary = totalTokens
             ssmStateCache.store(
                 ssmStates: ssmStates,
                 tokens: promptTokens,
-                boundary: boundary
+                boundary: boundary,
+                mediaSalt: mediaSalt
             )
         }
     }

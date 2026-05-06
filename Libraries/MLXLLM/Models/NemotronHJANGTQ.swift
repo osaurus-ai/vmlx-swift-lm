@@ -32,7 +32,6 @@
 //   loaded by `loadWeights` before model.update() so the kernels have
 //   everything on first forward.
 
-import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -98,29 +97,22 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
             inFeatures: hiddenDims, bits: fc2.bits)
         else { fatalError("JANGTQ sidecar missing codebook.\(hiddenDims).\(fc2.bits)") }
 
-        // x: (B, T, hidden). Expand to per-(token, expert) rows.
+        // x: (B, T, hidden). Rotate once per token for fc1; the gather
+        // kernel reuses each rotated row across the K selected experts.
         let totalTokens = x.size / inputDims          // = B * T
         let kSlots = indices.dim(-1)                  // = K
         let xPerToken = x.reshaped([totalTokens, inputDims]) // (B*T, hidden)
-
-        // Broadcast-replicate each token K times to give one row per
-        // (token, expert). idxFlat has shape (B*T*K,) — same flatten.
-        // Cheap broadcast: (B*T, 1, hidden) → (B*T, K, hidden) → (B*T*K, hidden).
-        let xBroadcast = MLX.broadcast(
-            xPerToken.expandedDimensions(axis: 1),
-            to: [totalTokens, kSlots, inputDims]
-        ).reshaped([totalTokens * kSlots, inputDims])
 
         let idxFlat = indices.reshaped([-1]).asType(.uint32)
 
         // === fc1: (B*T*K, hidden) → (B*T*K, hidden_inter) ===
         // Hadamard rotate, then gather TQ matmul per row.
         let xRot1 = JANGTQKernels.hadamardRotate(
-            xBroadcast, signs: signsIn, dim: inputDims)
-        var h = JANGTQKernels.gatherTQ(
+            xPerToken, signs: signsIn, dim: inputDims)
+        var h = JANGTQKernels.gatherTQTopK(
             xRot: xRot1, packed: fc1.packed, norms: fc1.norms,
             codebook: cbIn, rhsIndices: idxFlat,
-            nRows: totalTokens * kSlots,
+            batchTokens: totalTokens, K: kSlots,
             inFeatures: inputDims, outFeatures: hiddenDims, bits: fc1.bits)
 
         // ReLU² activation — Nemotron MoE squared ReLU, NOT SwiGLU.
@@ -142,6 +134,8 @@ internal final class NemotronHJANGTQSwitchMLP: Module, NemotronHSwitchMLPLayer {
         return out.reshaped(outShape).asType(x.dtype)
     }
 }
+
+extension StreamingTurboQuantSwitchReLUSquaredMLP: NemotronHSwitchMLPLayer {}
 
 // MARK: - Public NemotronHJANGTQ helpers
 //

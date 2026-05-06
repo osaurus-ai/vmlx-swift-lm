@@ -283,7 +283,12 @@ class Gemma4Attention: Module {
             cachedValues = sharedKV.values
         } else {
             // Normal path: project K/V, apply RoPE, update cache
-            usedOffset = cache?.offset ?? 0
+            // Avoid host-reading `cache.offset` after compiled-cache
+            // promotion. Shared-KV consumers receive `offsetArray`
+            // below and use that graph value for RoPE; scalar
+            // `usedOffset` is only needed for non-compiled caches.
+            let normalOffsetArray = graphOffsetArray(for: cache)
+            usedOffset = normalOffsetArray == nil ? (cache?.offset ?? 0) : 0
 
             var keys = keyProj(x).reshaped(B, L, nKVHeads, headDim)
 
@@ -310,26 +315,14 @@ class Gemma4Attention: Module {
             }
         }
 
-        // vmlx #52: Gemma 4 attention scores can exceed fp16 max
-        // (±65504) on long contexts, especially in combination with
-        // the final-logit softcap amplifying tails. Promote Q/K/V to
-        // fp32 for the SDPA, then cast the result back to the
-        // original dtype. Mirrors the Python v1.3.29 patch and the
-        // VLM-side fix in Libraries/MLXVLM/Models/Gemma4.swift.
-        // Critical for the sliding-window layers in particular —
-        // sliding window concentrates attention on a smaller key set
-        // so individual scores climb faster as context grows.
-        let origDType = queries.dtype
-        var qF = queries, kF = cachedKeys, vF = cachedValues
-        if origDType == .float16 {
-            qF = qF.asType(.float32)
-            kF = kF.asType(.float32)
-            vF = vF.asType(.float32)
-        }
-        var sdpa = MLXFast.scaledDotProductAttention(
-            queries: qF, keys: kF, values: vF, scale: scale, mask: mask
+        // Load.swift casts fp16 params to bf16 at load time, so attention
+        // arrives with the fp32 exponent range needed to avoid overflow.
+        // Keep SDPA native; the prior fp32 upcast/cast-back path was a
+        // decode-time tax on Gemma4-26B.
+        let sdpa = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            scale: scale, mask: mask
         )
-        if origDType == .float16 { sdpa = sdpa.asType(.float16) }
         let output = sdpa.transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
         return (outputProj(output), cachedKeys, cachedValues, usedOffset)
@@ -403,25 +396,19 @@ class Gemma4Router: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
-        // Pre-norm (RMSNormNoScale — no learnable weight)
-        var h = rmsNormNoScale(x, eps: eps)
-        h = h * rootSize
-        h = h * routerScale
+        // Python parity: fused pre-norm with scale, then top-k on raw
+        // scores, then softmax over selected experts only.
+        let scaledWeight = routerScale * rootSize
+        let h = MLXFast.rmsNorm(x, weight: scaledWeight, eps: eps)
 
         let expertScores = proj(h)
-        // softmax already computes in float32 internally — no explicit cast needed
-        let routerProbs = softmax(expertScores, axis: -1)
 
-        // Top-K via argPartition on negated scores (get highest scores)
         let topKIndices = argPartition(
-            MLXArray(0) - expertScores,
-            kth: topK - 1, axis: -1
+            -expertScores, kth: topK - 1, axis: -1
         )[.ellipsis, ..<topK]
 
-        var topKWeights = takeAlong(routerProbs, topKIndices, axis: -1)
-        // Renormalize
-        topKWeights = topKWeights / topKWeights.sum(axis: -1, keepDims: true)
-        // Per-expert scale indexed by selected experts
+        let topKLogits = takeAlong(expertScores, topKIndices, axis: -1)
+        var topKWeights = softmax(topKLogits, axis: -1)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
         return (indices: topKIndices, weights: topKWeights)
@@ -449,10 +436,7 @@ class Gemma4Experts: Module {
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = indices.dim(-1)
 
-        let xFlat = x.reshaped(B * S, H)
-        let indicesFlat = indices.reshaped(B * S, K)
-
-        let expertOut = switchGLU(xFlat, indicesFlat)
+        let expertOut = switchGLU(x.reshaped(B * S, H), indices.reshaped(B * S, K))
 
         let weightsFlat = expandedDimensions(weights.reshaped(B * S, K), axis: -1)
         return (expertOut * weightsFlat).sum(axis: -2).reshaped(B, S, H)
@@ -463,6 +447,7 @@ class Gemma4Experts: Module {
 
 class Gemma4DecoderLayer: Module {
     let hasMoE: Bool
+    let layerIndex: Int
 
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4Attention
     @ModuleInfo var mlp: Gemma4MLP
@@ -490,6 +475,7 @@ class Gemma4DecoderLayer: Module {
 
     init(_ config: Gemma4TextConfiguration, layerIndex: Int) {
         self.hasMoE = config.enableMoeBlock && config.numExperts > 0
+        self.layerIndex = layerIndex
 
         self._selfAttention.wrappedValue = Gemma4Attention(config, layerIndex: layerIndex)
 
@@ -567,6 +553,8 @@ class Gemma4DecoderLayer: Module {
             h1 = postFeedforwardLayernorm1(h1)
 
             let (topKIndices, topKWeights) = router(h)
+            JangPressCanonicalExpertAdvisor.shared.observe(
+                layer: layerIndex, indices: topKIndices)
             var h2 = preFeedforwardLayernorm2(h)
             h2 = experts(h2, indices: topKIndices, weights: topKWeights)
             h2 = postFeedforwardLayernorm2(h2)
@@ -771,7 +759,7 @@ public class Gemma4Model: Module {
                 sharedOffsetArray: sharedOffsetArray)
 
             h = result.h
-            let layerOffsetArray = (layerCacheEntry as? BatchKVCache)?.offsetArray
+            let layerOffsetArray = graphOffsetArray(for: layerCacheEntry)
             intermediates[i] = (keys: result.keys, values: result.values, offset: result.offset, offsetArray: layerOffsetArray)
         }
 

@@ -733,12 +733,21 @@ class DeepseekV4HyperHead: Module {
         let B = h.dim(0)
         let L = h.dim(1)
         let xFlat = h.reshaped(B, L, hcMult * hiddenSize)
+        // Same dtype rule as `_hc_pre`: this RMS reduction spans
+        // hcMult*hiddenSize (≈16K for DSV4-Flash). Apple GPUs differ in
+        // implicit bf16 accumulation behavior, so keep the reduction and
+        // the tiny gate projection in fp32, then cast the final mixed
+        // residual back to the model dtype. This mirrors the jang-tools
+        // HyperHead fix documented in DSV4-HC-PRE-FP32-CAST-FIX.
         let xNormed = MLXFast.rmsNorm(
-            xFlat, weight: hcHeadRMSOnes.asType(xFlat.dtype), eps: hcEps)
-        let mixes = xNormed.matmul(fn.transposed())  // (B, L, hcMult)
-        let pre = sigmoid(mixes * scale + base) + MLXArray(hcEps)
+            xFlat.asType(.float32),
+            weight: hcHeadRMSOnes.asType(.float32),
+            eps: hcEps)
+        let mixes = xNormed.matmul(fn.asType(.float32).transposed())  // (B, L, hcMult)
+        let pre = sigmoid(mixes * scale.asType(.float32) + base.asType(.float32))
+            + MLXArray(hcEps)
         let xReshape = xFlat.reshaped(B, L, hcMult, hiddenSize)
-        return (pre.expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
+        return (pre.asType(dtype).expandedDimensions(axis: -1) * xReshape).sum(axis: -2)
             .asType(dtype)
     }
 }
@@ -874,8 +883,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     ///   - `cr == 0` (layers 0 and n-1) → `RotatingKVCache(window=128)`
     ///   - `cr > 0`  (every other layer) → `DeepseekV4Cache(window=128, cr=cr)`
     ///
-    /// `DSV4_KV_MODE` env override is preserved so the host can pick
-    /// the local KV sizing tradeoff:
+    /// `DSV4_KV_MODE` env override is preserved for diagnostics so the
+    /// host can deliberately pick the local KV sizing tradeoff:
     ///   - default (unset / "sliding"): rotating window + DeepseekV4Cache pool
     ///   - "full"  : plain KVCacheSimple on every layer (no compression,
     ///               no pool — for memory-permits long-reasoning runs
@@ -883,15 +892,16 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     ///   - "tq"    : KVCacheSimple, BatchEngine swaps to TurboQuantKVCache
     ///               once offset > min-tokens (caller must also set
     ///               `GenerateParameters.kvMode = .turboQuant(...)`)
+    ///
+    /// Caller-level `GenerateParameters.kvMode = .turboQuant` is
+    /// intentionally NOT enough to switch DSV4 into `"tq"` mode. Osaurus
+    /// can set global TQ defaults for ordinary KV models; DSV4 must keep
+    /// its SWA+CSA+HSA hybrid cache unless the operator explicitly opts
+    /// into the diagnostic/simple-cache override via `DSV4_KV_MODE=tq`.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
-        let callerWantsTQ: Bool = {
-            guard let p = parameters else { return false }
-            if case .turboQuant = p.kvMode { return true }
-            return false
-        }()
-        let mode: String = envMode ?? (callerWantsTQ ? "tq" : "sliding")
+        let mode: String = envMode ?? "sliding"
 
         return (0..<config.numHiddenLayers).map { layerIdx in
             switch mode {
@@ -1113,12 +1123,20 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // `model.layers.L.mlp.experts.E.gate_proj.{suffix}`. Stack into
         // `model.layers.L.mlp.switch_mlp.{gate,down,up}_proj.{suffix}`.
         let suffixes = ["weight", "scales", "biases", "tq_packed", "tq_norms"]
+        let streamJANGTQExperts = JANGTQStreamingExperts.isEnabled
         for layerIdx in 0..<config.numHiddenLayers {
             let prefix = "model.layers.\(layerIdx).mlp.experts"
             for projName in ["gate_proj", "down_proj", "up_proj"] {
                 for suffix in suffixes {
                     let first = "\(prefix).0.\(projName).\(suffix)"
                     guard out[first] != nil else { continue }
+                    if streamJANGTQExperts && (suffix == "tq_packed" || suffix == "tq_norms") {
+                        for e in 0..<config.nRoutedExperts {
+                            out.removeValue(
+                                forKey: "\(prefix).\(e).\(projName).\(suffix)")
+                        }
+                        continue
+                    }
                     var tensors: [MLXArray] = []
                     for e in 0..<config.nRoutedExperts {
                         let key = "\(prefix).\(e).\(projName).\(suffix)"

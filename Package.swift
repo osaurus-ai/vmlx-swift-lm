@@ -65,20 +65,14 @@ let package = Package(
         // mlx-swift backport branch points at `e577ca02` or later.
         .package(url: "https://github.com/osaurus-ai/mlx-swift", revision: "0a56f9041d56b4b8161f67a6cbd540ae66efc9fd"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
-        // swift-jinja: pinned to osaurus-ai fork at 58d21aa which
-        // contains a 1-line parser fix lifting the for-loop iterable
-        // from parseFilter() (factor + |filter only) to parseOr()
-        // (full binary + comparison + logical hierarchy, excluding
-        // ternary). Required for Mistral-Medium-3.5's chat template
-        // (`{%- for message in loop_messages + [{...}] %}` was
-        // rejected with "Expected '%}' after for loop.. Got plus
-        // instead"). All 756 swift-jinja tests pass on the fork.
-        // Upstream: https://github.com/osaurus-ai/swift-jinja
-        // SwiftPM transitive resolution honors this override because
-        // it appears before swift-transformers (which depends on
-        // swift-jinja).
-        .package(url: "https://github.com/osaurus-ai/swift-jinja", revision: "58d21aa5b69fdd9eb7e23ce2c3730f47db8e0c9d"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        // Osaurus-owned Jinja chain. `osaurus-ai/Jinja` carries the
+        // HuggingFace swift-jinja 2.3.5 code on the `osaurus/hf-2.3.5`
+        // branch/tag, and `osaurus-ai/swift-transformers` is the 1.3.0
+        // transformer package with its Jinja dependency pointed at that
+        // osaurus repo. Keeping both edges in the osaurus org avoids SwiftPM's
+        // duplicate package-identity warning while retaining the 2.x Jinja API.
+        .package(url: "https://github.com/osaurus-ai/Jinja.git", from: "2.0.0"),
+        .package(url: "https://github.com/osaurus-ai/swift-transformers", revision: "b4a094b34b997167549c7f45bde16c80f18ed5a8"),
         // SwiftNIO stack — used by MLXDistributedTransport for TLS-backed
         // pipeline-parallel inference (Phase 2). swift-nio is already
         // resolved transitively via swift-transformers; we pin the floor
@@ -295,6 +289,7 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "jinja"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
@@ -306,26 +301,6 @@ let package = Package(
                 "README.md"
             ],
             resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
-        ),
-        .testTarget(
-            name: "MLXDistributedCoreTests",
-            dependencies: ["MLXDistributedCore"],
-            path: "Tests/MLXDistributedCoreTests"
-        ),
-        .testTarget(
-            name: "MLXDistributedTransportTests",
-            dependencies: ["MLXDistributedTransport", "MLXDistributedCore"],
-            path: "Tests/MLXDistributedTransportTests"
-        ),
-        .testTarget(
-            name: "MLXDistributedJACCLTests",
-            dependencies: ["MLXDistributedJACCL"],
-            path: "Tests/MLXDistributedJACCLTests"
-        ),
-        .testTarget(
-            name: "MLXDistributedTPTests",
-            dependencies: ["MLXDistributedTP", "MLXDistributedCore"],
-            path: "Tests/MLXDistributedTPTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
@@ -357,4 +332,29 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
     package.dependencies.append(
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     )
+}
+
+if Context.environment["VMLINUX_ENABLE_DISTRIBUTED_TESTS"] == "1" {
+    package.targets.append(contentsOf: [
+        .testTarget(
+            name: "MLXDistributedCoreTests",
+            dependencies: ["MLXDistributedCore"],
+            path: "Tests/MLXDistributedCoreTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedTransportTests",
+            dependencies: ["MLXDistributedTransport", "MLXDistributedCore"],
+            path: "Tests/MLXDistributedTransportTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedJACCLTests",
+            dependencies: ["MLXDistributedJACCL"],
+            path: "Tests/MLXDistributedJACCLTests"
+        ),
+        .testTarget(
+            name: "MLXDistributedTPTests",
+            dependencies: ["MLXDistributedTP", "MLXDistributedCore"],
+            path: "Tests/MLXDistributedTPTests"
+        ),
+    ])
 }

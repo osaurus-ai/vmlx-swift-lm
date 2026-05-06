@@ -12,6 +12,9 @@
 
 import Foundation
 import MLX
+#if canImport(Cmlx)
+import Cmlx
+#endif
 
 #if canImport(Darwin)
 import Darwin
@@ -24,6 +27,7 @@ public struct JangPressCanonicalExpertAdvisorStatus: Sendable, Equatable {
     public var asyncReadback: Bool
     public var warmAdvice: Bool
     public var symbolAvailable: Bool
+    public var hotPerLayer: Int
     public var hotExpertCount: Int
     public var warmCalls: Int
     public var coldCalls: Int
@@ -32,8 +36,18 @@ public struct JangPressCanonicalExpertAdvisorStatus: Sendable, Equatable {
     public var pendingObservations: Int
     public var droppedQueueFull: Int
     public var skippedLargeIndexTensors: Int
+    public var skippedTracerArrays: Int
     public var readbacks: Int
+    public var rewarms: Int
+    public var distinctColdAdvisedPairs: Int
 }
+
+private typealias SafetensorsMmapAdviseExpertsFn = @convention(c) (
+    Int32,
+    UnsafePointer<Int32>?,
+    UnsafePointer<Int32>?,
+    Int64
+) -> Int64
 
 public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
     public static let shared = JangPressCanonicalExpertAdvisor()
@@ -66,6 +80,7 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         var configID: UInt64 = 0
         var generation: UInt64 = 0
         var hotByLayer: [Int: [Int: UInt64]] = [:]
+        var coldHistoryByLayer: [Int: Set<Int>] = [:]
         var pendingObservations: [PendingObservation] = []
         var workerScheduled = false
         var symbolResolved = false
@@ -76,28 +91,26 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         var coldBytes: Int64 = 0
         var droppedQueueFull = 0
         var skippedLargeIndexTensors = 0
+        var skippedTracerArrays = 0
         var readbacks = 0
+        var rewarms = 0
     }
-
-    private typealias AdviseExpertsFn = @convention(c) (
-        Int32,
-        UnsafePointer<Int32>?,
-        UnsafePointer<Int32>?,
-        Int64
-    ) -> Int64
 
     private let lock = NSLock()
     private let workerQueue = DispatchQueue(
         label: "org.osaurus.jangpress.router-advisor",
         qos: .utility)
     private var state = MutableState()
-    private var adviseExpertsFn: AdviseExpertsFn?
+    private var adviseExperts: SafetensorsMmapAdviseExpertsFn?
+    private nonisolated(unsafe) var fastEnabled = false
 
     private init() {}
 
     public func configure(
         options: JangPressLoadOptions,
-        mmapEnabled: Bool
+        mmapEnabled: Bool,
+        numRoutedExperts: Int? = nil,
+        topK: Int? = nil
     ) {
         let env = ProcessInfo.processInfo.environment
         let routerEnv = env["JANGPRESS_ROUTER_ADVICE"]?.lowercased()
@@ -113,7 +126,10 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         let hotPerLayer = parsePositiveEnv(
             "JANGPRESS_ROUTER_HOT_PER_LAYER",
             env: env,
-            default: defaultHotPerLayer(compressPct: options.compressPct))
+            default: hotPerLayerDefault(
+                compressPct: options.compressPct,
+                numRoutedExperts: numRoutedExperts,
+                topK: topK))
         let maxIndices = parsePositiveEnv(
             "JANGPRESS_ROUTER_MAX_INDICES",
             env: env,
@@ -139,6 +155,7 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
             || env["JANGPRESS_ROUTER_DEBUG"] == "1"
 
         lock.lock()
+        fastEnabled = enabled
         state.configID &+= 1
         state.config = Config(
             enabled: enabled,
@@ -150,7 +167,18 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
             drainBatchSize: max(1, drainBatch),
             debug: debug)
         state.hotByLayer.removeAll(keepingCapacity: true)
+        state.coldHistoryByLayer.removeAll(keepingCapacity: true)
         state.pendingObservations.removeAll(keepingCapacity: true)
+        state.workerScheduled = false
+        state.warmCalls = 0
+        state.coldCalls = 0
+        state.warmBytes = 0
+        state.coldBytes = 0
+        state.droppedQueueFull = 0
+        state.skippedLargeIndexTensors = 0
+        state.skippedTracerArrays = 0
+        state.readbacks = 0
+        state.rewarms = 0
         if enabled {
             _ = resolveAdviseExpertsSymbolLocked()
         }
@@ -165,6 +193,7 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
     }
 
     public func observe(layer: Int, indices: MLXArray) {
+        if !fastEnabled { return }
         lock.lock()
         let config = state.config
         let configID = state.configID
@@ -183,42 +212,93 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         }
         lock.unlock()
 
+        if isTracerArray(indices) {
+            lock.lock()
+            state.skippedTracerArrays += 1
+            lock.unlock()
+            return
+        }
+
         // Keep MLXArray use on the caller's execution path. Passing
         // unevaluated arrays into a background Dispatch queue is not a
         // stable MLX contract and can crash during concurrent decode.
+        //
+        // This readback is also a deliberate speed tradeoff: it forces
+        // CPU visibility of a tiny top-k router tensor. Router advice stays
+        // default-off until this path is proven tok/s-neutral on real MoE
+        // bundles; JangPress's production win is canonical mmap residency,
+        // not per-token readback.
         let uniqueExperts = readUniqueExperts(indices)
         guard !uniqueExperts.isEmpty else { return }
 
         if config.asyncReadback {
-            lock.lock()
-            guard state.config.enabled, state.configID == configID else {
-                lock.unlock()
-                return
-            }
-            if state.pendingObservations.count >= config.maxPendingObservations {
-                state.droppedQueueFull += 1
-                lock.unlock()
-                return
-            }
-            state.pendingObservations.append(PendingObservation(
-                configID: configID,
-                layer: layer,
-                expertIDs: uniqueExperts))
-            let shouldSchedule = !state.workerScheduled
-            if shouldSchedule {
-                state.workerScheduled = true
-            }
-            lock.unlock()
-
-            if shouldSchedule {
-                workerQueue.async { [weak self] in
-                    self?.drainPendingObservations()
-                }
-            }
+            enqueue(configID: configID, layer: layer, experts: uniqueExperts)
             return
         }
 
         processExperts(configID: configID, layer: layer, uniqueExperts: uniqueExperts)
+    }
+
+    public func observe(layer: Int, experts: [Int32]) {
+        if !fastEnabled { return }
+        lock.lock()
+        let config = state.config
+        let configID = state.configID
+        if !config.enabled {
+            lock.unlock()
+            return
+        }
+        if !resolveAdviseExpertsSymbolLocked() {
+            lock.unlock()
+            return
+        }
+        if experts.count > config.maxIndicesPerReadback {
+            state.skippedLargeIndexTensors += 1
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        let unique = Array(Set(experts.filter { $0 >= 0 })).sorted()
+        guard !unique.isEmpty else { return }
+
+        if config.asyncReadback {
+            enqueue(configID: configID, layer: layer, experts: unique)
+        } else {
+            processExperts(configID: configID, layer: layer, uniqueExperts: unique)
+        }
+    }
+
+    private func enqueue(
+        configID: UInt64,
+        layer: Int,
+        experts: [Int32]
+    ) {
+        lock.lock()
+        guard state.config.enabled, state.configID == configID else {
+            lock.unlock()
+            return
+        }
+        if state.pendingObservations.count >= state.config.maxPendingObservations {
+            state.droppedQueueFull += 1
+            lock.unlock()
+            return
+        }
+        state.pendingObservations.append(PendingObservation(
+            configID: configID,
+            layer: layer,
+            expertIDs: experts))
+        let shouldSchedule = !state.workerScheduled
+        if shouldSchedule {
+            state.workerScheduled = true
+        }
+        lock.unlock()
+
+        if shouldSchedule {
+            workerQueue.async { [weak self] in
+                self?.drainPendingObservations()
+            }
+        }
     }
 
     private func drainPendingObservations() {
@@ -249,6 +329,15 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         return Array(Set(routed.filter { $0 >= 0 })).sorted()
     }
 
+    private func isTracerArray(_ indices: MLXArray) -> Bool {
+        // The standalone vmlx tree exposes a patched C ABI for tracer
+        // detection. This vmlx-swift-lm checkout does not, so keep the
+        // guard as a conservative no-op until the MLX pin grows that
+        // surface. Size guards above still keep normal decode telemetry
+        // bounded.
+        false
+    }
+
     private func processExperts(
         configID: UInt64,
         layer: Int,
@@ -269,10 +358,15 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         state.generation &+= 1
         let generation = state.generation
         var hot = state.hotByLayer[layer] ?? [:]
+        var coldHistory = state.coldHistoryByLayer[layer] ?? Set<Int>()
+        var layerRewarms = 0
         for expert in uniqueExperts {
             let e = Int(expert)
             if hot[e] == nil {
                 warm.append((Int32(layer), expert))
+                if coldHistory.remove(e) != nil {
+                    layerRewarms &+= 1
+                }
             }
             hot[e] = generation
         }
@@ -288,9 +382,12 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
             for (expert, _) in evicted {
                 hot.removeValue(forKey: expert)
                 cold.append((Int32(layer), Int32(expert)))
+                coldHistory.insert(expert)
             }
         }
         state.hotByLayer[layer] = hot
+        state.coldHistoryByLayer[layer] = coldHistory
+        state.rewarms &+= layerRewarms
         debug = config.debug
         warmAdvice = config.warmAdvice
         lock.unlock()
@@ -320,11 +417,15 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let hotCount = state.hotByLayer.values.reduce(0) { $0 + $1.count }
+        let coldHistoryCount = state.coldHistoryByLayer.values.reduce(0) {
+            $0 + $1.count
+        }
         return JangPressCanonicalExpertAdvisorStatus(
             enabled: state.config.enabled,
             asyncReadback: state.config.asyncReadback,
             warmAdvice: state.config.warmAdvice,
             symbolAvailable: state.symbolAvailable,
+            hotPerLayer: state.config.hotPerLayer,
             hotExpertCount: hotCount,
             warmCalls: state.warmCalls,
             coldCalls: state.coldCalls,
@@ -333,7 +434,10 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
             pendingObservations: state.pendingObservations.count,
             droppedQueueFull: state.droppedQueueFull,
             skippedLargeIndexTensors: state.skippedLargeIndexTensors,
-            readbacks: state.readbacks)
+            skippedTracerArrays: state.skippedTracerArrays,
+            readbacks: state.readbacks,
+            rewarms: state.rewarms,
+            distinctColdAdvisedPairs: coldHistoryCount)
     }
 
     public func waitUntilIdle(timeoutSeconds: TimeInterval = 2.0) {
@@ -349,18 +453,31 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
     }
 
     private func advise(pairs: [(Int32, Int32)], advice: Int32) -> Int64 {
-        guard let fn = adviseExpertsFn else { return 0 }
+#if canImport(Cmlx)
+        lock.lock()
+        let adviseExperts = resolveAdviseExpertsSymbolLocked()
+            ? self.adviseExperts
+            : nil
+        lock.unlock()
+
+        guard let adviseExperts else {
+            return 0
+        }
+
         let layers = pairs.map { $0.0 }
         let experts = pairs.map { $0.1 }
         return layers.withUnsafeBufferPointer { layerBuffer in
             experts.withUnsafeBufferPointer { expertBuffer in
-                fn(
+                adviseExperts(
                     advice,
                     layerBuffer.baseAddress,
                     expertBuffer.baseAddress,
                     Int64(pairs.count))
             }
         }
+#else
+        return 0
+#endif
     }
 
     private func resolveAdviseExpertsSymbolLocked() -> Bool {
@@ -368,17 +485,21 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
             return state.symbolAvailable
         }
         state.symbolResolved = true
-#if canImport(Darwin) || canImport(Glibc)
+#if canImport(Cmlx)
         guard let handle = dlopen(nil, RTLD_NOW),
               let symbol = dlsym(handle, "mlx_safetensors_mmap_advise_experts")
         else {
+            adviseExperts = nil
             state.symbolAvailable = false
             return false
         }
-        adviseExpertsFn = unsafeBitCast(symbol, to: AdviseExpertsFn.self)
+        adviseExperts = unsafeBitCast(
+            symbol,
+            to: SafetensorsMmapAdviseExpertsFn.self)
         state.symbolAvailable = true
         return true
 #else
+        adviseExperts = nil
         state.symbolAvailable = false
         return false
 #endif
@@ -416,5 +537,24 @@ public final class JangPressCanonicalExpertAdvisor: @unchecked Sendable {
         let clamped = max(0, min(100, compressPct))
         let hotFraction = Double(100 - clamped) / 100.0
         return max(8, min(64, Int((hotFraction * 128.0).rounded(.up))))
+    }
+
+    private func hotPerLayerDefault(
+        compressPct: Int,
+        numRoutedExperts: Int?,
+        topK: Int?
+    ) -> Int {
+        guard let n = numRoutedExperts, n > 0 else {
+            return defaultHotPerLayer(compressPct: compressPct)
+        }
+
+        let pct = max(0, min(100, compressPct))
+        let pctBudget = Int(ceil(Double(n) * Double(100 - pct) / 100.0))
+        let k = max(1, topK ?? 4)
+        var hot = max(k * 4, pctBudget)
+        let lowerBound = max(8, k * 2)
+        if hot < lowerBound { hot = lowerBound }
+        if hot > n { hot = n }
+        return hot
     }
 }

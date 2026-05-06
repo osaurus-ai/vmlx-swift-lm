@@ -11,6 +11,7 @@
 | `OSAURUS-INTEGRATION.md` (this file) | Narrative overview — what osaurus flipped / closed / is blocked on. |
 | **`TPAE-2026-04-20-TRIAGE.md`** | **Start here if you're reading tpae's Slack thread.** Line-by-line map from every message (1:58 AM through 3:17 AM) to its resolution — commit, doc, real-model verification row. |
 | `OSAURUS-API-SURFACE.md` | Per-symbol public API surface. The canonical reference osaurus integrators link against. |
+| **`OSAURUS-RUNTIME-HANDOFF-2026-05-06.md`** | **Current production-runtime handoff for osaurus agents.** Chat-template kwargs, reasoning/tool event contract, DSV4 coherence and long-context limits, Ling/Bailing runtime notes, cache stack, SSM companion state, TurboQuant KV, and commands to rerun the gates. |
 | `OSAURUS-SPECDEC.md` (one level up) | `GenerateParameters.draftStrategy` contract — DFlash / DDTree speculative decoding. |
 | `GEMMA4-SLIDING-WINDOW-CRASH.md` | 2026-04-20 fix for tpae's `broadcast_shapes` crash on Gemma-4 at prompts past `sliding_window=1024`. Real-model verification matrix included. |
 | `REASONING-STREAM-EVENT.md` | 2026-04-20 `Generation.reasoning(String)` library-level streaming channel. Closes tpae's "thinking parsers should be handled at library level". Updated 2026-04-20 PM with harmony (Gemma-4) + `startInReasoning` (Qwen 3.x enable_thinking prefill) support. |

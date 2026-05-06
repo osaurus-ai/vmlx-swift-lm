@@ -143,15 +143,18 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         // Direct-answer (thinking-off) callers therefore see all output
                         // trapped in Generation.reasoning. When (a) additionalContext sets
                         // enable_thinking=false, (b) the tokenizer carries the MiniMax-
-                        // specific ]~b] / [e~[ special tokens, and (c) no env override
+                        // specific ]~!b[ / [e~[ BOS/EOS pair, and (c) no env override
                         // is set, force the corrected MiniMaxM2Minimal fallback first.
+                        // Do not use convertTokenToId here: some tokenizers return an
+                        // unknown-token id for arbitrary strings, which can misroute
+                        // Gemma/Laguna/Nemotron into the MiniMax fallback.
                         // Auto-engage is one-way: thinking-on requests fall through to
                         // the native template untouched.
                         if let ctx = additionalContext,
                            let enableThinking = ctx["enable_thinking"] as? Bool,
                            enableThinking == false,
-                           upstream.convertTokenToId("]~b]") != nil,
-                           upstream.convertTokenToId("[e~[") != nil {
+                           upstream.bosToken == "]~!b[",
+                           upstream.eosToken == "[e~[" {
                             do {
                                 if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                     FileHandle.standardError.write(
@@ -199,35 +202,84 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: mistral4AdjustedContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
-                            // DSV4-Flash family: bundles ship NO chat_template
-                            // (the stock distribution carries an external
-                            // `encoding/encoding_dsv4.py` instead). Detect via
-                            // the curly-quote BOS marker (U+FF5C fullwidth
-                            // vertical bar around `begin` U+2581 `of` U+2581
-                            // `sentence`) and apply the in-process DSV4Minimal
-                            // template. VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1
+                            // Missing-template fallbacks for bundles that ship
+                            // tokenizer special tokens but no tokenizer_config
+                            // chat_template field. VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1
                             // opts out.
                             let dsv4Bos =
                                 "<" + String(UnicodeScalar(0xFF5C)!)
                                 + "begin" + String(UnicodeScalar(0x2581)!) + "of"
                                 + String(UnicodeScalar(0x2581)!) + "sentence"
                                 + String(UnicodeScalar(0xFF5C)!) + ">"
-                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1",
-                               upstream.bosToken == dsv4Bos {
-                                if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
-                                    FileHandle.standardError.write(
-                                        "[vmlx] chat-template missing -> DSV4Minimal fallback engaged\\n"
-                                            .data(using: .utf8)!)
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                                if upstream.bosToken == dsv4Bos {
+                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                        FileHandle.standardError.write(
+                                            "[vmlx] chat-template missing -> DSV4Minimal fallback engaged\\n"
+                                                .data(using: .utf8)!)
+                                    }
+                                    return try upstream.applyChatTemplate(
+                                        messages: messages,
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                            MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
                                 }
-                                return try upstream.applyChatTemplate(
-                                    messages: messages,
-                                    chatTemplate: Tokenizers.ChatTemplateArgument.literal(
-                                        MLXLMCommon.ChatTemplateFallbacks.dsv4Minimal),
-                                    addGenerationPrompt: true,
-                                    truncation: false,
-                                    maxLength: nil,
-                                    tools: tools,
-                                    additionalContext: additionalContext)
+                                if upstream.bosToken == "]~!b[",
+                                   upstream.eosToken == "[e~[" {
+                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                        FileHandle.standardError.write(
+                                            "[vmlx] chat-template missing -> MiniMaxM2Minimal fallback engaged\\n"
+                                                .data(using: .utf8)!)
+                                    }
+                                    return try upstream.applyChatTemplate(
+                                        messages: messages,
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                            MLXLMCommon.ChatTemplateFallbacks.minimaxM2Minimal),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
+                                }
+                                if upstream.bosToken == "<bos>" {
+                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                        FileHandle.standardError.write(
+                                            "[vmlx] chat-template missing -> Gemma4 fallback engaged\\n"
+                                                .data(using: .utf8)!)
+                                    }
+                                    let template = (tools?.isEmpty ?? true)
+                                        ? MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal
+                                        : MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools
+                                    return try upstream.applyChatTemplate(
+                                        messages: messages,
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(template),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
+                                }
+                                if upstream.bosToken == "<s>",
+                                   upstream.convertTokenToId("<|im_end|>") != nil {
+                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                        FileHandle.standardError.write(
+                                            "[vmlx] chat-template missing -> NemotronMinimal fallback engaged\\n"
+                                                .data(using: .utf8)!)
+                                    }
+                                    return try upstream.applyChatTemplate(
+                                        messages: messages,
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                            MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
+                                }
                             }
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         } catch {
@@ -248,55 +300,32 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             // bos. That single check lets us pick the right
                             // fallback ordering without needing the model
                             // config parsed separately. `convertTokenToId`
-                            // for added-special tokens isn't universally
-                            // reliable across swift-transformers builds, so
-                            // we keep bosToken as the primary signal and
-                            // treat the `<|turn>` probe as a confirmatory
-                            // tiebreaker only when bos is ambiguous.
-                            let isGemmaFamily: Bool = {
-                                if upstream.bosToken == "<bos>" { return true }
-                                if upstream.convertTokenToId("<|turn>") != nil { return true }
-                                return false
-                            }()
-                            // Note (2026-05-01): the Laguna `〈|EOS|〉`
-                            // and Mistral 3 `[INST]` family sniffs were
-                            // REMOVED. They previously force-routed to
-                            // family-specific minimal fallbacks because
-                            // swift-jinja's `parseFilter()` rejected
-                            // for-iterable expressions (Mistral's
-                            // `loop_messages + [sentinel]`) and unknown
-                            // block tags (Laguna's `{% generation %}`).
-                            //
-                            // The osaurus-ai/swift-jinja fork at
-                            // 58d21aa5 fixes the for-iterable parsing
-                            // (lifts to parseOr — handles `+` etc.
-                            // without consuming the for-loop's `if`
-                            // filter token). Verified: BOTH Mistral 3.5
-                            // and Laguna native templates now parse
-                            // and render correctly. The sniffs would
-                            // preempt native templates and emit the
-                            // less-faithful minimal fallbacks instead;
-                            // removing them lets the native templates
-                            // run with their full reasoning_effort
-                            // plumbing, MODEL_SETTINGS block, and
-                            // generation block tags intact. Fallbacks
-                            // remain registered in `ordered` below as
-                            // insurance for future regressions.
+                            // protects us from applying a fallback whose
+                            // sentinel tokens are not in vocab.
+                            let isGemma = upstream.bosToken == "<bos>"
+                            let hasNemotronSentinel =
+                                upstream.convertTokenToId("<|im_start|>") != nil
+                                || upstream.convertTokenToId("<|im_end|>") != nil
                             let ordered: [(label: String, template: String)]
-                            if isGemmaFamily {
-                                ordered = MLXLMCommon.ChatTemplateFallbacks.orderedFallbacks
-                            } else {
+                            if isGemma {
+                                ordered = [
+                                    ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
+                                    ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
+                                ]
+                            } else if hasNemotronSentinel {
                                 ordered = [
                                     ("NemotronMinimal", MLXLMCommon.ChatTemplateFallbacks.nemotronMinimal),
                                     ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                     ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),
                                 ]
+                            } else {
+                                ordered = MLXLMCommon.ChatTemplateFallbacks.orderedFallbacks
                             }
-                            for (label, template) in ordered {
+                            for candidate in ordered {
                                 do {
                                     let ids = try upstream.applyChatTemplate(
                                         messages: messages,
-                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(template),
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(candidate.template),
                                         addGenerationPrompt: true,
                                         truncation: false,
                                         maxLength: nil,
@@ -304,7 +333,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         additionalContext: additionalContext)
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                         FileHandle.standardError.write(
-                                            "[vmlx] chat-template fallback engaged: \\(label) (original error: \\(error))\\n"
+                                            "[vmlx] chat-template fallback engaged: \\(candidate.label)\\n"
                                                 .data(using: .utf8)!)
                                     }
                                     return ids
@@ -312,14 +341,13 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                     continue
                                 }
                             }
-                            // No fallback worked — surface the original upstream error.
                             throw error
                         }
                     }
                 }
 
                 return TokenizerBridge(huggingFaceTokenizer)
-            }(\(argument))
+            }(\(raw: argument))
             """
     }
 }

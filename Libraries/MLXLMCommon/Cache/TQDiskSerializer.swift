@@ -501,9 +501,9 @@ public enum TQDiskSerializer {
     ///                                 [keep, maxSize, step, offset, idx,
     ///                                  compressRatio, slidingWindow]
     ///
-    /// All "buffer/pool" arrays use a `(1, 0, 1)` zero-row sentinel for
-    /// "nil" so the safetensors round-trip never has to deal with
-    /// optional shapes.
+    /// All "buffer/pool" arrays are paired with `__dsv4_{i}_nilmask__`.
+    /// Nil slots use a small `(1, 1, 1)` sentinel because safetensors cannot
+    /// serialize empty arrays. The nil mask is authoritative.
     private static func serializeDeepseekV4Layer(
         _ dsv4: HybridPoolCache,
         index i: Int,
@@ -535,17 +535,27 @@ public enum TQDiskSerializer {
             Int32(dsv4.slidingWindow),
         ])
 
-        let zeroSentinel = MLXArray.zeros([1, 0, 1], dtype: .float32)
-        result["dsv4_\(i)_pool_comp"] = dsv4.hybridPool(branch: .compressor) ?? zeroSentinel
-        result["dsv4_\(i)_pool_idx"] = dsv4.hybridPool(branch: .indexer) ?? zeroSentinel
+        let nilSentinel = MLXArray.zeros([1, 1, 1], dtype: .float32)
+        var nilMask: [Int32] = []
+        func putOptional(_ key: String, _ value: MLXArray?) {
+            if let value {
+                result[key] = value
+                nilMask.append(0)
+            } else {
+                result[key] = nilSentinel
+                nilMask.append(1)
+            }
+        }
 
+        putOptional("dsv4_\(i)_pool_comp", dsv4.hybridPool(branch: .compressor))
+        putOptional("dsv4_\(i)_pool_idx", dsv4.hybridPool(branch: .indexer))
         let compBuf = dsv4.hybridBuffers(branch: .compressor)
-        result["dsv4_\(i)_buf_comp_kv"] = compBuf.kv ?? zeroSentinel
-        result["dsv4_\(i)_buf_comp_gate"] = compBuf.gate ?? zeroSentinel
-
+        putOptional("dsv4_\(i)_buf_comp_kv", compBuf.kv)
+        putOptional("dsv4_\(i)_buf_comp_gate", compBuf.gate)
         let idxBuf = dsv4.hybridBuffers(branch: .indexer)
-        result["dsv4_\(i)_buf_idx_kv"] = idxBuf.kv ?? zeroSentinel
-        result["dsv4_\(i)_buf_idx_gate"] = idxBuf.gate ?? zeroSentinel
+        putOptional("dsv4_\(i)_buf_idx_kv", idxBuf.kv)
+        putOptional("dsv4_\(i)_buf_idx_gate", idxBuf.gate)
+        result["__dsv4_\(i)_nilmask__"] = MLXArray(nilMask)
 
         result[kindKey(for: i)] = kindArray(.deepseekV4)
     }
@@ -1090,8 +1100,9 @@ public enum TQDiskSerializer {
 
     /// 2026-05-04: Deserialize a single `DeepseekV4Cache` layer.
     /// Reads `dsv4_{i}_keys/values`, the 7-element
-    /// `__dsv4_{i}_meta__` tuple, and the 6 pool/buffer slots. Sentinel
-    /// `(1, 0, 1)` zero-row tensors decode back to nil.
+    /// `__dsv4_{i}_meta__` tuple, and the 6 pool/buffer slots.
+    /// `__dsv4_{i}_nilmask__` marks nil optionals. Legacy zero-row
+    /// sentinels still decode to nil for old dev entries.
     private static func deserializeDeepseekV4Layer(
         index i: Int,
         from arrays: [String: MLXArray]
@@ -1104,7 +1115,12 @@ public enum TQDiskSerializer {
         let m = metaArr.asArray(Int32.self)
         guard m.count == 7 else { return nil }
 
-        func unsentinel(_ key: String) -> MLXArray? {
+        let nilMask = arrays["__dsv4_\(i)_nilmask__"]?.asArray(Int32.self)
+
+        func unsentinel(_ key: String, slot: Int) -> MLXArray? {
+            if let nilMask, nilMask.indices.contains(slot), nilMask[slot] != 0 {
+                return nil
+            }
             guard let arr = arrays[key] else { return nil }
             if arr.ndim >= 2 && arr.dim(1) == 0 { return nil }
             return arr
@@ -1116,12 +1132,12 @@ public enum TQDiskSerializer {
             offset: Int(m[3]), idx: Int(m[4]),
             compressRatio: Int(m[5]),
             slidingWindow: Int(m[6]),
-            poolComp: unsentinel("dsv4_\(i)_pool_comp"),
-            poolIdx: unsentinel("dsv4_\(i)_pool_idx"),
-            bufCompKV: unsentinel("dsv4_\(i)_buf_comp_kv"),
-            bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate"),
-            bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv"),
-            bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate"))
+            poolComp: unsentinel("dsv4_\(i)_pool_comp", slot: 0),
+            poolIdx: unsentinel("dsv4_\(i)_pool_idx", slot: 1),
+            bufCompKV: unsentinel("dsv4_\(i)_buf_comp_kv", slot: 2),
+            bufCompGate: unsentinel("dsv4_\(i)_buf_comp_gate", slot: 3),
+            bufIdxKV: unsentinel("dsv4_\(i)_buf_idx_kv", slot: 4),
+            bufIdxGate: unsentinel("dsv4_\(i)_buf_idx_gate", slot: 5))
     }
 
     // MARK: - Helpers

@@ -6,6 +6,9 @@
 - `docs/OSAURUS-CACHE-CONTRACT.md` — multi-turn / paged / prefix cache rules.
 - `docs/OSAURUS-JANGPRESS.md` — production weights cache.
 - `docs/superpowers/specs/2026-05-04-dsv4-flash-jangpress-prod-design.md` — design rationale.
+- `/Users/eric/mlx/vllm-mlx/docs/DSV4_RUNTIME_REGRESSION_TRACE.md` — Python
+  runtime regression trace. The originally requested
+  `DSV4_FIX_NUANCES.md` filename was not present locally on 2026-05-06.
 
 ## What is DSV4-Flash?
 
@@ -158,6 +161,48 @@ The legacy `DSV4_LONG_CTX={0,1}` toggle has been **removed**. There is
 no "short-context" path anymore — DSV4 always uses the hybrid cache for
 `cr > 0` layers.
 
+## Prefix / L2 Cache Contract
+
+DSV4 cache keys are prompt-token keys. The stored cache payload must be a
+prompt-boundary snapshot, not the live cache after generated tokens have
+been decoded. This is stricter than ordinary KV models because DSV4's
+`DeepseekV4Cache` carries:
+
+- local SWA ring-buffer state,
+- CSA compressor pool rows,
+- HSA indexer pool rows,
+- incomplete-window buffers for both compressor and indexer branches.
+
+As of 2026-05-06, both Swift generation paths follow that contract:
+
+- `TokenIterator` captures a prompt-boundary cache snapshot before the
+  async generation loop starts and stores from that snapshot on stream
+  completion.
+- `BatchEngine` captures `BatchSlot.promptCacheSnapshot` immediately
+  after prefill and before the first generated token is fed back into the
+  model.
+- The disk tier receives a copy of that snapshot. If KV TurboQuant is
+  requested and the prompt length crosses the TQ threshold, the snapshot
+  is compressed before disk write, preserving TQ encoded-block storage
+  without using post-decode cache state.
+
+The disk serializer stores DSV4 layers as `LayerKind.deepseekV4` with
+rotating SWA state plus CSA/HSA pool and buffer payloads. Nil pool/buffer
+slots are marked by `__dsv4_{layer}_nilmask__`; the tensor payload uses a
+small non-empty sentinel because safetensors rejects empty arrays.
+
+Validated live on `/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ`:
+
+```bash
+BENCH_BATCH_DISK_RESTORE=1 BENCH_MAX_TOKENS=4 \
+  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  .build/release/RunBench
+```
+
+Expected result: session 1 writes a disk entry, a fresh coordinator
+probes a disk hit for 132/132 prompt tokens, and session 2 restores from
+disk without re-prefilling the whole prompt.
+
 ## Reasoning parser
 
 `reasoningStampFromModelType("deepseek_v4")` returns `"think_xml"`.
@@ -171,11 +216,19 @@ A `.chunk` stream that arrives empty after a `<think>` block usually
 means `maxTokens` ran out before the model closed `</think>`. Bumping
 `max_tokens` to 1024+ is normal for DSV4 chat.
 
+Current Swift note from the 2026-05-06 full-weight chat row:
+`enable_thinking=false` is still intentionally forced onto the thinking path
+for this bundle. The run recalled `sapphire-42`, but turn 2 hit the token
+budget with the answer in `.reasoning` and an empty `.chunk`. Osaurus must
+surface this as a reasoning-only/length-finished state or allocate a larger
+budget; do not treat empty visible content as failed generation for DSV4.
+
 ## Multi-turn caveats
 
 - Pool buffers (compressor + indexer pools, per-branch
   incomplete-window buffer state) DO survive disk round-trip and prefix
-  cache restoration as of 2026-05-04 (`LayerKind.deepseekV4 = 7`). The
+  cache restoration as of 2026-05-06 (`LayerKind.deepseekV4 = 7` plus
+  `__dsv4_{layer}_nilmask__`). The
   host does NOT need to do anything special to enable this; passing the
   same `cache: [KVCache]` array across turns just works.
 - Pre-2026-05-04 builds had a known bug where `DeepseekV4Cache.trim(_:)`

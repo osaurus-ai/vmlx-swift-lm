@@ -393,10 +393,11 @@ public final class JangPressMmapTier: @unchecked Sendable {
     private static let switchMlpRegex = try! NSRegularExpression(
         pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.mlp\.switch_mlp\.(?:gate|up|down)_proj\.weight$"#)
 
-    // Pattern B — Mistral 4 / DSV3.x / Kimi K2 per-expert layout:
+    // Pattern B — Mistral 4 / DSV3.x / Kimi K2 / Ling per-expert layout:
     //   [<vlPrefix>]layers.<L>.mlp.experts.<E>.<gate|up|down>_proj.weight
+    //   [<vlPrefix>]layers.<L>.mlp.experts.<E>.<gate|up|down>_proj.tq_packed
     private static let perExpertMlpRegex = try! NSRegularExpression(
-        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:gate|up|down)_proj\.weight$"#)
+        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:gate|up|down)_proj\.(?:weight|tq_packed|tq_norms)$"#)
 
     // Pattern C — Laguna / Qwen3.6 / MiniMax JANGTQ stacked:
     //   [<vlPrefix>]layers.<L>.mlp.experts.<gate_up_proj|down_proj>.tq_packed
@@ -412,36 +413,48 @@ public final class JangPressMmapTier: @unchecked Sendable {
     // TQ-packed, one stacked tile per layer per projection):
     //   [<vlPrefix>]layers.<L>.mlp.switch_mlp.<gate|up|down>_proj.tq_packed
     private static let switchMlpJangtqRegex = try! NSRegularExpression(
-        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.mlp\.switch_mlp\.(?:gate|up|down)_proj\.tq_packed$"#)
+        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.mlp\.switch_mlp\.(?:gate|up|down)_proj\.(?:tq_packed|tq_norms)$"#)
+
+    // Pattern N — Gemma 4 VLM JANG/SWA MoE stacked:
+    //   [<vlPrefix>]layers.<L>.switch_mlp.<gate|up|down>_proj.*
+    // Gemma's exported text tower omits the `.mlp.` namespace used by
+    // Qwen/Laguna, but it is still a stacked expert bank on axis 0.
+    private static let gemmaSwitchMlpRegex = try! NSRegularExpression(
+        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.switch_mlp\.(?:gate|up|down)_proj\.(?:weight|scales|biases|tq_packed|tq_norms)$"#)
 
     // Pattern H — MiniMax M2 / M2.7 per-expert JANGTQ:
     //   [<vlPrefix>]layers.<L>.block_sparse_moe.experts.<E>.w[123].tq_packed
     private static let minimaxBlockSparseRegex = try! NSRegularExpression(
-        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w[123]\.tq_packed$"#)
+        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w[123]\.(?:tq_packed|tq_norms)$"#)
 
     // Pattern I — MiniMax affine JANG (no .tq_packed suffix):
     //   [<vlPrefix>]layers.<L>.block_sparse_moe.experts.<E>.w[123].weight
     private static let minimaxBlockSparseAffineRegex = try! NSRegularExpression(
         pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w[123]\.weight$"#)
 
+    // Pattern O — MiniMax M2.7 JangPressPrestacker overlay:
+    //   [<vlPrefix>]layers.<L>.block_sparse_moe.switch_mlp.<gate|up|down>_proj.*
+    private static let minimaxBlockSparseSwitchMlpRegex = try! NSRegularExpression(
+        pattern: #"^"# + vlPrefix + #"layers\.(\d+)\.block_sparse_moe\.switch_mlp\.(?:gate|up|down)_proj\.(?:weight|scales|biases|tq_packed|tq_norms)$"#)
+
     // Pattern J — Nemotron Omni / Cascade nemotron_h JANGTQ:
     //   backbone.layers.<L>.mixer.experts.<E>.<gate|up|down>_proj.tq_packed
     // Nvidia uses `backbone.layers` + `mixer` (since hybrid SSM/attn
     // mixer pattern), with the same projection trio as Qwen.
     private static let nemotronMixerRegex = try! NSRegularExpression(
-        pattern: #"^backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\.(?:gate|up|down)_proj\.tq_packed$"#)
+        pattern: #"^backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\.(?:gate|up|down)_proj\.(?:tq_packed|tq_norms)$"#)
 
     // Pattern K — Nemotron affine variant:
     //   backbone.layers.<L>.mixer.experts.<E>.<gate|up|down>_proj.weight
     private static let nemotronMixerAffineRegex = try! NSRegularExpression(
         pattern: #"^backbone\.layers\.(\d+)\.mixer\.experts\.(\d+)\.(?:gate|up|down)_proj\.weight$"#)
 
-    // Pattern L — Nemotron MXFP4 stacked switch_mlp (one tile per layer):
-    //   backbone.layers.<L>.mixer.switch_mlp.<fc1|fc2>.weight
-    // The .biases and .scales sidecars are tiny — only .weight matters
-    // for compression-target purposes.
+    // Pattern L — Nemotron stacked switch_mlp (one tile per layer):
+    //   backbone.layers.<L>.mixer.switch_mlp.<fc1|fc2>.(weight|tq_packed|tq_norms)
+    // JangPressPrestacker rewrites per-expert Nemotron JANGTQ tensors
+    // into this `fc1/fc2.tq_*` layout.
     private static let nemotronSwitchMlpRegex = try! NSRegularExpression(
-        pattern: #"^backbone\.layers\.(\d+)\.mixer\.switch_mlp\.fc[12]\.weight$"#)
+        pattern: #"^backbone\.layers\.(\d+)\.mixer\.switch_mlp\.fc[12]\.(?:weight|tq_packed|tq_norms)$"#)
 
     // Pattern M — Nemotron Cascade-2 affine stacked switch_mlp:
     //   backbone.layers.<L>.mixer.switch_mlp.<gate|up|down>_proj.weight
@@ -461,12 +474,17 @@ public final class JangPressMmapTier: @unchecked Sendable {
     //
     //   layers.<L>.ffn.experts.<E>.<w1|w2|w3>.tq_packed
     private static let dsv4PerExpertRegex = try! NSRegularExpression(
-        pattern: #"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w[123]\.tq_packed$"#)
+        pattern: #"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(?:w[123]|(?:gate|up|down)_proj)\.(?:tq_packed|tq_norms)$"#)
 
     // Pattern F — DeepSeek V4 per-expert affine (e.g. JANG_2L of DSV4):
     //   layers.<L>.ffn.experts.<E>.<w1|w2|w3>.weight
     private static let dsv4PerExpertAffineRegex = try! NSRegularExpression(
-        pattern: #"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w[123]\.weight$"#)
+        pattern: #"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(?:w[123]|(?:gate|up|down)_proj)\.weight$"#)
+
+    // Pattern P — DeepSeek V3/V4 canonical prestacked JANGTQ:
+    //   layers.<L>.ffn.switch_mlp.<gate|up|down>_proj.*
+    private static let deepseekFfnSwitchMlpRegex = try! NSRegularExpression(
+        pattern: #"^layers\.(\d+)\.ffn\.switch_mlp\.(?:gate|up|down)_proj\.(?:weight|scales|biases|tq_packed|tq_norms)$"#)
 
     /// Parse a tensor name and return (layer, expert) if it's a routed
     /// expert tile, else nil. For stacked-expert layouts (patterns A,
@@ -482,8 +500,10 @@ public final class JangPressMmapTier: @unchecked Sendable {
     public static func isStackedTensorName(_ name: String) -> Bool {
         let range = NSRange(name.startIndex..<name.endIndex, in: name)
         for regex in [switchMlpRegex, jangtqStackedRegex, affineStackedRegex,
-                      switchMlpJangtqRegex, nemotronSwitchMlpRegex,
-                      nemotronSwitchMlpAffineRegex] {
+                      switchMlpJangtqRegex, gemmaSwitchMlpRegex,
+                      minimaxBlockSparseSwitchMlpRegex,
+                      nemotronSwitchMlpRegex, nemotronSwitchMlpAffineRegex,
+                      deepseekFfnSwitchMlpRegex] {
             if regex.firstMatch(in: name, range: range) != nil { return true }
         }
         return false
@@ -509,10 +529,13 @@ public final class JangPressMmapTier: @unchecked Sendable {
             }
         }
 
-        // Stacked patterns (A + C + D + G + L). Each whole layer = one tile;
+        // Stacked patterns. Each whole layer = one tile;
         // synthetic expert id 0.
         for regex in [switchMlpRegex, jangtqStackedRegex, affineStackedRegex,
-                      switchMlpJangtqRegex, nemotronSwitchMlpRegex, nemotronSwitchMlpAffineRegex] {
+                      switchMlpJangtqRegex, gemmaSwitchMlpRegex,
+                      minimaxBlockSparseSwitchMlpRegex,
+                      nemotronSwitchMlpRegex, nemotronSwitchMlpAffineRegex,
+                      deepseekFfnSwitchMlpRegex] {
             if let m = regex.firstMatch(in: name, range: range), m.numberOfRanges >= 2 {
                 guard
                     let lr = Range(m.range(at: 1), in: name),

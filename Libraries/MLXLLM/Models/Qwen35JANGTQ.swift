@@ -472,13 +472,24 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
         self.topK = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-        _switchMLP.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts,
-            bits: args.mxtqBits,
-            seed: args.mxtqSeed
-        )
+        if JANGTQStreamingExperts.isEnabled {
+            _switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.numExperts,
+                gateUpBits: args.mxtqBits,
+                downBits: args.mxtqBits,
+                seed: args.mxtqSeed,
+                layerIdx: layerIdx)
+        } else {
+            _switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.numExperts,
+                bits: args.mxtqBits,
+                seed: args.mxtqSeed
+            )
+        }
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
             dimensions: args.hiddenSize,
@@ -501,8 +512,13 @@ final class Qwen35JANGTQSparseMoeBlock: Module, UnaryLayer {
         let scores = routed[1]
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
 
-        let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined: MLXArray
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            combined = streaming.reduced(x, indices: inds, scores: scores)
+        } else {
+            let y = switchMLP(x, inds)
+            combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        }
 
         let sharedY = sharedExpert(x)
         let gatedSharedY = qwen35JANGTQCompiledSigmoidGate(sharedExpertGate(x), sharedY)
@@ -740,6 +756,13 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
                     for kind in ["tq_packed", "tq_norms"] {
                         let first = "\(prefix).experts.0.\(orig).\(kind)"
                         guard weights[first] != nil else { continue }
+                        if JANGTQStreamingExperts.isEnabled {
+                            for e in 0 ..< configuration.numExperts {
+                                weights.removeValue(
+                                    forKey: "\(prefix).experts.\(e).\(orig).\(kind)")
+                            }
+                            continue
+                        }
                         let target = "\(prefix).switch_mlp.\(updated).\(kind)"
                         if weights[target] != nil {
                             for e in 0 ..< configuration.numExperts {
@@ -752,7 +775,7 @@ public class Qwen35JANGTQTextModel: Module, LLMModel, KVCacheDimensionProvider {
                             weights.removeValue(
                                 forKey: "\(prefix).experts.\(e).\(orig).\(kind)")!
                         }
-                        weights[target] = MLX.stacked(stacked)
+                        weights[target] = loadTimeMaterializedStacked(stacked)
                     }
                 }
             }

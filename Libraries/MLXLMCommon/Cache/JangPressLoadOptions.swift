@@ -136,4 +136,19 @@ public struct JangPressRuntime: Sendable {
     public var isActive: Bool {
         mmap != nil || embed != nil
     }
+
+    /// Feed prompt token ids into the embed/lm_head Zipfian tier and,
+    /// once enough distinct ids have been observed, schedule cold-row
+    /// advice off the request hot path. Safe to call unconditionally;
+    /// it is a no-op when JangPress or the embed tier is disabled.
+    public func recordPromptTokenActivity(_ tokenIds: [Int]) {
+        guard let embed, !tokenIds.isEmpty else { return }
+        embed.recordTokenActivity(tokenIds)
+
+        let stats = embed.snapshotIfBuilt()
+        guard stats.distinctTokensSeen >= 256 else { return }
+        Task.detached(priority: .background) { [weak embed] in
+            embed?.applyZipfianAdvise()
+        }
+    }
 }

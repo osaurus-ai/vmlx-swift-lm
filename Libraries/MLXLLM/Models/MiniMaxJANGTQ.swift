@@ -16,6 +16,47 @@ import MLX
 import MLXNN
 import MLXLMCommon
 
+// MARK: - Compiled router fast path
+
+private struct MiniMaxJANGTQRouterKey: Hashable {
+    let numExperts: Int
+    let k: Int
+}
+
+private nonisolated(unsafe) var miniMaxJANGTQRouterCache:
+    [MiniMaxJANGTQRouterKey: ([MLXArray]) -> [MLXArray]] = [:]
+private let miniMaxJANGTQRouterLock = NSLock()
+
+private func miniMaxJANGTQRouter(numExperts: Int, k: Int) -> ([MLXArray]) -> [MLXArray] {
+    let key = MiniMaxJANGTQRouterKey(numExperts: numExperts, k: k)
+    miniMaxJANGTQRouterLock.lock()
+    defer { miniMaxJANGTQRouterLock.unlock() }
+    if let cached = miniMaxJANGTQRouterCache[key] { return cached }
+
+    let topStart = numExperts - k
+    let body: ([MLXArray]) -> [MLXArray] = { args in
+        let gates = args[0]
+        let bias = args[1]
+        let originalScores = sigmoid(gates)
+        let biasedScores = originalScores + bias
+        let inds = argPartition(biasedScores, kth: topStart, axis: -1)[
+            .ellipsis, topStart ..< numExperts]
+        var scores = takeAlong(originalScores, inds, axis: -1)
+        scores = scores
+            / (scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype))
+        return [inds, scores]
+    }
+
+    let raw = ProcessInfo.processInfo.environment["VMLINUX_MINIMAX_ROUTER_COMPILE"]?
+        .lowercased()
+    let enabled = raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+    let router = (HardwareInfo.isCompiledDecodeSupported && enabled)
+        ? compile(shapeless: false, body)
+        : body
+    miniMaxJANGTQRouterCache[key] = router
+    return router
+}
+
 // MARK: - Attention (identical to MiniMax.swift)
 
 private class MiniMaxJANGTQAttention: Module {
@@ -24,10 +65,10 @@ private class MiniMaxJANGTQAttention: Module {
     let numAttentionHeads: Int
     let numKeyValueHeads: Int
     let headDim: Int
+    let qOutDim: Int
+    let kvOutDim: Int
 
-    @ModuleInfo(key: "q_proj") var wq: Linear
-    @ModuleInfo(key: "k_proj") var wk: Linear
-    @ModuleInfo(key: "v_proj") var wv: Linear
+    @ModuleInfo(key: "qkv_proj") var wqkv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm?
@@ -41,11 +82,11 @@ private class MiniMaxJANGTQAttention: Module {
         self.numKeyValueHeads = args.kvHeads
         self.headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
         self.scale = pow(Float(headDim), -0.5)
+        self.qOutDim = numAttentionHeads * headDim
+        self.kvOutDim = numKeyValueHeads * headDim
 
-        _wq.wrappedValue = Linear(args.hiddenSize, numAttentionHeads * headDim, bias: false)
-        _wk.wrappedValue = Linear(args.hiddenSize, numKeyValueHeads * headDim, bias: false)
-        _wv.wrappedValue = Linear(args.hiddenSize, numKeyValueHeads * headDim, bias: false)
-        _wo.wrappedValue = Linear(numAttentionHeads * headDim, args.hiddenSize, bias: false)
+        _wqkv.wrappedValue = Linear(args.hiddenSize, qOutDim + 2 * kvOutDim, bias: false)
+        _wo.wrappedValue = Linear(qOutDim, args.hiddenSize, bias: false)
 
         if args.useQkNorm {
             _qNorm.wrappedValue = RMSNorm(
@@ -66,9 +107,10 @@ private class MiniMaxJANGTQAttention: Module {
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
-        var queries = wq(x)
-        var keys = wk(x)
-        let values = wv(x)
+        let qkv = wqkv(x)
+        var queries = qkv[.ellipsis, 0 ..< qOutDim]
+        var keys = qkv[.ellipsis, qOutDim ..< (qOutDim + kvOutDim)]
+        let values = qkv[.ellipsis, (qOutDim + kvOutDim) ..< (qOutDim + 2 * kvOutDim)]
 
         if let qNorm, let kNorm {
             queries = qNorm(queries)
@@ -113,14 +155,25 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
         // result as the pre-2026-05-04 uniform-bit constructor.
         let gateUpBits = args.mxtqGateUpBits ?? args.mxtqBits
         let downBits = args.mxtqDownBits ?? args.mxtqBits
-        _switchMLP.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.intermediateSize,
-            numExperts: args.numLocalExperts,
-            gateUpBits: gateUpBits,
-            downBits: downBits,
-            seed: args.mxtqSeed
-        )
+        if JANGTQStreamingExperts.isEnabled {
+            _switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.intermediateSize,
+                numExperts: args.numLocalExperts,
+                gateUpBits: gateUpBits,
+                downBits: downBits,
+                seed: args.mxtqSeed,
+                layerIdx: layerIdx)
+        } else {
+            _switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.intermediateSize,
+                numExperts: args.numLocalExperts,
+                gateUpBits: gateUpBits,
+                downBits: downBits,
+                seed: args.mxtqSeed
+            )
+        }
         _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([args.numLocalExperts])
     }
 
@@ -137,19 +190,16 @@ private class MiniMaxJANGTQSparseMoeBlock: Module {
         // which already does this correctly.)
         let gates = gate(x.asType(.float32))
 
-        var scores = sigmoid(gates)
-        let originalScores = scores
-        scores = scores + eScoreCorrectionBias
-
-        let k = numExpertsPerTok
-        let inds = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        let routed = miniMaxJANGTQRouter(numExperts: gates.dim(-1), k: numExpertsPerTok)([
+            gates, eScoreCorrectionBias,
+        ])
+        let inds = routed[0]
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: inds)
-        scores = takeAlong(originalScores, inds, axis: -1)
+        let scores = routed[1].asType(x.dtype)
 
-        scores = scores
-            / (scores.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: scores.dtype))
-        scores = scores.asType(x.dtype)
-
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            return streaming.reduced(x, indices: inds, scores: scores)
+        }
         let y = switchMLP(x, inds)
         return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
     }
@@ -256,6 +306,52 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitized[key] = nil
         }
 
+        // MiniMax keeps attention dense/affine while the MoE block is
+        // TurboQuant. Fuse q/k/v at load time to match the optimized affine
+        // path and avoid two extra decode matmul dispatches per layer.
+        for layerIndex in 0 ..< configuration.hiddenLayers {
+            let prefix = "model.layers.\(layerIndex).self_attn"
+            let qKey = "\(prefix).q_proj"
+            let kKey = "\(prefix).k_proj"
+            let vKey = "\(prefix).v_proj"
+            let fusedKey = "\(prefix).qkv_proj"
+
+            guard let qW = sanitized["\(qKey).weight"],
+                  let kW = sanitized["\(kKey).weight"],
+                  let vW = sanitized["\(vKey).weight"]
+            else { continue }
+
+            let qPacked = qW.dim(qW.ndim - 1)
+            let kPacked = kW.dim(kW.ndim - 1)
+            let vPacked = vW.dim(vW.ndim - 1)
+            if qPacked != kPacked || kPacked != vPacked {
+                fatalError(
+                    """
+                    [MiniMaxJANGTQ sanitize] layer \(layerIndex) self_attn has \
+                    mismatched bit widths across q/k/v projections \
+                    (q packed_in=\(qPacked), k=\(kPacked), v=\(vPacked)). \
+                    QKV fusion requires identical bit widths.
+                    """
+                )
+            }
+
+            sanitized["\(fusedKey).weight"] = concatenated([qW, kW, vW], axis: 0)
+            sanitized.removeValue(forKey: "\(qKey).weight")
+            sanitized.removeValue(forKey: "\(kKey).weight")
+            sanitized.removeValue(forKey: "\(vKey).weight")
+
+            for suffix in ["scales", "biases"] {
+                let qS = sanitized["\(qKey).\(suffix)"]
+                let kS = sanitized["\(kKey).\(suffix)"]
+                let vS = sanitized["\(vKey).\(suffix)"]
+                guard let qS, let kS, let vS else { continue }
+                sanitized["\(fusedKey).\(suffix)"] = concatenated([qS, kS, vS], axis: 0)
+                sanitized.removeValue(forKey: "\(qKey).\(suffix)")
+                sanitized.removeValue(forKey: "\(kKey).\(suffix)")
+                sanitized.removeValue(forKey: "\(vKey).\(suffix)")
+            }
+        }
+
         let probe = "model.layers.0.block_sparse_moe.experts.0.w1.tq_packed"
         guard sanitized[probe] != nil else { return sanitized }
 
@@ -268,6 +364,13 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                 for key in ["tq_packed", "tq_norms"] {
                     let first = "\(prefix).experts.0.\(orig).\(key)"
                     guard sanitized[first] != nil else { continue }
+                    if JANGTQStreamingExperts.isEnabled {
+                        for e in 0 ..< configuration.numLocalExperts {
+                            sanitized.removeValue(
+                                forKey: "\(prefix).experts.\(e).\(orig).\(key)")
+                        }
+                        continue
+                    }
                     let target = "\(prefix).switch_mlp.\(updated).\(key)"
                     if sanitized[target] != nil {
                         for e in 0 ..< configuration.numLocalExperts {
@@ -280,7 +383,7 @@ public class MiniMaxJANGTQModel: Module, LLMModel, KVCacheDimensionProvider {
                         sanitized.removeValue(
                             forKey: "\(prefix).experts.\(e).\(orig).\(key)")!
                     }
-                    sanitized[target] = MLX.stacked(stacked)
+                    sanitized[target] = loadTimeMaterializedStacked(stacked)
                 }
             }
         }
@@ -350,6 +453,134 @@ public struct MiniMaxJANGTQConfiguration: Codable, Sendable {
         case mxtqSeed = "mxtq_seed"
         case mxtqGateUpBits = "mxtq_gate_up_bits"
         case mxtqDownBits = "mxtq_down_bits"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "minimax_m2"
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
+        numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        numLocalExperts = try container.decode(Int.self, forKey: .numLocalExperts)
+        sharedIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .sharedIntermediateSize) ?? 0
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        rotaryDim = try container.decode(Int.self, forKey: .rotaryDim)
+        vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        scoringFunc = try container.decodeIfPresent(String.self, forKey: .scoringFunc) ?? "sigmoid"
+        headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
+        useQkNorm = try container.decodeIfPresent(Bool.self, forKey: .useQkNorm) ?? true
+
+        weightFormat =
+            try container.decodeIfPresent(String.self, forKey: .weightFormat) ?? "mxtq"
+        mxtqSeed = try container.decodeIfPresent(Int.self, forKey: .mxtqSeed) ?? 42
+        mxtqGateUpBits = try container.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits)
+        mxtqDownBits = try container.decodeIfPresent(Int.self, forKey: .mxtqDownBits)
+
+        if let routed = try container.decodeIfPresent(RoutedMxtqBits.self, forKey: .mxtqBits) {
+            apply(routedBits: routed)
+        } else if let routed = Self.peekQuantizationRoutedBits(decoder) {
+            apply(routedBits: routed)
+        } else {
+            mxtqBits = 2
+        }
+    }
+
+    private mutating func apply(routedBits: RoutedMxtqBits) {
+        switch routedBits {
+        case .uniform(let bits):
+            mxtqBits = bits
+        case .projected(let gateUp, let down):
+            mxtqBits = gateUp ?? down ?? 2
+            if mxtqGateUpBits == nil { mxtqGateUpBits = gateUp }
+            if mxtqDownBits == nil { mxtqDownBits = down }
+        }
+    }
+}
+
+private enum MiniMaxQuantizationKey: String, CodingKey {
+    case quantization
+}
+
+private struct MiniMaxQuantizationPeek: Decodable {
+    let bits: Int?
+    let routedExpertBits: RoutedMxtqBits?
+    let mxtqBits: MxtqBitsSpec?
+
+    enum CodingKeys: String, CodingKey {
+        case bits
+        case routedExpertBits = "routed_expert_bits"
+        case mxtqBits = "mxtq_bits"
+    }
+}
+
+private extension MiniMaxJANGTQConfiguration {
+    static func peekQuantizationRoutedBits(_ decoder: Decoder) -> RoutedMxtqBits? {
+        guard let outer = try? decoder.container(keyedBy: MiniMaxQuantizationKey.self),
+              let q = try? outer.decodeIfPresent(
+                MiniMaxQuantizationPeek.self, forKey: .quantization)
+        else { return nil }
+        if let routed = q.routedExpertBits {
+            return routed
+        }
+        if let routed = q.mxtqBits?.routed {
+            return routed
+        }
+        guard let bits = q.bits, bits == 2 || bits == 4 else { return nil }
+        return .uniform(bits)
+    }
+}
+
+private struct MxtqBitsSpec: Decodable {
+    let routed: RoutedMxtqBits?
+
+    enum CodingKeys: String, CodingKey {
+        case routedExpert = "routed_expert"
+        case routed
+    }
+
+    init(from decoder: Decoder) throws {
+        if let flat = try? Int(from: decoder) {
+            routed = .uniform(flat)
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        routed =
+            (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routedExpert))
+            ?? (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routed))
+    }
+}
+
+private enum RoutedMxtqBits: Decodable {
+    case uniform(Int)
+    case projected(gateUp: Int?, down: Int?)
+
+    enum CodingKeys: String, CodingKey {
+        case gateProj = "gate_proj"
+        case gateUpProj = "gate_up_proj"
+        case upProj = "up_proj"
+        case downProj = "down_proj"
+    }
+
+    init(from decoder: Decoder) throws {
+        if let flat = try? Int(from: decoder) {
+            self = .uniform(flat)
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let gate = try container.decodeIfPresent(Int.self, forKey: .gateProj)
+        let gateUp = try container.decodeIfPresent(Int.self, forKey: .gateUpProj)
+        let up = try container.decodeIfPresent(Int.self, forKey: .upProj)
+        let down = try container.decodeIfPresent(Int.self, forKey: .downProj)
+        self = .projected(gateUp: gateUp ?? gate ?? up, down: down)
     }
 }
 

@@ -82,7 +82,7 @@ struct JangPressMmapTierTests {
 
     // MARK: - Tests
 
-    @Test("regex parses all 13 expert tile layouts (A-M)")
+    @Test("regex parses current expert tile layouts")
     func regexParsesAllLayouts() {
         // Pattern A — Qwen/GLM/MiniMax fp16 stacked
         let switchMlp = "model.layers.13.mlp.switch_mlp.up_proj.weight"
@@ -95,6 +95,17 @@ struct JangPressMmapTierTests {
         let r2 = JangPressMmapTier.parseRoutedExpertName(perExpertMlp)
         #expect(r2?.layer == 7)
         #expect(r2?.expert == 42)
+
+        // Pattern B also covers Ling-style per-expert TQ tensors.
+        let lingTq = "model.layers.7.mlp.experts.42.gate_proj.tq_packed"
+        let r2b = JangPressMmapTier.parseRoutedExpertName(lingTq)
+        #expect(r2b?.layer == 7)
+        #expect(r2b?.expert == 42)
+
+        let lingNorms = "model.layers.7.mlp.experts.42.up_proj.tq_norms"
+        let r2c = JangPressMmapTier.parseRoutedExpertName(lingNorms)
+        #expect(r2c?.layer == 7)
+        #expect(r2c?.expert == 42)
 
         // Pattern C — Laguna / Qwen3.6 JANGTQ stacked
         let jangtqStacked = "model.layers.5.mlp.experts.gate_up_proj.tq_packed"
@@ -132,6 +143,11 @@ struct JangPressMmapTierTests {
         #expect(r7b?.layer == 4)
         #expect(r7b?.expert == 0)
 
+        let qwen35Norms = "model.layers.4.mlp.switch_mlp.gate_proj.tq_norms"
+        let r7n = JangPressMmapTier.parseRoutedExpertName(qwen35Norms)
+        #expect(r7n?.layer == 4)
+        #expect(r7n?.expert == 0)
+
         // Pattern D / Qwen3.6 JANG_2L deep-VL prefix:
         //   model.language_model.layers.<L>... (NEW iter 18)
         let qwen36deep = "model.language_model.layers.21.mlp.switch_mlp.down_proj.weight"
@@ -150,6 +166,13 @@ struct JangPressMmapTierTests {
         let r9 = JangPressMmapTier.parseRoutedExpertName(minimaxAff)
         #expect(r9?.layer == 4)
         #expect(r9?.expert == 0)
+
+        // Pattern O — MiniMax prestacker overlay, stacked on axis 0.
+        let minimaxPrestacked =
+            "model.layers.12.block_sparse_moe.switch_mlp.gate_proj.tq_packed"
+        let r9b = JangPressMmapTier.parseRoutedExpertName(minimaxPrestacked)
+        #expect(r9b?.layer == 12)
+        #expect(r9b?.expert == 0)
 
         // Pattern J — Nemotron Omni JANGTQ per-expert (NEW iter 17)
         let nemotron = "backbone.layers.34.mixer.experts.17.up_proj.tq_packed"
@@ -174,6 +197,18 @@ struct JangPressMmapTierTests {
         let r13 = JangPressMmapTier.parseRoutedExpertName(cascade2)
         #expect(r13?.layer == 29)
         #expect(r13?.expert == 0)
+
+        // Pattern N — Gemma 4 text/VLM omits `.mlp.` before switch_mlp.
+        let gemma4 = "model.language_model.layers.8.switch_mlp.up_proj.tq_norms"
+        let r14 = JangPressMmapTier.parseRoutedExpertName(gemma4)
+        #expect(r14?.layer == 8)
+        #expect(r14?.expert == 0)
+
+        // Pattern P — DeepSeek V3/V4 canonical prestacked overlay.
+        let dsv4Stacked = "layers.19.ffn.switch_mlp.down_proj.tq_packed"
+        let r15 = JangPressMmapTier.parseRoutedExpertName(dsv4Stacked)
+        #expect(r15?.layer == 19)
+        #expect(r15?.expert == 0)
 
         // DSV4 hash-routed layers L0-L2 use the same physical naming
         // as routed layers — distinguished only at routing time, not

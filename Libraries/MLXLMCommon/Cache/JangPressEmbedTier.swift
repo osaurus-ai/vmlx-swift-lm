@@ -118,6 +118,7 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     /// the Zipfian profile.
     private var tokenFrequency: [Int: UInt64] = [:]
     private var observedSamples: UInt64 = 0
+    private let frequencyLock = NSLock()
 
     /// iter 24: build state machine. Init is now O(1) — actual file I/O
     /// is deferred to `ensureBuilt()` which fires on first use.
@@ -242,20 +243,82 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     // MARK: - Routing-time API
 
     /// Per-decode-step hook. Records token activity for the warm-up
-    /// profile. Cheap (single dict update).
+    /// profile. **RAM/CPU safety:**
+    ///
+    /// Long prompts can carry tens of thousands of token ids. Updating
+    /// the frequency map for every token resizes/copies the dictionary
+    /// repeatedly and can put JangPress work back onto the TTFT path.
+    /// For long arrays we sample every Nth token, and cap the number of
+    /// distinct token ids we retain. Existing ids continue to tick after
+    /// the cap; new tail ids are ignored.
+    ///
+    /// Tunables:
+    /// - `VMLX_JANGPRESS_STRIDE_THRESHOLD` default `256`
+    /// - `VMLX_JANGPRESS_TOKEN_STRIDE` default `8`
+    /// - `VMLX_JANGPRESS_MAX_DISTINCT` default `8192`
     public func recordTokenActivity(_ tokenIds: [Int]) {
-        for t in tokenIds {
-            tokenFrequency[t, default: 0] &+= 1
-            observedSamples &+= 1
+        guard !tokenIds.isEmpty else { return }
+        let stride = tokenIds.count >= Self.strideActivationThreshold
+            ? Self.tokenStride
+            : 1
+        let cap = Self.maxDistinctTokens
+
+        frequencyLock.lock()
+        defer { frequencyLock.unlock() }
+
+        var idx = 0
+        while idx < tokenIds.count {
+            let t = tokenIds[idx]
+            if let existing = tokenFrequency[t] {
+                tokenFrequency[t] = existing &+ 1
+                observedSamples &+= 1
+            } else if tokenFrequency.count < cap {
+                tokenFrequency[t] = 1
+                observedSamples &+= 1
+            }
+            idx += stride
         }
+    }
+
+    /// Token-array length above which stride sampling kicks in.
+    private static var strideActivationThreshold: Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_JANGPRESS_STRIDE_THRESHOLD"],
+           let parsed = Int(raw), parsed > 0
+        {
+            return parsed
+        }
+        return 256
+    }
+
+    /// Stride for `recordTokenActivity` sampling. Min 1.
+    private static var tokenStride: Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_JANGPRESS_TOKEN_STRIDE"],
+           let parsed = Int(raw), parsed > 0
+        {
+            return parsed
+        }
+        return 8
+    }
+
+    /// Hard cap on distinct-token entries in `tokenFrequency`.
+    private static var maxDistinctTokens: Int {
+        if let raw = ProcessInfo.processInfo.environment["VMLX_JANGPRESS_MAX_DISTINCT"],
+           let parsed = Int(raw), parsed > 0
+        {
+            return parsed
+        }
+        return 8192
     }
 
     /// After warm-up, set advise on the bottom (1 - hotPercent)% of
     /// vocab rows to MADV_DONTNEED. The hottest rows are kept
     /// MADV_WILLNEED. Idempotent — safe to call multiple times.
     public func applyZipfianAdvise() {
-        guard !tokenFrequency.isEmpty else { return }
-        let sorted = tokenFrequency.sorted { $0.value > $1.value }
+        let frequencySnapshot: [Int: UInt64] = frequencyLock.withLock {
+            tokenFrequency
+        }
+        guard !frequencySnapshot.isEmpty else { return }
+        let sorted = frequencySnapshot.sorted { $0.value > $1.value }
         let total = sorted.count
         guard let embed = embedTokens else { return }
 
@@ -293,13 +356,16 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     }
 
     public func snapshot() -> Stats {
-        Stats(
+        let (samples, distinct) = frequencyLock.withLock {
+            (observedSamples, tokenFrequency.count)
+        }
+        return Stats(
             hasEmbedTokens: embedTokens != nil,
             hasLMHead: lmHead != nil,
             vocabSize: embedTokens?.vocabSize ?? 0,
             hiddenSize: embedTokens?.hiddenSize ?? 0,
-            observedTokenSamples: observedSamples,
-            distinctTokensSeen: tokenFrequency.count,
+            observedTokenSamples: samples,
+            distinctTokensSeen: distinct,
             hotPercent: config.hotPercent)
     }
 
@@ -308,13 +374,16 @@ public final class JangPressEmbedTier: @unchecked Sendable {
     /// uses the tier (so /v1/cache/jangpress doesn't force a full
     /// sniff pass just for stats).
     public func snapshotIfBuilt() -> Stats {
+        let (samples, distinct) = frequencyLock.withLock {
+            (observedSamples, tokenFrequency.count)
+        }
         buildLock.lock(); defer { buildLock.unlock() }
         if !didBuild {
             return Stats(
                 hasEmbedTokens: false, hasLMHead: false,
                 vocabSize: 0, hiddenSize: 0,
-                observedTokenSamples: observedSamples,
-                distinctTokensSeen: tokenFrequency.count,
+                observedTokenSamples: samples,
+                distinctTokensSeen: distinct,
                 hotPercent: config.hotPercent)
         }
         return Stats(
@@ -322,8 +391,8 @@ public final class JangPressEmbedTier: @unchecked Sendable {
             hasLMHead: _lmHead != nil,
             vocabSize: _embedTokens?.vocabSize ?? 0,
             hiddenSize: _embedTokens?.hiddenSize ?? 0,
-            observedTokenSamples: observedSamples,
-            distinctTokensSeen: tokenFrequency.count,
+            observedTokenSamples: samples,
+            distinctTokensSeen: distinct,
             hotPercent: config.hotPercent)
     }
 }

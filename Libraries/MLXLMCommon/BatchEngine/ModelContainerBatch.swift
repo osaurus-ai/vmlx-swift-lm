@@ -39,12 +39,11 @@ extension ModelContainer {
         // CacheCoordinator is Sendable so this is safe.
         let coordinator = self.cacheCoordinator
 
-        // Build the engine inside the serial access container so ModelContext
-        // (which is non-Sendable) doesn't cross isolation boundaries.
+        // Build the engine inside the serial access container so it observes
+        // the same model-access discipline as generation.
         return await perform { context in
-            nonisolated(unsafe) let ctx = context
             return BatchEngine(
-                context: ctx,
+                context: context,
                 maxBatchSize: maxBatchSize,
                 memoryPurgeInterval: memoryPurgeInterval,
                 cacheCoordinator: coordinator

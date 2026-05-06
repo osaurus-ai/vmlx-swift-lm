@@ -217,6 +217,7 @@ public struct BailingHybridConfiguration: Codable, Sendable {
     public var isJANGTQ: Bool {
         weightFormat.lowercased() == "mxtq"
             || weightFormat.lowercased() == "jangtq2"
+            || weightFormat.lowercased() == "jangtq3"
             || weightFormat.lowercased() == "jangtq4"
     }
 
@@ -677,9 +678,9 @@ class BailingMLAAttention: Module {
             (keys, values) = cache.update(keys: keys, values: values)
         }
 
-        let output = attentionWithCacheUpdate(
+        let output = mlaScaledDotProductAttention(
             queries: queries, keys: keys, values: values,
-            cache: cache, scale: scale, mask: mask
+            scale: scale, mask: mask
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -837,8 +838,13 @@ class BailingSparseMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x)
-        var out = switchMLP(x, indices)
-        out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        var out: MLXArray
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            out = streaming.reduced(x, indices: indices, scores: weights)
+        } else {
+            out = switchMLP(x, indices)
+            out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        }
         if let shared = sharedExperts {
             out = out + shared(x)
         }
@@ -852,21 +858,34 @@ class BailingSparseMoE: Module, UnaryLayer {
 /// triggers this path via `BailingDecoderLayer` dispatch.
 class BailingSparseMoEJANGTQ: Module, UnaryLayer {
     let numExpertsPerTok: Int
+    let layerIdx: Int
     @ModuleInfo(key: "switch_mlp") var switchMLP: TurboQuantSwitchGLU
     @ModuleInfo(key: "gate") var gate: BailingMoEGate
     @ModuleInfo(key: "shared_experts") var sharedExperts: BailingMLP?
 
-    init(_ args: BailingHybridConfiguration) {
+    init(_ args: BailingHybridConfiguration, layerIdx: Int) {
         self.numExpertsPerTok = args.numExpertsPerTok
-        self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: args.hiddenSize,
-            hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts,
-            bits: args.mxtqBits,
-            seed: args.mxtqSeed
-            // swigluLimit defaults to 0 — Bailing/Ling does NOT use
-            // the limited-SwiGLU clamp DSV4 needs.
-        )
+        self.layerIdx = layerIdx
+        if JANGTQStreamingExperts.isEnabled {
+            self._switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.numExperts,
+                gateUpBits: args.mxtqBits,
+                downBits: args.mxtqBits,
+                seed: args.mxtqSeed,
+                layerIdx: layerIdx)
+        } else {
+            self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: args.hiddenSize,
+                hiddenDims: args.moeIntermediateSize,
+                numExperts: args.numExperts,
+                bits: args.mxtqBits,
+                seed: args.mxtqSeed
+                // swigluLimit defaults to 0 — Bailing/Ling does NOT use
+                // the limited-SwiGLU clamp DSV4 needs.
+            )
+        }
         self._gate.wrappedValue = BailingMoEGate(args)
         if args.numSharedExperts > 0, args.moeRouterEnableSharedExpert {
             let sharedDim = (args.moeSharedExpertIntermediateSize
@@ -945,7 +964,7 @@ class BailingDecoderLayer: Module {
         }
         if layerIdx >= args.firstKDenseReplace {
             if args.isJANGTQ {
-                self.mlp = BailingSparseMoEJANGTQ(args)
+                self.mlp = BailingSparseMoEJANGTQ(args, layerIdx: layerIdx)
             } else {
                 self.mlp = BailingSparseMoE(args)
             }
@@ -1122,6 +1141,13 @@ public class BailingHybridModel:
                 for key in ["weight", "scales", "biases", "tq_packed", "tq_norms"] {
                     let first = "\(prefix).mlp.experts.0.\(proj).\(key)"
                     guard out[first] != nil else { continue }
+                    if JANGTQStreamingExperts.isEnabled && (key == "tq_packed" || key == "tq_norms") {
+                        for e in 0..<args.numExperts {
+                            out.removeValue(
+                                forKey: "\(prefix).mlp.experts.\(e).\(proj).\(key)")
+                        }
+                        continue
+                    }
                     var tensors: [MLXArray] = []
                     tensors.reserveCapacity(args.numExperts)
                     for e in 0..<args.numExperts {
@@ -1133,7 +1159,7 @@ public class BailingHybridModel:
                         let stackedKey =
                             "\(prefix).mlp.switch_mlp.\(proj).\(key)"
                         if out[stackedKey] == nil {
-                            let s = stacked(tensors)
+                            let s = loadTimeMaterializedStacked(tensors)
                             out[stackedKey] = s
                             perLayerStacked.append(s)
                         }

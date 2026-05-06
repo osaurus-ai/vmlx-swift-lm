@@ -693,6 +693,21 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
+    /// DSV4's HybridPoolCache carries compressor/indexer pool state in
+    /// addition to the local sliding-window KV. Chunked prefill mutates that
+    /// pool across multiple forwards and has diverged from the Python
+    /// production path, so force a single prepare-forward for this cache
+    /// family unless the caller is only seeding a one-token cache hit.
+    private func effectivePrefillWindow(
+        requested: Int,
+        input: LMInput
+    ) -> Int {
+        guard cache.contains(where: { $0 is HybridPoolCache }) else {
+            return requested
+        }
+        return Swift.max(requested, input.text.tokens.size)
+    }
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -724,7 +739,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
-            try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
+            let promptInput = LMInput(text: y)
+            try prepare(
+                input: promptInput,
+                windowSize: effectivePrefillWindow(
+                    requested: parameters.prefillStepSize,
+                    input: promptInput))
         }
     }
 
@@ -791,6 +811,17 @@ public struct TokenIterator: TokenIteratorProtocol {
         // BaichuanM1, Qwen3.5-VL inherited) now get full L2 disk
         // persistence + paged restore on cache hit.
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
+            if !coordinator.isHybrid {
+                let hasSSM = self.cache.contains { layer in
+                    layer is MambaCache || layer is ArraysCache
+                }
+                if hasSSM {
+                    coordinator.setHybrid(true)
+                    Self.logger.info(
+                        "TokenIterator: coordinator flipped to isHybrid=true"
+                    )
+                }
+            }
             // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
             // Mirror BatchEngine.admit's detection — if the cache has any
             // hybrid pool layer (DSV4 SWA+CSA+HSA), flip the coordinator
@@ -815,6 +846,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                 var restored = false
                 if !blocks.isEmpty {
                     let restoredTokens = restoreLayerData(from: blocks, into: self.cache)
+                    coordinator.release(blocks: blocks)
                     if restoredTokens > 0 {
                         if let ssm = ssmStates {
                             restoreSSMStates(ssm, into: self.cache)
@@ -871,12 +903,81 @@ public struct TokenIterator: TokenIteratorProtocol {
             case .miss:
                 let count = promptTokenIds.count
                 Self.logger.debug("Cache miss for \(count) prompt tokens")
+
+                // 2026-05-05 (Ling-2.6-flash multi-turn fix): coordinator
+                // missed but the cache may already hold a previous turn's
+                // state (e.g. ChatSession reuse path with a hybrid
+                // KVCache + ArraysCache that the multi-tier disk/paged
+                // coordinator can't yet round-trip). Without correcting,
+                // the model double-feeds previously-prefilled tokens onto
+                // the populated cache → wrong RoPE positions on KVCache
+                // layers AND duplicated GLA recurrence on ArraysCache
+                // (Linear-Attn) layers → NaN logits → fatalError SIGKILL.
+                //
+                // We can only safely trim if the new prompt's prefix
+                // matches the cached tokens. Some chat templates (Bailing,
+                // DeepSeek-R1, Qwen3 reasoning) STRIP `<think>...</think>`
+                // content from past assistant turns when re-rendering for
+                // the next turn — so the input on Turn 2 is SHORTER than
+                // what's actually cached (cache still holds the reasoning
+                // tokens that were generated and decoded on Turn 1).
+                //
+                // Detection: if cacheOffset > promptTokenIds.count, the
+                // cache holds content the new prompt doesn't include
+                // (chat-template stripping). We can't safely trim — the
+                // recurrent state encodes context the model would need
+                // to "forget". Reset the cache and prefill the full new
+                // prompt from scratch.
+                if let cacheOffset = self.cache.first?.offset, cacheOffset > 0 {
+                    if cacheOffset > promptTokenIds.count {
+                        // Reasoning-strip mismatch — replace cache entirely.
+                        // Some chat templates (Bailing, DeepSeek-R1, Qwen3
+                        // reasoning) drop `<think>...</think>` blocks from
+                        // past assistant turns when re-rendering for the
+                        // next turn, so the new prompt is SHORTER than what
+                        // was cached. We can't safely trim because we don't
+                        // know exactly which positions to drop. Replace the
+                        // cache with a fresh one — full re-prefill is
+                        // O(prompt) but correct, vs producing garbage.
+                        let resetMsg = "Populated-cache miss: cache offset (\(cacheOffset)) > prompt length (\(promptTokenIds.count)) — likely reasoning-strip in chat template; reset cache for full prefill"
+                        self.cache = self.model.newCache(parameters: parameters)
+                        Self.logger.info("\(resetMsg)")
+                    } else if cacheOffset == promptTokenIds.count,
+                              let last = promptTokenIds.last
+                    {
+                        let lastToken = MLXArray([Int32(last)])
+                            .expandedDimensions(axis: 0)
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: lastToken),
+                            image: nil, video: nil)
+                        Self.logger.info(
+                            "Populated-cache miss: full prefix matches cache (offset=\(cacheOffset)), seeding with last token only"
+                        )
+                    } else {
+                        // cacheOffset < promptTokenIds.count — assume
+                        // prefix matches (safe for templates that don't
+                        // strip past content). Trim and prefill remainder.
+                        let remaining = Array(promptTokenIds[cacheOffset...])
+                        let remainingArray = MLXArray(remaining.map { Int32($0) })
+                            .expandedDimensions(axis: 0)
+                        inputForPrepare = LMInput(
+                            text: LMInput.Text(tokens: remainingArray),
+                            image: nil, video: nil)
+                        Self.logger.info(
+                            "Populated-cache miss: trimmed \(cacheOffset) cached tokens, prefilling \(remaining.count) remaining"
+                        )
+                    }
+                }
             }
         }
 
         // Prefill: either full input (cache miss) or remaining tokens (cache hit).
         self.promptPrefillTime = try measure {
-            try prepare(input: inputForPrepare, windowSize: parameters.prefillStepSize)
+            try prepare(
+                input: inputForPrepare,
+                windowSize: effectivePrefillWindow(
+                    requested: parameters.prefillStepSize,
+                    input: inputForPrepare))
         }
 
         if parameters.enableCompiledDecode {
@@ -919,7 +1020,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: prefillStepSize)
+            try prepare(
+                input: input,
+                windowSize: effectivePrefillWindow(
+                    requested: prefillStepSize,
+                    input: input))
         }
     }
 
@@ -960,8 +1065,27 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Whether cache quantization is needed (skip the function call entirely when not)
     var needsCacheQuantization: Bool { kvBits != nil || kvMode != .none }
 
+    /// Keep TurboQuant's encode/decode phase off the first-token critical path.
+    ///
+    /// `next()` returns the previous sampled token after it primes the next
+    /// decode step. If we compress during that first priming step, TTFT pays
+    /// the full TQ encode/decode cost before the caller can see token 1.
+    /// Delaying TQ by one surfaced token preserves the sustained decode
+    /// memory/throughput benefit while avoiding the misleading TTFT penalty.
+    var shouldQuantizeAfterStep: Bool {
+        guard needsCacheQuantization else { return false }
+        if case .turboQuant = kvMode {
+            return tokenCount > 0
+        }
+        return true
+    }
+
     mutating func setupCompiledDecode(maxCacheLength: Int) throws {
         guard HardwareInfo.isCompiledDecodeSupported else { return }
+        // Runtime KV quantization swaps cache objects after prefill. The
+        // single-stream compiled closure captures the original cache array,
+        // so keep compile disabled when KV compression/quantization is active.
+        guard !needsCacheQuantization else { return }
         // Compiled decode requires no auxiliary state — models with state (e.g. vision
         // encoder cross-attention) use the uncompiled path.
         guard state == nil else { return }
@@ -1003,7 +1127,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
             if result.count > 0 {
                 self.state = nil
-                if needsCacheQuantization {
+                if shouldQuantizeAfterStep {
                     maybeQuantizeKVCache(
                         cache: &cache, kvBits: kvBits,
                         kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
@@ -1024,7 +1148,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             stepInput, cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
-        if needsCacheQuantization {
+        if shouldQuantizeAfterStep {
             maybeQuantizeKVCache(
                 cache: &cache,
                 kvBits: kvBits,
@@ -1427,6 +1551,23 @@ private func buildStopTokenIds(
             stopTokenIds.insert(id)
         }
     }
+    // Match BatchEngine's defensive end-of-turn widening so the
+    // single-request generate() path cannot leak a chat-template turn
+    // terminator when a bundle's config only lists a partial EOS set.
+    let commonEndTokens = [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|eot_id|>",
+        "<|end_of_text|>",
+        "<|end|>",
+        "<|end_of_turn|>",
+        "<end_of_turn>",
+    ]
+    for token in commonEndTokens {
+        if let id = tokenizer.convertTokenToId(token) {
+            stopTokenIds.insert(id)
+        }
+    }
     return stopTokenIds
 }
 
@@ -1711,6 +1852,9 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<Generation> {
+    context.jangPressRuntime.recordPromptTokenActivity(
+        input.text.tokens.reshaped(-1).asArray(Int.self))
+
     // Block-diffusion speculative decoding dispatch. When
     // parameters.draftStrategy is .dflash or .ddtree AND the target
     // model conforms to HiddenStateCaptureModel + TokenEmbedderModel,
@@ -1799,6 +1943,9 @@ public func generate(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    context.jangPressRuntime.recordPromptTokenActivity(
+        input.text.tokens.reshaped(-1).asArray(Int.self))
+
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -1880,20 +2027,36 @@ public func generateTask(
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
-        let rawCache = iterator.cache
-        let perLayerData = extractLayerData(from: rawCache)
-        let ssmStates: [MLXArray]? = coordinator.isHybrid
-            ? extractSSMStates(from: rawCache) : nil
+        let promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: iterator.cache)
+        let model = iterator.model
+        let perLayerData = extractLayerData(from: promptCacheSnapshot)
+        let kvBits = iterator.kvBits
+        let kvGroupSize = iterator.kvGroupSize
+        let quantizedKVStart = iterator.quantizedKVStart
+        let kvMode = iterator.kvMode
         // MLXArray is not Sendable but is safe after eval; suppress the diagnostic.
         nonisolated(unsafe) let layerCapture = perLayerData
-        nonisolated(unsafe) let ssmCapture = ssmStates
-        nonisolated(unsafe) let cacheCapture = rawCache
+        nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
+        nonisolated(unsafe) let modelCapture = model
         return {
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid
+                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                    coordinator: coordinator,
+                    model: modelCapture,
+                    promptTokenIds: promptTokenIds,
+                    mediaSalt: capturedMediaSalt)
+                : nil
+            let diskStoreCache = makeDiskStoreCache(
+                fromPromptBoundary: promptCacheCapture,
+                kvBits: kvBits,
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart,
+                kvMode: kvMode)
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
                 ssmStates: ssmCapture,
-                cache: cacheCapture,
+                cache: diskStoreCache,
                 mediaSalt: capturedMediaSalt
             )
         }
@@ -1942,6 +2105,9 @@ public func generateTokens(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    context.jangPressRuntime.recordPromptTokenActivity(
+        input.text.tokens.reshaped(-1).asArray(Int.self))
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)
@@ -1984,6 +2150,9 @@ public func generateTokens(
     numDraftTokens: Int = 2,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<TokenGeneration> {
+    context.jangPressRuntime.recordPromptTokenActivity(
+        input.text.tokens.reshaped(-1).asArray(Int.self))
+
     let iterator = try SpeculativeTokenIterator(
         input: input,
         mainModel: context.model,
@@ -2030,6 +2199,9 @@ public func generateTokensTask(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
+    context.jangPressRuntime.recordPromptTokenActivity(
+        input.text.tokens.reshaped(-1).asArray(Int.self))
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters,
         cacheCoordinator: cacheCoordinator)
@@ -2074,19 +2246,35 @@ public func generateTokenTask(
               !iterator.promptTokenIds.isEmpty else { return nil }
         let promptTokenIds = iterator.promptTokenIds
         let capturedMediaSalt = iterator.mediaSalt
-        let rawCache = iterator.cache
-        let perLayerData = extractLayerData(from: rawCache)
-        let ssmStates: [MLXArray]? = coordinator.isHybrid
-            ? extractSSMStates(from: rawCache) : nil
+        let promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: iterator.cache)
+        let model = iterator.model
+        let perLayerData = extractLayerData(from: promptCacheSnapshot)
+        let kvBits = iterator.kvBits
+        let kvGroupSize = iterator.kvGroupSize
+        let quantizedKVStart = iterator.quantizedKVStart
+        let kvMode = iterator.kvMode
         nonisolated(unsafe) let layerCapture = perLayerData
-        nonisolated(unsafe) let ssmCapture = ssmStates
-        nonisolated(unsafe) let cacheCapture = rawCache
+        nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
+        nonisolated(unsafe) let modelCapture = model
         return {
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid
+                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                    coordinator: coordinator,
+                    model: modelCapture,
+                    promptTokenIds: promptTokenIds,
+                    mediaSalt: capturedMediaSalt)
+                : nil
+            let diskStoreCache = makeDiskStoreCache(
+                fromPromptBoundary: promptCacheCapture,
+                kvBits: kvBits,
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart,
+                kvMode: kvMode)
             coordinator.storeAfterGeneration(
                 promptTokens: promptTokenIds,
                 perLayerData: layerCapture,
                 ssmStates: ssmCapture,
-                cache: cacheCapture,
+                cache: diskStoreCache,
                 mediaSalt: capturedMediaSalt
             )
         }

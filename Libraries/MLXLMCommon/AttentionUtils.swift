@@ -34,6 +34,46 @@ import MLX
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
 /// - Returns: Attention output [B, nHeads, L, D]
+/// MLA-specific SDPA helper for DeepSeek-style latent attention families.
+///
+/// Unlike `attentionWithCacheUpdate`, this helper assumes the caller already
+/// called `cache.update(...)` and is passing the full post-update keys/values.
+/// Calling the generic helper after a manual MLA update appends the same keys
+/// twice and corrupts cache length/positioning.
+public func mlaScaledDotProductAttention(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+) -> MLXArray {
+    let originalDtype = queries.dtype
+    let queryLength = queries.dim(2)
+    if queryLength == 1 && originalDtype != .float32 {
+        let maskFp32: MLXFast.ScaledDotProductAttentionMaskMode = {
+            switch mask {
+            case .array(let m): return .array(m.asType(.float32))
+            default: return mask
+            }
+        }()
+        let out = MLXFast.scaledDotProductAttention(
+            queries: queries.asType(.float32),
+            keys: keys.asType(.float32),
+            values: values.asType(.float32),
+            scale: scale,
+            mask: maskFp32
+        )
+        return out.asType(originalDtype)
+    }
+    return MLXFast.scaledDotProductAttention(
+        queries: queries,
+        keys: keys,
+        values: values,
+        scale: scale,
+        mask: mask
+    )
+}
+
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,

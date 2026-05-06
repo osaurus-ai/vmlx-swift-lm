@@ -44,18 +44,30 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
         self.config = config
         self.layerIdx = layerIdx
         self.topK = config.numExpertsPerTok
-        self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
-            inputDims: config.hiddenSize,
-            hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts,
-            bits: mxtqBits,
-            seed: mxtqSeed,
-            // DSV4-Flash always routes through limited-SwiGLU. Pulling
-            // the magnitude from `config.swigluLimit` (10.0 by default)
-            // matches the dense path applied by `DeepseekV4MLP` and the
-            // Python `_dsv4_swiglu` helper. Without this clamp, deep MoE
-            // stacks diverge numerically per the DSV4 reference impl.
-            swigluLimit: config.swigluLimit)
+        if JANGTQStreamingExperts.isEnabled {
+            self._switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                gateUpBits: mxtqBits,
+                downBits: mxtqBits,
+                seed: mxtqSeed,
+                swigluLimit: config.swigluLimit,
+                layerIdx: layerIdx)
+        } else {
+            self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                bits: mxtqBits,
+                seed: mxtqSeed,
+                // DSV4-Flash always routes through limited-SwiGLU. Pulling
+                // the magnitude from `config.swigluLimit` (10.0 by default)
+                // matches the dense path applied by `DeepseekV4MLP` and the
+                // Python `_dsv4_swiglu` helper. Without this clamp, deep MoE
+                // stacks diverge numerically per the DSV4 reference impl.
+                swigluLimit: config.swigluLimit)
+        }
         self.gate = DeepseekV4MoEGate(config: config, layerIdx: layerIdx)
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
             hiddenSize: config.hiddenSize,
@@ -66,8 +78,13 @@ final class DeepseekV4MoEJANGTQ: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: currentInputIds)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIdx, indices: indices)
-        var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        var y: MLXArray
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            y = streaming.reduced(x, indices: indices, scores: scores)
+        } else {
+            y = switchMLP(x, indices)
+            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        }
         y = y + sharedExperts(x)
         return y
     }
@@ -171,15 +188,12 @@ public final class DeepseekV4JANGTQModel:
     /// always allocates the hybrid `DeepseekV4Cache` for `cr>0` layers
     /// and a `RotatingKVCache(window=128)` for `cr=0` layers. The
     /// `DSV4_LONG_CTX` toggle is gone (was a regression vector).
+    /// Caller-level `.turboQuant` does not switch cache topology because
+    /// that would drop CSA/HSA; only explicit `DSV4_KV_MODE=tq` does.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let env = ProcessInfo.processInfo.environment
         let envMode = env["DSV4_KV_MODE"]?.lowercased()
-        let callerWantsTQ: Bool = {
-            guard let p = parameters else { return false }
-            if case .turboQuant = p.kvMode { return true }
-            return false
-        }()
-        let mode: String = envMode ?? (callerWantsTQ ? "tq" : "sliding")
+        let mode: String = envMode ?? "sliding"
 
         return (0..<config.numHiddenLayers).map { layerIdx in
             switch mode {

@@ -204,6 +204,16 @@ public struct LoadBundleFacts: Sendable, Equatable {
     /// `false` when inspection failed (treat as dense).
     public var isRouted: Bool
 
+    /// Best-effort routed-expert count sniffed from `config.json`.
+    /// Used by router-aware JangPress advice to size each layer's hot
+    /// set. `nil` when the bundle does not expose the shape.
+    public var numRoutedExperts: Int?
+
+    /// Best-effort top-k routed experts per token sniffed from
+    /// `config.json`. `nil` falls back to the advisor's conservative
+    /// default.
+    public var topK: Int?
+
     /// Physical memory snapshot captured at the same moment, so cap
     /// math stays internally consistent with the bundle inspection.
     public var physicalMemory: UInt64
@@ -211,11 +221,15 @@ public struct LoadBundleFacts: Sendable, Equatable {
     public init(
         totalSafetensorsBytes: UInt64,
         isRouted: Bool,
-        physicalMemory: UInt64
+        physicalMemory: UInt64,
+        numRoutedExperts: Int? = nil,
+        topK: Int? = nil
     ) {
         self.totalSafetensorsBytes = totalSafetensorsBytes
         self.isRouted = isRouted
         self.physicalMemory = physicalMemory
+        self.numRoutedExperts = numRoutedExperts
+        self.topK = topK
     }
 
     /// Inspect the bundle directory at `url`. All probes are best-effort —
@@ -243,6 +257,8 @@ public struct LoadBundleFacts: Sendable, Equatable {
 
         // Probe config.json for routed markers.
         var routed = false
+        var numRoutedExperts: Int?
+        var topK: Int?
         let configURL = url.appendingPathComponent("config.json")
         if let data = try? Data(contentsOf: configURL),
             let json = try? JSONSerialization.jsonObject(with: data)
@@ -254,6 +270,34 @@ public struct LoadBundleFacts: Sendable, Equatable {
                 "moe_intermediate_size",
                 "n_routed_experts",
             ]
+            let routedExpertKeys = [
+                "n_routed_experts",
+                "num_local_experts",
+                "num_experts",
+            ]
+            let topKKeys = [
+                "num_experts_per_tok",
+                "top_k_experts",
+                "experts_per_token",
+            ]
+            func firstPositiveInt(
+                in object: [String: Any],
+                keys: [String]
+            ) -> Int? {
+                for key in keys {
+                    if let n = object[key] as? Int, n > 0 {
+                        return n
+                    }
+                    if let n = object[key] as? NSNumber, n.intValue > 0 {
+                        return n.intValue
+                    }
+                }
+                return nil
+            }
+
+            numRoutedExperts = firstPositiveInt(
+                in: json, keys: routedExpertKeys)
+            topK = firstPositiveInt(in: json, keys: topKKeys)
             for key in routedKeys {
                 if let n = json[key] as? Int, n > 1 {
                     routed = true
@@ -261,10 +305,19 @@ public struct LoadBundleFacts: Sendable, Equatable {
                 }
             }
             // Some VLMs nest the LM stanza under `text_config` /
-            // `language_config`; check those too.
-            if !routed {
-                for sub in ["text_config", "language_config"] {
-                    if let nested = json[sub] as? [String: Any] {
+            // `language_config`; check those too. Even when the
+            // top-level wrapper already proved "routed", nested
+            // values may be the only source for `num_experts_per_tok`.
+            for sub in ["text_config", "language_config"] {
+                if let nested = json[sub] as? [String: Any] {
+                    if numRoutedExperts == nil {
+                        numRoutedExperts = firstPositiveInt(
+                            in: nested, keys: routedExpertKeys)
+                    }
+                    if topK == nil {
+                        topK = firstPositiveInt(in: nested, keys: topKKeys)
+                    }
+                    if !routed {
                         for key in routedKeys {
                             if let n = nested[key] as? Int, n > 1 {
                                 routed = true
@@ -272,15 +325,19 @@ public struct LoadBundleFacts: Sendable, Equatable {
                             }
                         }
                     }
-                    if routed { break }
                 }
+            }
+            if (numRoutedExperts ?? 0) > 1 {
+                routed = true
             }
         }
 
         return LoadBundleFacts(
             totalSafetensorsBytes: totalBytes,
             isRouted: routed,
-            physicalMemory: physical)
+            physicalMemory: physical,
+            numRoutedExperts: numRoutedExperts,
+            topK: topK)
     }
 }
 

@@ -5,6 +5,56 @@ import MLX
 
 // MARK: - KV Cache Extraction
 
+/// Deep-copy a cache list at the prompt boundary for later cache-tier storage.
+///
+/// Cache coordinator keys are built from prompt tokens only. Disk arrays must
+/// therefore represent exactly that prompt boundary, not the live cache after
+/// decode has appended generated tokens. DSV4's `HybridPoolCache` is especially
+/// sensitive here because post-decode CSA/HSA pool rows can look structurally
+/// valid while carrying generated-token state under a prompt-only key.
+func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache] {
+    let snapshot = cache.map { $0.copy() }
+    if snapshot.contains(where: { $0 is HybridPoolCache }) {
+        MLX.eval(snapshot)
+    }
+    return snapshot
+}
+
+/// Build the cache object list passed to ``TQDiskSerializer`` from a clean
+/// prompt-boundary snapshot.
+///
+/// This preserves the TurboQuant-on-disk path without using the live decode
+/// cache: if the caller requested KV TurboQuant and the prompt is long enough,
+/// the snapshot is compressed here after generation has finished.
+func makeDiskStoreCache(
+    fromPromptBoundary snapshot: [any KVCache],
+    kvBits: Int?,
+    kvGroupSize: Int,
+    quantizedKVStart: Int,
+    kvMode: KVQuantizationMode
+) -> [any KVCache] {
+    var diskCache = snapshot.map { $0.copy() }
+    maybeQuantizeKVCache(
+        cache: &diskCache,
+        kvBits: kvBits,
+        kvGroupSize: kvGroupSize,
+        quantizedKVStart: quantizedKVStart,
+        kvMode: kvMode)
+    return diskCache
+}
+
+func makeDiskStoreCache(
+    fromPromptBoundary snapshot: [any KVCache],
+    parameters: GenerateParameters
+) -> [any KVCache] {
+    makeDiskStoreCache(
+        fromPromptBoundary: snapshot,
+        kvBits: parameters.kvBits,
+        kvGroupSize: parameters.kvGroupSize,
+        quantizedKVStart: parameters.quantizedKVStart,
+        kvMode: parameters.kvMode)
+}
+
 /// Extract per-layer KV tensors from a model's cache array.
 ///
 /// Returns per-layer `(keys, values)` tuples. SSM/MambaCache layers return `nil`.

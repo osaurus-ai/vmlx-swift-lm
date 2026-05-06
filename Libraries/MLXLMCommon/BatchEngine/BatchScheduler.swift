@@ -58,6 +58,11 @@ struct BatchSlot {
     /// per-slot state before the swap is migrated by `TurboQuantKVCache.fromSimpleCache`.
     var cache: [KVCache]
 
+    /// Clean prompt-boundary cache snapshot captured after prefill and before
+    /// any generated token is fed back into the model. Cache stores use this,
+    /// not the live decode cache, because coordinator keys are prompt-only.
+    var promptCacheSnapshot: [KVCache]?
+
     /// The original full input, preserved for VLM `prepare()` which needs image data.
     /// Also used for seeding the logit processor with the full prompt tokens.
     let originalInput: LMInput
@@ -150,6 +155,7 @@ extension BatchSlot {
         self.stopTokenIDs = stopTokenIDs
         self.maxTokens = request.parameters.maxTokens
         self.cache = cache
+        self.promptCacheSnapshot = nil
         self.originalInput = request.input
         self.pendingTokens = request.input.text.tokens
         self.nextToken = nil

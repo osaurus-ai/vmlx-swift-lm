@@ -112,13 +112,13 @@ public func loadWeights(
                     "-of-\(String(format: "%05d", completeTotal)).safetensors")
             }
         }
-        // Stock MLX loader (pread + allocator::malloc). The mmap-backed
-        // alternative in MmapSafetensorsLoader.swift is documented as
-        // experimental: the public Swift `MLXArray(rawPointer:..)` API
-        // does not yield Metal-buffer-backed arrays for arbitrary mmap
-        // pointers, so GPU ops on the resulting arrays read garbage.
-        // See docs/WIRED-LIMIT-INVESTIGATION-2026-05-03.md for the
-        // diagnostic + the upstream MLX C++ work needed to enable it.
+        // Canonical loader entry. On patched osaurus mlx-swift pins,
+        // `loadArraysAndMetadata(url:)` honors the safetensors mmap
+        // environment set by `ModelFactory.withMmapSafetensorsEnv`,
+        // returning MLX arrays backed by whole-shard file mappings.
+        // Older pins ignore the env and fall back to the stock
+        // pread/allocator path. `MmapSafetensorsLoader.swift` remains
+        // a header/parser test utility, not the production tensor path.
         for url in allShardURLs {
             let (w, m) = try loadArraysAndMetadata(url: url)
             for (key, value) in w {
@@ -325,7 +325,13 @@ public func loadWeights(
     if quantization != nil || effectivePerLayerQuantization != nil {
         // Inline quantize with error logging instead of try! crash
         let updates = model.leafModules().flattened().compactMap { (path, m) -> (String, Module)? in
-            guard weights["\(path).scales"] != nil else { return nil }
+            let weightKey = "\(path).weight"
+            let scalesKey = "\(path).scales"
+            let biasesKey = "\(path).biases"
+            let biasKey = "\(path).bias"
+            guard let loadedWeight = weights[weightKey],
+                let loadedScales = weights[scalesKey]
+            else { return nil }
             let tup: (groupSize: Int, bits: Int, mode: QuantizationMode)?
             if let effectivePerLayerQuantization {
                 tup = effectivePerLayerQuantization.quantization(layer: path)?.asTuple
@@ -334,14 +340,34 @@ public func loadWeights(
             }
             guard let (gs, b, mode) = tup else { return nil }
 
-            // MXFP4/MXFP8: quantizeSingle creates QuantizedLinear with dummy biases
-            // from MLX.quantized(), but MX formats don't use biases. Create the module
-            // directly with nil biases to avoid "biases must be null" at inference time.
-            if (mode == .mxfp4 || mode == .mxfp8), m is Linear {
-                let linear = m as! Linear
-                let (qW, scales, _) = MLX.quantized(linear.weight, groupSize: gs, bits: b)
+            let quantBiases =
+                (mode == .mxfp4 || mode == .mxfp8) ? nil : weights[biasesKey]
+
+            // Pre-quantized safetensors already provide `.weight` +
+            // `.scales` (+ optional quant `.biases`). Build the quantized
+            // module from those arrays directly instead of quantizing the
+            // randomly initialized placeholder module and immediately
+            // overwriting it during `model.update(parameters:)`. This is
+            // especially important for routed-MoE `SwitchLinear`, where the
+            // placeholder can be tens of GB on Ling/DSV4-class bundles.
+            if let linear = m as? Linear {
                 return (path, QuantizedLinear(
-                    weight: qW, bias: linear.bias, scales: scales, biases: nil,
+                    weight: loadedWeight,
+                    bias: weights[biasKey] ?? linear.bias,
+                    scales: loadedScales,
+                    biases: quantBiases,
+                    groupSize: gs, bits: b, mode: mode))
+            }
+
+            if let switchLinear = m as? SwitchLinear {
+                return (path, QuantizedSwitchLinear(
+                    inputDims: switchLinear.inputDims,
+                    outputDims: switchLinear.outputDims,
+                    numExperts: switchLinear.numExperts,
+                    weight: loadedWeight,
+                    bias: weights[biasKey] ?? switchLinear.bias,
+                    scales: loadedScales,
+                    biases: quantBiases,
                     groupSize: gs, bits: b, mode: mode))
             }
 
@@ -365,8 +391,17 @@ public func loadWeights(
     // Use .noUnusedKeys instead of .all — MXFP4/MXFP8 quantized layers don't have .biases
     // in the weight files, but QuantizedLinear's optional .biases property gets initialized
     // by the quantize step. Strict .all verification would fail on the missing keys.
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.noUnusedKeys])
+    do {
+        let parameters = ModuleParameters.unflattened(weights)
+        try model.update(parameters: parameters, verify: [.noUnusedKeys])
+    }
+
+    // `weights` is only a load/update staging dictionary. Drop it before
+    // any post-load dtype materialization so quantized bundles do not keep
+    // a second complete copy of the original safetensor arrays alive while
+    // the model parameters are being converted in place.
+    weights.removeAll(keepingCapacity: false)
+    MLX.Memory.clearCache()
 
     // Convert all float16/float32 parameters to bfloat16 to prevent AsType cascades.
     // float16 causes AsType when mixed with internal float32 ops (softmax, RMSNorm).
@@ -378,16 +413,11 @@ public func loadWeights(
     // MiniMax M2.7 JANGTQ_2L). JANGTQ dispatches are already fp32 internally,
     // so there's no fp16↔fp32 ping-pong to collapse. Skip the cast entirely.
     if !isJANGTQNative {
-        let allParams = model.parameters().flattened().map { $0.1 }
-        let hasNonBFloat16 = allParams.contains { (arr: MLXArray) in
-            arr.dtype == .float16 || arr.dtype == .float32
-        }
-        if hasNonBFloat16 {
-            convertToBFloat16(model: model)
-        }
+        convertToBFloat16(model: model)
     }
 
     eval(model)
+    MLX.Memory.clearCache()
 }
 
 /// Convert float16/float32 model parameters to bfloat16 for MoE performance.
@@ -398,19 +428,97 @@ public func loadWeights(
 /// Quantization scales/biases are ALSO converted — QuantizedMatmul uses scales dtype to
 /// determine output dtype, so float16 scales → float16 output → AsType when multiplied
 /// with bfloat16 norms. Converting scales to bfloat16 eliminates this cascade.
+///
+/// Keep the conversion chunked. Ling MXFP4 carries tens of GB of affine
+/// scale/bias metadata; converting every array into one dictionary keeps
+/// both fp16 and bf16 copies alive until the final eval and can push peak
+/// memory past 100 GB. Chunking bounds the transient extra allocation while
+/// preserving the dtype contract.
 private func convertToBFloat16(model: Module) {
-    var converted = [String: MLXArray]()
-    for (key, array) in model.parameters().flattened() {
-        if array.dtype == .float16 || array.dtype == .float32 {
-            converted[key] = array.asType(.bfloat16)
+    let convertibleParams: [(key: String, convertedBytes: Int)] = {
+        let flat = model.parameters().flattened()
+        return flat.compactMap { key, array in
+            guard array.dtype == .float16 || array.dtype == .float32 else {
+                return nil
+            }
+            return (key: key, convertedBytes: estimatedByteCount(array, as: .bfloat16))
         }
-    }
-    if !converted.isEmpty {
+    }()
+
+    guard !convertibleParams.isEmpty else { return }
+
+    let chunkLimit = bfloat16ConversionChunkLimit()
+    var index = 0
+    while index < convertibleParams.count {
+        var converted = [String: MLXArray]()
+        var convertedBytes = 0
+
+        do {
+            let current = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+            while index < convertibleParams.count {
+                let entry = convertibleParams[index]
+                if !converted.isEmpty,
+                    convertedBytes + entry.convertedBytes > chunkLimit
+                {
+                    break
+                }
+
+                guard let array = current[entry.key],
+                    array.dtype == DType.float16 || array.dtype == DType.float32
+                else {
+                    index += 1
+                    continue
+                }
+
+                converted[entry.key] = array.asType(DType.bfloat16)
+                convertedBytes += entry.convertedBytes
+                index += 1
+            }
+        }
+
+        guard !converted.isEmpty else { continue }
+
+        let values = Array(converted.values)
+        MLX.eval(values)
+
         let params = ModuleParameters.unflattened(converted)
         do {
             try model.update(parameters: params, verify: [])
         } catch {
             print("[convertToBFloat16] model.update failed: \(error)")
         }
+        MLX.Memory.clearCache()
     }
+}
+
+private func bfloat16ConversionChunkLimit() -> Int {
+    let env = ProcessInfo.processInfo.environment
+    if let raw = env["VMLX_BF16_CONVERT_CHUNK_MB"],
+        let mb = Int(raw), mb > 0
+    {
+        return mb * 1024 * 1024
+    }
+    return 256 * 1024 * 1024
+}
+
+private func estimatedByteCount(_ array: MLXArray, as dtype: DType) -> Int {
+    let elements = array.shape.reduce(1) { partial, dim in
+        partial * max(dim, 1)
+    }
+    return elements * dtypeByteWidth(dtype)
+}
+
+private func dtypeByteWidth(_ dtype: DType) -> Int {
+    if dtype == .bool || dtype == .int8 || dtype == .uint8 {
+        return 1
+    }
+    if dtype == .float16 || dtype == .bfloat16
+        || dtype == .int16 || dtype == .uint16
+    {
+        return 2
+    }
+    if dtype == .int64 || dtype == .uint64 {
+        return 8
+    }
+    return 4
 }
