@@ -80,9 +80,9 @@ public struct BaseConfiguration: Codable, Sendable {
     /// ```
     ///
     /// This mixed type structure requires manual decoding.
-    struct QuantizationContainer: Codable, Sendable {
-        var quantization: Quantization
-        var perLayerQuantization: PerLayerQuantization
+    public struct QuantizationContainer: Codable, Sendable {
+        public var quantization: Quantization
+        public var perLayerQuantization: PerLayerQuantization
 
         // based on Dictionary's coding key
         internal struct _DictionaryCodingKey: CodingKey {
@@ -100,7 +100,7 @@ public struct BaseConfiguration: Codable, Sendable {
             }
         }
 
-        init(from decoder: any Decoder) throws {
+        public init(from decoder: any Decoder) throws {
             // handle the embedded Quantization
             self.quantization = try Quantization(from: decoder)
 
@@ -142,7 +142,7 @@ public struct BaseConfiguration: Codable, Sendable {
                 quantization: quantization, perLayerQuantization: perLayerQuantization)
         }
 
-        func encode(to encoder: any Encoder) throws {
+        public func encode(to encoder: any Encoder) throws {
             try quantization.encode(to: encoder)
 
             var container = encoder.container(keyedBy: _DictionaryCodingKey.self)
@@ -157,7 +157,7 @@ public struct BaseConfiguration: Codable, Sendable {
         }
     }
 
-    var quantizationContainer: QuantizationContainer?
+    public var quantizationContainer: QuantizationContainer?
 
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
