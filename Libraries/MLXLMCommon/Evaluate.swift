@@ -2039,7 +2039,7 @@ public func generateTask(
         nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
         nonisolated(unsafe) let modelCapture = model
         return {
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: modelCapture,
@@ -2257,7 +2257,7 @@ public func generateTokenTask(
         nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
         nonisolated(unsafe) let modelCapture = model
         return {
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: modelCapture,

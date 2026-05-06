@@ -125,9 +125,13 @@ public final class CacheCoordinator: @unchecked Sendable {
                 ?? FileManager.default.temporaryDirectory
                     .appendingPathComponent("vmlx_disk_cache")
             let ssmDir = baseDir.appendingPathComponent("ssm_companion")
+            let ssmMaxBytes = max(
+                1,
+                Int(config.diskCacheMaxGB * 1_073_741_824))
             self.ssmStateCache.diskStore = try? SSMCompanionDiskStore(
                 cacheDir: ssmDir,
-                modelKey: config.modelKey)
+                modelKey: config.modelKey,
+                maxBytes: ssmMaxBytes)
         }
     }
 

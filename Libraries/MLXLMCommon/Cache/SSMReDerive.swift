@@ -46,8 +46,11 @@
 //
 // Cost: one extra chunked-prefill pass over the prompt (no decode
 // loop, no sampling). On a 2K prompt at ~1000 prefill tok/s that's
-// ~2 seconds. On long contexts it dominates so the watcher MUST be
-// skippable via `GlobalSettings.enableSSMReDerive`.
+// ~2 seconds. On long contexts it dominates, so production hosts can
+// disable the extra pass with `CacheCoordinatorConfig.enableSSMReDerive`
+// for controlled A/B rows. The synchronous prompt-boundary path is the
+// shipped path; the old detached async helper was reverted after a
+// Metal command-encoder race.
 //
 // PARITY MAP — vmlx (Python) GH issues #103/#105/#107/#109/#110
 // =============================================================
@@ -57,15 +60,12 @@
 // • #103 deferred re-derive starves queued requests
 //   Python: scheduler runs re-derive when `running.empty` but ignores
 //   `waiting`, so a freshly arrived request eats N × re-derive TTFT.
-//   Swift parity: `Stream.swift:~2037` fires the re-derive on
-//   `Task.detached(priority: .utility)` AFTER the user's stream
-//   completes. The detached task acquires `container.perform`, which
-//   is sequential — a follow-up request would block on it. Mitigation
-//   is the cancel-Task guard already in place + the .utility priority
-//   so the system scheduler de-prioritizes it under load. There is no
-//   `waiting` queue concept in Swift's single-stream design, so the
-//   exact #103 bug doesn't reproduce; the analogous "interactive
-//   responsiveness" concern is bounded to one re-derive per turn.
+//   Swift parity: detached async re-derive is not active. The production
+//   path stores prompt-boundary SSM state synchronously at turn-end through
+//   `Evaluate.swift` / `BatchEngine.swift`, then `BatchEngine` admission
+//   restores it only when the boundary is safe. A host can disable the
+//   extra prompt-only pass with `CacheCoordinatorConfig.enableSSMReDerive`
+//   for matrix rows or latency-sensitive deployments.
 //
 // • #105 `mx.contiguous(mx.array(a))` redundant wrap
 //   Python: three sites in scheduler/mllm_batch_generator clone SSM
@@ -87,32 +87,20 @@
 //   Python: proposes capturing SSM state at the prefill→decode
 //   transition (when `num_computed_tokens == prompt_len - gen_prompt_len`)
 //   so the next turn doesn't have to re-derive at all.
-//   Swift parity: NOT IMPLEMENTED. Today the deferred re-derive in
-//   `maybeReDeriveSSMState` runs a full fresh prefill pass, costing
-//   O(prompt_len) compute per thinking turn. A capture-during-prefill
-//   hook would zero this cost for the common case (single-chunk
-//   prefill, no chunked / image / resumed prefill). Integration
-//   point: in `Evaluate.swift::TokenIterator.prepare(input:windowSize:)`
-//   add an optional `cachePromptOnlyBoundary: Int?` callback that
-//   fires after the last prompt-only token forward pass — extract
-//   SSM layer state from the live cache and store via
-//   `coordinator.ssmStateCache.store(..., isComplete: true)`. Then
-//   `maybeReDeriveSSMState` becomes a fallback for chunked prefill
-//   only. See vmlx GH #109 for the full mechanics.
+//   Swift parity: PARTIAL. `captureCleanSSMStateInline` exists as the
+//   source-compatible hook for live-cache capture, but the production
+//   store path currently uses `reDeriveAndStoreSSMStatesForPromptBoundaries`
+//   so full-block and exact prompt boundaries can be captured together
+//   for paged prefix reuse. There is no detached async helper.
 //
 // • #110 SSM companion disk persistence (L2 write-through)
 //   Python: proposes safetensors + JSON sidecar disk store for
 //   SSMCompanionCache so a stable-system-prompt workload doesn't pay
 //   full prefill on every cold start.
-//   Swift parity: NOT IMPLEMENTED. `SSMStateCache` is in-memory only.
-//   Paged KV blocks already disk-persist via `BlockDiskStore`, but
-//   SSM companion shares no key/shape with that store. Future work:
-//   add `SSMCompanionDiskStore` keyed on the same SHA-256 hash the
-//   in-memory cache uses, with `is_complete` in the sidecar JSON.
-//   Wire `SSMStateCache` to write-through on `store()` and
-//   read-through fallback on `fetch()`. Gate behind a setting
-//   (`enableSSMCompanionDiskCache`) defaulting OFF, parallel to the
-//   `enableBlockDiskStore` toggle pattern.
+//   Swift parity: IMPLEMENTED. `SSMCompanionDiskStore` is wired by
+//   `CacheCoordinator` whenever disk cache is enabled, and
+//   `SSMStateCache` write-through/read-through shares the coordinator
+//   model key and media salt isolation with the KV tiers.
 
 import Foundation
 import MLX

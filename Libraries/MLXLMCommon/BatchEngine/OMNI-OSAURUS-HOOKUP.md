@@ -454,15 +454,16 @@ properties for multi-turn:
    across turns when the cache list is reused. Verified by Row 11 —
    if Mamba state went corrupt, T2's output would be garbage; it isn't.
 2. **No "warm-pass divergence" vs full re-prefill** — for omni's
-   synchronous SSM rederive path (no `SSMReDeriver` async helper yet,
+   synchronous SSM rederive path (no detached `SSMReDeriver` async helper,
    per `BATCH_ENGINE.md` §11.3 limitation), warm = re-derive = full
    prefill of the new tokens with the SSM state already loaded. Row 11
    confirms T2 produces sensible output when the cache holds T1's
-   state, demonstrating warm-pass works. There is no asynchronous
-   path that could diverge — the synchronous flow is the only flow.
+   state, demonstrating warm-pass works. There is no detached background
+   path that could diverge — the synchronous flow is the only production
+   flow.
 
-**Async SSM re-derive (Python-side feature) is intentionally NOT
-ported** to vmlx. See `BATCH_ENGINE.md` §11.3 limitation #3. If the
+**Detached async SSM re-derive (Python-side feature) is intentionally
+NOT ported** to vmlx. See `BATCH_ENGINE.md` §11.3 limitation #3. If the
 SSM state cache misses on a partial-prefix hit, the runtime currently
 runs full re-prefill (correct, just slower than Python's async
 optimization). Production omni traffic is unaffected; long-form

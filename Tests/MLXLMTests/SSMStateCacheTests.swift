@@ -128,4 +128,53 @@ struct SSMStateCacheTests {
     let differentTokens = SSMStateCache.makeKey(tokens: [100, 200, 999], boundary: 3)
     #expect(differentTokens != first)
 }
+
+@Test func ssmCompanionDiskStoreRoundTrip() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ssm-companion-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let store = try SSMCompanionDiskStore(
+        cacheDir: dir,
+        modelKey: "test-model",
+        maxBytes: 10_000_000)
+    let tokens = [11, 22, 33, 44]
+    let state0 = MLXArray([1.0, 2.0, 3.0] as [Float])
+    let state1 = MLXArray.ones([1, 2])
+
+    try store.store(
+        ssmStates: [state0, state1],
+        tokens: tokens,
+        boundary: 3,
+        mediaSalt: "audio-a",
+        isComplete: false)
+
+    let fetched = store.fetch(tokens: tokens, boundary: 3, mediaSalt: "audio-a")
+    #expect(fetched != nil)
+    #expect(fetched?.states.count == 2)
+    #expect(fetched?.isComplete == false)
+    #expect(fetched?.states[0].asArray(Float.self) == [1.0, 2.0, 3.0])
+
+    let saltedMiss = store.fetch(tokens: tokens, boundary: 3, mediaSalt: "audio-b")
+    #expect(saltedMiss == nil)
+}
+
+@Test func ssmCompanionDiskStoreEvictsOverCap() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("ssm-companion-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let store = try SSMCompanionDiskStore(
+        cacheDir: dir,
+        modelKey: "test-model",
+        maxBytes: 1)
+
+    try store.store(
+        ssmStates: [MLXArray.ones([4, 4])],
+        tokens: [1, 2, 3, 4],
+        boundary: 4)
+
+    let fetched = store.fetch(tokens: [1, 2, 3, 4], boundary: 4)
+    #expect(fetched == nil)
+}
 }

@@ -23,13 +23,15 @@
 // Cache key derivation matches the in-memory `SSMStateCache`:
 //   key = SHA-256( modelKey + ":" + tokens[..<boundary].joined(",") )
 //
-// Concurrency: `OSAllocatedUnfairLock` for index mutation, IO outside
-// the lock (parity with `DiskCache.swift:138`).
+// Concurrency: store/fetch/clear are serialized with an
+// `OSAllocatedUnfairLock`. MLX tensor realization and safetensors IO should
+// not overlap on this store, and the metadata sidecar must stay paired with
+// the tensor file.
 //
-// NOT WIRED INTO `SSMStateCache.fetch/store` BY DEFAULT this iter —
-// the primitive lands first so the wiring is a 5-LOC change in
-// `SSMStateCache.swift` (write-through on store; fall-through on miss).
-// Default OFF behind `enableSSMCompanionDiskCache` setting once wired.
+// Wired by `CacheCoordinator` when `CacheCoordinatorConfig.enableDiskCache`
+// is true. `SSMStateCache.store` write-throughs here and `fetchEntry`
+// falls through on memory miss, using the same model key and media salt
+// isolation as the KV tiers.
 
 import CryptoKit
 import Foundation
@@ -45,8 +47,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     private let lock = OSAllocatedUnfairLock()
     private let cacheDir: URL
     private let modelKey: String?
-    /// Maximum total disk bytes before LRU eviction. 0 = unlimited
-    /// (parity with `DiskCache`'s default — eviction is a follow-up).
+    /// Maximum total disk bytes before oldest-entry eviction. 0 = unlimited.
     private let maxBytes: Int
 
     // MARK: - Initialization
@@ -83,6 +84,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             tokens: tokens, boundary: boundary,
             mediaSalt: mediaSalt, modelKey: modelKey)
 
+        lock.lock()
+        defer { lock.unlock() }
+
         // Pre-realize on calling thread — same rationale as
         // DiskCache.swift:114-116. GPU work must complete before the
         // safetensors writer can read the storage. MLX's tensor
@@ -115,6 +119,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         let sidecarData = try JSONSerialization.data(
             withJSONObject: sidecar, options: [.sortedKeys])
         try sidecarData.write(to: sidecarURL, options: [.atomic])
+
+        evictIfNeededLocked()
     }
 
     /// Look up SSM layer states for a given token prefix + boundary.
@@ -134,6 +140,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             mediaSalt: mediaSalt, modelKey: modelKey)
         let safetensorsURL = self.safetensorsURL(for: key)
         let sidecarURL = self.sidecarURL(for: key)
+
+        lock.lock()
+        defer { lock.unlock() }
 
         guard FileManager.default.fileExists(atPath: safetensorsURL.path),
               FileManager.default.fileExists(atPath: sidecarURL.path)
@@ -172,6 +181,9 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// unload so subsequent loads don't see stale state. No-op if the
     /// directory is empty.
     public func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: cacheDir, includingPropertiesForKeys: nil) else { return }
         for url in entries {
@@ -190,6 +202,62 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
 
     private func sidecarURL(for hash: String) -> URL {
         cacheDir.appendingPathComponent("ssm-\(hash).json")
+    }
+
+    private struct DiskEntry {
+        var urls: [URL] = []
+        var bytes: Int = 0
+        var modified: Date = .distantPast
+    }
+
+    private func evictIfNeededLocked() {
+        guard maxBytes > 0 else { return }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: cacheDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles])
+        else { return }
+
+        var entries: [String: DiskEntry] = [:]
+        var totalBytes = 0
+        for url in urls {
+            guard let hash = entryHash(for: url) else { continue }
+            let values = try? url.resourceValues(forKeys: [
+                .contentModificationDateKey, .fileSizeKey,
+            ])
+            let bytes = values?.fileSize ?? 0
+            let modified = values?.contentModificationDate ?? .distantPast
+            totalBytes += bytes
+
+            var entry = entries[hash] ?? DiskEntry()
+            entry.urls.append(url)
+            entry.bytes += bytes
+            if entry.modified == .distantPast || modified < entry.modified {
+                entry.modified = modified
+            }
+            entries[hash] = entry
+        }
+
+        guard totalBytes > maxBytes else { return }
+
+        for entry in entries.values.sorted(by: { $0.modified < $1.modified }) {
+            for url in entry.urls {
+                try? FileManager.default.removeItem(at: url)
+            }
+            totalBytes -= entry.bytes
+            if totalBytes <= maxBytes { break }
+        }
+    }
+
+    private func entryHash(for url: URL) -> String? {
+        let name = url.lastPathComponent
+        guard name.hasPrefix("ssm-"),
+              (name.hasSuffix(".safetensors") || name.hasSuffix(".json")),
+              let dot = name.lastIndex(of: ".")
+        else { return nil }
+        let start = name.index(name.startIndex, offsetBy: 4)
+        guard start < dot else { return nil }
+        return String(name[start..<dot])
     }
 
     /// SHA-256 hash. P0-2 (2026-04-30): converged with `SSMStateCache.makeKey`

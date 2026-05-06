@@ -51,8 +51,10 @@ Production-ready minimum as of this handoff:
 - Ling JANGTQ/JANGTQ2/MXFP4 load and answer coherently in multi-turn recall.
   JANGTQ2 is the preferred Ling production bundle for memory. MXFP4 is now
   memory-bounded but slow.
-- DSV4 Flash loads, routes reasoning modes, stores/restores cache state, and
-  passes semantic long-context recall at the tested 3K-token prompt size.
+- DSV4 Flash loads, routes reasoning modes, and stores/restores cache state.
+  Short chat recall is revalidated in this pass. The long-context row had
+  previously passed at the 3K-token prompt size, but must be rerun after the
+  local DSV4 bundle redownload completes.
 - Qwen 35B, Qwen 27B, Gemma4 26B, Laguna XS.2, MiniMax M2.7, and Nemotron Omni
   have live coherent-output coverage without marker leakage in the tested rows.
 - Paged/prefix cache, L2 disk restore, SSM companion state, and TurboQuant KV
@@ -91,6 +93,29 @@ the osaurus-owned dependency chain and fixing RunBench's tokenizer smoke path.
 | Qwen cache stack live probes | PASS. Paged-prefix hit fired with hybrid rollback semantics; disk L2 restore hit with `ssm_companion`; TurboQuant KV B=2 kept plain-slot output byte-identical beside a TQ slot. |
 | Ling 2.6 flash JANGTQ/JANGTQ2/MXFP4 live ChatSession | PASS compile off/on. Multi-turn recall stayed coherent through `ArraysCache` reuse. JANGTQ2 peak footprint about 30.4 GB; MXFP4 peak footprint fixed from ~110 GB to ~66.8 GB by disabling oversized fused gate/up cache materialization. |
 | MiniMax M2.7 JANGTQ live perf/coherence probe | PASS for coherent visible text, no loop, no raw marker leakage. Throughput remains below target and is deferred to speed work. |
+
+### 2026-05-06 Cache/SSM WIP Recheck
+
+This recheck was run in `/Users/eric/vmlx-swift-lm` after the Ling
+`enable_thinking` fix landed at `82ce729`.
+
+| Row | Result |
+|---|---|
+| `swift test -c release --filter SSMStateCacheTests --no-parallel` | PASS with Xcode toolchain after copying `default.metallib` / `mlx.metallib` beside the release test bundle. 7 tests passed, including SSM companion disk round-trip, media-salt isolation, and over-cap eviction. |
+| `swift build -c release --product RunBench` | PASS with existing distributed/VL/model warnings only. |
+| Ling JANGTQ `BENCH_COHERENT=1` | PASS. Compile off/on both recalled favorite color, identified blue as cool, and produced no loop or raw marker leak. |
+| DSV4 Flash short `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` | PASS before the local DSV4 bundle was removed for redownload. Three turns recalled `sapphire-42`; visible answer content was routed through `.reasoning`, not `.chunk`, as expected for this bundle. |
+| DSV4 Flash long row | BLOCKED locally while `/Users/eric/models/DeepSeek-V4-Flash-JANGTQ` is being redownloaded. The old `/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ` path disappeared during this pass; rerun the long-context row after the bundle has all config/tokenizer/shard files. |
+| Qwen3.6 35B JANGTQ `BENCH_BATCH_TQ_B2=1` | PASS. Plain KV slot stayed byte-identical beside a TurboQuant KV neighbor; both TQ slots decoded coherent text. |
+| MiniMax M2.7 Small JANGTQ `BENCH_BATCH_DISK_RESTORE=1` | PASS. Fresh coordinator hit disk L2; prompt time dropped from 13.608s to 0.179s. |
+| MiniMax M2.7 Small JANGTQ `BENCH_BATCH_CACHE_HIT=1` | PASS. Paged prefix probe hit 128/186 tokens and warm/cold prompt ratio was 0.36. |
+| MiniMax M2.7 full-size speed row | NOT COMPLETED. The process never entered a real heavy load path and was stopped after several minutes at ~300 MiB RSS. Keep prior MiniMax speed status as open. |
+
+Runtime change made in this pass: `CacheCoordinatorConfig.enableSSMReDerive`
+now gates the extra synchronous prompt-boundary SSM companion rederive/store
+pass in both `Evaluate` and `BatchEngine`. Direct prompt-end SSM seed handling
+remains enabled for correctness. Detached async SSM rederive is still not a
+production path.
 
 Latest speed/coherence sample from the local ignored `RunBench` perf harness
 after adding output previews to the audit logs:
@@ -401,6 +426,7 @@ let config = CacheCoordinatorConfig(
     diskCacheMaxGB: 10,
     diskCacheDir: kvDir,
     ssmMaxEntries: 64,
+    enableSSMReDerive: true,
     modelKey: modelKey,
     defaultKVMode: .none,
     defaultMaxKVSize: nil,
@@ -420,7 +446,7 @@ Tier behavior:
 |---|---|---|
 | Paged L1 | Shared-prefix reuse for ordinary KV models | Exact block prefix hits. Unsafe partial hits roll back for VL/SSM. Disabled for DSV4 hybrid-pool caches. |
 | Disk L2 | Session replay/restart and long-lived prefix cache | Uses TQDiskSerializer. DSV4 and SSM companion state serialize here. |
-| SSM companion | Mamba/Arrays hidden-state sidecar | Stores prompt-boundary and block-boundary states so KV hits do not lose SSM recurrence state. |
+| SSM companion | Mamba/Arrays hidden-state sidecar | Stores prompt-boundary and block-boundary states so KV hits do not lose SSM recurrence state. Controlled by `enableSSMReDerive`; detached async rederive is not used. |
 | TurboQuant KV | Optional compressed KV cache | Batch path supports `.turboQuant(keyBits:valueBits:)`; disk round-trip covered by stability and batch probes. |
 
 Cache semantics:

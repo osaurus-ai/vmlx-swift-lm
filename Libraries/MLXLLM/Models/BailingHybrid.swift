@@ -837,13 +837,8 @@ class BailingSparseMoE: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x)
-        var out: MLXArray
-        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
-            out = streaming.reduced(x, indices: indices, scores: weights)
-        } else {
-            out = switchMLP(x, indices)
-            out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
-        }
+        var out = switchMLP(x, indices)
+        out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
         if let shared = sharedExperts {
             out = out + shared(x)
         }
@@ -897,8 +892,13 @@ class BailingSparseMoEJANGTQ: Module, UnaryLayer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x)
-        var out = switchMLP(x, indices)
-        out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        var out: MLXArray
+        if let streaming = switchMLP as? StreamingTurboQuantSwitchGLU {
+            out = streaming.reduced(x, indices: indices, scores: weights)
+        } else {
+            out = switchMLP(x, indices)
+            out = (out * weights[.ellipsis, .newAxis]).sum(axis: -2)
+        }
         if let shared = sharedExperts {
             out = out + shared(x)
         }

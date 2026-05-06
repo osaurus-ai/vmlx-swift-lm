@@ -1928,13 +1928,15 @@ See `Tests/MLXLMTests/BatchEngineTurboQuantTests.swift` (15 tests):
    error. Real verification requires hybrid-model forward support, which
    is separate spec scope (not Stages 1-5).
 
-3. **No `SSMReDeriver` / async rederive** — the Python engine's SSM
-   companion watcher is NOT ported. Hybrid models rely on the synchronous
-   `extractSSMStates` / `restoreSSMStates` helpers in `Cache/CacheHelpers.swift`,
-   plus the `SSMStateCache` L2 layer in `CacheCoordinator`. Async
-   rederivation on cache miss (re-running the SSM branch over the prompt
-   prefix in a background task) is intentionally out of scope — listed
-   only as a hook in the batch-engine-blockers spec §11.3.
+3. **No detached async SSM rederive** — the Python engine's background
+   SSM watcher is intentionally not ported. Hybrid models use the
+   synchronous `extractSSMStates` / `restoreSSMStates` helpers in
+   `Cache/CacheHelpers.swift`, the `SSMStateCache` L2 layer, and the
+   prompt-boundary fresh pass in
+   `reDeriveAndStoreSSMStatesForPromptBoundaries(...)`. Production keeps
+   that pass enabled with `CacheCoordinatorConfig.enableSSMReDerive`.
+   Disable it only for matrix rows that intentionally prove the fallback
+   full-prefill path.
 
 ## Audit — 2026-04-19 (iter 28)
 
@@ -1944,14 +1946,14 @@ Per-component status against the "sliding / hybrid SSM / SSM watcher / L2 disk /
 |-----------|--------|----------|
 | **Sliding window** | **shipped, compiled** | `CompilableRotatingKVCache` (`BatchEngine/CompilableRotatingKVCache.swift`, 265 lines). `CacheFamily.rotating.isCompileEligibleAtCurrentStage = true`. Tests: `CompilableRotatingKVCacheTests` (4 cases: linear, growth, wrap, promotion) all pass at FP precision (1.0e-6 to 4.2e-7 vs 5% tolerance). `RotatingKVCacheCompileProbeTests` documents the uncompiled baseline drift that motivated the subclass. |
 | **Hybrid SSM forward** | **uncompiled fallback, honest** | `CacheFamily.mamba.isCompileEligibleAtCurrentStage = false`. `CacheFamily.classify(...)` returns `.heterogeneous` for Qwen3.5-style mixed layer caches; `BatchEngine.maybePromoteToCompiledDecode` falls through to `stepDecode`. The `CompilableMambaCache` subclass exists but 2 of its tests skip with the recorded reason "real verification needs hybrid-model forward support" — no pretence that compile works. |
-| **SSM watcher / helper / async rederive** | **NOT ported** | Grep for `SSMReDeriver\|asyncRederive\|ssmWatcher\|SSMCompanion` in `Libraries/` returns zero hits. Spec §11.3 lists it as a hook, not an obligation for Stages 1-5. Hybrid models rely on synchronous `extractSSMStates` / `restoreSSMStates` at admission and finish, plus `SSMStateCache` L2 lookup. If a miss occurs for the SSM branch but a hit for the attention branch, the current code runs full prefill for both (no partial SSM rederive). Documented above as limitation #3. |
+| **SSM watcher / helper / async rederive** | **sync prompt-boundary path shipped** | Detached async rederive is not ported, by design. Hybrid models rely on synchronous `extractSSMStates` / `restoreSSMStates` at admission plus `reDeriveAndStoreSSMStatesForPromptBoundaries(...)` at store time, with `SSMStateCache` and `SSMCompanionDiskStore` behind the coordinator. If the companion state is unavailable for a partial-prefix hit, the runtime falls back to full prefill for correctness. Documented above as limitation #3. |
 | **L2 disk cache** | **shipped (inherited SLIDING-1)** | `TQDiskSerializer` v2 schema carries `LayerKind` per layer (attn=0, turboQuant=1, rotating=6, mamba=3). `BatchEngine.stepPrefill` restores from disk via `restoreFromDiskArrays` at `BatchEngine.swift:438` when `coordinator.fetch` returns a disk hit. Symmetric store path at `BatchEngine.swift:910-921`. `mediaSalt` is round-tripped so VL multi-turn hits line up. Tests: `SSMStateCacheTests` (5 cases) pass; `CacheCoordinatorRotatingGuardTests` validates the v2 round-trip path. |
 | **Compiled detokenizer relay** | **fixed iter 28** | `generate()` at `BatchEngine.swift:210-245` now uses `AsyncStream.makeStream() + Task {} + if let text = detokenizer.next()` — matches the canonical `Evaluate.generateLoopTask` pattern. Earlier iterations tried `while let` and `Task.detached`; the former infinite-looped on ASCII tokens (throughput collapse under real HF tokenizer), the latter didn't fix it because the bug wasn't scheduling but the detokenizer loop. Verified: `BENCH_BATCH_CHAT=1` on Qwen3-0.6B, 3 coherent turns on both compile-OFF (0.46s / 0.31s / 0.32s) and compile-ON (0.29s / 0.27s / 0.27s) paths, byte-identical content. |
 
 ### What is NOT claimed
 
 - **Hybrid SSM models through compile()**. They route to the uncompiled path. That is correct, not a stub.
-- **Async rederive**. Not implemented. If you need it, spec §11.3 describes where the hook would go.
+- **Detached async rederive**. Not implemented. Use the synchronous prompt-boundary path unless a future scheduler proves a Metal-safe background helper.
 - **Sliding window + SSM interaction**. Models that mix sliding attention with SSM (hypothetical) would hit `.heterogeneous` and uncompiled fallback. Not specifically tested because no such model ships in the current model zoo.
 
 ### Tests run for this audit

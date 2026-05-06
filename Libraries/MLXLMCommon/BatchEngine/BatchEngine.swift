@@ -1572,7 +1572,7 @@ public actor BatchEngine {
                 return
             }
             let perLayerData = extractLayerData(from: promptCacheSnapshot)
-            let ssmStates: [MLXArray]? = coordinator.isHybrid
+            let ssmStates: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: context.model,

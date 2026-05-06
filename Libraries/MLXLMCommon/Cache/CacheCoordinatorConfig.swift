@@ -50,6 +50,14 @@ public struct CacheCoordinatorConfig: Sendable {
     /// Maximum number of SSM state entries in the companion LRU cache.
     public var ssmMaxEntries: Int
 
+    /// Whether hybrid SSM models should run the prompt-boundary companion
+    /// state re-derive/store pass after generation.
+    ///
+    /// Keep this enabled for production hybrid-cache reuse. Disable only for
+    /// controlled A/B matrix rows where the host intentionally wants to prove
+    /// the fallback full-prefill path or isolate non-SSM cache behavior.
+    public var enableSSMReDerive: Bool
+
     /// Model-specific key to prevent cross-model cache poisoning.
     /// Include model path, type, or a unique identifier. When set, cache hashes
     /// incorporate this key so different models with the same tokenizer cannot
@@ -100,6 +108,7 @@ public struct CacheCoordinatorConfig: Sendable {
         diskCacheMaxGB: Float = 10.0,
         diskCacheDir: URL? = nil,
         ssmMaxEntries: Int = 50,
+        enableSSMReDerive: Bool = true,
         modelKey: String? = nil,
         defaultKVMode: KVQuantizationMode = .none,
         defaultMaxKVSize: Int? = nil,
@@ -112,6 +121,7 @@ public struct CacheCoordinatorConfig: Sendable {
         self.diskCacheMaxGB = diskCacheMaxGB
         self.diskCacheDir = diskCacheDir
         self.ssmMaxEntries = ssmMaxEntries
+        self.enableSSMReDerive = enableSSMReDerive
         self.modelKey = modelKey
         self.defaultKVMode = defaultKVMode
         self.defaultMaxKVSize = defaultMaxKVSize

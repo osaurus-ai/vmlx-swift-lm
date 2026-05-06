@@ -50,18 +50,16 @@ public final class SSMStateCache: @unchecked Sendable {
     /// Number of cache misses since creation (or last ``clear()``).
     public private(set) var misses: Int = 0
 
-    /// Number of times the hybrid-SSM re-derive watcher fired (iter-40).
-    /// Incremented by `markReDeriveFired()` from `maybeReDeriveSSMState`
-    /// whenever a thinking-template turn triggers a prompt-only pass.
+    /// Number of times the hybrid-SSM prompt-boundary re-derive path fired.
+    /// Incremented by `markReDeriveFired()` from the synchronous SSM helpers
+    /// whenever a hybrid turn triggers a prompt-only companion pass.
     /// Distinct from `misses` so the UI can distinguish "I never tried"
     /// from "I tried but the cache was contaminated so I re-derived".
     /// Zero for pure-attention models (re-derive always no-ops early).
     public private(set) var reDerives: Int = 0
 
     /// Bump the re-derive counter. Lock-protected so it stays
-    /// consistent with the hits/misses counters under concurrent
-    /// access. Called from the detached Task in `Stream.swift` or
-    /// synchronously when `VMLX_DISABLE_SSM_RE_DERIVE_ASYNC=1`.
+    /// consistent with the hits/misses counters under concurrent access.
     public func markReDeriveFired() {
         lock.lock()
         reDerives &+= 1
@@ -90,9 +88,8 @@ public final class SSMStateCache: @unchecked Sendable {
     /// §441 — Optional disk tier for cold-start cache survival. When
     /// non-nil, `store()` write-throughs to disk and `fetchEntry()`
     /// falls through on memory miss + reloads into the LRU slot.
-    /// Wired by `CacheCoordinator` when
-    /// `enableSSMCompanionDiskCache` setting is on. Default nil =
-    /// in-memory only (pre-§441 behavior).
+    /// Wired by `CacheCoordinator` when `enableDiskCache` is true.
+    /// Default nil = in-memory only.
     public var diskStore: SSMCompanionDiskStore? = nil
 
     // MARK: - Public API
