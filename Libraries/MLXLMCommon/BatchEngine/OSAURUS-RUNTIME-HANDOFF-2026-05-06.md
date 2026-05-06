@@ -189,6 +189,21 @@ after adding output previews to the audit logs:
 Raw local logs are under `docs/benchmarks/speed-2026-05-06/` but that directory
 is gitignored. Recreate them with `BENCH_PERF=1` if the PR needs fresh numbers.
 
+Additional HQ continuation after this table:
+
+- Qwen3.6 35B JANGTQ `BENCH_PERF` BatchEngine, 64 tokens:
+  **80.4 tok/s**, coherent text, no loop, no leaks, and no factory fallback noise.
+- MiniMax M2.7 JANGTQ TokenIterator, 64 tokens: baseline **34.7 tok/s**;
+  `VMLINUX_MINIMAX_ROUTER_COMPILE=1` **34.6 tok/s**;
+  `VMLX_TQ_SWITCH_GLU_COMPILE=0` **35.1 tok/s**. The current MiniMax gap is
+  therefore not a simple router-compile or SwitchGLU-compile default issue.
+- Qwen cache rows after a local ignored RunBench engine-shutdown cleanup:
+  `BENCH_BATCH_CACHE_HIT`, `BENCH_BATCH_DISK_RESTORE`, and
+  `BENCH_BATCH_TQ_B2` all PASS and exit 0. Before this cleanup the cache-hit row
+  printed PASS but could return 139 during process teardown. `RunBench/` remains
+  gitignored in this checkout, so treat that harness cleanup as local validation
+  hygiene unless the benchmark target is intentionally promoted into source.
+
 The requested Python file
 `/Users/eric/mlx/vllm-mlx/docs/DSV4_FIX_NUANCES.md` was not present locally.
 The equivalent local Python-runtime notes are in
@@ -223,6 +238,9 @@ Audit result for the new cache/JangPress stack on 2026-05-06:
 - `LoadTimeStacking` materializes load-time per-expert JANGTQ stacks so large 3D
   routed tensors do not retain every per-expert source tensor until final eval.
   It must not be used in model forward paths.
+- `ModelFactory` fallback attempts are quiet by default. Set
+  `VMLINUX_MODEL_FACTORY_TRACE=1` only when diagnosing factory routing; thrown
+  load errors still preserve the most informative factory failure.
 - JangPress mmap/prestack is a residency policy. It must not cast weights, change
   JANGTQ norm dtypes, or replace `TurboQuantSwitchGLU`.
 - JangPress router advice is default-off because it reads router indices back to
@@ -719,9 +737,7 @@ BENCH_OMNI=1 BENCH_OMNI_BATCH=1 BENCH_MAX_TOKENS=24 \
 - Distributed XCTest targets are opt-in with
   `VMLINUX_ENABLE_DISTRIBUTED_TESTS=1 swift test`; default `swift test` covers
   the active local runtime package surface.
-- Cosmetic VLM factory fallback warnings appear for some LLM-only JANGTQ
-  bundles before LLM loading succeeds. This should be quieted for production
-  logs but is not a runtime failure.
+- Factory fallback tracing is opt-in via `VMLINUX_MODEL_FACTORY_TRACE=1`.
 
 ## License
 

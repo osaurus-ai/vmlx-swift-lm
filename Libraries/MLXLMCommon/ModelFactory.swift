@@ -614,6 +614,11 @@ public func loadModel(
 
 private func load<R>(loader: (ModelFactory) async throws -> sending R) async throws -> sending R {
     let factories = ModelFactoryRegistry.shared.modelFactories()
+    let traceFactoryFallbacks: Bool = {
+        let raw = ProcessInfo.processInfo.environment["VMLINUX_MODEL_FACTORY_TRACE"]?
+            .lowercased()
+        return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+    }()
     // Track all failures across factories. When multiple factories fail, the
     // most informative error wins: a real load/decode/weight failure is
     // strictly more useful than `unsupportedModelType` (which just means
@@ -628,7 +633,9 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
             let model = try await loader(factory)
             return model
         } catch let error as ModelFactoryError {
-            print("[ModelFactory] \(type(of: factory)) failed: \(error)")
+            if traceFactoryFallbacks {
+                print("[ModelFactory] \(type(of: factory)) failed: \(error)")
+            }
             switch error {
             case .unsupportedModelType, .unsupportedProcessorType:
                 if unsupportedError == nil { unsupportedError = error }
@@ -638,7 +645,9 @@ private func load<R>(loader: (ModelFactory) async throws -> sending R) async thr
                 if realError == nil { realError = error }
             }
         } catch {
-            print("[ModelFactory] \(type(of: factory)) failed: \(error)")
+            if traceFactoryFallbacks {
+                print("[ModelFactory] \(type(of: factory)) failed: \(error)")
+            }
             if realError == nil { realError = error }
         }
     }
