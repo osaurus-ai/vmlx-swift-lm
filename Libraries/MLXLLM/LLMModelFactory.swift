@@ -206,6 +206,8 @@ public enum LLMTypeRegistry {
             "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
             "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
             "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
+            "bailing_hybrid": create(BailingHybridConfiguration.self, BailingHybridModel.init),
+            "bailing_moe_v2_5": create(BailingHybridConfiguration.self, BailingHybridModel.init),
             "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
             "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
             "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
@@ -1271,7 +1273,7 @@ public final class LLMModelFactory: ModelFactory {
         // metadata (e.g. DSV4-Flash bundles ship `weight_format: "bf16"`).
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            quantization: jangConfig != nil ? baseConfig.quantization : nil,
+            quantization: jangConfig != nil ? baseConfig.quantizationContainer?.quantization : nil,
             // 2026-04-28: pass perLayerQuantization through even when JANG;
             // loadWeights merges config.json's explicit per-layer dict on
             // top of the shape walk to fix mis-inference of (bits, gs) pairs

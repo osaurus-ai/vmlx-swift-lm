@@ -542,6 +542,11 @@ class BailingLinearAttention: Module {
             q: queries, k: keys, v: values,
             g: slope, scale: scale, h: priorState)
         cache?[0] = newState
+        // Advance cache offset by L so that the next call's `offset`
+        // reflects the new context length. Without this RoPE on Turn 2
+        // resets to position 0 and the recurrent state is out-of-sync
+        // with the positional encoding.
+        cache?.offset += L
 
         let flat = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let gated = gNorm(flat) * sigmoid(gProj(x))
@@ -1155,6 +1160,41 @@ public class BailingHybridModel:
             if !perLayerStacked.isEmpty {
                 MLX.eval(perLayerStacked)
                 MLX.Memory.clearCache()
+            }
+
+            // Ling-2.6-flash MXFP4 ships routed-expert weights ALREADY
+            // prestacked on disk but FLATTENED to 2D (num_experts, ...).
+            // SwitchGLU's QuantizedSwitchLinear expects 3D
+            // (num_experts, out, in/8) for weight and (num_experts, out,
+            // in/group_size) for scales/biases. Reshape here.
+            //
+            // For Ling: hidden=4096, moe_intermediate=1024, group_size=32,
+            // bits=4.
+            //   gate_proj/up_proj: per-expert (out=mInt, in=hidden)
+            //     packed weight (mInt, hidden/8) ; meta (mInt, hidden/gs)
+            //   down_proj: per-expert (out=hidden, in=mInt)
+            //     packed weight (hidden, mInt/8) ; meta (hidden, mInt/gs)
+            let mInt = args.moeIntermediateSize
+            let hidden = args.hiddenSize
+            let gs = 32  // MXFP4 group_size
+            let projShapes: [(String, Int, Int)] = [
+                ("gate_proj", mInt, hidden),
+                ("up_proj", mInt, hidden),
+                ("down_proj", hidden, mInt),
+            ]
+            for (proj, outF, inF) in projShapes {
+                let wKey = "\(prefix).mlp.switch_mlp.\(proj).weight"
+                if let w = out[wKey], w.ndim == 2,
+                   w.shape == [args.numExperts, outF * (inF / 8)] {
+                    out[wKey] = w.reshaped([args.numExperts, outF, inF / 8])
+                }
+                for meta in ["scales", "biases"] {
+                    let mKey = "\(prefix).mlp.switch_mlp.\(proj).\(meta)"
+                    if let m = out[mKey], m.ndim == 2,
+                       m.shape == [args.numExperts, outF * (inF / gs)] {
+                        out[mKey] = m.reshaped([args.numExperts, outF, inF / gs])
+                    }
+                }
             }
 
             // Spec §5: the gate router projection name in the bundle is

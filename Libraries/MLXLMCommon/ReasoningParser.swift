@@ -501,6 +501,12 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
         "kimi",         // kimi_k2, kimi_k25
         "nemotron_h",   // NemotronH / Cascade series
         "holo",         // Holo3 variants
+        "bailing",      // bailing_hybrid / bailing_moe_v2_5 (Ling-2.6-flash) —
+                        // chat template emits `<think>...</think>` envelope
+                        // when system message contains "detailed thinking on";
+                        // jang_config.capabilities.reasoning_parser is
+                        // "deepseek_r1" but stamping via model_type prefix
+                        // lets non-JANG bundles also resolve correctly.
         "laguna",       // Poolside Laguna — `laguna_glm_thinking_v5/chat_template.jinja`
                         // emits `<think>...</think>` when enable_thinking=true.
                         // Pre-registered here so that on the day the vmlx
