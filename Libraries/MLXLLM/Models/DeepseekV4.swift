@@ -1140,12 +1140,19 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                         }
                     }
                 }
-                // Drop per-expert tq_bits scalars — TurboQuantSwitchLinear
-                // gets bit width from the JANGTQ config, not weights.
+                // Drop per-expert + prestacked-switch_mlp tq_bits scalars
+                // — TurboQuantSwitchLinear gets the bit width from the
+                // JANGTQ config (`mxtq_bits.routed_expert`), not weights.
+                // Legacy bundles ship `mlp.experts.{e}.{proj}.tq_bits`;
+                // prestacked bundles (DSV4-Flash JANGTQ_K, etc.) ship a
+                // single `mlp.switch_mlp.{proj}.tq_bits` per layer.
+                // Drop both regardless of which layout.
                 for e in 0..<config.nRoutedExperts {
                     out.removeValue(
                         forKey: "\(prefix).\(e).\(projName).tq_bits")
                 }
+                out.removeValue(
+                    forKey: "model.layers.\(layerIdx).mlp.switch_mlp.\(projName).tq_bits")
             }
         }
         return out
