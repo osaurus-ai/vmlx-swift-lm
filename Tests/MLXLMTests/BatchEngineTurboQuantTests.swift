@@ -278,6 +278,35 @@ struct BatchQuantizeHookTests {
         #expect(cache[2] is TurboQuantKVCache)
         #expect(cache[3] is MambaCache, "SSM/state layer must remain untouched")
     }
+
+    @Test("maybeCompress preserves DSV4 hybrid SWA+CSA+HSA cache")
+    func testDeepseekV4HybridPreservation() {
+        // DSV4's production cache is already compressed structurally:
+        // cr=0 layers use a 128-token rotating SWA window, and cr>0
+        // layers use DeepseekV4Cache for SWA plus CSA/HSA pool rows.
+        // A global TurboQuant default must not replace that topology.
+        var cache: [KVCache] = [
+            RotatingKVCache(maxSize: 128, keep: 0),
+            DeepseekV4Cache(slidingWindow: 128, compressRatio: 128),
+            DeepseekV4Cache(slidingWindow: 128, compressRatio: 4),
+        ]
+        for layer in cache {
+            _ = layer.update(
+                keys: MLXArray.ones([1, 1, 10, 64]),
+                values: MLXArray.ones([1, 1, 10, 64]))
+        }
+        let params = GenerateParameters(
+            maxTokens: 5,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+            temperature: 0)
+
+        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+
+        #expect(cache[0] is RotatingKVCache)
+        #expect(cache[1] is DeepseekV4Cache)
+        #expect(cache[2] is DeepseekV4Cache)
+        #expect(!cache.contains { $0 is TurboQuantKVCache })
+    }
 }
 
 // MARK: - Integration Tests: BatchEngine + TurboQuant

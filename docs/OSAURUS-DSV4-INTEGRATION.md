@@ -6,7 +6,7 @@
 - `docs/OSAURUS-CACHE-CONTRACT.md` — multi-turn / paged / prefix cache rules.
 - `docs/OSAURUS-JANGPRESS.md` — production weights cache.
 - `docs/superpowers/specs/2026-05-04-dsv4-flash-jangpress-prod-design.md` — design rationale.
-- `/Users/eric/mlx/vllm-mlx/docs/DSV4_RUNTIME_REGRESSION_TRACE.md` — Python
+- `~/mlx/vllm-mlx/docs/DSV4_RUNTIME_REGRESSION_TRACE.md` — Python
   runtime regression trace. The originally requested
   `DSV4_FIX_NUANCES.md` filename was not present locally on 2026-05-06.
 
@@ -52,13 +52,13 @@ A DSV4-Flash JANGTQ bundle must ship:
 |---|---|---|
 | `config.json` | yes | `model_type = "deepseek_v4"` |
 | `jang_config.json` | yes | `weight_format`, `profile`, `mxtq_seed`, `mxtq_bits` (or `routed_expert_bits`) |
-| `tokenizer.json` / `tokenizer_config.json` / `chat_template` | yes | the chat template MUST be present; missing template breaks chat at runtime |
+| `tokenizer.json` / `tokenizer_config.json` | yes | The local Flash bundle has `chat_template = null`; Swift uses the tracked `DSV4Minimal` fallback. Bundles may ship a compatible template, but absence is no longer a runtime blocker. |
 | `model-*.safetensors` shards | yes | per-expert weights OR prestacked routed-expert tensors directly at `switch_mlp.{gate,up,down}_proj.{tq_packed,tq_norms}` (`routed_expert_layout: prestacked`) |
-| `jangtq_runtime.safetensors` | yes (JANGTQ) | sidecar with codebook + Hadamard signs |
-| `jangtq_stacked.safetensors` | **deprecated, optional** | pre-stacked routed-expert overlay. The loader recognizes both `tq_packed`/`tq_norms` and the un-prefixed `packed`/`norms` aliases. Bundles built with `routed_expert_layout: prestacked` ship the same tensors directly in the main shards — the sidecar is redundant. See **§ Sidecar deprecation** below. |
+| `jangtq_runtime.safetensors` | yes (JANGTQ) | Small required runtime sidecar with codebook + Hadamard signs. The 2026-05-06 Flash bundle needed `signs.4096.42`, `codebook.4096.2`, `signs.2048.42`, and `codebook.2048.2`. |
+| `jangtq_stacked.safetensors` | deprecated, optional | Old pre-stacked routed-expert overlay. Do not confuse this large overlay with the small required `jangtq_runtime.safetensors` sidecar. |
 | `model.safetensors.index.json` | optional | speeds up weight discovery |
 
-### Sidecar deprecation
+### Stacked overlay deprecation
 
 `jangtq_stacked.safetensors` was added when DSV4 bundles still stored
 routed-expert weights per-expert (`mlp.experts.{E}.gate_proj.…`) and
@@ -71,9 +71,14 @@ the routed-expert weights live directly at
 `model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.{tq_packed,tq_norms}`
 inside the main `model-*.safetensors` shards. Same MXTQ codec, same
 seed, same Hadamard rotation — just relayouted on disk so the loader
-doesn't have to restack. **In this layout the sidecar is fully
-redundant** and shipping it doubles bundle disk size (~65 GB on
-JANGTQ_K).
+doesn't have to restack. In this layout the old stacked overlay is
+redundant and shipping it doubles bundle disk size on large variants.
+
+This does **not** deprecate `jangtq_runtime.safetensors`. The runtime
+sidecar remains required for JANGTQ bundles because the TurboQuant kernels
+need deterministic codebook and Hadamard-sign tensors. The local DSV4 Flash
+JANGTQ bundle was prestacked in the main shards but still needed the small
+runtime sidecar rebuilt on 2026-05-06 before live loading was valid.
 
 The Swift loader supports BOTH layouts today (commit `2534e88`'s
 `packed` → `tq_packed` alias rewriter handles whichever file the
@@ -81,21 +86,20 @@ keys come from). Migration plan:
 
 | Phase | Bundle action | Loader behavior |
 |---|---|---|
-| **A (current)** | Sidecar shipped + prestacked-in-shards | Both files loaded; main shard wins on key collision |
-| **B (validation)** | Sidecar shipped + prestacked-in-shards | Set `VMLX_DSV4_SKIP_SIDECAR=1` to deliberately skip the sidecar at load. Validates the sidecar-free path works without rebuilding the bundle. |
-| **C (deprecation)** | Sidecar removed from HF release | Old Swift loaders (pre-`2534e88`) fail; new loaders work. Bundle disk usage drops ~65 GB. |
-| **D (cleanup)** | Sidecar gone everywhere | Drop the alias rewriter at `DeepseekV4.swift:1086-1096` and the per-expert stacking path at `1098-1149`; bundles use canonical `tq_packed`/`tq_norms` natively. |
+| **A (current)** | `jangtq_runtime.safetensors` shipped + prestacked-in-shards | Required runtime sidecar loads codebooks/signs; main shards provide prestacked routed tensors. |
+| **B (validation)** | No `jangtq_stacked.safetensors`; runtime sidecar present | Validates the overlay-free prestacked path without removing codebooks/signs. |
+| **C (deprecation)** | Old stacked overlay removed from releases | Loader still works because routed tensors are in the main shards. Bundle disk usage drops when old overlays are absent. |
+| **D (cleanup)** | Overlay path gone everywhere | Drop only the old overlay/per-expert restacking compatibility code after all bundles are prestacked. Keep runtime sidecar handling. |
 
 Hosts that want to validate Phase C against the current bundle
-(without rebuilding) can run any DSV4 bench with
-`VMLX_DSV4_SKIP_SIDECAR=1` set. The skip is logged to stderr as
-`[loadWeights] VMLX_DSV4_SKIP_SIDECAR=1 — skipping jangtq_stacked.safetensors`.
+(without rebuilding) should verify that `jangtq_stacked.safetensors` is absent
+or unused while `jangtq_runtime.safetensors` remains present and non-empty.
 
 Audit a bundle from Python with the codex kit:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 \
-  /Users/eric/jang/codex_dsv4_fixkit/scripts/audit_dsv4_bundle.py \
+  ~/jang/codex_dsv4_fixkit/scripts/audit_dsv4_bundle.py \
   /path/to/DSV4-Flash-JANGTQ2
 ```
 
@@ -118,24 +122,38 @@ let context = try await ModelFactory.shared.loadContainer(
     progressHandler: nil,
     loadConfiguration: loadConfig)
 
-// 3. Chat: ChatSession handles chat template + reasoning parser + tools.
-let session = ChatSession(
-    context,
-    instructions: nil,            // DSV4 always thinks; system prompt is optional
-    generateParameters: GenerateParameters(maxTokens: 512, temperature: 0))
+// 3. Production chat: use UserInput(chat:) so template kwargs flow into
+//    the DSV4 fallback/bundle template.
+let coordinator = CacheCoordinator(config: .init(
+    usePagedCache: true,
+    enableDiskCache: true,
+    diskCacheDir: osaurusDiskCacheDir,
+    modelKey: bundleURL.lastPathComponent))
+let engine = BatchEngine(context: context, maxBatchSize: 4, cacheCoordinator: coordinator)
 
-// 4. Per turn:
-for try await event in session.streamDetails(
-    to: "What is 17 + 28?", images: [], videos: [])
-{
-    if let chunk = event.chunk {
-        // user-visible text (after reasoning parser strips <think>...</think>)
-        print(chunk, terminator: "")
-    } else if case .reasoning(let r) = event {
-        // present in a separate UI region — DSV4 always emits a thinking trace
-        ui.appendReasoning(r)
+let input = UserInput(
+    chat: [.system("You are concise."), .user("What is 17 + 28?")],
+    additionalContext: [
+        "enable_thinking": false,
+        "reasoning_effort": Optional<String>.none as Any
+    ])
+
+let params = GenerateParameters(maxTokens: 512, temperature: 0, topP: 0.95)
+let prepared = try await context.processor.prepare(input: input)
+let stream = await engine.generate(input: prepared, parameters: params)
+
+for await event in stream {
+    switch event {
+    case .chunk(let text): ui.appendVisibleText(text)
+    case .reasoning(let text): ui.appendReasoning(text)
+    case .toolCall(let call): await dispatchTool(call)
+    case .info(let info): logCompletion(info)
     }
 }
+
+// Hard reasoning / max-effort requests should enable thinking and allocate a
+// larger budget. The strict live RunBench row passed with 384 max tokens and a
+// max-only repetition penalty; product requests may use larger budgets.
 ```
 
 ## Cache mode env vars (`DSV4_KV_MODE`)
@@ -154,8 +172,29 @@ The host can override the SWA-component sizing via `DSV4_KV_MODE`:
 | Value | Behavior | When to use |
 |---|---|---|
 | unset / `sliding` (default) | Hybrid cache. SWA window = 128; CSA + HSA pools persist across decode steps for `cr > 0` layers. | Chat, reasoning, normal traffic. |
-| `full` | Plain `KVCacheSimple` on every layer. No rotation, no pool. Memory grows linearly with sequence length. | Long-reasoning runs that fit in memory and don't benefit from the pool. |
-| `tq` | `KVCacheSimple` at construction; `BatchEngine.maybeCompress` swaps in `TurboQuantKVCache` once offset crosses the min-tokens threshold. Caller MUST also set `GenerateParameters.kvMode = .turboQuant(...)`. | Long reasoning where memory is tight. |
+| `full` | Plain `KVCacheSimple` on every layer. No rotation, no pool. Memory grows linearly with sequence length. | Diagnostic comparison only; not the osaurus serving path. |
+| `tq` | `KVCacheSimple` at construction; `BatchEngine.maybeCompress` swaps in `TurboQuantKVCache` once offset crosses the min-tokens threshold. Caller MUST also set `GenerateParameters.kvMode = .turboQuant(...)`. | Diagnostic memory experiments only; this disables the DSV4 CSA/HSA pool. |
+
+The default hybrid path is the production compression path. A global
+`GenerateParameters.kvMode = .turboQuant(...)` or coordinator
+`defaultKVMode = .turboQuant(...)` does **not** replace DSV4's hybrid
+cache; `DeepseekV4Model.newCache(parameters:)` still returns
+`RotatingKVCache` plus `DeepseekV4Cache`, and BatchEngine's TQ hook has no
+`KVCacheSimple` layer to promote. TurboQuant is available only through the
+explicit diagnostic override `DSV4_KV_MODE=tq`.
+
+For paged/prefix/L2 cache integration, do not put DSV4 on the generic
+TurboQuant block-cache path. The coordinator marks DSV4's hybrid pool as
+paged-incompatible and uses the disk tier (`TQDiskSerializer` with
+`LayerKind.deepseekV4`) to persist the rotating SWA window, CSA/HSA pools,
+and incomplete compressor/indexer buffers together.
+
+At long context, the default cache is already roughly the 90% KV-memory cut
+the model was designed around. The exact ratio depends on how many layer
+positions are in `compress_ratio = 4` versus `128`, but the shape is:
+`128` local SWA tokens plus `T / compress_ratio` pooled rows instead of `T`
+ordinary KV rows. For DSV4-Flash, layers 0 and 42 are SWA-only; the middle
+layers alternate CSA (`cr=128`) and CSA+HSA (`cr=4`).
 
 The legacy `DSV4_LONG_CTX={0,1}` toggle has been **removed**. There is
 no "short-context" path anymore — DSV4 always uses the hybrid cache for
@@ -191,11 +230,11 @@ rotating SWA state plus CSA/HSA pool and buffer payloads. Nil pool/buffer
 slots are marked by `__dsv4_{layer}_nilmask__`; the tensor payload uses a
 small non-empty sentinel because safetensors rejects empty arrays.
 
-Validated live on `/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ`:
+Validated live on `~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ`:
 
 ```bash
 BENCH_BATCH_DISK_RESTORE=1 BENCH_MAX_TOKENS=4 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 ```
 
@@ -211,17 +250,16 @@ stream before tool-call processing fires. Use `streamDetails(...)` to
 receive the raw `.reasoning(String)` events alongside the regular
 `.chunk(String)` events.
 
-DSV4 ALWAYS emits a `<think>...</think>` block before its final answer.
-A `.chunk` stream that arrives empty after a `<think>` block usually
-means `maxTokens` ran out before the model closed `</think>`. Bumping
-`max_tokens` to 1024+ is normal for DSV4 chat.
+`enable_thinking=false` is plain-answer mode. The current Swift fallback
+renders `<｜Assistant｜></think>`, so `ReasoningParser.forPrompt` starts in
+visible-answer mode and output flows through `.chunk`. The 2026-05-06 strict
+full-weight chat row recalled `sapphire-42` across three turns with
+`unclosedReasoning=false`.
 
-Current Swift note from the 2026-05-06 full-weight chat row:
-`enable_thinking=false` is still intentionally forced onto the thinking path
-for this bundle. The run recalled `sapphire-42`, but turn 2 hit the token
-budget with the answer in `.reasoning` and an empty `.chunk`. Osaurus must
-surface this as a reasoning-only/length-finished state or allocate a larger
-budget; do not treat empty visible content as failed generation for DSV4.
+`enable_thinking=true` opens `<think>` and routes thought text through
+`.reasoning`. A `.chunk` stream that arrives empty at a tiny budget can still
+be a valid reasoning-only or length-finished state; production should surface
+that telemetry rather than treating it as marker leakage.
 
 ## Multi-turn caveats
 
@@ -256,26 +294,26 @@ budget; do not treat empty visible content as failed generation for DSV4.
 # kill any other runtimes first (per CLAUDE.md memory)
 pkill -9 -f "ollama|lms|mlx_lm|RunBench|xctest"
 
-# 3-turn coherence smoke against the production JANGTQ2 bundle
-BENCH_COHERENT=1 BENCH_MAX_TOKENS=400 \
-  BENCH_MODEL=/Volumes/EricsLLMDrive/jangq-ai/DeepSeek-V4-Flash-JANGTQ2 \
+# Full DSV4 production gate on the local Flash JANGTQ bundle
+BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=all \
+  BENCH_MAX_TOKENS=128 BENCH_DSV4_REASONING_MAX_TOKENS=384 \
+  BENCH_DSV4_LONG_REPEAT=220 BENCH_DSV4_LONG_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 ```
 
-Expected output (verified 2026-05-04 on M5 Max):
+Expected output (verified 2026-05-06 on M5 Max):
 
-- Turn 1 ("My favorite color is blue.") → reasoning content acknowledges
-  the color.
-- Turn 2 ("What is my favorite color?") → reasoning recalls "blue"
-  correctly (multi-turn cache reuse working).
-- Turn 3 ("Is that a warm or cool color?") → reasoning correctly
-  categorizes blue as cool.
+- Turn 1 stores `sapphire-42`; turn 2 recalls it; turn 3 answers the
+  sapphire/blue follow-up.
+- Reasoning off/on/max all answer `12` with no raw `<think>` leakage.
+- The 5,568-token long row recalls `CERULEAN RIVER / OSLO`.
+- Finish state is `stop=stop`, `unclosedReasoning=false`, clean process exit.
 
-Decode latency on M5 Max for the JANGTQ2 (74 GB) bundle:
-- Cold load: ~25 s (mmap warm-up).
-- Per-turn TTFT after warm load: ~6-30 s depending on prompt length.
-- Decode: limited by the 43-layer × 6-active-experts MoE. Acceptable
-  for chat workloads; not suited to high-tps API service.
+Latest strict full-row sample on M5 Max:
+- Load: about 7 s from warm local storage.
+- Full chat + reasoning + 5,568-token long row: about 132 s wall time.
+- Max RSS: about 69.1 GB; peak memory footprint: about 111.9 GB.
 
 ## Architecture summary table
 

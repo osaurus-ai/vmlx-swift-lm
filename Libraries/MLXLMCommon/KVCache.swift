@@ -1691,8 +1691,8 @@ public func quantizedScaledDotProductAttention(
 /// - **TurboQuant compression** (`kvMode: .turboQuant`): Converts to `TurboQuantKVCache`.
 ///   Returns float arrays — models need zero changes.
 ///
-/// Only converts `KVCacheSimple` layers. `RotatingKVCache`, `MambaCache`, and
-/// already-converted caches are skipped automatically.
+/// Only converts `KVCacheSimple` layers. `RotatingKVCache`, `DeepseekV4Cache`,
+/// `MambaCache`, and already-converted caches are skipped automatically.
 ///
 /// - Parameters:
 ///   - cache: Array of KV caches to potentially quantize/compress
@@ -1731,8 +1731,9 @@ public func maybeQuantizeKVCache(
                 cache[i] = TurboQuantKVCache.fromSimpleCache(
                     simpleCache, keyBits: keyBits, valueBits: valueBits)
             }
-            // RotatingKVCache, MambaCache, CacheList: skip (no KV to compress,
-            // or already manages its own memory)
+            // RotatingKVCache, DeepseekV4Cache, MambaCache, CacheList: skip
+            // (no ordinary full-history KV to compress, or already manages its
+            // own memory/pool layout)
         }
         return
 

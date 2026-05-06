@@ -156,10 +156,11 @@ mentioning here:
 - `DSV4_JANGTQ_BITS={2,4}` — overrides the routed-MoE codebook bits.
   Only consulted by the JANGTQ codebook resolution path; orthogonal
   to the affine-quant shape walker covered here.
-- `DSV4_KV_MODE={sliding,full,tq}` — DSV4 cache layout. Default
-  `sliding` is correct for short outputs; long-reasoning workloads
-  should use `full` or set `GenerateParameters.kvMode = .turboQuant`
-  for auto-promotion to `tq`.
+- `DSV4_KV_MODE={sliding,full,tq}` — DSV4 cache layout. Leave unset
+  or set `sliding` in production so DSV4 keeps the SWA+CSA+HSA
+  `DeepseekV4Cache` path. `full` and `tq` are diagnostics; global
+  `GenerateParameters.kvMode = .turboQuant` must not auto-promote DSV4
+  unless `DSV4_KV_MODE=tq` is set deliberately.
 
 ---
 

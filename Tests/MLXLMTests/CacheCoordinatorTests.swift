@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLLM
 @testable import MLXLMCommon
 import Testing
 
@@ -59,6 +60,57 @@ import Testing
     let afterBlocks = coordinator.pagedCache?.stats.allocatedBlocks ?? 0
     #expect(beforeBlocks == afterBlocks,
         "paged-incompatible store must not allocate new paged blocks")
+}
+
+@Test func coordinatorPagedIncompatibleStoresDeepseekV4InDiskTier() {
+    let blockSize = 4
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dsv4-disk-tier-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let config = CacheCoordinatorConfig(
+        usePagedCache: true,
+        enableDiskCache: true,
+        pagedBlockSize: blockSize,
+        maxCacheBlocks: 20,
+        diskCacheMaxGB: 1.0,
+        diskCacheDir: tmp,
+        modelKey: "dsv4-cache-contract-test"
+    )
+    let coordinator = CacheCoordinator(config: config)
+    coordinator.setPagedIncompatible(true)
+
+    let tokens = [101, 102, 103, 104]
+    let v4 = DeepseekV4Cache(slidingWindow: 16, compressRatio: 4)
+    _ = v4.update(
+        keys: MLXArray.ones([1, 1, tokens.count, 8]),
+        values: MLXArray.ones([1, 1, tokens.count, 8]) * 2.0)
+    v4.setHybridPool(branch: .compressor, value: MLXArray.ones([1, 2, 8]) * 3.0)
+    v4.setHybridPool(branch: .indexer, value: MLXArray.ones([1, 2, 8]) * 4.0)
+
+    coordinator.storeAfterGeneration(
+        promptTokens: tokens,
+        perLayerData: extractLayerData(from: [v4]),
+        ssmStates: nil,
+        cache: [v4])
+
+    #expect(coordinator.pagedCache?.stats.allocatedBlocks == 0,
+        "DSV4 paged-incompatible store must not allocate generic paged blocks")
+
+    switch coordinator.fetch(tokens: tokens) {
+    case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
+        #expect(matchedTokens == tokens.count)
+        #expect(remainingTokens.isEmpty)
+        #expect(detail == .disk)
+        #expect(blocks.isEmpty,
+            "DSV4 L2 hits should return disk arrays, not pinned paged blocks")
+        #expect(diskArrays?["dsv4_0_keys"] != nil)
+        #expect(diskArrays?["dsv4_0_pool_comp"] != nil)
+        #expect(diskArrays?["tq_0_ck_indices"] == nil,
+            "DSV4 default path must not store TurboQuant cache blocks")
+    case .miss:
+        Issue.record("DSV4 paged-incompatible coordinator should hit disk tier")
+    }
 }
 
 @Test func coordinatorMiss() {

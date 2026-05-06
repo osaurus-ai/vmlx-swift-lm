@@ -16,7 +16,7 @@
 | `GEMMA4-SLIDING-WINDOW-CRASH.md` | 2026-04-20 fix for tpae's `broadcast_shapes` crash on Gemma-4 at prompts past `sliding_window=1024`. Real-model verification matrix included. |
 | `REASONING-STREAM-EVENT.md` | 2026-04-20 `Generation.reasoning(String)` library-level streaming channel. Closes tpae's "thinking parsers should be handled at library level". Updated 2026-04-20 PM with harmony (Gemma-4) + `startInReasoning` (Qwen 3.x enable_thinking prefill) support. |
 | `STOP-SEQUENCES-CONTRACT.md` | 2026-04-20 `GenerateParameters.extraStopStrings` field + `StopStringMatcher`. Closes tpae's "what should happen to text-level stop sequences". |
-| **`OMNI-OSAURUS-HOOKUP.md`** | **2026-04-29 Nemotron-3-Nano-Omni multimodal integration guide.** Bundle detection, four-tower wrapper (LLM + RADIO + Parakeet + projectors), image/video/audio splice contracts, hybrid Mamba/Attn cache topology, TQ KV interaction, EVS pruning, JANGTQ × all-three-quants routing, cross-VLM `VLMVideoUtils.swift` shared library, full audio-LMInput integration, API-endpoint hand-off contract for OpenAI/Anthropic/Llama, hybrid-SSM warm-pass parity, full migration checklist. **Read this first** if osaurus is wiring any omni bundle. |
+| **`OMNI-OSAURUS-HOOKUP.md`** | **2026-04-29 Nemotron-3-Nano-Omni multimodal integration guide.** Bundle detection, four-tower wrapper (LLM + RADIO + Parakeet + projectors), image/video/audio splice contracts, hybrid Mamba/Attn cache topology, TQ KV interaction, EVS pruning, JANGTQ × all-three-quants routing, cross-VLM `VLMVideoUtils.swift` shared library, full audio-LMInput integration, API endpoint hand-off contract, hybrid-SSM warm-pass parity, full migration checklist. **Read this first** if osaurus is wiring any omni bundle. |
 | **`OMNI-VOICE-INTEGRATION.md`** | **2026-04-29 voice/audio/video product-engineering guide for osaurus app + UI workers.** How to wire `NemotronHOmniMicRecorder` (live mic) + `NemotronHOmniSpeaker` (system TTS) + drag-drop file UX + push-to-talk + voice-mode UX patterns into the chat app. RADIO + Parakeet + mel STFT + NVLM tile reference for engineers doing custom work on the encoders. Honest scope boundary on neural TTS (not in bundle — BYOM). Read this for **product-level** voice/audio/video features beyond the API surface contract. |
 | `FORK-SYNC-PROCESS.md` | 2026-04-20 upstream-sync procedure (`ml-explore/mlx-swift-lm` → `osaurus-ai/vmlx-swift-lm`). **Note:** `osaurus-ai/mlx-swift-lm` is deprecated — osaurus consumes vmlx directly. Closes tpae's "are we keeping this up to date". |
 | `BATCH_ENGINE.md` (next to these) | Internal iter log — architecture decisions, per-iter rationale, the ~2100-line deep dive. |
@@ -267,17 +267,22 @@ DSV4-Flash (43-layer MLA + sqrtsoftplus MoE + per-layer rope + Compressor/Indexe
 
 - Reasoning parser: `think_xml` (auto, `deepseek_*` model_type).
 - Tool format: `.dsml` (auto on model_type `deepseek_v4`; also via JANG `chat.tool_calling.parser = "dsml"`).
-- Chat template: bundle's `tokenizer_config.json.chat_template` accepts `enable_thinking` (bool) and `reasoning_effort` (`'max'` / `nil`) kwargs through `UserInput.additionalContext` → `applyChatTemplate(messages:tools:additionalContext:)`. Auto-prepends max-effort preface and toggles `<think>` open vs `</think>` closed at the prompt tail.
+- Chat template: use `UserInput(chat:)` plus `additionalContext` so `enable_thinking` (bool) and `reasoning_effort` (`'max'` / `nil`) flow into the tokenizer template or Swift `DSV4Minimal` fallback. The current local Flash bundle has no tokenizer `chat_template`, so the fallback is the production path; it auto-prepends the max-effort preface and toggles `<think>` open vs `</think>` closed at the prompt tail.
 
-Cache-mode env knobs (osaurus can set at process start; defaults preserve status-quo):
+Cache-mode env knobs (osaurus can set at process start; defaults preserve the
+production SWA+CSA+HSA topology):
 
 | Env var | Effect | Memory @ 8K output | Use when |
 |---|---|---|---|
-| (default) | `RotatingKVCache(maxSize: 128)` per layer — local sliding window. Decode beyond 128 tokens loses prompt visibility. | ~6 MB | FIM / short Q&A / classifier prompts. |
-| `DSV4_KV_MODE=full` | `KVCacheSimple` — no rotation, no compression. Model attends to full prompt + decode. | ~360 MB | **Default for any chat / reasoning workload.** |
-| `DSV4_KV_MODE=tq` | `KVCacheSimple` at construction; BatchEngine's `BatchQuantize.maybeCompress` swaps to `TurboQuantKVCache` once the offset crosses the min-token threshold. **Caller must also set `GenerateParameters.kvMode = .turboQuant(3, 3)`** for the swap to fire. | ~14 MB | Long reasoning / agent loops on memory-constrained hosts. |
+| (default) | Hybrid cache: layer 0/last use `RotatingKVCache(128)`; every `compress_ratio > 0` layer uses `DeepseekV4Cache(128, cr)` with CSA/HSA pools. | context-dependent; roughly a 90% KV-row cut at long context | Chat, reasoning, normal traffic. |
+| `DSV4_KV_MODE=full` | `KVCacheSimple` on every layer. No rotation, no CSA/HSA pool. Memory grows linearly with sequence length. | ~360 MB | Diagnostic full-KV runs that fit in memory. |
+| `DSV4_KV_MODE=tq` | `KVCacheSimple` at construction; BatchEngine's `BatchQuantize.maybeCompress` swaps to `TurboQuantKVCache` once the offset crosses the min-token threshold. **Caller must also set `GenerateParameters.kvMode = .turboQuant(3, 3)`** for the swap to fire. | ~14 MB | Diagnostic memory-constrained runs that explicitly trade away the DSV4 pool. |
 
-Auto-promotion: when `parameters.kvMode` is `.turboQuant`, `newCache()` selects `tq` automatically without an env var. Explicit env always wins.
+TurboQuant policy: a global `parameters.kvMode = .turboQuant(...)` or
+coordinator `defaultKVMode = .turboQuant(...)` does not auto-select the `tq`
+override for DSV4. The default model cache has no `KVCacheSimple` layers for
+BatchEngine to promote, so the SWA+CSA+HSA cache stays intact unless
+`DSV4_KV_MODE=tq` is set deliberately.
 
 Bundle dispatch / quantization knobs:
 
@@ -285,9 +290,15 @@ Bundle dispatch / quantization knobs:
 |---|---|
 | `DSV4_FORCE_JANGTQ=1` | Forces the JANGTQ model class for bundles whose `weight_format` stamp is `bf16` (mislabeled — we've seen this on JANGTQ_2L bundles in the wild). |
 | `DSV4_JANGTQ_BITS={2\|4}` | Routed-MoE codebook bits override. Use `4` for JANGTQ_4 bundles. Default resolution: `weight_format` stamp → config.json `quantization.bits` (only when in `{2, 4}`) → `2`. |
-| `DSV4_LONG_CTX=1` | Activates `DeepseekV4Cache` (persistent compressor pool) on `compress_ratio > 0` layers. PRE-RELEASE — has unresolved Compressor prefill shape edge cases per `research/JANGTQ-COMPRESSOR-INDEXER-PROPER-FIX-2026-04-25.md`. Use `DSV4_KV_MODE=full` instead until the PR #1195 port lands. |
+| `DSV4_KV_MODE=sliding` or unset | Production path. Uses `RotatingKVCache(128)` on SWA-only layers and `DeepseekV4Cache(128, cr)` on CSA/HSA layers. This is the default and should be used for osaurus serving. |
+| `DSV4_KV_MODE=full` | Diagnostic only. Forces plain `KVCacheSimple` and drops DSV4's CSA/HSA pools. Do not use as an osaurus default. |
+| `DSV4_KV_MODE=tq` | Diagnostic only. Enables the simple-cache shape that can later be swapped to `TurboQuantKVCache` when the request also sets `.turboQuant(...)`. This deliberately trades away the DSV4 hybrid pool and must not be selected by global cache defaults. |
 | `VMLX_CHAT_TEMPLATE_OVERRIDE=/path/to/template.jinja` | Bypass the tokenizer's bundled chat template (e.g. when swift-jinja chokes on a specific construct). |
 | `VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` | Opt out of in-process `DSV4Minimal` fallback when a legacy bundle ships no `chat_template`. |
+
+`DSV4_LONG_CTX` is removed. There is no short-context fallback anymore;
+DSV4 always uses the SWA+CSA+HSA cache topology unless the operator sets
+one of the explicit diagnostic `DSV4_KV_MODE` overrides above.
 
 Loader robustness (2026-04-25): the per-layer quantization inference walks every `.scales` key in the bundle and chooses `(bits, group_size)` from a fixed empirical preference order — `(8,32) (8,64) (8,128) (4,32) (4,64) (4,128) (2,32) (2,64) (2,128) (3,32) (6,32)`. This is shape-authoritative: bundles whose `config.json` got re-stamped with mismatched per-layer overrides (or uniform `bits: 8` while routed experts are actually `bits: 2`) load correctly without manual config patching. Idempotent — clean configs add zero overrides.
 

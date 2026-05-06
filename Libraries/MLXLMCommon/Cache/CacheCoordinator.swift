@@ -327,10 +327,11 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///
     /// Distributes the data to each enabled cache tier:
     /// 1. Paged cache receives the token sequence and per-block layer data.
-    /// 2. Disk cache receives flattened KV arrays keyed by token hash.
-    ///    When TurboQuant-compressed layers are detected in `cache`, the disk
-    ///    tier stores the 26x-smaller compressed representation via
-    ///    ``TQDiskSerializer`` instead of raw float16 arrays.
+    /// 2. Disk cache receives serialized cache state keyed by token hash.
+    ///    ``TQDiskSerializer`` preserves each layer's real cache kind:
+    ///    TurboQuant layers stay compressed, and DSV4 `HybridPoolCache`
+    ///    layers store their SWA window plus CSA/HSA pool state instead of
+    ///    being flattened into generic paged KV blocks.
     /// 3. SSM companion cache receives states for hybrid models.
     ///
     /// The `perLayerData` is the full-sequence per-layer output from

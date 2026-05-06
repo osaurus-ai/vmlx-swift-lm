@@ -53,6 +53,23 @@ struct DeepseekV4ModelSmokeTests {
         return c
     }
 
+    static func withEnv<T>(_ name: String, _ value: String?, _ body: () throws -> T) rethrows -> T {
+        let prior = ProcessInfo.processInfo.environment[name]
+        if let value {
+            setenv(name, value, 1)
+        } else {
+            unsetenv(name)
+        }
+        defer {
+            if let prior {
+                setenv(name, prior, 1)
+            } else {
+                unsetenv(name)
+            }
+        }
+        return try body()
+    }
+
     // NOTE: standalone `DeepseekV4Model(cfg)` / `DeepseekV4JANGTQModel(cfg)`
     // instantiation tests are covered via the factory dispatch tests below.
     // Separate standalone tests triggered a Metal concurrent-init segfault
@@ -61,6 +78,47 @@ struct DeepseekV4ModelSmokeTests {
     // issue also seen with Gemma4VLMTests / EvalTests.
 
     // MARK: - Sanitize remapping
+
+    @Test("newCache keeps DSV4 hybrid cache even when request asks for TurboQuant")
+    func newCacheKeepsHybridDespiteTurboQuantRequest() throws {
+        var cfg = Self.tinyConfig()
+        cfg.numHiddenLayers = 4
+        cfg.compressRatios = [0, 128, 4, 0]
+        let model = DeepseekV4Model(cfg)
+        let params = GenerateParameters(
+            maxTokens: 8,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+            temperature: 0)
+
+        try Self.withEnv("DSV4_KV_MODE", nil) {
+            let cache = model.newCache(parameters: params)
+            #expect(cache.count == 4)
+            #expect(cache[0] is RotatingKVCache)
+            #expect(cache[1] is DeepseekV4Cache)
+            #expect(cache[2] is DeepseekV4Cache)
+            #expect(cache[3] is RotatingKVCache)
+            #expect(!cache.contains { $0 is KVCacheSimple })
+            #expect(!cache.contains { $0 is TurboQuantKVCache })
+        }
+    }
+
+    @Test("DSV4_KV_MODE=tq is the explicit diagnostic simple-cache override")
+    func newCacheTQModeUsesSimpleCacheForExplicitDiagnosticOverride() throws {
+        var cfg = Self.tinyConfig()
+        cfg.numHiddenLayers = 4
+        cfg.compressRatios = [0, 128, 4, 0]
+        let model = DeepseekV4Model(cfg)
+        let params = GenerateParameters(
+            maxTokens: 8,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+            temperature: 0)
+
+        try Self.withEnv("DSV4_KV_MODE", "tq") {
+            let cache = model.newCache(parameters: params)
+            #expect(cache.count == 4)
+            #expect(cache.allSatisfy { $0 is KVCacheSimple })
+        }
+    }
 
     @Test("sanitize() rewrites attn→self_attn, ffn→mlp, norms, hc_*, top-level")
     func sanitizeRemap() {

@@ -27,9 +27,9 @@
 //   • HyperHead reduce at the top of the model (mHC copies → hidden)
 //
 // Compressor + Indexer (for long-context attention with compress_ratio>0)
-// are NOT wired in Phase 1b. Short prompts (L < sliding_window=128) run
-// the bypass path correctly; long prompts degrade to sliding-window-only
-// attention until Phase 2. Their weights are dropped in sanitize().
+// are wired for the canonical DSV4-Flash SWA+CSA+HSA path. Layers with
+// cr>0 use DeepseekV4Cache to preserve the local sliding window plus
+// pooled global context across turns and disk-cache restores.
 
 import Foundation
 import MLX

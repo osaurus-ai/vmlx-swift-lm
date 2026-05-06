@@ -279,32 +279,24 @@ public enum ChatTemplateFallbacks {
 {%- endfor -%}
 {%- if add_generation_prompt -%}
 {{- asst_token -}}
-{# DSV4 force-thinking override (mirrors Python `vmlx serve`): the
-   shipping DSV4-Flash-JANGTQ bundle is fundamentally broken in
-   chat-mode. When the prompt tail is `</think>` (close-only) the
-   model regurgitates training-data artifacts (spam URLs,
-   `[URL REMOVED BY BROTS]` markers, mixed-language instruction
-   annotations). With `<think>` (open) at the tail the model produces
-   clean coherent output. ReasoningParser strips `<think>...</think>`
-   from the user-visible chunk stream so callers that asked for
-   thinking-off still see only the final answer. Reproduced under
-   `BENCH_COHERENT` 2026-05-04 as silent-empty-output. #}
+{%- if enable_thinking -%}
 {{- think_open -}}
+{%- else -%}
+{{- think_close -}}
+{%- endif -%}
 {%- endif -%}
 """#
 
-    /// REMOVED 2026-05-01 — kept as `_lagunaMinimal_DEPRECATED` for one
-    /// release in case the osaurus-ai/swift-jinja parseOr fork breaks
-    /// on a Laguna template variant we haven't tested. Verified that
-    /// the native `laguna_glm_thinking_v5/chat_template.jinja` (with
-    /// `{%- generation -%}…{%- endgeneration -%}` block tags) parses
-    /// AND renders correctly through the bridge against the swift-jinja
-    /// fork at 58d21aa5. End-to-end Laguna BENCH_BATCH_CHAT 3-turn is
-    /// coherent ("That's a great color!..." → "Your favorite color is
-    /// blue!..." → "Blue is a cool color..."). No fallback engaged in
-    /// the verified path; the bridge sniff that previously force-routed
-    /// to this template was removed in the same commit.
-    private static let _lagunaMinimal_DEPRECATED: String = #"""
+    /// Laguna / Poolside minimal chat template.
+    ///
+    /// Real Laguna bundles expose `tokenizer_config.json.chat_template`
+    /// as `{% include 'chat_template.jinja' %}`. Some Jinja bridges can
+    /// resolve that sidecar, but others either throw or render without
+    /// directory context. Treat this as a production template, not a
+    /// recovery path, so all hosts get the native Poolside turn format:
+    /// `<system>`, `<user>`, `<assistant>`, `</think>` for direct-answer
+    /// mode, and `<think>` for reasoning mode.
+    public static let lagunaMinimal: String = #"""
 {{- "〈|EOS|〉" -}}
 {%- set enable_thinking = enable_thinking | default(false) -%}
 {%- set add_generation_prompt = add_generation_prompt | default(false) -%}
@@ -344,13 +336,26 @@ public enum ChatTemplateFallbacks {
     {{- "\n</user>\n" -}}
   {%- elif message.role == "assistant" -%}
     {{- "<assistant>\n" -}}
-    {%- if enable_thinking -%}
-      {{- "<think>\n" -}}
+    {%- set content = message.content if message.content is string else "" -%}
+    {%- set reasoning_content = "" -%}
+    {%- if message['reasoning'] is string -%}
+      {%- set reasoning_content = message['reasoning'] -%}
+    {%- elif message['reasoning_content'] is string -%}
+      {%- set reasoning_content = message['reasoning_content'] -%}
+    {%- endif -%}
+    {%- if '</think>' in content -%}
+      {%- if not reasoning_content -%}
+        {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') -%}
+      {%- endif -%}
+      {%- set content = content.split('</think>')[-1].lstrip('\n') -%}
+    {%- endif -%}
+    {%- if reasoning_content -%}
+      {{- "<think>\n" -}}{{- reasoning_content.strip() -}}{{- "\n</think>\n" -}}
     {%- else -%}
       {{- "</think>\n" -}}
     {%- endif -%}
-    {%- if message.content is string -%}
-      {{- message.content -}}
+    {%- if content.strip() -%}
+      {{- content.strip() -}}
     {%- else -%}
       {%- for item in message.content -%}
         {%- if item.type == "text" -%}{{- item.text -}}{%- endif -%}

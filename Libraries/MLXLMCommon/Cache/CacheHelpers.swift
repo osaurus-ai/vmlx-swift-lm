@@ -23,9 +23,10 @@ func makePromptBoundaryCacheSnapshot(from cache: [any KVCache]) -> [any KVCache]
 /// Build the cache object list passed to ``TQDiskSerializer`` from a clean
 /// prompt-boundary snapshot.
 ///
-/// This preserves the TurboQuant-on-disk path without using the live decode
-/// cache: if the caller requested KV TurboQuant and the prompt is long enough,
-/// the snapshot is compressed here after generation has finished.
+/// This preserves cache-specific disk paths without using the live decode
+/// cache: ordinary `KVCacheSimple` layers can be compressed here when the
+/// caller requested TurboQuant, while DSV4 `HybridPoolCache` layers remain
+/// in their SWA+CSA+HSA shape for `LayerKind.deepseekV4` serialization.
 func makeDiskStoreCache(
     fromPromptBoundary snapshot: [any KVCache],
     kvBits: Int?,

@@ -51,10 +51,10 @@ Production-ready minimum as of this handoff:
 - Ling JANGTQ/JANGTQ2/MXFP4 load and answer coherently in multi-turn recall.
   JANGTQ2 is the preferred Ling production bundle for memory. MXFP4 is now
   memory-bounded but slow.
-- DSV4 Flash loads, routes reasoning modes, and stores/restores cache state.
-  Short chat recall and the 3K-token long-context row are revalidated after
-  the local sidecar rebuild. The 5K+ stress row remains a memory-hardening
-  task, not a minimum coherence blocker.
+- DSV4 Flash loads, routes chat/reasoning/max modes, and stores/restores
+  hybrid cache state. Short multi-turn chat and the 5,568-token long-context
+  row are revalidated cleanly after the local sidecar rebuild and RunBench
+  teardown fix.
 - Qwen 35B, Qwen 27B, Gemma4 26B, Laguna XS.2, MiniMax M2.7, and Nemotron Omni
   have live coherent-output coverage without marker leakage in the tested rows.
 - Paged/prefix cache, L2 disk restore, SSM companion state, and TurboQuant KV
@@ -85,9 +85,9 @@ the osaurus-owned dependency chain and fixing RunBench's tokenizer smoke path.
 | Release build | PASS. `swift build -c release --product RunBench`. |
 | Focused Swift tests | PASS with Xcode toolchain and `--no-parallel`: paged/prefix cache, cache coordinator, SSM state cache, TQ disk serializer CacheList, interleaved reasoning/tool calls, Gemma4 template probes, and CompilableTurboQuantKVCache parity. |
 | Kimi K2.6 Small JANGTQ config/template | PASS after RunBench switched to the production tokenizer substitution path. Remaining warning: tokenizer EOS `163585` is not in effective EOS `[163586]`. |
-| DSV4 template kwargs | PASS. `enable_thinking` and `reasoning_effort=max` reached the shipped DSV4 template through Swift-Jinja. |
-| DSV4 production chat row | PASS. Full-weight `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` recalled `sapphire-42` and answered the sapphire/blue follow-up. Wall time was 503 s under memory pressure; turn 2 finished with answer content inside `.reasoning` and empty `.chunk` at 128 tokens. |
-| Laguna XS.2 JANGTQ live loop probe | PASS. No loop and no raw marker leak. Thinking-on stayed in `.reasoning` at short budget. Peak memory footprint about 11.9 GB. |
+| DSV4 template kwargs | PASS. `enable_thinking=false` renders the DSV4 prompt tail as `<｜Assistant｜></think>`, `enable_thinking=true` opens `<think>`, and `reasoning_effort=max` reaches the fallback template through Swift-Jinja. |
+| DSV4 production chat row | PASS. Full-weight `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` recalled `sapphire-42`, answered the sapphire/blue follow-up, emitted visible `.chunk` text with `unclosedReasoning=false`, and clean-exited after explicit engine shutdown. |
+| Laguna XS.2 JANGTQ live loop probe | PASS. The bridge engaged the native Poolside/Laguna template, and the strict 512-token loop probe stopped cleanly in both thinking modes with no raw marker leak. Peak memory footprint about 12.0 GB. |
 | Qwen3.6 35B JANGTQ live reasoning gate | PASS. No `<think>` leakage in `.chunk`; reasoning deltas populated. Cosmetic VLM factory warning still appears before LLM factory succeeds. |
 | Gemma4 26B JANG live harmony gate | PASS. No harmony markers in `.chunk`; the selected prompt did not elicit `.reasoning` deltas. Peak memory footprint about 27.9 GB. |
 | Qwen cache stack live probes | PASS. Paged-prefix hit fired with hybrid rollback semantics; disk L2 restore hit with `ssm_companion`; TurboQuant KV B=2 kept plain-slot output byte-identical beside a TQ slot. |
@@ -96,7 +96,7 @@ the osaurus-owned dependency chain and fixing RunBench's tokenizer smoke path.
 
 ### 2026-05-06 Cache/SSM WIP Recheck
 
-This recheck was run in `/Users/eric/vmlx-swift-lm` after the Ling
+This recheck was run in `~/vmlx-swift-lm` after the Ling
 `enable_thinking` fix landed at `82ce729`.
 
 | Row | Result |
@@ -104,8 +104,8 @@ This recheck was run in `/Users/eric/vmlx-swift-lm` after the Ling
 | `swift test -c release --filter SSMStateCacheTests --no-parallel` | PASS with Xcode toolchain after copying `default.metallib` / `mlx.metallib` beside the release test bundle. 7 tests passed, including SSM companion disk round-trip, media-salt isolation, and over-cap eviction. |
 | `swift build -c release --product RunBench` | PASS with existing distributed/VL/model warnings only. |
 | Ling JANGTQ `BENCH_COHERENT=1` | PASS. Compile off/on both recalled favorite color, identified blue as cool, and produced no loop or raw marker leak. |
-| DSV4 Flash short `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` | PASS before the local DSV4 bundle was removed for redownload. Three turns recalled `sapphire-42`; visible answer content was routed through `.reasoning`, not `.chunk`, as expected for this bundle. |
-| DSV4 Flash long row | PASS after local sidecar rebuild. The 3,068-token row recalled `CERULEAN RIVER / OSLO` with reasoning present, visible final answer, and no loop. The 5,568-token stress row was killed under overlapping DSV4 load and is not a clean verdict. |
+| DSV4 Flash short `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` | PASS after the DSV4 fallback-template fix. Three turns recalled `sapphire-42`; visible answer content arrived through `.chunk` with `unclosedReasoning=false`. |
+| DSV4 Flash long row | PASS after local sidecar rebuild and RunBench teardown fix. The 5,568-token row recalled `CERULEAN RIVER / OSLO` with visible final answer, `stop=stop`, no loop, `unclosedReasoning=false`, and clean process exit. |
 | Qwen3.6 35B JANGTQ `BENCH_BATCH_TQ_B2=1` | PASS. Plain KV slot stayed byte-identical beside a TurboQuant KV neighbor; both TQ slots decoded coherent text. |
 | MiniMax M2.7 Small JANGTQ `BENCH_BATCH_DISK_RESTORE=1` | PASS. Fresh coordinator hit disk L2; prompt time dropped from 13.608s to 0.179s. |
 | MiniMax M2.7 Small JANGTQ `BENCH_BATCH_CACHE_HIT=1` | PASS. Paged prefix probe hit 128/186 tokens and warm/cold prompt ratio was 0.36. |
@@ -128,7 +128,7 @@ metadata/template only.
 | Qwen3.6 35B JANGTQ `BENCH_QWEN_THINKING_CHECK=1` | PASS. 63 reasoning deltas, empty `.chunk`, no `<think>` marker leak. Peak footprint about 11.2 GB. |
 | Qwen3.6 35B JANGTQ `BENCH_QWEN_MULTITURN_TOOL=1` | PASS. Three prompt/tool-style turns had zero reasoning-envelope marker leakage in `.chunk`. The selected budget stayed inside `.reasoning`, which is acceptable for the leak gate. |
 | Gemma4 26B JANG_4M `BENCH_HARMONY_CHECK=1` | PASS. Coherent README-template visible text, no harmony markers in `.chunk`. The prompt did not elicit reasoning deltas. |
-| Laguna XS.2 JANGTQ `BENCH_LAGUNA_LOOP=1` | PASS. Thinking off/on both produced coherent folder summaries with `loop=NO`; thinking-on split reasoning and visible text without marker leakage. |
+| Laguna XS.2 JANGTQ `BENCH_LAGUNA_LOOP=1` | PASS. Thinking off/on both produced coherent folder summaries, reached `finish=stop`, and reported `loop=NO`, `unclosedReasoning=NO`, and `leaks=none`. |
 | MiniMax M2.7 JANGTQ `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and answered cool color correctly. Peak footprint about 61.2 GB. |
 | MiniMax M2.7 JANGTQ_K `BENCH_COHERENT=1` | COHERENT / PERF ISSUE. Compile off/on both recalled blue. The first cold run had 163s TTFT under cold shader/cache conditions; rerun after warmup had about 4.2s first TTFT and warm turns around 350 ms. Peak footprint stayed about 80.0 GB, so memory/speed remain optimization work. |
 | Qwen3.6 27B JANG_4M `BENCH_COHERENT=1` | PASS with explicit visible-answer policy. The generic 48-token row stayed entirely in reasoning, but `BENCH_THINK_LOOP_PROBE=1 THINK=0` produced visible content with zero reasoning chars, EOS stop, no loop, and no marker leak. |
@@ -137,8 +137,8 @@ metadata/template only.
 | Ling 2.6 flash MXFP4 `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and cool color. Peak footprint about 66.8 GB, not the earlier ~110 GB failure mode. |
 | Nemotron Omni Nano JANGTQ `BENCH_OMNI=1 BENCH_OMNI_BATCH=1` | PASS. 17/17 rows passed: text single/multi-turn, image, video encoder, audio encoder, video/audio LMInput, reasoning ON/OFF toggle, mixed image+audio, media-salt isolation, hybrid SSM warm-pass, BatchEngine B=1/B=2/image/audio. |
 | Production bundle `BENCH_CONFIG_SMOKE=1` sweep | PASS for Qwen 35B, Qwen 27B, Gemma4, Laguna, MiniMax JANGTQ/JANGTQ_K, Ling JANGTQ2/MXFP4, Nemotron Omni JANGTQ, and DSV4 Flash. DSV4 reports `sidecar=true` after local sidecar rebuild. |
-| Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 always opens `<think>` even with `enable_thinking=false`; `reasoning_effort=max` changes the rendered prompt. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
-| DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | PASS. Reasoning-off and reasoning-on both answered `12`; reasoning-on routed thought text through `.reasoning`. Max-effort produced reasoning-only within the 128-token cap, which is stream-correct but means production should allocate enough token budget if visible final text is required after max reasoning. |
+| Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 has no bundle chat template in this local Flash bundle, so the Swift `DSV4Minimal` fallback is the production path: `thinking_false` closes `</think>`, `thinking_true` opens `<think>`, and `reasoning_effort=max` changes the rendered prompt. Laguna now uses the Swift `LagunaMinimal` Poolside template when the bundle exposes only an include wrapper. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
+| DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | PASS. Reasoning-off, reasoning-on, and max-effort all answered `12`; thinking rows routed thought text through `.reasoning`, closed reasoning, stopped by EOS/stop, and did not leak raw `<think>` markers. Max-effort needs the larger `BENCH_DSV4_REASONING_MAX_TOKENS=384` budget and the max-only repetition penalty. |
 
 Runtime fix made after this matrix: `MiniMaxJANGTQConfiguration` now decodes
 the real JANGTQ_K nested bit map directly from `mxtq_bits.routed_expert`, not
@@ -150,7 +150,7 @@ local MiniMax M2.7 JANGTQ_K bundle passes with
 multi-turn, and tool rows.
 
 DSV4 model-file issue found during this continuation: the copied
-`/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ` bundle had all 78 model
+`~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ` bundle had all 78 model
 shards, `model.safetensors.index.json`, and tokenizer files, but it was missing
 `jangtq_runtime.safetensors` while `jang_config.json` declared
 `weight_format="mxtq"`. The safetensors index confirms this DSV4 bundle is a
@@ -165,18 +165,25 @@ Both copies have SHA-256
 `f488d42982781d5653f5bbd6e6d6bd6d93416c9759e2dceaabde4a9817ad571c`.
 Model publishing should include that sidecar in the DSV4 Flash bundle.
 
-DSV4 long-context retry status: after the sidecar rebuild, DSV4 loaded as
-`DeepseekV4JANGTQModel`. A 5,568-token stress prompt was killed after 285s at
-about 118 GB peak footprint while another DSV4 validation process overlapped,
-so that row is not a clean exclusive-host verdict. The documented 3K-ish row
-then passed with `BENCH_DSV4_LONG_REPEAT=120`: prompt 3,068 tokens, 305s wall
-time, about 108 GB peak footprint, visible answer
-`CERULEAN RIVER / OSLO`, routed reasoning present, and no loop.
+DSV4 long-context retry status: after the sidecar rebuild and RunBench teardown
+fix, DSV4 loaded as `DeepseekV4JANGTQModel` and the strict 5,568-token row
+passed cleanly:
+
+- command: `BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=all BENCH_MAX_TOKENS=128 BENCH_DSV4_LONG_REPEAT=220 BENCH_DSV4_LONG_MAX_TOKENS=96 BENCH_DSV4_REASONING_MAX_TOKENS=384`
+- long prompt: 5,568 tokens
+- answer: `CERULEAN RIVER / OSLO`
+- finish: `stop=stop`, `unclosedReasoning=false`, no loop
+- memory: max RSS about 69.1 GB; peak footprint about 111.9 GB
+- wall time: about 132 s for the full chat + reasoning + long row
 
 Latest speed/coherence sample from the local ignored `RunBench` perf harness
-after adding output previews to the audit logs:
+after adding output previews to the audit logs. `BatchEngine observed` is the
+production batch path (`BENCH_PERF_PATH=batch`). `Simple observed` is the
+single-request `TokenIterator` path (`BENCH_PERF_PATH=iter`), used to separate
+model/kernel speed from batching overhead. These are the live speed-progress
+numbers from this pass, not final speed acceptance for the slower families:
 
-| Model | Target | BatchEngine observed | TokenIterator observed | Coherence status |
+| Model | Target | BatchEngine observed | Simple observed | Coherence status |
 |---|---:|---:|---:|---|
 | Qwen3.6 35B JANGTQ | 80 tok/s | 78.8 tok/s | 94.2 tok/s | Coherent visible text, no loop, no leaks. |
 | Qwen3.6 27B JANG_4M | 25 tok/s | 25.5 tok/s | not rerun | Coherent visible text, no loop, no leaks. |
@@ -188,11 +195,24 @@ after adding output previews to the audit logs:
 
 Raw local logs are under `docs/benchmarks/speed-2026-05-06/` but that directory
 is gitignored. Recreate them with `BENCH_PERF=1` if the PR needs fresh numbers.
+Use `BENCH_PERF_PATH=batch` for the production BatchEngine row and
+`BENCH_PERF_PATH=iter` for the simple TokenIterator row. `BENCH_SIMPLE=1`
+remains the quick single-load sanity check; for Ling JANGTQ it generated 64
+tokens at prompt length 30 with about 29.1 GB peak RSS.
 
 Additional HQ continuation after this table:
 
 - Qwen3.6 35B JANGTQ `BENCH_PERF` BatchEngine, 64 tokens:
   **80.4 tok/s**, coherent text, no loop, no leaks, and no factory fallback noise.
+- Laguna XS.2 JANGTQ `BENCH_TEMPLATE_SMOKE=1 VMLX_CHAT_TEMPLATE_FALLBACK_LOG=1`:
+  PASS. The tokenizer bridge selected `LagunaMinimal`; thinking-off rendered a
+  closed `</think>` prompt tail, thinking-on opened `<think>`, and assistant
+  reasoning history rendered as `<think>...</think>` followed by visible
+  content.
+- Laguna XS.2 JANGTQ strict `BENCH_LAGUNA_LOOP=1 BENCH_MAX_TOKENS=512`:
+  PASS. Thinking-off generated 374 tokens and stopped; thinking-on generated
+  171 tokens and stopped; no loop, unclosed reasoning, or marker leak. Log:
+  `/tmp/vmlx_laguna_loop_strict_default_after_20260506.log`.
 - MiniMax M2.7 JANGTQ TokenIterator, 64 tokens: baseline **34.7 tok/s**;
   `VMLINUX_MINIMAX_ROUTER_COMPILE=1` **34.6 tok/s**;
   `VMLX_TQ_SWITCH_GLU_COMPILE=0` **35.1 tok/s**. The current MiniMax gap is
@@ -205,13 +225,13 @@ Additional HQ continuation after this table:
   hygiene unless the benchmark target is intentionally promoted into source.
 
 The requested Python file
-`/Users/eric/mlx/vllm-mlx/docs/DSV4_FIX_NUANCES.md` was not present locally.
+`~/mlx/vllm-mlx/docs/DSV4_FIX_NUANCES.md` was not present locally.
 The equivalent local Python-runtime notes are in
-`/Users/eric/mlx/vllm-mlx/docs/DSV4_RUNTIME_REGRESSION_TRACE.md` and
-`/Users/eric/mlx/vllm-mlx/docs/DSV4-PYTHON-AUDIT-2026-05-03.md`; their relevant
-requirements are reflected here: force DSV4 thinking mode, keep DSV4 prefill
-single-shot, preserve SWA+CSA+HSA hybrid cache state, and never route DSV4
-through paged KV ownership.
+`~/mlx/vllm-mlx/docs/DSV4_RUNTIME_REGRESSION_TRACE.md` and
+`~/mlx/vllm-mlx/docs/DSV4-PYTHON-AUDIT-2026-05-03.md`; their relevant
+requirements are reflected here: preserve DSV4 prompt-mode kwargs, keep DSV4
+prefill single-shot, preserve SWA+CSA+HSA hybrid cache state, and never route
+DSV4 through paged KV ownership.
 
 ## Speed / Dtype Contract For New Runtime Work
 
@@ -337,13 +357,12 @@ for await event in stream {
 
 Important behavior:
 
-- `.reasoning` can be non-empty even when the caller requested
-  `enable_thinking=false` on families whose bundle/runtime force an open
-  thinking tail for coherence. DSV4 currently does this.
-- `.chunk` can be empty at `max_tokens` while `.reasoning` contains the right
-  answer. This is a length/state policy issue, not marker leakage. The UI should
-  surface a reasoning-only or length-finished state instead of treating it as no
-  output.
+- `.reasoning` can be non-empty on thinking-enabled rows and should always be
+  rendered separately from visible answer text.
+- `.chunk` can be empty at `max_tokens` on thinking-enabled short-budget rows
+  while `.reasoning` contains useful text. This is a length/state policy issue,
+  not marker leakage. The UI should surface a reasoning-only or length-finished
+  state instead of treating it as no output.
 - Thinking-on short prompts may end before the model closes `</think>`. Do not
   assume every thinking turn produces visible answer text within tiny budgets.
 - Tool calls belong in `.toolCall`; do not scan visible chunks for raw tool
@@ -370,7 +389,7 @@ Family notes:
 | Qwen 3.x / 3.6 | `enable_thinking` affects prompt tail; parser uses decoded prompt tail via `ReasoningParser.forPrompt`. |
 | Gemma 4 | Harmony parser is channel based. Use Gemma4 fallback templates when native Swift Jinja compatibility is not enough. |
 | MiniMax M2.7 | JANG fallback detects MiniMax tokens by BOS/EOS, not by fragile `convertTokenToId` checks. |
-| Laguna | Thinking-off/on is template-controlled; loop probe is the production smoke. |
+| Laguna | Poolside/Laguna bundles can expose only `{% include 'chat_template.jinja' %}`. vmlx selects `LagunaMinimal` from BOS/EOS and `<assistant>` / `<think>` sentinels; loop probe is the production smoke. |
 | Nemotron-Omni | Text/image/video/audio rows go through Omni processor; reasoning parser strips raw markers from validation summaries. |
 
 Swift-Jinja now resolves through the osaurus-owned chain:
@@ -400,20 +419,20 @@ Required runtime behavior:
 
 Reasoning modes:
 
-- `enable_thinking=false`: should be treated as "plain answer requested", but
-  current DSV4 bundles may still force the open thinking path for quality. Route
-  reasoning deltas separately and allow enough max tokens for final answer text
-  when product UX requires visible answer text.
+- `enable_thinking=false`: plain-answer mode. The current Swift fallback closes
+  the thinking block at the prompt tail and the strict live DSV4 row produced
+  visible `.chunk` text with `unclosedReasoning=false`.
 - `enable_thinking=true`: normal reasoning stream.
 - `reasoning_effort="max"`: template preface is applied and can consume more
-  budget before visible answer.
+  budget before visible answer. Use a larger budget; the live max row passed
+  with 384 tokens and a max-only repetition penalty.
 
 Live DSV4 gate added:
 
 ```bash
 BENCH_DSV4_COHERENCE=1 \
   BENCH_DSV4_ROW=chat|reasoning|long|all \
-  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 ```
 
@@ -421,15 +440,16 @@ Observed on 2026-05-06:
 
 | Row | Result |
 |---|---|
-| `chat` | PASS, clean exit. Multi-turn recalled `sapphire-42`; turn 3 answered sapphire/blue follow-up. Turn 2 answer stayed in `.reasoning` at 128 tokens. |
-| `reasoning` | PASS, clean exit. Reasoning off/on/max routed without raw `<think>` in `.chunk`; arithmetic answer was present in routed stream. |
+| `chat` | PASS, clean exit. Multi-turn recalled `sapphire-42`; turn 3 answered sapphire/blue follow-up. All three turns had visible `.chunk` text and `unclosedReasoning=false`. |
+| `reasoning` | PASS, clean exit. Reasoning off/on/max routed without raw `<think>` in `.chunk`; arithmetic answer was present in visible output; thinking rows closed reasoning. |
 | `long` repeat=120 | PASS, clean exit. 3,068 prompt tokens, recalled buried `CERULEAN RIVER, OSLO`. |
-| `long` repeat=220 | Semantically PASS at 5,568 prompt tokens, recalled `CERULEAN RIVER, OSLO`, but process exited abnormally after printing PASS, likely teardown/memory pressure. |
+| `long` repeat=220 | PASS, clean exit. 5,568 prompt tokens, recalled buried `CERULEAN RIVER, OSLO`, `stop=stop`, no loop, `unclosedReasoning=false`. |
 | `long` repeat=650 | OOM during long prefill/decode. Treat as a memory ceiling until DSV4 long-context memory is hardened. |
 
 For production, use DSV4 long-context chat confidently past the 128-token local
-window at the validated 3K-token scale. Treat 5K+ prompt tokens as a live
-memory-pressure area on a 128 GB M5 Max until further hardening lands.
+window at the validated 5,568-token scale. Treat much larger prompts, including
+the 650-filler stress row, as a live memory-pressure area on a 128 GB M5 Max
+until further hardening lands.
 
 ## Ling / Bailing Runtime Notes
 
@@ -574,16 +594,16 @@ Current speed note:
 
 | Family/model | Minimum current status |
 |---|---|
-| DSV4 Flash JANGTQ | PASS for production chat row, reasoning row, and 3K-token semantic long-context row. 5K+ memory pressure open. |
+| DSV4 Flash JANGTQ | PASS for production chat row, reasoning row, and 5,568-token semantic long-context row. Much larger long-agent prompts remain memory-hardening work. |
 | Ling/Bailing JANGTQ/JANGTQ2/MXFP4 | PASS for multi-turn recall after MLA no-double-update fix and live ArraysCache reuse. |
 | Qwen3.6 35B JANGTQ | PASS for thinking marker routing, tool-call multi-turn, paged prefix, disk restore, TQ B=2. Latest marker gate clean-exited with no raw `<think>` in `.chunk`. |
 | Gemma4 26B JANG | PASS for harmony parser marker stripping and live perf/coherence smoke. Latest harmony gate clean-exited with no raw harmony markers in `.chunk`. |
-| Laguna XS.2 JANGTQ | PASS for thinking-off/on loop probe, no marker leak, no loop. Thinking-on stayed in `.reasoning` at short budget. |
+| Laguna XS.2 JANGTQ | PASS for strict thinking-off/on loop probe. Both modes reached `stop`, produced visible content, and had no marker leak or loop. |
 | MiniMax M2.7 JANGTQ | PASS for full-size ChatSession multi-turn coherence, compile off/on, clean exit. Speed remains open. MiniMax-small also passed JP regression and TQ disk round-trip. |
 | Nemotron-Omni Nano JANGTQ | PASS for Omni matrix covering text, image, video, audio, media salt, hybrid SSM warm-pass, B=1/B=2. |
 
 Mistral 3.5 was requested, but no local model directory existed under
-`/Users/eric/models` during this pass.
+`~/models` during this pass.
 
 ## Toolchain Notes
 
@@ -606,7 +626,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild build -scheme MLX -destination 'platform=macOS,arch=arm64')
 
-cp /Users/eric/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib \
+cp ~/Library/Developer/Xcode/DerivedData/mlx-swift-*/Build/Products/Debug/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib \
   .build/arm64-apple-macosx/debug/default.metallib
 cp .build/arm64-apple-macosx/debug/default.metallib \
   .build/arm64-apple-macosx/debug/mlx.metallib
@@ -628,23 +648,39 @@ Build:
 swift build -c release --product RunBench
 ```
 
+Speed progress, batch vs simple:
+
+```bash
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  .build/release/RunBench
+
+BENCH_SIMPLE=1 BENCH_PROMPT_LEN=30 BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/JANGQ/Ling-2.6-flash-JANGTQ \
+  .build/release/RunBench
+```
+
 DSV4 production gates:
 
 ```bash
 BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=chat \
   BENCH_MAX_TOKENS=128 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 
 BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=reasoning \
-  BENCH_MAX_TOKENS=192 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  BENCH_MAX_TOKENS=128 BENCH_DSV4_REASONING_MAX_TOKENS=384 \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 
 BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=long \
-  BENCH_MAX_TOKENS=96 BENCH_DSV4_LONG_REPEAT=120 \
-  BENCH_DSV4_LONG_MAX_TOKENS=80 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  BENCH_MAX_TOKENS=128 BENCH_DSV4_LONG_REPEAT=220 \
+  BENCH_DSV4_LONG_MAX_TOKENS=96 BENCH_DSV4_REASONING_MAX_TOKENS=384 \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
   .build/release/RunBench
 ```
 
@@ -652,15 +688,15 @@ Ling:
 
 ```bash
 BENCH_COHERENT=1 BENCH_MAX_TOKENS=64 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/Ling-2.6-flash-JANGTQ \
+  BENCH_MODEL=~/models/JANGQ/Ling-2.6-flash-JANGTQ \
   .build/release/RunBench
 
 BENCH_COHERENT=1 BENCH_MAX_TOKENS=96 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK \
   .build/release/RunBench
 
 BENCH_COHERENT=1 BENCH_MAX_TOKENS=96 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Ling-2.6-flash-MXFP4-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Ling-2.6-flash-MXFP4-CRACK \
   .build/release/RunBench
 ```
 
@@ -668,7 +704,7 @@ MiniMax full-size:
 
 ```bash
 BENCH_COHERENT=1 BENCH_MAX_TOKENS=64 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/MiniMax-M2.7-JANGTQ \
+  BENCH_MODEL=~/models/JANGQ/MiniMax-M2.7-JANGTQ \
   .build/release/RunBench
 ```
 
@@ -676,7 +712,7 @@ Qwen reasoning marker gate:
 
 ```bash
 BENCH_QWEN_THINKING_CHECK=1 BENCH_MAX_TOKENS=64 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
   .build/release/RunBench
 ```
 
@@ -684,7 +720,7 @@ Gemma harmony gate:
 
 ```bash
 BENCH_HARMONY_CHECK=1 BENCH_MAX_TOKENS=96 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Gemma-4-26B-A4B-it-JANG_4M-CRACK \
   .build/release/RunBench
 ```
 
@@ -692,23 +728,23 @@ Qwen cache stack:
 
 ```bash
 BENCH_BATCH_CACHE_HIT=1 BENCH_MAX_TOKENS=8 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
   .build/release/RunBench
 
 BENCH_BATCH_DISK_RESTORE=1 BENCH_MAX_TOKENS=8 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
   .build/release/RunBench
 
 BENCH_BATCH_TQ_B2=1 BENCH_MAX_TOKENS=8 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Qwen3.6-35B-A3B-JANGTQ-CRACK \
   .build/release/RunBench
 ```
 
 Laguna:
 
 ```bash
-BENCH_LAGUNA_LOOP=1 BENCH_MAX_TOKENS=64 \
-  BENCH_MODEL=/Users/eric/models/JANGQ/Laguna-XS.2-JANGTQ \
+BENCH_LAGUNA_LOOP=1 BENCH_MAX_TOKENS=512 \
+  BENCH_MODEL=~/models/JANGQ/Laguna-XS.2-JANGTQ \
   .build/release/RunBench
 ```
 
@@ -716,18 +752,18 @@ Omni:
 
 ```bash
 BENCH_OMNI=1 BENCH_OMNI_BATCH=1 BENCH_MAX_TOKENS=24 \
-  BENCH_MODEL=/Users/eric/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK \
+  BENCH_MODEL=~/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK \
   .build/release/RunBench
 ```
 
 ## Open Risks
 
-- DSV4 at roughly 5K prompt tokens semantically recalled the buried fact but
-  exited abnormally after PASS on this host. At 650 filler lines it OOMed. Long
-  DSV4 memory hardening is still needed for production long-agent loops.
-- DSV4 `enable_thinking=false` still often routes useful answer content through
-  `.reasoning` before `.chunk`; osaurus must expose/handle reasoning-only
-  length finishes.
+- DSV4 passed the 5,568-token semantic long-context row cleanly on this host,
+  but the 650-filler stress row OOMed. Long DSV4 memory hardening is still
+  needed for very long production agent loops.
+- DSV4 thinking-enabled short-budget turns can still finish with useful text in
+  `.reasoning` and empty visible content. Osaurus must expose/handle
+  reasoning-only or length finishes.
 - MiniMax M2.7 full-size speed is below the expected 45-50 tok/s band in the
   latest live run. This is a speed task, not a minimum coherence blocker.
 - Ling MXFP4 speed is now low (~6 tok/s in BatchEngine perf) because the

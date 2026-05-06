@@ -142,7 +142,7 @@ middle layers alternate `4` (SWA+CSA+HSA, with YaRN on
 ### P0 correctness gaps in current Swift (vs Python ref)
 
 Identified by reading
-`/Users/eric/jang/jang-tools/jang_tools/dsv4/mlx_model.py` 1–1458 and
+`~/jang/jang-tools/jang_tools/dsv4/mlx_model.py` 1–1458 and
 diffing against
 `Libraries/MLXLLM/Models/DeepseekV4.swift` + `DeepseekV4Compressor.swift`
 + `DeepseekV4JANGTQ.swift` + `Libraries/MLXLMCommon/JANGTQKernels.swift`.
@@ -198,16 +198,17 @@ delegates only to `local.trim(n)` — same bug.
 
 ### Fix (r2 — pure long-context, no fallback)
 
-1. **Remove `DSV4_LONG_CTX` env knob entirely.** Both `DeepseekV4Model.newCache(parameters:)`
-   and `DeepseekV4JANGTQModel.newCache(parameters:)` now ALWAYS return:
+1. **Remove `DSV4_LONG_CTX` env knob entirely.** By default, both
+   `DeepseekV4Model.newCache(parameters:)` and
+   `DeepseekV4JANGTQModel.newCache(parameters:)` return:
    - `RotatingKVCache(maxSize: slidingWindow, keep: 0)` for layers with
      `compress_ratio == 0` (pure SWA — layers 0 and n-1).
    - `DeepseekV4Cache(slidingWindow: ..., compressRatio: cr)` for every
      other layer (CSA on `cr=128`, CSA+HSA on `cr=4`).
-   - `DSV4_KV_MODE` env override is **kept** (sliding | full | tq) for the
-     SWA component sizing (host can opt for full-context KV when memory
-     permits or `tq` to let `BatchEngine.maybeCompress` swap to
-     `TurboQuantKVCache` once offset crosses the min-tokens threshold).
+   - `DSV4_KV_MODE` env override is **kept** (`sliding | full | tq`) only
+     for diagnostics. `full` and `tq` deliberately replace the hybrid pool
+     with `KVCacheSimple`; `tq` can then let `BatchEngine.maybeCompress`
+     swap to `TurboQuantKVCache` once offset crosses the min-token threshold.
 2. `DeepseekV4Cache.init` REQUIRES `compressRatio: Int` — no optional.
    Old `DeepseekV4Cache(slidingWindow:)` removed; one callsite migrated.
 3. `DeepseekV4Cache.trim(_:)` runs proportional pool-row truncation
@@ -366,9 +367,9 @@ Sections:
    present, JANGTQ2 / JANGTQ4 layout, MTP weights kept).
 2. Minimum SDK call sequence — `LoadConfiguration` → `ModelFactory.load` →
    chat session.
-3. Cache mode env vars: `DSV4_LONG_CTX={0,1}`, `DSV4_KV_MODE={sliding,full,tq}`,
-   what each tradeoff costs in memory and which to pick for chat vs FIM
-   vs reasoning.
+3. Cache mode env vars: `DSV4_KV_MODE={sliding,full,tq}`; unset/`sliding`
+   is the production SWA+CSA+HSA path, while `full` and `tq` are
+   diagnostics that deliberately drop the hybrid pool.
 4. Reasoning parser (`<think>` envelope is auto-stripped before tool-call
    processor runs; how to surface it in the host UI as a separate stream).
 5. SWA/CSA/HSA architecture summary (one paragraph + table) so on-call

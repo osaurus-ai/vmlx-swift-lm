@@ -560,8 +560,7 @@ would close the precision gap while the runtime stays unchanged.
 
 - `VMLX_MISTRAL3_LAYER_PROBE=1` — per-layer residual L2 (mxfp4 + JANGTQ)
 - `VMLX_MISTRAL3_PROJ_PROBE=1`  — layer 0..2 q/k/v/o L2 + tq_norms
-- `DSV4_LONG_CTX=0` — opt-out of full-context KV (default ON since 2026-05-01)
-- `DSV4_KV_MODE=full|tq|sliding` — KV mode override for DSV4
+- `DSV4_KV_MODE=sliding|full|tq` — DSV4 cache override. Leave unset/`sliding` in production so DSV4 keeps its SWA+CSA+HSA `DeepseekV4Cache`; `full` and `tq` are diagnostics only.
 - `DSV4_FORCE_JANGTQ=1` — force JANGTQ dispatch when bundle weight_format mislabeled
 - `OSAURUS_MLX_CLEAR_LIBRARY_TRACE=1` — Metal library-eviction trace
 - `MLX_CLEAR_LIBRARY_RELEASE=1` — restore eager-release (testing only)

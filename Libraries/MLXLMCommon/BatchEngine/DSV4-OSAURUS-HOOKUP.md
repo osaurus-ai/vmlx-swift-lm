@@ -107,8 +107,9 @@ let engine = BatchEngine(
 
 ```swift
 // User input — kwargs flow through additionalContext to the bundle's
-// chat_template. DSV4-Flash bundles ship a real chat_template in
-// tokenizer_config.json that honors:
+// chat template. The local DSV4-Flash bundle has no tokenizer_config
+// chat_template, so Swift's tracked DSV4Minimal fallback is the
+// production path and honors:
 //   - enable_thinking: Bool        — toggles <think> open vs </think> closed tail
 //   - reasoning_effort: "max"|nil  — prepends max-effort system preface
 //   - drop_thinking on prior msgs  — strips earlier reasoning blocks (multi-turn)
@@ -120,17 +121,19 @@ let userInput = UserInput(
         "reasoning_effort": isHardProblem ? "max" : nil
     ])
 
-// Sampling — DeepSeek's official recipe for DSV4
+// Sampling — normal chat can run deterministic validation settings.
+// Product hard-reasoning traffic may use the bundle's sampling defaults.
 var params = GenerateParameters(
     maxTokens: isReasoningWorkload ? 8192 : 512,    // 8k for reasoning, 512 for chat
-    temperature: 1.0,                                // NOT 0 — JANGTQ MoE collapses at greedy
-    topP: 1.0,                                       // canonical paper setting
+    temperature: isReasoningWorkload ? 0.6 : 0,
+    topP: 0.95,
     prefillStepSize: 512)
-// kvMode: leave .none unless you need TQ-compressed cache for long context
-//   .turboQuant(3, 3) compresses KV ~26x; set DSV4_KV_MODE=tq env to engage
+// kvMode: leave .none. DSV4's production compression is SWA+CSA+HSA.
+// DSV4_KV_MODE=tq is a diagnostic override that trades away the hybrid pool.
 
 // Submit + iterate
-let (_, stream) = await engine.submit(input: prepared, parameters: params)
+let prepared = try await context.processor.prepare(input: userInput)
+let stream = await engine.generate(input: prepared, parameters: params)
 for await event in stream {
     switch event {
     case .chunk(let text):     appendToContentBubble(text)
@@ -141,11 +144,13 @@ for await event in stream {
 }
 ```
 
-**Critical sampling note.** `temperature: 0` (greedy) on JANGTQ 2-bit
-routed-MoE collapses into degenerate loops within 50-200 tokens —
-exactly the multilingual gibberish symptom users report. Always use
-`T >= 0.6` (DSV4 paper recommends 1.0) for JANGTQ models. This is
-the SECOND most common cause of garbage output after pin staleness.
+**Sampling note.** Earlier DSV4 debugging saw degenerate output when greedy
+sampling was paired with stale pins or the wrong prompt mode. The current
+2026-05-06 strict DSV4 gate passes at `temperature=0` for normal chat and
+reasoning rows; max-effort reasoning uses a larger token budget and a
+max-only repetition penalty. If product traffic uses the bundle defaults
+(`temperature=0.6`, `top_p=0.95`), keep the reasoning parser and stop-state
+telemetry enabled so loops or length finishes are visible.
 
 ---
 
@@ -156,7 +161,7 @@ If a JANGTQ bundle loads but emits `"matters Reasons | claiming aims allow…"`:
 | Cause | How to test | Fix |
 |---|---|---|
 | **Stale vmlx pin** | `nm osaurus \| grep sniffCodebookBits` — empty? | `rm -rf .build && swift package update && swift build -c release` |
-| **Greedy sampling** | Check `parameters.temperature` — 0? | Bump to ≥ 0.6, ideally 1.0; pair with `topP: 1.0` |
+| **Prompt/sampling mismatch** | Check the rendered chat prompt tail, reasoning kwargs, token budget, and repetition settings. | Use `UserInput(chat:)`; `enable_thinking=false` for normal chat; allocate larger budgets for reasoning/max; use the validated max-only repetition penalty for max-effort rows. |
 | **Empty/corrupted sidecar** | `ls -la $BUNDLE/jangtq_runtime.safetensors` — < 1 KB? | Re-download bundle (this is the 29-byte case) |
 
 If all three are clean and gibberish persists, capture for the vmlx maintainers:
@@ -207,7 +212,7 @@ precedence. Operator should fix the bundle's config at source.
 |---|---|---|
 | Reasoning parser | `model_type == "deepseek_v4"` → `reasoningStampFromModelType` | `think_xml` |
 | Tool format | `model_type == "deepseek_v4"` → `ToolCallFormat.infer` | `.dsml` (curly-quote `<｜DSML｜tool_calls>`) |
-| Chat template | `tokenizer_config.json.chat_template` | bundled — uses `enable_thinking` + `reasoning_effort` kwargs |
+| Chat template | tokenizer template or Swift `DSV4Minimal` fallback | uses `enable_thinking` + `reasoning_effort` kwargs; the local Flash bundle currently relies on the Swift fallback |
 
 Streaming events are split by the reasoning parser (post-`c98ae5c`):
 - pre-`</think>` → `.reasoning(String)` events (route to thinking pane)
@@ -294,23 +299,23 @@ off-distribution (gibberish, leaked markers).
 
 ## 9. Cache modes + long context
 
-DSV4 ships with three cache modes via `DSV4_KV_MODE` env (or
-auto-pick from `parameters.kvMode`):
+DSV4 ships with three cache modes via `DSV4_KV_MODE`. There is no
+auto-pick from `parameters.kvMode`; global TurboQuant defaults do not
+replace the DSV4 hybrid cache.
 
 | Mode | Cache | Memory @ 8K out | Coherence | Use when |
 |---|---|---|---|---|
-| `sliding` (default) | `RotatingKVCache(128)` | ~6 MB | drifts past 128 tok | FIM / short Q&A only |
-| `full` | `KVCacheSimple` | ~360 MB | full attention, no drift | recommended chat default |
-| `tq` | `KVCacheSimple` → auto-promoted to `TurboQuantKVCache` | ~14 MB | full context, ~26x compressed | very long agent loops on memory-constrained hosts |
+| unset / `sliding` (default) | `RotatingKVCache(128)` on SWA-only layers plus `DeepseekV4Cache(128, cr)` on CSA/HSA layers | context-dependent; roughly a 90% KV-row cut at long context | production hybrid long-context path | chat, reasoning, normal traffic |
+| `full` | `KVCacheSimple` on every layer; no CSA/HSA pool | ~360 MB | diagnostic full KV | debugging only |
+| `tq` | `KVCacheSimple` → promoted to `TurboQuantKVCache` only when request kvMode is also `.turboQuant` | ~14 MB | diagnostic compressed KV, no CSA/HSA pool | memory experiments only |
 
 The bench `BENCH_DSV4_FIM_VS_CHAT` covers all three modes at multiple
 prompt lengths. Live-verified coherent on M4 Max + M3 Ultra (Mac Studio).
 
-The PR #1195 long-context architectural port (Compressor + Indexer
-4D-mask path, 12K NIAH at 21 tok/s on Mac Studio per the parallel
-agent's verification) is the proper memory-efficient long-context
-solution but is not yet wired into vmlx-swift-lm. `DSV4_KV_MODE=full`
-is the working alternative for now.
+The Compressor + Indexer path is the proper memory-efficient long-context
+solution and is now the default vmlx-swift-lm path through
+`DeepseekV4Cache`. `DSV4_KV_MODE=full` is a diagnostic comparison mode,
+not the osaurus serving path.
 
 ---
 

@@ -45,7 +45,10 @@ import os
 ///   after each batched decode step. Delegates to ``maybeQuantizeKVCache``
 ///   which already handles threshold checking, already-quantised skip, and
 ///   type gating (`RotatingKVCache` / `MambaCache` / `CacheList` / already-TQ
-///   layers are skipped automatically).
+///   layers are skipped automatically). DSV4's `DeepseekV4Cache` is also
+///   skipped; its SWA+CSA+HSA pool is the production compression path and
+///   must not be replaced by TurboQuant unless the model was explicitly loaded
+///   with `DSV4_KV_MODE=tq`.
 public enum BatchQuantize {
 
     private static let logger = Logger(subsystem: "vmlx", category: "BatchQuantize")
@@ -97,9 +100,9 @@ public enum BatchQuantize {
     /// - Checks the first `KVCacheSimple` layer's offset against
     ///   `max(quantizedKVStart, 8)` (TQ minimum threshold).
     /// - Skips if any layer is already `TurboQuantKVCache`.
-    /// - Preserves `RotatingKVCache`, `MambaCache`, `CacheList` layers
-    ///   (hybrid SSM models have mixed cache arrays — only the KV layers
-    ///   compress).
+    /// - Preserves `RotatingKVCache`, `DeepseekV4Cache`, `MambaCache`,
+    ///   `CacheList` layers (hybrid models have mixed cache arrays — only
+    ///   ordinary `KVCacheSimple` layers compress).
     ///
     /// Calling this multiple times is safe: the helper's internal guard
     /// prevents re-quantisation once a layer has been converted.

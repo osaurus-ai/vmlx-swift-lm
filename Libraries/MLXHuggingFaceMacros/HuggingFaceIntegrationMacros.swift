@@ -137,6 +137,34 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 throw MLXLMCommon.TokenizerError.missingChatTemplate
                             }
                         }
+                        let lagunaEos =
+                            String(UnicodeScalar(0x3008)!)
+                            + "|EOS|"
+                            + String(UnicodeScalar(0x3009)!)
+                        let hasLagunaSentinel =
+                            upstream.bosToken == lagunaEos
+                            && upstream.eosToken == lagunaEos
+                            && upstream.convertTokenToId("<assistant>") != nil
+                            && upstream.convertTokenToId("</assistant>") != nil
+                            && upstream.convertTokenToId("<think>") != nil
+                            && upstream.convertTokenToId("</think>") != nil
+                        if hasLagunaSentinel
+                            && (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                            if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                FileHandle.standardError.write(
+                                    "[vmlx] chat-template auto-correction engaged: LagunaMinimal\\n"
+                                        .data(using: .utf8)!)
+                            }
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                    MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: tools,
+                                additionalContext: additionalContext)
+                        }
                         // MiniMax-M2 native template auto-correction: every shipping
                         // MiniMax-M2 / M2.7 chat_template.jinja unconditionally prefills
                         // <think> at the assistant tail and ignores enable_thinking.
@@ -212,6 +240,22 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 + String(UnicodeScalar(0x2581)!) + "sentence"
                                 + String(UnicodeScalar(0xFF5C)!) + ">"
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
+                                if hasLagunaSentinel {
+                                    if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
+                                        FileHandle.standardError.write(
+                                            "[vmlx] chat-template missing -> LagunaMinimal fallback engaged\\n"
+                                                .data(using: .utf8)!)
+                                    }
+                                    return try upstream.applyChatTemplate(
+                                        messages: messages,
+                                        chatTemplate: Tokenizers.ChatTemplateArgument.literal(
+                                            MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
+                                        addGenerationPrompt: true,
+                                        truncation: false,
+                                        maxLength: nil,
+                                        tools: tools,
+                                        additionalContext: additionalContext)
+                                }
                                 if upstream.bosToken == dsv4Bos {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
                                         FileHandle.standardError.write(
@@ -307,7 +351,11 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                 upstream.convertTokenToId("<|im_start|>") != nil
                                 || upstream.convertTokenToId("<|im_end|>") != nil
                             let ordered: [(label: String, template: String)]
-                            if isGemma {
+                            if hasLagunaSentinel {
+                                ordered = [
+                                    ("LagunaMinimal", MLXLMCommon.ChatTemplateFallbacks.lagunaMinimal),
+                                ]
+                            } else if isGemma {
                                 ordered = [
                                     ("Gemma4WithTools", MLXLMCommon.ChatTemplateFallbacks.gemma4WithTools),
                                     ("Gemma4Minimal",   MLXLMCommon.ChatTemplateFallbacks.gemma4Minimal),

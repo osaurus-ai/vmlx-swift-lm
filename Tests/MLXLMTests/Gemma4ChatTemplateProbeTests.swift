@@ -448,6 +448,45 @@ final class Gemma4ChatTemplateProbeTests: XCTestCase {
             "model turn — this is where the model continues generating.")
     }
 
+    func testDSV4MinimalTemplateHonorsThinkingToggle() throws {
+        var searchPath = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+        var found: URL? = nil
+        for _ in 0..<6 {
+            let candidate = searchPath
+                .appendingPathComponent("Libraries/MLXLMCommon/ChatTemplates/DSV4Minimal.jinja")
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                found = candidate
+                break
+            }
+            searchPath = searchPath.deletingLastPathComponent()
+        }
+        guard let templateURL = found else {
+            throw XCTSkip("DSV4Minimal.jinja not found relative to test source.")
+        }
+        let src = try String(contentsOf: templateURL, encoding: .utf8)
+        let template = try Template(src)
+        let messages = [["role": "user", "content": "Remember sapphire-42."]]
+
+        let chat = try template.renderAny([
+            "messages": messages,
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+        XCTAssertTrue(
+            chat.hasSuffix("<\u{FF5C}Assistant\u{FF5C}></think>"),
+            "DSV4 chat mode must close the thinking block when enable_thinking=false.")
+
+        let thinking = try template.renderAny([
+            "messages": messages,
+            "add_generation_prompt": true,
+            "enable_thinking": true,
+        ])
+        XCTAssertTrue(
+            thinking.hasSuffix("<\u{FF5C}Assistant\u{FF5C}><think>"),
+            "DSV4 thinking mode must open the thinking block when enable_thinking=true.")
+    }
+
     func testJinjaNamespaceAssignmentIsSupported() throws {
         let src = """
         {%- set ns = namespace(found_first=false) -%}
