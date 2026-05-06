@@ -188,11 +188,11 @@ numbers from this pass, not final speed acceptance for the slower families:
 | Qwen3.6 35B JANGTQ | 80 tok/s | 78.8 tok/s | 94.2 tok/s | Coherent visible text, no loop, no leaks. |
 | Qwen3.6 27B JANG_4M | 25 tok/s | 25.5 tok/s | not rerun | Coherent visible text, no loop, no leaks. |
 | Gemma4 26B JANG_4M | 80 tok/s | 79.1 tok/s | 94.4 tok/s | Coherent visible text, no loop, no leaks. |
-| Laguna XS.2 JANGTQ | 80 tok/s | 29.2 tok/s | 31.3 tok/s | Coherent visible text, no loop, no leaks. |
-| MiniMax M2.7 JANGTQ | 45-50 tok/s | 28.1 tok/s | 30.0 tok/s | Coherent visible text, no loop, no leaks. |
-| Ling 2.6 flash JANGTQ2 | 80 tok/s | 30.7 tok/s | 30.3 tok/s | Coherent visible text, no loop, no leaks. |
+| Laguna XS.2 JANGTQ | 80 tok/s | 28.3 tok/s | 31.1 tok/s | Coherent visible text, no loop, no leaks. QKV is now fused at sanitize/load time. |
+| MiniMax M2.7 JANGTQ | 45-50 tok/s | 30.9 tok/s | 34.5 tok/s | Coherent visible text, no loop, no leaks. SwitchGLU compile regression removed from default. |
+| Ling 2.6 flash JANGTQ2 | 80 tok/s | 29.6 tok/s | 29.5 tok/s | Coherent visible text, no loop, no leaks. |
 | Nemotron Omni Nano JANGTQ2 | 90 tok/s | 65.4 tok/s | 76.3 tok/s | Coherent visible text, no loop, no leaks. |
-| DSV4 Flash JANGTQ | 20 tok/s | 11.1 tok/s | 13.2 tok/s | Reasoning stream coherent; visible text empty on the perf prompt at short budget. |
+| DSV4 Flash JANGTQ | 20 tok/s | 11.9 tok/s | 13.7 tok/s | Coherent visible text on the perf prompt, no loop, no leaks. Reasoning/long rows are separately passing below. |
 
 Raw local logs are under `docs/benchmarks/speed-2026-05-06/` but that directory
 is gitignored. Recreate them with `BENCH_PERF=1` if the PR needs fresh numbers.
@@ -221,9 +221,27 @@ Additional HQ continuation after this table:
   171 tokens and stopped; no loop, unclosed reasoning, or marker leak. Log:
   `/tmp/vmlx_laguna_loop_strict_default_after_20260506.log`.
 - MiniMax M2.7 JANGTQ TokenIterator, 64 tokens: baseline **34.7 tok/s**;
-  `VMLINUX_MINIMAX_ROUTER_COMPILE=1` **34.6 tok/s**;
+  `VMLX_MINIMAX_ROUTER_COMPILE=1` **34.6 tok/s**;
   `VMLX_TQ_SWITCH_GLU_COMPILE=0` **35.1 tok/s**. The current MiniMax gap is
   therefore not a simple router-compile or SwitchGLU-compile default issue.
+- Speed continuation after the JANGTQ runtime audit:
+  - `TurboQuantSwitchGLU` whole-path compile is now opt-in via
+    `VMLX_TQ_SWITCH_GLU_COMPILE=1`. Default compiled SwitchGLU regressed
+    MiniMax M2.7 simple decode into the high-20s / low-30s tok/s band; the
+    plain custom Metal chain restored MiniMax to **34.5 tok/s** simple and
+    **30.9 tok/s** BatchEngine with identical coherent text.
+  - DSV4 was also checked both ways. On the production BatchEngine path,
+    compile-off/default measured **11.9 tok/s** while forced compile measured
+    lower in the same pass. Keep DSV4 limited-SwiGLU correctness in the Metal
+    kernel, but do not silently enable whole-SwitchGLU compile for serving.
+  - Laguna attention now fuses affine q/k/v at sanitize time into `qkv_proj`,
+    matching the Python JANGTQ P18 optimization and MiniMaxJANGTQ's Swift
+    sanitize path. It is coherent and gives a small simple-path lift; the large
+    80 tok/s gap remains routed-MoE/kernel work, not template or loop failure.
+  - The local full-size MiniMax bundle reports 256 local experts and affine
+    `group_size=64`; the historical 45-50 tok/s MiniMax reference was for a
+    different 139B/154-expert/gs=128 profile. Treat any remaining MiniMax speed
+    gap as both runtime-kernel and model-file/profile audit work.
 - Qwen cache rows after a local ignored RunBench engine-shutdown cleanup:
   `BENCH_BATCH_CACHE_HIT`, `BENCH_BATCH_DISK_RESTORE`, and
   `BENCH_BATCH_TQ_B2` all PASS and exit 0. Before this cleanup the cache-hit row
@@ -677,6 +695,38 @@ BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=64 \
 BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=64 \
   BENCH_MODEL=~/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK \
   .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/JANGQ/MiniMax-M2.7-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/JANGQ/MiniMax-M2.7-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/dealign.ai/Ling-2.6-flash-JANGTQ2-CRACK \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/JANGQ/Laguna-XS.2-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=96 \
+  BENCH_MODEL=~/models/JANGQ/Laguna-XS.2-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/JANGQ/DeepSeek-V4-Flash-JANGTQ \
+  .build/release/RunBench
 ```
 
 DSV4 production gates:
@@ -779,8 +829,9 @@ BENCH_OMNI=1 BENCH_OMNI_BATCH=1 BENCH_MAX_TOKENS=24 \
 - DSV4 thinking-enabled short-budget turns can still finish with useful text in
   `.reasoning` and empty visible content. Osaurus must expose/handle
   reasoning-only or length finishes.
-- MiniMax M2.7 full-size speed is below the expected 45-50 tok/s band in the
-  latest live run. This is a speed task, not a minimum coherence blocker.
+- MiniMax M2.7 full-size speed improved after removing default whole-SwitchGLU
+  compile, but is still below the expected 45-50 tok/s band in the latest live
+  run. This is a speed/model-profile task, not a minimum coherence blocker.
 - Ling MXFP4 speed is now low (~6 tok/s in BatchEngine perf) because the
   previous faster path kept a second fused gate/up expert bank resident and
   pushed footprint to ~110 GB. Reintroduce speed only with a memory-safe fused

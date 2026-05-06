@@ -239,9 +239,7 @@ internal final class LagunaAttention: Module {
     let partial: Float
     let ropeDim: Int
 
-    @ModuleInfo(key: "q_proj") var wq: Linear
-    @ModuleInfo(key: "k_proj") var wk: Linear
-    @ModuleInfo(key: "v_proj") var wv: Linear
+    @ModuleInfo(key: "qkv_proj") var wqkv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
@@ -271,9 +269,8 @@ internal final class LagunaAttention: Module {
         self.ropeDim = Int(Float(headDim) * partial)
 
         let h = cfg.hiddenSize
-        self._wq.wrappedValue = Linear(h, nHeads * headDim, bias: cfg.attentionBias)
-        self._wk.wrappedValue = Linear(h, nKVHeads * headDim, bias: cfg.attentionBias)
-        self._wv.wrappedValue = Linear(h, nKVHeads * headDim, bias: cfg.attentionBias)
+        self._wqkv.wrappedValue = Linear(
+            h, (nHeads + 2 * nKVHeads) * headDim, bias: cfg.attentionBias)
         self._wo.wrappedValue = Linear(nHeads * headDim, h, bias: cfg.attentionBias)
         self._qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: cfg.rmsNormEps)
         self._kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: cfg.rmsNormEps)
@@ -329,9 +326,15 @@ internal final class LagunaAttention: Module {
         cache: KVCache?
     ) -> MLXArray {
         let (B, T, _) = (x.dim(0), x.dim(1), x.dim(2))
-        var q = wq(x).reshaped(B, T, nHeads, headDim).transposed(0, 2, 1, 3)
-        var k = wk(x).reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
-        var v = wv(x).reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        let qOutDim = nHeads * headDim
+        let kvOutDim = nKVHeads * headDim
+        let qkv = wqkv(x)
+        var q = qkv[.ellipsis, 0 ..< qOutDim]
+            .reshaped(B, T, nHeads, headDim).transposed(0, 2, 1, 3)
+        var k = qkv[.ellipsis, qOutDim ..< (qOutDim + kvOutDim)]
+            .reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        let v = qkv[.ellipsis, (qOutDim + kvOutDim) ..< (qOutDim + 2 * kvOutDim)]
+            .reshaped(B, T, nKVHeads, headDim).transposed(0, 2, 1, 3)
         // Per-head q_norm / k_norm AFTER projection, BEFORE rope (matches reference)
         q = qNorm(q)
         k = kNorm(k)
@@ -795,6 +798,55 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
                 out[upK]   = v[0..., mid..., 0...]
             } else {
                 out[k] = v
+            }
+        }
+
+        // Third pass: fuse attention Q/K/V affine projections at load time.
+        // This mirrors the Python JANGTQ P18 optimization and MiniMaxJANGTQ's
+        // Swift sanitize path: Laguna's attention keeps q/k/v as ordinary
+        // affine quantized Linear layers, so concatenating the rows gives one
+        // quantized matmul per layer instead of three. q_norm / k_norm still run
+        // after the split in `LagunaAttention.callAsFunction`.
+        for layer in 0 ..< cfg.numHiddenLayers {
+            let prefix = "layers.\(layer).self_attn"
+            let qKey = "\(prefix).q_proj"
+            let kKey = "\(prefix).k_proj"
+            let vKey = "\(prefix).v_proj"
+            let fusedKey = "\(prefix).qkv_proj"
+
+            guard let qW = out["\(qKey).weight"],
+                  let kW = out["\(kKey).weight"],
+                  let vW = out["\(vKey).weight"]
+            else { continue }
+
+            let qPacked = qW.dim(qW.ndim - 1)
+            let kPacked = kW.dim(kW.ndim - 1)
+            let vPacked = vW.dim(vW.ndim - 1)
+            if qPacked != kPacked || kPacked != vPacked {
+                fatalError(
+                    """
+                    [Laguna sanitize] layer \(layer) self_attn has mismatched \
+                    bit widths across q/k/v projections (q packed_in=\(qPacked), \
+                    k=\(kPacked), v=\(vPacked)). QKV fusion requires identical \
+                    bit widths.
+                    """
+                )
+            }
+
+            out["\(fusedKey).weight"] = concatenated([qW, kW, vW], axis: 0)
+            out.removeValue(forKey: "\(qKey).weight")
+            out.removeValue(forKey: "\(kKey).weight")
+            out.removeValue(forKey: "\(vKey).weight")
+
+            for suffix in ["scales", "biases", "bias"] {
+                let qS = out["\(qKey).\(suffix)"]
+                let kS = out["\(kKey).\(suffix)"]
+                let vS = out["\(vKey).\(suffix)"]
+                guard let qS, let kS, let vS else { continue }
+                out["\(fusedKey).\(suffix)"] = concatenated([qS, kS, vS], axis: 0)
+                out.removeValue(forKey: "\(qKey).\(suffix)")
+                out.removeValue(forKey: "\(kKey).\(suffix)")
+                out.removeValue(forKey: "\(vKey).\(suffix)")
             }
         }
         return out

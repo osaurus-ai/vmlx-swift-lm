@@ -183,19 +183,28 @@ public class TurboQuantSwitchGLU: Module {
         super.init()
     }
 
-    /// Decode fast-path cache keyed by `(batchTokens, K, projection bits,
-    /// swigluLimit)`. The compiled body runs the full
-    /// rotate -> fused gate/up SwiGLU -> rotate -> down gather chain as
-    /// one MLX graph, matching the Python `load_jangtq` compile island
-    /// and the production `../vmlx` Swift path. Large prefill batches
-    /// intentionally stay on the plain path to keep TTFT predictable.
+    /// Optional decode fast-path cache keyed by `(batchTokens, K, projection
+    /// bits, swigluLimit)`. The compiled body runs the full rotate -> fused
+    /// gate/up SwiGLU -> rotate -> down gather chain as one MLX graph.
+    ///
+    /// This remains opt-in because real MiniMax M2.7, Ling JANGTQ2, and DSV4
+    /// runs on the local M5 Max match the Python `jang_tools` finding:
+    /// compiling the whole SwitchGLU path can regress decode into the ~30 tok/s
+    /// band or hurt the BatchEngine production path. The plain custom Metal
+    /// kernel chain is the production default; set
+    /// `VMLX_TQ_SWITCH_GLU_COMPILE=1` only for targeted experiments.
     private var compiledCache: [String: ([MLXArray]) -> [MLXArray]] = [:]
 
-    private static let compiledFastPathEnabled: Bool = {
+    private static let compiledFastPathExplicitOn: Bool = {
         let raw = ProcessInfo.processInfo.environment["VMLX_TQ_SWITCH_GLU_COMPILE"]?
             .lowercased()
-        return HardwareInfo.isCompiledDecodeSupported
-            && !(raw == "0" || raw == "false" || raw == "off" || raw == "no")
+        return raw == "1" || raw == "true" || raw == "on" || raw == "yes"
+    }()
+
+    private static let compiledFastPathExplicitOff: Bool = {
+        let raw = ProcessInfo.processInfo.environment["VMLX_TQ_SWITCH_GLU_COMPILE"]?
+            .lowercased()
+        return raw == "0" || raw == "false" || raw == "off" || raw == "no"
     }()
 
     private static let compiledFastPathThreshold: Int = {
@@ -231,7 +240,9 @@ public class TurboQuantSwitchGLU: Module {
         let K = indices.dim(-1)
         let idxFlat = indices.reshaped([-1]).asType(.uint32)
 
-        let useCompiledFastPath = Self.compiledFastPathEnabled
+        let useCompiledFastPath = HardwareInfo.isCompiledDecodeSupported
+            && !Self.compiledFastPathExplicitOff
+            && Self.compiledFastPathExplicitOn
             && Self.compiledFastPathThreshold > 0
             && indices.size <= Self.compiledFastPathThreshold
         if useCompiledFastPath {

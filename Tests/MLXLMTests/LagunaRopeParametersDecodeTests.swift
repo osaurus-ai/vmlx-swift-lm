@@ -8,6 +8,7 @@
 // dict-valued entries instead so loading proceeds.
 
 import Foundation
+import MLX
 @testable import MLXLLM
 @testable import MLXLMCommon
 import Testing
@@ -126,5 +127,55 @@ struct LagunaRopeParametersDecodeTests {
         """#
         let cfg = try JSONDecoder().decode(LagunaConfiguration.self, from: json.data(using: .utf8)!)
         #expect(cfg.ropeParameters.isEmpty)
+    }
+
+    @Test("sanitize fuses Laguna attention q/k/v into qkv_proj")
+    func sanitizeFusesAttentionQKV() throws {
+        let cfg = try JSONDecoder().decode(
+            LagunaConfiguration.self,
+            from: #"""
+            {
+              "model_type": "laguna",
+              "hidden_size": 4,
+              "intermediate_size": 8,
+              "num_hidden_layers": 1,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "head_dim": 2,
+              "max_position_embeddings": 64,
+              "vocab_size": 16,
+              "rms_norm_eps": 1.0e-5,
+              "tie_word_embeddings": true,
+              "layer_types": ["full_attention"],
+              "mlp_layer_types": ["dense"],
+              "num_attention_heads_per_layer": [2],
+              "moe_intermediate_size": 4,
+              "shared_expert_intermediate_size": 4,
+              "num_experts": 4,
+              "num_experts_per_tok": 2
+            }
+            """#.data(using: .utf8)!)
+
+        let model = LagunaModel(cfg, jangtq: nil)
+        let prefix = "model.layers.0.self_attn"
+        let weights: [String: MLXArray] = [
+            "\(prefix).q_proj.weight": MLXArray.ones([4, 3]),
+            "\(prefix).k_proj.weight": MLXArray.ones([2, 3]) * 2,
+            "\(prefix).v_proj.weight": MLXArray.ones([2, 3]) * 3,
+            "\(prefix).q_proj.scales": MLXArray.ones([4, 1]),
+            "\(prefix).k_proj.scales": MLXArray.ones([2, 1]) * 2,
+            "\(prefix).v_proj.scales": MLXArray.ones([2, 1]) * 3,
+            "\(prefix).q_proj.biases": MLXArray.ones([4, 1]),
+            "\(prefix).k_proj.biases": MLXArray.ones([2, 1]) * 2,
+            "\(prefix).v_proj.biases": MLXArray.ones([2, 1]) * 3,
+        ]
+
+        let sanitized = model.sanitize(weights: weights)
+        #expect(sanitized["layers.0.self_attn.qkv_proj.weight"]?.shape == [8, 3])
+        #expect(sanitized["layers.0.self_attn.qkv_proj.scales"]?.shape == [8, 1])
+        #expect(sanitized["layers.0.self_attn.qkv_proj.biases"]?.shape == [8, 1])
+        #expect(sanitized["layers.0.self_attn.q_proj.weight"] == nil)
+        #expect(sanitized["layers.0.self_attn.k_proj.weight"] == nil)
+        #expect(sanitized["layers.0.self_attn.v_proj.weight"] == nil)
     }
 }
