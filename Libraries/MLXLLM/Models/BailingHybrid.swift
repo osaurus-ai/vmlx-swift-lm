@@ -217,7 +217,6 @@ public struct BailingHybridConfiguration: Codable, Sendable {
     public var isJANGTQ: Bool {
         weightFormat.lowercased() == "mxtq"
             || weightFormat.lowercased() == "jangtq2"
-            || weightFormat.lowercased() == "jangtq3"
             || weightFormat.lowercased() == "jangtq4"
     }
 

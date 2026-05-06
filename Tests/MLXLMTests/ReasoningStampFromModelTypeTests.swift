@@ -43,7 +43,7 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
             "starcoder2", "cohere", "openelm", "internlm2", "granite",
             "granitemoehybrid", "mimo", "mimo_v2_flash",
             "minicpm", "nanochat", "olmoe", "olmo2", "olmo3",
-            "bailing_moe", "smollm3", "ernie4_5", "baichuan_m1",
+            "smollm3", "ernie4_5", "baichuan_m1",
             "exaone4", "lille-130m", "apertus", "jamba_3b",
             "falcon_h1", "bitnet", "afmoe",
         ]
@@ -75,6 +75,13 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
     func testDeepseekFamilyGetsThinkXml() {
         // DSV3 / DSV4 / R1 all use `<think>` envelope.
         for modelType in ["deepseek_v3", "deepseek_v4", "deepseek_r1"] {
+            XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
+        }
+    }
+
+    func testBailingFamilyGetsThinkXml() {
+        // Ling/Bailing templates use the DeepSeek-R1-style `<think>` envelope.
+        for modelType in ["bailing_moe", "bailing_hybrid", "bailing_moe_v2_5"] {
             XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
         }
     }

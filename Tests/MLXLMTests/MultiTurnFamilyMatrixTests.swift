@@ -55,6 +55,8 @@ struct ReasoningStampFamilyMatrixTests {
         "nemotron_h", "nemotron_h_omni",
         // Holo3
         "holo", "holo3",
+        // Ling / Bailing
+        "bailing_moe", "bailing_hybrid", "bailing_moe_v2_5",
         // Laguna (Poolside)
         "laguna", "laguna_xs", "laguna_s", "laguna_m",
     ])
