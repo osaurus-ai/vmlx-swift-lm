@@ -909,19 +909,26 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
+    let modelType: String?
     let messageGenerator: MessageGenerator
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
+        modelType: String?,
         messageGenerator: MessageGenerator
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
+        self.modelType = modelType
         self.messageGenerator = messageGenerator
     }
 
     func prepare(input: UserInput) throws -> LMInput {
-        let messages = messageGenerator.generate(from: input)
+        let messages = BailingThinkingTemplateContext.apply(
+            to: messageGenerator.generate(from: input),
+            modelType: modelType,
+            additionalContext: input.additionalContext
+        )
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: input.additionalContext)
@@ -1354,6 +1361,7 @@ public final class LLMModelFactory: ModelFactory {
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,
+            modelType: baseConfig.modelType,
             messageGenerator: messageGenerator)
 
         return .init(
