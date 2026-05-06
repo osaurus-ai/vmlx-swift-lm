@@ -299,17 +299,29 @@ ZAYA addendum:
 - Local ZAYA bundles inspected under `/Users/eric/jang/models/Zyphra`:
   source `ZAYA1-8B`, `ZAYA1-8B-JANGTQ2`, `ZAYA1-8B-JANGTQ4`, and
   `ZAYA1-8B-MXFP4`.
-- Metadata smoke passed for JANGTQ2/JANGTQ4/MXFP4. JANGTQ bundles report
-  `model_type=zaya`, 80 layers, `weight_format=mxtq`, per-role `mxtq_bits`,
-  `tq_in_features` count 120, and `jangtq_runtime.safetensors` present.
-  MXFP4 reports `weight_format=mxfp4`. Logs:
-  `/tmp/vmlx_hook_zaya_jangtq2_config_smoke_20260506.log`,
-  `/tmp/vmlx_hook_zaya_jangtq4_config_smoke_20260506.log`, and
-  `/tmp/vmlx_hook_zaya_mxfp4_config_smoke_20260506.log`.
-- Template smoke passed for JANGTQ2. The bundle template renders the
-  Gemma-style `<|im_start|>` transcript and closes thinking when
-  `enable_thinking=false`. Log:
-  `/tmp/vmlx_hook_zaya_jangtq2_template_smoke_20260506.log`.
+- Metadata smoke passed for JANGTQ2/JANGTQ4/MXFP4 after fixing the local
+  bundle `generation_config.json` EOS from `1` to tokenizer/config EOS `106`.
+  JANGTQ bundles report `model_type=zaya`, 80 layers, `weight_format=mxtq`,
+  per-role `mxtq_bits`, `tq_in_features` count 120, and
+  `jangtq_runtime.safetensors` present. MXFP4 reports `weight_format=mxfp4`.
+  Logs:
+  `/tmp/vmlx_zaya_JANGTQ2_config_smoke_after_eos_20260506.log`,
+  `/tmp/vmlx_zaya_JANGTQ4_config_smoke_after_eos_20260506.log`, and
+  `/tmp/vmlx_zaya_MXFP4_config_smoke_after_eos_20260506.log`.
+- ZAYA CCA contract gate passed for JANGTQ2/JANGTQ4/MXFP4. The gate asserts
+  40 even CCA attention layers, 40 odd pre-stacked MoE layers, `cache_subtype`
+  `zaya_cca`, hybrid cache metadata, `conv_qk`/`temp`/`linear_q`/`linear_k`/
+  `val_proj1`/`val_proj2` counts, sidecar/TQ tensor counts, `tq_in_features`,
+  tokenizer template presence, and effective EOS coverage. Logs:
+  `/tmp/vmlx_zaya_jangtq2_contract_20260506.log`,
+  `/tmp/vmlx_zaya_jangtq4_contract_20260506.log`, and
+  `/tmp/vmlx_zaya_mxfp4_contract_20260506.log`.
+- Template smoke passed for JANGTQ2/JANGTQ4/MXFP4. The bundle template renders
+  the Gemma-style `<|im_start|>` transcript and closes thinking when
+  `enable_thinking=false`. Logs:
+  `/tmp/vmlx_zaya_JANGTQ2_template_smoke_after_eos_20260506.log`,
+  `/tmp/vmlx_zaya_JANGTQ4_template_smoke_after_eos_20260506.log`, and
+  `/tmp/vmlx_zaya_MXFP4_template_smoke_after_eos_20260506.log`.
 - Current vmlx-swift-lm status is explicit unsupported, not production-ready.
   ZAYA is not a stock attention/Mamba model: even layers use CCA attention with
   standard KV plus `conv_state [B,1280,2]` and `prev_hs [B,2048]`; odd layers
@@ -328,9 +340,10 @@ ZAYA addendum:
 - TurboQuant KV, if enabled later, should compress only standard K/V pages.
   Keep CCA `conv_state` and `prev_hs` float32 until single-shot versus
   chunked-prefill parity and cache-restore parity are proven.
-- Bundle issue found: `generation_config.json` sets `eos_token_id=1` while
-  `config.json` and tokenizer use EOS token `106` (`<|im_end|>`). Fix the
-  model bundles before publishing to avoid stop-condition drift.
+- Bundle issue fixed locally: converted ZAYA `generation_config.json` files now
+  set `eos_token_id=106` to match `config.json` and tokenizer
+  `<|im_end|>`. Keep that fix in the published model bundles to avoid
+  stop-condition drift.
 
 TurboQuant KV cache rows:
 
