@@ -66,13 +66,33 @@ public final class ModelContainer: Sendable {
         let modelConfig = await context.read { $0.configuration }
         config.modelKey = modelConfig.name
 
-        let coordinator = CacheCoordinator(config: config)
-
         // Auto-detect hybrid: check if model creates MambaCache/ArraysCache layers
         let isHybrid = await context.read { ctx -> Bool in
             let testCache = ctx.model.newCache(parameters: nil)
             return testCache.contains { $0 is MambaCache || $0 is ArraysCache }
         }
+
+        // 2026-05-05 (Ling-2.6-flash multi-turn fix): hybrid models with
+        // ArraysCache (Linear-Attn / GLA recurrence) live or die by the
+        // SSMStateCache fetch in CacheCoordinator.fetch — and that fetch
+        // is gated INSIDE the paged-hit branch. With the default
+        // `pagedBlockSize=64`, short chat prompts (≤ 64 tokens, common
+        // for Bailing/Ling chat templates which render to ~30 tokens)
+        // store ZERO paged blocks → coordinator misses → SSM state never
+        // restored → the live cache passed across ChatSession turns goes
+        // stale → incoherent Turn 2 output (or SIGKILL on full re-prefill
+        // since recurrentGLA can't handle L>~30 reliably).
+        //
+        // Lower the paged block size for hybrid models so even short
+        // chat turns store at least one block, enabling the SSM-state
+        // restoration path to fire on Turn 2+. 16 tokens covers system-
+        // only prefixes and short user messages while keeping hash-chain
+        // cost negligible.
+        if isHybrid {
+            config.pagedBlockSize = 16
+        }
+
+        let coordinator = CacheCoordinator(config: config)
         coordinator.setHybrid(isHybrid)
 
         _cacheCoordinator.withLock { $0 = coordinator }

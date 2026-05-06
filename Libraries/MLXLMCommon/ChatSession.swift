@@ -388,7 +388,39 @@ public final class ChatSession {
                         cache = .kvcache(kvCache)
 
                     case .kvcache(let array):
-                        kvCache = array
+                        // 2026-05-05 (Ling-2.6-flash multi-turn fix):
+                        // Models with `ArraysCache` (Linear-Attn / Lightning-
+                        // Attn-2 / GLA recurrence — Bailing-V2.5 / Ling-2.6-
+                        // flash) cannot tolerate the chat-template re-render
+                        // mismatch on Turn 2+. The recurrent state encodes
+                        // the EXACT sequence the model decoded, including
+                        // reasoning tokens and EOS markers; the re-rendered
+                        // prompt drops past `<think>` blocks (Bailing /
+                        // DeepSeek-R1 / Qwen3-reasoning templates) and adds
+                        // role-end markers that were never decoded. Re-
+                        // feeding the new prompt onto the populated GLA
+                        // state evolves it on top of itself → state goes
+                        // degenerate → garbage Turn 2 output.
+                        //
+                        // `MambaCache` (Nemotron-H, Jamba) is explicitly
+                        // EXCLUDED here: those models handle the re-feed
+                        // gracefully (verified — Nemotron-Omni multi-turn
+                        // recall WAS working with cache reuse, and the
+                        // current upstream re-derive logic in their model
+                        // class compensates for the redundant prefill at
+                        // prefill-end). Resetting their cache regresses
+                        // multi-turn fact recall ("We don't have context").
+                        //
+                        // Softmax-attention models (KVCacheSimple /
+                        // RotatingKVCache) tolerate the re-feed because
+                        // attention re-weights duplicates; keep cache.
+                        let needsFreshCache = array.contains { $0 is ArraysCache }
+                        if needsFreshCache {
+                            kvCache = model.newCache(parameters: generateParameters)
+                            cache = .kvcache(kvCache)
+                        } else {
+                            kvCache = array
+                        }
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
