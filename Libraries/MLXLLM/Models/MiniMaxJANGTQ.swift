@@ -485,7 +485,7 @@ public struct MiniMaxJANGTQConfiguration: Codable, Sendable {
         mxtqGateUpBits = try container.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits)
         mxtqDownBits = try container.decodeIfPresent(Int.self, forKey: .mxtqDownBits)
 
-        if let routed = try container.decodeIfPresent(RoutedMxtqBits.self, forKey: .mxtqBits) {
+        if let routed = try container.decodeIfPresent(MxtqBitsSpec.self, forKey: .mxtqBits)?.routed {
             apply(routedBits: routed)
         } else if let routed = Self.peekQuantizationRoutedBits(decoder) {
             apply(routedBits: routed)
@@ -552,10 +552,19 @@ private struct MxtqBitsSpec: Decodable {
             routed = .uniform(flat)
             return
         }
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        routed =
-            (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routedExpert))
-            ?? (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routed))
+        if let container = try? decoder.container(keyedBy: CodingKeys.self),
+            let nested =
+                (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routedExpert))
+                ?? (try? container.decodeIfPresent(RoutedMxtqBits.self, forKey: .routed))
+        {
+            routed = nested
+            return
+        }
+        if let direct = try? RoutedMxtqBits(from: decoder), direct.isSpecified {
+            routed = direct
+            return
+        }
+        routed = nil
     }
 }
 
@@ -581,6 +590,15 @@ private enum RoutedMxtqBits: Decodable {
         let up = try container.decodeIfPresent(Int.self, forKey: .upProj)
         let down = try container.decodeIfPresent(Int.self, forKey: .downProj)
         self = .projected(gateUp: gateUp ?? gate ?? up, down: down)
+    }
+
+    var isSpecified: Bool {
+        switch self {
+        case .uniform:
+            return true
+        case .projected(let gateUp, let down):
+            return gateUp != nil || down != nil
+        }
     }
 }
 

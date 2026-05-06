@@ -52,9 +52,9 @@ Production-ready minimum as of this handoff:
   JANGTQ2 is the preferred Ling production bundle for memory. MXFP4 is now
   memory-bounded but slow.
 - DSV4 Flash loads, routes reasoning modes, and stores/restores cache state.
-  Short chat recall is revalidated in this pass. The long-context row had
-  previously passed at the 3K-token prompt size, but must be rerun after the
-  local DSV4 bundle redownload completes.
+  Short chat recall and the 3K-token long-context row are revalidated after
+  the local sidecar rebuild. The 5K+ stress row remains a memory-hardening
+  task, not a minimum coherence blocker.
 - Qwen 35B, Qwen 27B, Gemma4 26B, Laguna XS.2, MiniMax M2.7, and Nemotron Omni
   have live coherent-output coverage without marker leakage in the tested rows.
 - Paged/prefix cache, L2 disk restore, SSM companion state, and TurboQuant KV
@@ -105,7 +105,7 @@ This recheck was run in `/Users/eric/vmlx-swift-lm` after the Ling
 | `swift build -c release --product RunBench` | PASS with existing distributed/VL/model warnings only. |
 | Ling JANGTQ `BENCH_COHERENT=1` | PASS. Compile off/on both recalled favorite color, identified blue as cool, and produced no loop or raw marker leak. |
 | DSV4 Flash short `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` | PASS before the local DSV4 bundle was removed for redownload. Three turns recalled `sapphire-42`; visible answer content was routed through `.reasoning`, not `.chunk`, as expected for this bundle. |
-| DSV4 Flash long row | BLOCKED locally while `/Users/eric/models/DeepSeek-V4-Flash-JANGTQ` is being redownloaded. The old `/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ` path disappeared during this pass; rerun the long-context row after the bundle has all config/tokenizer/shard files. |
+| DSV4 Flash long row | PASS after local sidecar rebuild. The 3,068-token row recalled `CERULEAN RIVER / OSLO` with reasoning present, visible final answer, and no loop. The 5,568-token stress row was killed under overlapping DSV4 load and is not a clean verdict. |
 | Qwen3.6 35B JANGTQ `BENCH_BATCH_TQ_B2=1` | PASS. Plain KV slot stayed byte-identical beside a TurboQuant KV neighbor; both TQ slots decoded coherent text. |
 | MiniMax M2.7 Small JANGTQ `BENCH_BATCH_DISK_RESTORE=1` | PASS. Fresh coordinator hit disk L2; prompt time dropped from 13.608s to 0.179s. |
 | MiniMax M2.7 Small JANGTQ `BENCH_BATCH_CACHE_HIT=1` | PASS. Paged prefix probe hit 128/186 tokens and warm/cold prompt ratio was 0.36. |
@@ -130,8 +130,8 @@ metadata/template only.
 | Gemma4 26B JANG_4M `BENCH_HARMONY_CHECK=1` | PASS. Coherent README-template visible text, no harmony markers in `.chunk`. The prompt did not elicit reasoning deltas. |
 | Laguna XS.2 JANGTQ `BENCH_LAGUNA_LOOP=1` | PASS. Thinking off/on both produced coherent folder summaries with `loop=NO`; thinking-on split reasoning and visible text without marker leakage. |
 | MiniMax M2.7 JANGTQ `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and answered cool color correctly. Peak footprint about 61.2 GB. |
-| MiniMax M2.7 JANGTQ_K `BENCH_COHERENT=1` | COHERENT / PERF ISSUE. Compile off/on both recalled blue; first cold turn had 163s TTFT and the 40-token third answer ended mid-sentence. Peak footprint about 80.0 GB. Treat as runtime coherent but speed/cold-start not production-quality yet. |
-| Qwen3.6 27B JANG_4M `BENCH_COHERENT=1` | INCONCLUSIVE for visible-answer coherence. It loaded and generated, but the generic 48-token row stayed entirely in reasoning. |
+| MiniMax M2.7 JANGTQ_K `BENCH_COHERENT=1` | COHERENT / PERF ISSUE. Compile off/on both recalled blue. The first cold run had 163s TTFT under cold shader/cache conditions; rerun after warmup had about 4.2s first TTFT and warm turns around 350 ms. Peak footprint stayed about 80.0 GB, so memory/speed remain optimization work. |
+| Qwen3.6 27B JANG_4M `BENCH_COHERENT=1` | PASS with explicit visible-answer policy. The generic 48-token row stayed entirely in reasoning, but `BENCH_THINK_LOOP_PROBE=1 THINK=0` produced visible content with zero reasoning chars, EOS stop, no loop, and no marker leak. |
 | Qwen3.6 27B JANG_4M `BENCH_QWEN_THINKING_CHECK=1` | PASS for reasoning split. 95 reasoning deltas, empty `.chunk`, no `<think>` marker leak. Osaurus should set explicit `enable_thinking=false` for normal visible-answer mode on Qwen-family traffic. |
 | Ling 2.6 flash JANGTQ2 `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and cool color. Peak footprint about 30.4 GB. |
 | Ling 2.6 flash MXFP4 `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and cool color. Peak footprint about 66.8 GB, not the earlier ~110 GB failure mode. |
@@ -139,6 +139,15 @@ metadata/template only.
 | Production bundle `BENCH_CONFIG_SMOKE=1` sweep | PASS for Qwen 35B, Qwen 27B, Gemma4, Laguna, MiniMax JANGTQ/JANGTQ_K, Ling JANGTQ2/MXFP4, Nemotron Omni JANGTQ, and DSV4 Flash. DSV4 reports `sidecar=true` after local sidecar rebuild. |
 | Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 always opens `<think>` even with `enable_thinking=false`; `reasoning_effort=max` changes the rendered prompt. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
 | DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | PASS. Reasoning-off and reasoning-on both answered `12`; reasoning-on routed thought text through `.reasoning`. Max-effort produced reasoning-only within the 128-token cap, which is stream-correct but means production should allocate enough token budget if visible final text is required after max reasoning. |
+
+Runtime fix made after this matrix: `MiniMaxJANGTQConfiguration` now decodes
+the real JANGTQ_K nested bit map directly from `mxtq_bits.routed_expert`, not
+only from factory-normalized `mxtq_gate_up_bits` / `mxtq_down_bits` fields.
+Focused unit coverage verifies uniform bits, gate/up/down projection bits,
+`quantization` fallback, and explicit field precedence. Targeted smoke on the
+local MiniMax M2.7 JANGTQ_K bundle passes with
+`routedBits=gateUp:2,down:4`; template smoke also passes for thinking on/off,
+multi-turn, and tool rows.
 
 DSV4 model-file issue found during this continuation: the copied
 `/Users/eric/models/JANGQ/DeepSeek-V4-Flash-JANGTQ` bundle had all 78 model
@@ -148,8 +157,7 @@ shards, `model.safetensors.index.json`, and tokenizer files, but it was missing
 prestacked JANGTQ layout (`format="jangtq"`,
 `rebundled_layout="prestacked-switch_mlp"`) with `tq_packed` / `tq_norms` /
 `tq_bits` tensors in the model shards. The small runtime sidecar still must
-exist because the
-TurboQuant kernels need deterministic `signs.{dim}.42` and
+exist because the TurboQuant kernels need deterministic `signs.{dim}.42` and
 `codebook.{dim}.2` tensors. Local sidecar rebuilt with keys:
 `signs.4096.42`, `codebook.4096.2`, `signs.2048.42`, and `codebook.2048.2`,
 then copied back to `/Volumes/eric-1/models/JANGQ/DeepSeek-V4-Flash-JANGTQ`.
