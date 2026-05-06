@@ -191,6 +191,7 @@ numbers from this pass, not final speed acceptance for the slower families:
 | Laguna XS.2 JANGTQ | 80 tok/s | 29.2 tok/s | 31.3 tok/s | Coherent visible text, no loop, no leaks. |
 | MiniMax M2.7 JANGTQ | 45-50 tok/s | 28.1 tok/s | 30.0 tok/s | Coherent visible text, no loop, no leaks. |
 | Ling 2.6 flash JANGTQ2 | 80 tok/s | 30.7 tok/s | 30.3 tok/s | Coherent visible text, no loop, no leaks. |
+| Nemotron Omni Nano JANGTQ2 | 90 tok/s | 65.4 tok/s | 76.3 tok/s | Coherent visible text, no loop, no leaks. |
 | DSV4 Flash JANGTQ | 20 tok/s | 11.1 tok/s | 13.2 tok/s | Reasoning stream coherent; visible text empty on the perf prompt at short budget. |
 
 Raw local logs are under `docs/benchmarks/speed-2026-05-06/` but that directory
@@ -204,6 +205,12 @@ Additional HQ continuation after this table:
 
 - Qwen3.6 35B JANGTQ `BENCH_PERF` BatchEngine, 64 tokens:
   **80.4 tok/s**, coherent text, no loop, no leaks, and no factory fallback noise.
+- Nemotron Omni Nano JANGTQ2 `BENCH_PERF`, 64 tokens:
+  BatchEngine **65.4 tok/s** median / 65.9 best; simple TokenIterator
+  **76.3 tok/s** median / 76.9 best. Both runs emitted coherent visible text
+  with no loop or marker leaks. Peak footprint was about 15.1 GB. Logs:
+  `/tmp/vmlx_omni_jangtq_perf_batch_20260506.log` and
+  `/tmp/vmlx_omni_jangtq_perf_iter_20260506.log`.
 - Laguna XS.2 JANGTQ `BENCH_TEMPLATE_SMOKE=1 VMLX_CHAT_TEMPLATE_FALLBACK_LOG=1`:
   PASS. The tokenizer bridge selected `LagunaMinimal`; thinking-off rendered a
   closed `</think>` prompt tail, thinking-on opened `<think>`, and assistant
@@ -661,6 +668,14 @@ BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=64 \
 
 BENCH_SIMPLE=1 BENCH_PROMPT_LEN=30 BENCH_MAX_TOKENS=64 \
   BENCH_MODEL=~/models/JANGQ/Ling-2.6-flash-JANGTQ \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK \
+  .build/release/RunBench
+
+BENCH_PERF=1 BENCH_PERF_PATH=iter BENCH_MAX_TOKENS=64 \
+  BENCH_MODEL=~/models/dealign.ai/Nemotron-Omni-Nano-JANGTQ-CRACK \
   .build/release/RunBench
 ```
 
