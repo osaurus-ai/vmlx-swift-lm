@@ -383,6 +383,55 @@ External dirty state to keep out of this repo:
   agent. This handoff and the commit from this pass touch only
   `vmlx-swift-lm`.
 
+## 2026-05-06 Hook Model-Gate Continuation
+
+The local stop hook requires exact paths that are not present on this M5 host:
+
+- `~/models/Qwen3.5-35B-A3B-4bit`
+- `~/osaurus_models/finished/gemma-4-e2b-it-4bit`
+- `~/osaurus_models/finished/gemma-4-e4b-it-4bit`
+- `~/osaurus_models/finished/gemma-4-26b-a4b-it-4bit`
+- `~/.mlxstudio/models/Nemotron-Cascade-2-30B-A3B-JANG_2L`
+- `~/.mlxstudio/models/Nemotron-3-Super-120B-A12B-JANG_2L`
+- `~/models/Mistral-Small-4-119B-JANG_2L`
+- `~/.mlxstudio/models/Qwen3.5-VL-35B-A3B-JANG_4K-CRACK`
+- `~/.mlxstudio/models/Qwen3.5-VL-122B-A10B-JANG_4K-CRACK`
+- `~/.mlxstudio/models/MiniMax-M2.5-JANG_2L-CRACK`
+
+No acceptance claim is made for those exact bundles. The closest available
+local substitutes were tested sequentially with:
+
+```bash
+BENCH_PERF=1 BENCH_PERF_PATH=batch BENCH_PERF_WARMUP=0 \
+BENCH_PERF_RUNS=1 BENCH_MAX_TOKENS=64
+```
+
+| Model | TTFT | Decode | Output status | Memory |
+|---|---:|---:|---|---:|
+| Qwen3.6-35B-A3B-JANGTQ-CRACK | 82 ms | 75.4 tok/s | coherent, no loop, no marker leaks | 10.2 GiB max RSS |
+| Gemma-4-26B-A4B-it-JANG_4M-CRACK | 325 ms | 75.0 tok/s | coherent, no loop, no marker leaks | 12.8 GiB max RSS |
+| Nemotron-Omni-Nano-JANGTQ-CRACK | 159 ms | 63.8 tok/s | coherent, no loop, no marker leaks | 7.2 GiB max RSS |
+| MiniMax-M2.7-JANGTQ | 1,018 ms | 30.6 tok/s | coherent, no loop, no marker leaks | 52.6 GiB max RSS |
+| Ling-2.6-flash-JANGTQ2-CRACK | 340 ms | 29.0 tok/s | coherent, no loop, no marker leaks | 27.8 GiB max RSS |
+| Laguna-XS.2-JANGTQ | 160 ms | 27.8 tok/s | coherent, no loop, no marker leaks | 8.8 GiB max RSS |
+| DeepSeek-V4-Flash-JANGTQ | 9,097 ms | 8.4 tok/s | coherent, no loop, no marker leaks | 62.3 GiB max RSS |
+
+Logs:
+
+- `/tmp/vmlx_hook_available_qwen36_35b_perf_20260506.log`
+- `/tmp/vmlx_hook_available_gemma4_26b_perf_20260506.log`
+- `/tmp/vmlx_hook_available_nemotron_omni_perf_20260506.log`
+- `/tmp/vmlx_hook_available_minimax_m27_perf_20260506.log`
+- `/tmp/vmlx_hook_available_ling_jangtq2_perf_20260506.log`
+- `/tmp/vmlx_hook_available_laguna_xs2_perf_20260506.log`
+- `/tmp/vmlx_hook_available_dsv4_flash_perf_20260506.log`
+
+The current `RunBench` perf harness reports TTFT, decode tok/s, stop reason,
+visible/reasoning character counts, loop/leak checks, and process memory via
+`/usr/bin/time -l`. It does not currently emit graph-node or `AsType`
+primitive counts, so those hook fields remain unverified until an MLX graph
+instrumentation path is added.
+
 ## Speed / Dtype Contract For New Runtime Work
 
 The previous "speed stuck" cluster was real and should be treated as production
