@@ -222,6 +222,7 @@ public enum LLMTypeRegistry {
             // configured a Mistral 3.5 VLM bundle to expose `ministral3` outer.
             "ministral3": dispatchMistral3LLM,
             "apertus": create(ApertusConfiguration.self, ApertusModel.init),
+            "zaya": dispatchZaya,
             // DSV4 (DeepSeek-V4-Flash / -Pro): architecturally distinct
             // from DSV3 — mHC residual stream, CSA/HCA hybrid attention,
             // sqrtsoftplus gate, grouped low-rank O, sliding window,
@@ -238,6 +239,12 @@ public enum LLMTypeRegistry {
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
         ]
+    }
+
+    private static func dispatchZaya(data _: Data) throws -> any LanguageModel {
+        throw ModelFactoryError.unsupportedModelType(
+            "zaya (ZAYA1 CCA hybrid decoder is not implemented in vmlx-swift-lm yet; port requires CCA conv_state/prev_hs cache support, per-slot hybrid batching state, prefix-cache disabled until KV+CCA restore parity is proven, and JANGTQ pre-stacked switch_mlp expert wiring)"
+        )
     }
 
     private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {

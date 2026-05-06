@@ -226,19 +226,26 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             ctx["reasoning_effort"] = enableThinking ? "high" : "none"
                             mistral4AdjustedContext = ctx
                         }
+                        let dsv4Bos =
+                            "<" + String(UnicodeScalar(0xFF5C)!)
+                            + "begin" + String(UnicodeScalar(0x2581)!) + "of"
+                            + String(UnicodeScalar(0x2581)!) + "sentence"
+                            + String(UnicodeScalar(0xFF5C)!) + ">"
+                        var adjustedContext = mistral4AdjustedContext
+                        if upstream.bosToken == dsv4Bos,
+                           let enableThinking = adjustedContext?["enable_thinking"] as? Bool,
+                           enableThinking == false,
+                           adjustedContext?["reasoning_effort"] != nil {
+                            adjustedContext?.removeValue(forKey: "reasoning_effort")
+                        }
                         do {
                             return try upstream.applyChatTemplate(
-                                messages: messages, tools: tools, additionalContext: mistral4AdjustedContext)
+                                messages: messages, tools: tools, additionalContext: adjustedContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
                             // Missing-template fallbacks for bundles that ship
                             // tokenizer special tokens but no tokenizer_config
                             // chat_template field. VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1
                             // opts out.
-                            let dsv4Bos =
-                                "<" + String(UnicodeScalar(0xFF5C)!)
-                                + "begin" + String(UnicodeScalar(0x2581)!) + "of"
-                                + String(UnicodeScalar(0x2581)!) + "sentence"
-                                + String(UnicodeScalar(0xFF5C)!) + ">"
                             if (env["VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE"] ?? "0") != "1" {
                                 if hasLagunaSentinel {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
@@ -254,7 +261,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         truncation: false,
                                         maxLength: nil,
                                         tools: tools,
-                                        additionalContext: additionalContext)
+                                        additionalContext: adjustedContext)
                                 }
                                 if upstream.bosToken == dsv4Bos {
                                     if (env["VMLX_CHAT_TEMPLATE_FALLBACK_LOG"] ?? "0") == "1" {
@@ -270,7 +277,7 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                                         truncation: false,
                                         maxLength: nil,
                                         tools: tools,
-                                        additionalContext: additionalContext)
+                                        additionalContext: adjustedContext)
                                 }
                                 if upstream.bosToken == "]~!b[",
                                    upstream.eosToken == "[e~[" {

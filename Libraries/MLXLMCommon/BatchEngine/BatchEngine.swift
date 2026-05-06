@@ -707,19 +707,27 @@ public actor BatchEngine {
                 }
             }
 
-            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
-            // Detect paged-incompatible models at admission so the
-            // coordinator routes prefix reuse through the disk tier
-            // (`TQDiskSerializer` understands `LayerKind.deepseekV4`)
-            // instead of the paged tier (which would report a token-id
-            // hash hit on empty blocks for DSV4 and starve the disk
-            // tier of the lookup that would actually hit). Idempotent —
-            // safe to run on every admission.
+            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass) and
+            // 2026-05-06 (Gemma4 SWA cache-hit fix):
+            // Detect cache topologies the paged tier cannot represent at
+            // admission so the coordinator routes prefix reuse through the
+            // disk serializer instead.
+            //
+            // `PagedCacheManager` stores per-block full-history KV tensors.
+            // It cannot currently encode rotating/sliding-window ring
+            // metadata, and for mixed Gemma4-style caches it would restore
+            // only the full-attention KVCacheSimple layers while leaving SWA
+            // RotatingKVCache layers empty. The v2 disk serializer tags
+            // every layer kind (`.rotating`, `.deepseekV4`, `.kvSimple`,
+            // `.tqCompressed`, ...) and is therefore the correct restore
+            // mechanism for these models until paged blocks grow first-class
+            // rotating-cache payloads.
             if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
-                if hasHybridPool {
+                let hasRotating = cache.contains { $0 is RotatingKVCache || $0 is RotatingKVCacheWrapper }
+                if hasHybridPool || hasRotating {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
-                        "Coordinator flipped to isPagedIncompatible=true on first hybrid-pool slot admission"
+                        "Coordinator flipped to isPagedIncompatible=true on first paged-incompatible slot admission"
                     )
                 }
             }

@@ -85,7 +85,7 @@ the osaurus-owned dependency chain and fixing RunBench's tokenizer smoke path.
 | Release build | PASS. `swift build -c release --product RunBench`. |
 | Focused Swift tests | PASS with Xcode toolchain and `--no-parallel`: paged/prefix cache, cache coordinator, SSM state cache, TQ disk serializer CacheList, interleaved reasoning/tool calls, Gemma4 template probes, and CompilableTurboQuantKVCache parity. |
 | Kimi K2.6 Small JANGTQ config/template | PASS after RunBench switched to the production tokenizer substitution path. Remaining warning: tokenizer EOS `163585` is not in effective EOS `[163586]`. |
-| DSV4 template kwargs | PASS. `enable_thinking=false` renders the DSV4 prompt tail as `<｜Assistant｜></think>`, `enable_thinking=true` opens `<think>`, and `reasoning_effort=max` reaches the fallback template through Swift-Jinja. |
+| DSV4 template kwargs | PASS. `enable_thinking=false` renders the DSV4 prompt tail as `<｜Assistant｜></think>`, `enable_thinking=true` opens `<think>`, and `reasoning_effort=max` is honored only while thinking is enabled. |
 | DSV4 production chat row | PASS. Full-weight `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=chat` recalled `sapphire-42`, answered the sapphire/blue follow-up, emitted visible `.chunk` text with `unclosedReasoning=false`, and clean-exited after explicit engine shutdown. |
 | Laguna XS.2 JANGTQ live loop probe | PASS. The bridge engaged the native Poolside/Laguna template, and the strict 512-token loop probe stopped cleanly in both thinking modes with no raw marker leak. Peak memory footprint about 12.0 GB. |
 | Qwen3.6 35B JANGTQ live reasoning gate | PASS. No `<think>` leakage in `.chunk`; reasoning deltas populated. Cosmetic VLM factory warning still appears before LLM factory succeeds. |
@@ -137,7 +137,7 @@ metadata/template only.
 | Ling 2.6 flash MXFP4 `BENCH_COHERENT=1` | PASS. Compile off/on both recalled blue and cool color. Peak footprint about 66.8 GB, not the earlier ~110 GB failure mode. |
 | Nemotron Omni Nano JANGTQ `BENCH_OMNI=1 BENCH_OMNI_BATCH=1` | PASS. 17/17 rows passed: text single/multi-turn, image, video encoder, audio encoder, video/audio LMInput, reasoning ON/OFF toggle, mixed image+audio, media-salt isolation, hybrid SSM warm-pass, BatchEngine B=1/B=2/image/audio. |
 | Production bundle `BENCH_CONFIG_SMOKE=1` sweep | PASS for Qwen 35B, Qwen 27B, Gemma4, Laguna, MiniMax JANGTQ/JANGTQ_K, Ling JANGTQ2/MXFP4, Nemotron Omni JANGTQ, and DSV4 Flash. DSV4 reports `sidecar=true` after local sidecar rebuild. |
-| Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 has no bundle chat template in this local Flash bundle, so the Swift `DSV4Minimal` fallback is the production path: `thinking_false` closes `</think>`, `thinking_true` opens `<think>`, and `reasoning_effort=max` changes the rendered prompt. Laguna now uses the Swift `LagunaMinimal` Poolside template when the bundle exposes only an include wrapper. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
+| Production bundle `BENCH_TEMPLATE_SMOKE=1` sweep | PASS for the same set. DSV4 now works with both the local bundle template and the Swift `DSV4Minimal` fallback: `thinking_false` closes `</think>`, `thinking_true` opens `<think>`, and max-effort preface is gated by `enable_thinking=true`. Laguna uses the Swift `LagunaMinimal` Poolside template when the bundle exposes only an include wrapper. Qwen/MiniMax/Nemotron close thinking for `thinking_false`. Ling renders the Bailing "detailed thinking off" system hint in all tested toggle rows. |
 | DSV4 Flash `BENCH_DSV4_COHERENCE BENCH_DSV4_ROW=reasoning` | PASS. Reasoning-off, reasoning-on, and max-effort all answered `12`; thinking rows routed thought text through `.reasoning`, closed reasoning, stopped by EOS/stop, and did not leak raw `<think>` markers. Max-effort needs the larger `BENCH_DSV4_REASONING_MAX_TOKENS=384` budget and the max-only repetition penalty. |
 
 Runtime fix made after this matrix: `MiniMaxJANGTQConfiguration` now decodes
@@ -257,6 +257,118 @@ The equivalent local Python-runtime notes are in
 requirements are reflected here: preserve DSV4 prompt-mode kwargs, keep DSV4
 prefill single-shot, preserve SWA+CSA+HSA hybrid cache state, and never route
 DSV4 through paged KV ownership.
+
+## Late 2026-05-06 Production Matrix
+
+This continuation was run on the local M5 Max MacBook only. The stop-hook model
+paths under `~/.mlxstudio` and `~/osaurus_models` were not present on this
+machine, so the rows below use the available local production-equivalent
+bundles under `~/models/dealign.ai` and `~/models/JANGQ`.
+
+Runtime fixes made in this continuation:
+
+- Rotating/sliding-window cache topologies are now marked paged-incompatible in
+  both `BatchEngine` and `TokenIterator`. Gemma4/SWA prefix reuse therefore
+  restores via the disk serializer, which carries `.rotating` layer metadata,
+  instead of the paged tier, which only stores full-history KV blocks.
+- DSV4 chat-template context strips `reasoning_effort` when
+  `enable_thinking=false`, and the DSV4 fallback templates gate the max-effort
+  preface on `enable_thinking=true`.
+- `BENCH_BATCH_LONG_CONTEXT` now applies the same EOS-prefix comparison used by
+  the short cross-engine validator; raw `TokenIterator` can yield EOS as a
+  token, while `BatchEngine` correctly stops before surfacing it.
+- `BENCH_PERF` now prints `promptTokens=...` so long-context/TurboQuant logs
+  prove the actual context size.
+
+Fresh live rows:
+
+| Row | Result |
+|---|---|
+| DSV4 Flash full coherence `BENCH_DSV4_COHERENCE=1 BENCH_DSV4_ROW=all` | PASS. Three-turn chat recalled `sapphire-42`; reasoning off/on/max all answered `12`; 5,568-token long-context row recalled `CERULEAN RIVER / OSLO`; `stop=stop`, `unclosedReasoning=false`. Log: `/tmp/vmlx_hook_dsv4_coherence_all_20260506.log`. |
+| DSV4 template kwargs after fix | PASS. Chat+max suppresses the max preface while `enable_thinking=false`; thinking+max keeps the max preface. Log: `/tmp/vmlx_hook_dsv4_template_kwargs_after_fix_20260506.log`. |
+| DSV4 reasoning after fix | PASS. Reasoning off/on/max still route correctly after the context coercion. Log: `/tmp/vmlx_hook_dsv4_reasoning_after_template_fix_20260506.log`. |
+| Gemma4 26B production matrix after SWA cache fix | PASS 7/7. Same-prompt cache-hit row returned `4` instead of the prior repeated-text corruption; TTFT improved from 351 ms to 59 ms on the hit row. Log: `/tmp/vmlx_hook_gemma4_26b_prod_after_swa_cache_fix_20260506.log`. |
+| Ling 2.6 flash JANGTQ2 production matrix | PASS 7/7. Reasoning toggles, cache-hit row, and UTF-8 row passed; model load delta was about 28 GB and peak process RSS about 57 GB in this harness. Log: `/tmp/vmlx_hook_ling_prod_20260506.log`. |
+| Qwen3.6 long-context cross-engine | PASS. 2,048-token synthetic prompt matched the BatchEngine prefix, then BatchEngine stopped at EOS token `248046` that raw TokenIterator continued through. Log: `/tmp/vmlx_hook_qwen36_long_context_2048_after_stopfix_20260506.log`. |
+| Nemotron Omni JANGTQ multimodal matrix | PASS 17/17. Text, image, video encoder, audio encoder, video/audio LMInput, reasoning toggle, mixed image+audio, media-salt isolation, hybrid SSM warm-pass, and BatchEngine text/image/audio rows passed. Log: `/tmp/vmlx_hook_nemotron_omni_matrix_20260506.log`. |
+| Config smoke sweep | PASS for Qwen3.6 35B, Gemma4 26B, Nemotron Omni, Ling JANGTQ2, MiniMax M2.7, Laguna XS.2, and DSV4 Flash. Warnings remain for known BOS/EOS overlap/mismatch on Qwen, MiniMax, and Laguna. Logs: `/tmp/vmlx_hook_*_config_smoke_20260506.log`. |
+| Template smoke sweep | PASS for Qwen3.6, Ling, and DSV4. Logs: `/tmp/vmlx_hook_*_template_smoke_20260506.log`. |
+
+ZAYA addendum:
+
+- Local ZAYA bundles inspected under `/Users/eric/jang/models/Zyphra`:
+  source `ZAYA1-8B`, `ZAYA1-8B-JANGTQ2`, `ZAYA1-8B-JANGTQ4`, and
+  `ZAYA1-8B-MXFP4`.
+- Metadata smoke passed for JANGTQ2/JANGTQ4/MXFP4. JANGTQ bundles report
+  `model_type=zaya`, 80 layers, `weight_format=mxtq`, per-role `mxtq_bits`,
+  `tq_in_features` count 120, and `jangtq_runtime.safetensors` present.
+  MXFP4 reports `weight_format=mxfp4`. Logs:
+  `/tmp/vmlx_hook_zaya_jangtq2_config_smoke_20260506.log`,
+  `/tmp/vmlx_hook_zaya_jangtq4_config_smoke_20260506.log`, and
+  `/tmp/vmlx_hook_zaya_mxfp4_config_smoke_20260506.log`.
+- Template smoke passed for JANGTQ2. The bundle template renders the
+  Gemma-style `<|im_start|>` transcript and closes thinking when
+  `enable_thinking=false`. Log:
+  `/tmp/vmlx_hook_zaya_jangtq2_template_smoke_20260506.log`.
+- Current vmlx-swift-lm status is explicit unsupported, not production-ready.
+  ZAYA is not a stock attention/Mamba model: even layers use CCA attention with
+  standard KV plus `conv_state [B,1280,2]` and `prev_hs [B,2048]`; odd layers
+  are top-1 MoE with pre-stacked `switch_mlp` experts. A full port must add a
+  ZAYA model class, a cache object that carries KV+CCA state together, and
+  batching split/merge for the CCA state before live generation can be claimed.
+- The generic loader now accepts ZAYA's quantization metadata keys
+  (`expert_layout`, `embed_bits`, `router_bits`, role-bit policy keys) as
+  metadata rather than per-layer overrides. Attempting generation reaches the
+  explicit ZAYA unsupported error instead of failing while parsing
+  `quantization.expert_layout`. Log:
+  `/tmp/vmlx_hook_zaya_jangtq2_load_unsupported_20260506.log`.
+- Prefix caching must stay disabled for the first ZAYA port. Paged KV may only
+  cover the standard K/V tensors and must not report a complete prefix hit
+  unless the matching CCA state is restored for the exact same prefix length.
+- TurboQuant KV, if enabled later, should compress only standard K/V pages.
+  Keep CCA `conv_state` and `prev_hs` float32 until single-shot versus
+  chunked-prefill parity and cache-restore parity are proven.
+- Bundle issue found: `generation_config.json` sets `eos_token_id=1` while
+  `config.json` and tokenizer use EOS token `106` (`<|im_end|>`). Fix the
+  model bundles before publishing to avoid stop-condition drift.
+
+TurboQuant KV cache rows:
+
+| Model | Row | Result |
+|---|---|---|
+| Qwen3.6 35B JANGTQ | `BENCH_BATCH_TQ_B2=1` | PASS. Plain slot stayed byte-identical beside TQ(4,4). Log: `/tmp/vmlx_hook_qwen36_tq_b2_20260506.log`. |
+| Gemma4 26B JANG_4M | `BENCH_BATCH_TQ_B2=1` | PASS. Plain slot stayed byte-identical beside TQ(4,4). Log: `/tmp/vmlx_hook_gemma4_26b_tq_b2_20260506.log`. |
+| Nemotron Omni JANGTQ | `BENCH_BATCH_TQ_B2=1` | PASS. Plain slot stayed byte-identical beside TQ(4,4). Log: `/tmp/vmlx_hook_nemotron_omni_tq_b2_20260506.log`. |
+| Qwen3.6 35B JANGTQ | TQ(3,3) long context | PASS. `promptTokens=7464`, 32 generated tokens, 56.0 tok/s, no loop or marker leak. Log: `/tmp/vmlx_hook_qwen36_tq33_long_perf_after_promptcount_20260506.log`. |
+| Qwen3.6 35B JANGTQ | TQ(4,4) long context | PASS. `promptTokens=7464`, 32 generated tokens, 55.1 tok/s, no loop or marker leak. Log: `/tmp/vmlx_hook_qwen36_tq44_long_perf_20260506.log`. |
+
+KV-mode speed spot checks from the same build:
+
+| Model | Float KV | TQ(3,3) | TQ(4,4) | Policy note |
+|---|---:|---:|---:|---|
+| Qwen3.6 35B JANGTQ | 76.5 tok/s | 71.2 tok/s | 70.8 tok/s | Functionally good; ~7% speed cost in this one-run probe. |
+| Nemotron Omni JANGTQ | 66.6 tok/s | 63.4 tok/s | 63.3 tok/s | Functionally good; within about 5%. |
+| Gemma4 26B JANG_4M | 78.2 tok/s | 46.2 tok/s | 46.3 tok/s | Functionally correct but not a production default for SWA/rotating Gemma4 until a compressed rotating-cache path exists. |
+
+Batching rows:
+
+- Qwen3.6 B=2: PASS, slot 0 byte-identical, batched/serial ratio 0.93.
+  Log: `/tmp/vmlx_hook_qwen36_batch_b2_20260506.log`.
+- Qwen3.6 B=4: correctness PASS but throughput gate FAIL by the harness's
+  strict cutoff (`ratio=0.95`). Treat as a speed/scheduler efficiency item, not
+  cross-slot corruption. Log: `/tmp/vmlx_hook_qwen36_batch_b4_20260506.log`.
+- Gemma4 B=4: PASS, slot 0 byte-identical, ratio 0.45; throughput assertion
+  skipped because token counts were intentionally uneven. Log:
+  `/tmp/vmlx_hook_gemma4_26b_batch_b4_20260506.log`.
+
+External dirty state to keep out of this repo:
+
+- `/Users/eric/jang` contains unrelated DSV4/ZAYA/model-tool edits from another
+  agent, including local model metadata patches. Do not infer vmlx-swift-lm
+  source truth from that dirty tree without a separate review.
+- `/Users/eric/vmlx/swift` is also dirty with app/runtime changes from another
+  agent. This handoff and the commit from this pass touch only
+  `vmlx-swift-lm`.
 
 ## Speed / Dtype Contract For New Runtime Work
 

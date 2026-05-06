@@ -124,7 +124,14 @@ public enum VLMTypeRegistry {
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
+        "zaya": dispatchZayaUnsupported,
     ]
+
+    private static func dispatchZayaUnsupported(data _: Data) throws -> any LanguageModel {
+        throw ModelFactoryError.unsupportedModelType(
+            "zaya (ZAYA1 CCA hybrid decoder is not implemented in vmlx-swift-lm yet; port requires CCA conv_state/prev_hs cache support, per-slot hybrid batching state, prefix-cache disabled until KV+CCA restore parity is proven, and JANGTQ pre-stacked switch_mlp expert wiring)"
+        )
+    }
 
     /// Shared dispatch for Mistral 3 / 3.5 VLM bundles, registered under
     /// both `mistral3` (canonical outer model_type) and `ministral3`

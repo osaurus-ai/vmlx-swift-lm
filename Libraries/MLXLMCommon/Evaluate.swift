@@ -822,17 +822,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                     )
                 }
             }
-            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass):
-            // Mirror BatchEngine.admit's detection — if the cache has any
-            // hybrid pool layer (DSV4 SWA+CSA+HSA), flip the coordinator
-            // to paged-incompatible so the fetch routes through the disk
-            // tier (which understands `LayerKind.deepseekV4`) instead of
-            // the paged tier (which would report a hash hit on empty
-            // blocks for DSV4 and silently bypass the disk lookup that
-            // would actually hit). Idempotent.
+            // 2026-05-04 (DSV4 SWA/CSA/HSA correctness pass) and
+            // 2026-05-06 (Gemma4 SWA cache-hit fix):
+            // Mirror BatchEngine.admit's detection. Hybrid-pool and
+            // rotating/sliding-window caches must restore through the disk
+            // serializer because the paged tier stores only full-history KV
+            // blocks and cannot round-trip rotating ring metadata.
             if !coordinator.isPagedIncompatible {
                 let hasHybridPool = self.cache.contains { $0 is HybridPoolCache }
-                if hasHybridPool {
+                let hasRotating = self.cache.contains { $0 is RotatingKVCache || $0 is RotatingKVCacheWrapper }
+                if hasHybridPool || hasRotating {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
                         "TokenIterator: coordinator flipped to isPagedIncompatible=true"

@@ -127,6 +127,19 @@ public struct BaseConfiguration: Codable, Sendable {
                 // `configurationDecodingError`, blocking model load.
                 case "mxtq_bits", "routed_expert_bits", "mxtq_seed": continue
 
+                // 2026-05-06 (ZAYA prep):
+                // New hybrid bundles may stamp role-level quantization
+                // policy beside the MLX affine defaults. These values
+                // describe converter/runtime policy, not per-layer
+                // quantization overrides, so keep them out of the
+                // override decoder. Example: ZAYA uses
+                // `expert_layout: "split_switch_mlp"` plus role bit
+                // floors for embed/router paths.
+                case "expert_layout", "embed_bits", "router_bits",
+                    "attention_bits", "lm_head_bits", "cca_conv_bits",
+                    "norms_residual_bits":
+                    continue
+
                 default:
                     if let f = try? container.decode(Bool.self, forKey: key) {
                         if !f {
