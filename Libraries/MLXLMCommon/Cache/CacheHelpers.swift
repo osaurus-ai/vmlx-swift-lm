@@ -251,6 +251,14 @@ public func extractSSMStates(from cache: [any KVCache]) -> [MLXArray] {
             states.append(contentsOf: mamba.state)
         } else if let arrays = layer as? ArraysCache {
             states.append(contentsOf: arrays.state)
+        } else if let zaya = layer as? ZayaCCACache {
+            // ZAYA CCA-attention: conv_state + prev_hs are path-dependent
+            // and must round-trip alongside KV (per Zyphra runtime contract).
+            // Tagged here so the existing SSM rederive plumbing in
+            // BatchEngine.finishSlot picks them up automatically.
+            let (conv, prev) = zaya.readCCA()
+            states.append(conv)
+            states.append(prev)
         } else if let cacheList = layer as? CacheList {
             // Extract SSM sub-cache from composite layers
             for i in 0..<cacheList.count {
@@ -300,6 +308,14 @@ public func restoreSSMStates(_ states: [MLXArray], into cache: [any KVCache]) {
                 arrays.state = Array(states[stateIdx..<(stateIdx + existingCount)])
                     .map { $0[.ellipsis] }
                 stateIdx += existingCount
+            }
+        } else if let zaya = layer as? ZayaCCACache {
+            // ZAYA CCA-attention: extracted as (conv_state, prev_hs) pair.
+            if stateIdx + 2 <= states.count {
+                let conv = states[stateIdx][.ellipsis]
+                let prev = states[stateIdx + 1][.ellipsis]
+                zaya.writeCCA(conv: conv, prev: prev)
+                stateIdx += 2
             }
         } else if let cacheList = layer as? CacheList {
             for i in 0..<cacheList.count {
@@ -456,6 +472,16 @@ private func restoreFromV2Arrays(
                 totalTokens = comp.offset
             }
 
+        case .zayaCCA(let comp):
+            // 2026-05-06 (ZAYA1 CCA-attention port):
+            // Restore the four-array state (keys, values, conv_state,
+            // prev_hs) as one unit. KV-only restore would be a false hit
+            // because conv_state and prev_hs are path-dependent.
+            restoreZayaCCALayer(comp, into: cache[i])
+            if totalTokens == 0 {
+                totalTokens = comp.offset
+            }
+
         case .cacheList(let subLayers):
             // CacheList composite (BaichuanM1, FalconH1, MiMoV2Flash
             // hybrid stacks). Dispatch each sub-LayerData via the
@@ -494,7 +520,7 @@ private func restoreFromV2Arrays(
                         totalTokens = comp.offset
                     }
 
-                case .tq, .qkv, .deepseekV4, .cacheList, .skip:
+                case .tq, .qkv, .deepseekV4, .zayaCCA, .cacheList, .skip:
                     // .skip is a per-sub no-op (sub-cache had no
                     // persistable state). The other cases are not
                     // currently emitted as sub-cache kinds — see
@@ -803,6 +829,20 @@ private func restoreDeepseekV4Layer(
         return
     }
     // Type mismatch — caller will fall back to fresh prefill.
+}
+
+/// 2026-05-06 (ZAYA1 CCA-attention port):
+/// Restore a full `ZayaCCACache` layer — keys, values, conv_state, prev_hs
+/// — as one unit. The KV slots may be zero-seq sentinels (empty source
+/// cache); the cache's setter handles that case without instantiating an
+/// empty KVCacheSimple buffer. Silently no-ops on type mismatch so the
+/// caller falls back to fresh prefill.
+private func restoreZayaCCALayer(
+    _ comp: TQDiskSerializer.ZayaCCALayerComponents,
+    into layer: any KVCache
+) {
+    guard let zaya = layer as? ZayaCCACache else { return }
+    zaya.state = [comp.keys, comp.values, comp.convState, comp.prevHS]
 }
 
 /// Helper: restore Mamba SSM state into a `MambaCache` layer (or a
