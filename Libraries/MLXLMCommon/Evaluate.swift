@@ -2015,6 +2015,11 @@ public func generateTask(
     extraStopStrings: [String] = [],
     promptTail: String? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    let effectivePromptTail =
+        promptTail
+        ?? _decodePromptTail(
+            tokenIds: iterator.promptTokenIds, tokenizer: tokenizer, tokens: 64)
+
     // Capture cache coordinator state and extract KV data before consuming the iterator.
     //
     // SLIDING-1 (2026-04-15): the legacy `!hasRotatingCache` early-out
@@ -2072,7 +2077,7 @@ public func generateTask(
             format: modelConfiguration.toolCallFormat ?? .json,
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
-                promptTail: promptTail),
+                promptTail: effectivePromptTail),
             stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings)
         ),
         cacheStoreAction: cacheStoreAction
@@ -2945,4 +2950,14 @@ internal func _decodePromptTail(
     }
     let tailInts = tailArray.asArray(Int32.self).map { Int($0) }
     return tokenizer.decode(tokenIds: tailInts, skipSpecialTokens: false)
+}
+
+internal func _decodePromptTail(
+    tokenIds: [Int],
+    tokenizer: any Tokenizer,
+    tokens: Int
+) -> String? {
+    guard !tokenIds.isEmpty else { return nil }
+    let tail = Array(tokenIds.suffix(max(1, tokens)))
+    return tokenizer.decode(tokenIds: tail, skipSpecialTokens: false)
 }

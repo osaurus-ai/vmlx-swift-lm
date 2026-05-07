@@ -210,6 +210,20 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CmlxGraphShim",
+            dependencies: [],
+            path: "Libraries/CmlxGraphShim",
+            publicHeadersPath: "include",
+            cSettings: [
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+            ],
+            cxxSettings: [
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx"),
+                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/fmt/include"),
+            ]
+        ),
+        .target(
             name: "MLXDistributedTP",
             dependencies: [
                 "MLXDistributedCore",
@@ -276,6 +290,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXHuggingFace",
+                "CmlxGraphShim",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],

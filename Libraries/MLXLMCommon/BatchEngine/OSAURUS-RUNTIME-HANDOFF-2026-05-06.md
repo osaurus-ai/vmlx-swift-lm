@@ -19,6 +19,88 @@ Ling MXFP4 affine decode after removing the oversized fused gate/up cache. Do
 not block integration on speed unless product policy requires a token/s
 threshold.
 
+## Current Local Pass - 2026-05-06
+
+This continuation prioritized complete bundles already present under
+`~/models` and `~/models/JANGQ`. Mistral Small was intentionally deferred; the
+partial `~/models/Mistral-Small-4-119B-JANG_2L` download is not part of this
+matrix.
+
+Runtime fix made during this pass:
+
+- Low-level `generateTask(...)` now reconstructs the decoded prompt tail from
+  `TokenIterator.promptTokenIds` when the caller does not pass `promptTail`.
+  This keeps `ReasoningParser.forPrompt(...)` using the actual rendered prompt
+  state instead of falling back to a family stamp. Live impact: Ling/Bailing
+  ChatSession multi-turn output now streams visible answers through `.chunk`
+  when the prompt tail has no `<think>` opener, instead of routing the whole
+  answer to `.reasoning`.
+
+Current live local generation results:
+
+| Model | Result |
+|---|---|
+| Qwen3.6 35B A3B JANGTQ | PASS coherent. 75.8 tok/s median, 61-63 ms TTFT, peak footprint about 11.2 GB, `decodeNodes=2525`, `asType=260`. Reasoning channel check passed with 95 reasoning deltas and no `<think>` leakage. |
+| Qwen3.6 27B JANG_4M | PASS coherent. 26.1 tok/s median, peak footprint about 18.1 GB, `decodeNodes=4424`, `asType=480`. |
+| Qwen3.6 27B MXFP4 | PASS coherent. 30.1 tok/s median, peak footprint about 15.8 GB, `decodeNodes=4422`, `asType=480`. Tokenizer shim path is required. |
+| Gemma4 26B A4B JANG_4M | PASS coherent. 79.3 tok/s median against the 80 tok/s target, peak footprint about 25.2 GB, `decodeNodes=3334`, `asType=362`. Harmony marker check passed; selected prompt did not elicit reasoning deltas. |
+| Laguna XS.2 JANGTQ | PASS coherent, no loop/leak. 27.9 tok/s median, peak footprint about 12.1 GB, `decodeNodes=3677`, `asType=275`. Speed remains below target. |
+| Ling 2.6 Flash JANGTQ | PASS coherent. 30.1 tok/s median, peak footprint about 30.3 GB, `decodeNodes=5`, `asType=3` on the recurrentGLA graph probe. After the prompt-tail fix, 3-turn ChatSession recall emits visible `.chunk` text for compile off/on. |
+| Ling 2.6 Flash MXFP4 | PASS coherent but not production-preferred. 9.5 tok/s median, peak footprint about 66.7 GB. JANGTQ2/JANGTQ is the better Ling production choice today. |
+| MiniMax M2.7 Small JANGTQ | PASS coherent. 31.4 tok/s median, peak footprint about 70.8 GB, `decodeNodes=4046`, `asType=373`. Bundle warning: tokenizer BOS `200034` differs from configured BOS `[200019]`. |
+| MiniMax M2.7 JANGTQ | PASS coherent. 31.5 tok/s median, peak footprint about 61.3 GB, `decodeNodes=4045`, `asType=372`. Same BOS warning. |
+| MiniMax M2.7 JANGTQ_K | PASS coherent. 30.9 tok/s median, peak footprint about 80.0 GB, `decodeNodes=4045`, `asType=372`. JANGTQ_K routing detected as `gateUp:2,down:4`; same BOS warning. |
+| Nemotron Omni Nano JANGTQ2 | PASS coherent. 67.3 tok/s median, peak footprint about 15.1 GB, `decodeNodes=1947`, `asType=46`. |
+| Nemotron Omni Nano JANGTQ4 | PASS coherent. 65.6 tok/s median, peak footprint about 29.8 GB, `decodeNodes=1947`, `asType=46`. |
+| Nemotron Omni Nano MXFP4 | PASS coherent and fastest local Omni path. 129.1 tok/s median, peak footprint about 23.0 GB, `decodeNodes=2062`, `asType=161`. |
+| DSV4 Flash JANGTQ | PASS coherent. Short perf: 12.1 tok/s median, peak footprint about 86.4 GB, `decodeNodes=30143`, `asType=1325`. Long-context row below is the acceptance gate; speed remains below 20 tok/s target. |
+
+DSV4 production rows on the current local bundle:
+
+- Config smoke: PASS. `modelType=deepseek_v4`, dispatch `deepseek_v4`,
+  `weightFormat=mxtq`, `sidecar=true`, effective EOS includes `128804`.
+- Template kwargs: PASS. `enable_thinking=false` closes `</think>`,
+  `enable_thinking=true` opens `<think>`, and `reasoning_effort=max` is gated
+  behind thinking.
+- Chat multi-turn: PASS. Recalled `sapphire-42`; follow-up answered `Yes.`;
+  no reasoning leak, `unclosedReasoning=false`.
+- Reasoning modes: PASS. Thinking off/on/max all answered `12`; thinking rows
+  split internal text to `.reasoning` and final text to `.chunk`.
+- Long context: PASS. 5,568-token semantic recall returned
+  `CERULEAN RIVER / OSLO`, `stop=stop`, no loop, no reasoning leak. Peak
+  footprint was about 117.0 GB, so this row fits on the local M5 Max but is
+  close to the memory ceiling.
+
+Cache and batching checks from this pass:
+
+| Row | Result |
+|---|---|
+| Qwen3.6 35B JANGTQ paged prefix | PASS. Coordinator probe hit paged tier, matched 128/161 tokens. Because the model has hybrid/linear-attention state, the warm prefill ratio is informational and rollback semantics are correct. |
+| Qwen3.6 35B JANGTQ disk L2 | PASS. Fresh coordinator hit disk, `diskArrays=yes`, and `ssm_companion` was written. |
+| Qwen3.6 35B JANGTQ TurboQuant KV B=2 | PASS. Plain-KV slot stayed byte-identical beside a TurboQuant(4,4) slot; two TQ slots also completed. |
+| Qwen3.6 35B JANGTQ B=4 | FUNCTIONAL / PERF GAP. Four slots completed and slot 0 stayed byte-identical to solo, but B=4 wall time was about 96% of serial projection at both 24-token and 64-token budgets. Continuous batching isolation is correct; throughput gain for this hybrid/JANGTQ path is not yet there. |
+| Gemma4 26B B=4 | PASS. Slot 0 matched solo output; wall ratio about 0.51 with uneven stop lengths, so speed assertion was skipped by the harness but correctness passed. |
+| Nemotron Omni MXFP4 paged prefix | PASS. Coordinator probe hit paged tier, matched 128/173 tokens; `ssm_companion` handling remained enabled. |
+| Nemotron Omni MXFP4 disk L2 | PASS. Fresh coordinator hit disk and restored with `diskArrays=yes`; `ssm_companion` was written. |
+| DSV4 Flash disk L2 | PASS. Fresh coordinator hit disk using the DSV4 hybrid serializer path; prompt time dropped from 6.710 s cold to 0.097 s warm. This is the DSV4 cache path Osaurus should use. Do not globally replace DSV4 CSA/HSA/SWA with TurboQuant KV. |
+
+Current known gaps:
+
+- Speed: MiniMax M2.7, Laguna, Ling JANGTQ, Nemotron JANGTQ, and DSV4 remain
+  below target. Qwen3.6 35B and Gemma4 26B are near target but still show high
+  graph `AsType` counts. Nemotron MXFP4 is already above target.
+- Batching: Qwen3.6 hybrid/JANGTQ B=4 is functionally isolated but not faster
+  than serial projection. Treat this as a BatchEngine throughput optimization,
+  not a correctness blocker.
+- DSV4 memory: the 5,568-token long row passes, but peak footprint is close to
+  host ceiling. Larger stress rows still need memory hardening.
+- Tests: `swift build -c release --product RunBench` passes. Focused
+  prompt-tail tests also pass with the Xcode toolchain:
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test -c release --filter PromptTailDecodeTests --no-parallel`.
+  The Command Line Tools Swift environment on this host still fails before
+  test execution when importing `XCTest` from existing tests, so use the Xcode
+  toolchain for release test runs.
+
 ## Osaurus PR Agent Notes
 
 This is the handoff document to attach or cite from the first osaurus PR that
