@@ -241,10 +241,72 @@ public enum LLMTypeRegistry {
         ]
     }
 
-    private static func dispatchZaya(data _: Data) throws -> any LanguageModel {
-        throw ModelFactoryError.unsupportedModelType(
-            "zaya (ZAYA1 CCA hybrid decoder is not implemented in vmlx-swift-lm yet; port requires CCA conv_state/prev_hs cache support, per-slot hybrid batching state, prefix-cache disabled until KV+CCA restore parity is proven, and JANGTQ pre-stacked switch_mlp expert wiring)"
-        )
+    /// 2026-05-06 ZAYA1 CCA-attention port. Uses the context pattern
+    /// (à la NemotronH/Laguna): a single `ZayaModel` class drives all
+    /// four bundle variants — JANGTQ2/JANGTQ4 (codebook-quantized routed
+    /// experts), MXFP4 (affine routed experts), and the BF16 base model.
+    /// CCA state (`conv_state`, `prev_hs`) round-trips via `ZayaCCACache`
+    /// (LayerKind.zayaCCA) and `BatchZayaCCACache`; the BatchEngine
+    /// auto-detects ZAYA caches and flips paged-incompatible+hybrid.
+    private static func dispatchZaya(data: Data) throws -> any LanguageModel {
+        struct Probe: Codable {
+            let weightFormat: String?
+            let mxtqBits: ProbeBits?
+            let mxtqGateUpBits: Int?
+            let mxtqDownBits: Int?
+            let mxtqSeed: Int?
+            enum CodingKeys: String, CodingKey {
+                case weightFormat = "weight_format"
+                case mxtqBits = "mxtq_bits"
+                case mxtqGateUpBits = "mxtq_gate_up_bits"
+                case mxtqDownBits = "mxtq_down_bits"
+                case mxtqSeed = "mxtq_seed"
+            }
+        }
+        // mxtq_bits in the bundle may be a flat int OR a per-role dict
+        // (e.g. `{routed_expert: 2, attention: 8, ...}`). Accept both.
+        enum ProbeBits: Codable {
+            case flat(Int)
+            case roles([String: Int])
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if let v = try? c.decode(Int.self) {
+                    self = .flat(v); return
+                }
+                if let v = try? c.decode([String: Int].self) {
+                    self = .roles(v); return
+                }
+                throw DecodingError.typeMismatch(
+                    ProbeBits.self,
+                    .init(codingPath: decoder.codingPath,
+                          debugDescription: "mxtq_bits must be Int or [String: Int]"))
+            }
+        }
+        let config = try JSONDecoder().decode(ZayaConfiguration.self, from: data)
+        let probe = try? JSONDecoder().decode(Probe.self, from: data)
+
+        // Resolve routed-expert bit width from the probe, accepting both shapes.
+        let routedBits: Int? = {
+            switch probe?.mxtqBits {
+            case .flat(let v): return v
+            case .roles(let dict): return dict["routed_expert"] ?? dict.values.first
+            case nil: return nil
+            }
+        }()
+
+        let weightFormat = probe?.weightFormat?.lowercased()
+        let isJANGTQ =
+            weightFormat == "mxtq"
+            || weightFormat == "jangtq2"
+            || weightFormat == "jangtq4"
+            || routedBits != nil
+
+        let context: ZayaMoEContext? = isJANGTQ ? .jangtq(
+            gateUpBits: probe?.mxtqGateUpBits ?? routedBits ?? 2,
+            downBits:   probe?.mxtqDownBits   ?? routedBits ?? 2,
+            seed:       probe?.mxtqSeed ?? 42
+        ) : nil
+        return ZayaModel(config, moe: context)
     }
 
     private static func dispatchNemotronH(data: Data) throws -> any LanguageModel {
