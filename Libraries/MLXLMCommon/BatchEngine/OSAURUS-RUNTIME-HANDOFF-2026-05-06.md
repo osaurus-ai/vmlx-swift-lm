@@ -26,6 +26,30 @@ This continuation prioritized complete bundles already present under
 partial `~/models/Mistral-Small-4-119B-JANG_2L` download is not part of this
 matrix.
 
+Hook compatibility rerun after commit `a138f47`, all available rows tested
+sequentially with `BENCH_PERF=1 BENCH_GRAPH_STATS=1 BENCH_PERF_PATH=batch`,
+one model process at a time:
+
+| Hook row | Status |
+|---|---|
+| `~/models/Qwen3.5-35B-A3B-4bit` | PASS speed/coherence. 100.2 tok/s median, best 100.7, `decodeNodes=3854`, `asType=300`, max RSS about 20.6 GB. No loop, no marker leak, visible coherent text. |
+| `~/osaurus_models/finished/gemma-4-e2b-it-4bit` | PASS speed/coherence. 168.5 tok/s median, best 168.7, `decodeNodes=1704`, `asType=300`, max RSS about 3.3 GB. No loop, no marker leak. |
+| `~/osaurus_models/finished/gemma-4-e4b-it-4bit` | PASS coherence. 108.0 tok/s median, best 109.7, `decodeNodes=2210`, `asType=365`, max RSS about 5.0 GB. No loop, no marker leak. |
+| `~/osaurus_models/finished/gemma-4-26b-a4b-it-4bit` | PASS speed/coherence. 87.0 tok/s median, best 87.6, `decodeNodes=3334`, `asType=362`, max RSS about 15.9 GB. No loop, no marker leak. |
+| `~/.mlxstudio/models/Nemotron-Cascade-2-30B-A3B-JANG_2L` | PASS speed/coherence. 118.6 tok/s median, best 119.8, `decodeNodes=2062`, `asType=161`, max RSS about 9.3 GB. No loop, no marker leak. |
+| `~/.mlxstudio/models/Nemotron-3-Super-120B-A12B-JANG_2L` | PASS coherence, speed lower than smaller Cascade. 41.9 tok/s median/best, `decodeNodes=3599`, `asType=280`, max RSS about 41.8 GB. No loop, no marker leak. |
+| `~/models/Mistral-Small-4-119B-JANG_2L` | NOT TESTED. Local folder is incomplete: config/template/readme/images are present, but no safetensor shards or index. This row also remains deprioritized per the latest user direction. |
+| `~/.mlxstudio/models/Qwen3.5-VL-35B-A3B-JANG_4K-CRACK` | NOT TESTED. Path is not present on this host. |
+| `~/.mlxstudio/models/Qwen3.5-VL-122B-A10B-JANG_4K-CRACK` | NOT TESTED. Path is not present on this host. |
+| `~/.mlxstudio/models/MiniMax-M2.5-JANG_2L-CRACK` | NOT TESTED. Path is not present on this host. |
+| Gemma4 E2B/E4B VL | NOT TESTED. No matching local bundle found under `~/models`, `~/osaurus_models`, or `~/.mlxstudio/models`. |
+
+Interpretation: throughput for Qwen3.5 and Gemma4 meets or exceeds the hook
+targets, and all available rows emitted coherent text without loop/leak. The
+remaining hook failure is graph hygiene: MoE decode graphs still report
+`AsType` counts above the requested `<100` threshold, so dtype/graph cleanup
+remains an optimization task even where token/s is acceptable.
+
 Runtime fix made during this pass:
 
 - Low-level `generateTask(...)` now reconstructs the decoded prompt tail from
