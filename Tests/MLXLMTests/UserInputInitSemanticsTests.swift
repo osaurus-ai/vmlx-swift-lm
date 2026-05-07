@@ -62,6 +62,21 @@ final class UserInputInitSemanticsTests: XCTestCase {
             "UserInput.videos must be populated after `init(prompt:videos:)`.")
     }
 
+    /// Audio uses the same convenience init for Omni/Parakeet paths.
+    func testPromptAudiosInitExposesAudiosTopLevelAndChatMessage() {
+        let input = UserInput(
+            prompt: "hi",
+            audios: [.samples([0.0, 0.25, -0.25], sampleRate: 16_000)])
+        XCTAssertEqual(input.audios.count, 1,
+            "UserInput.audios must be populated after `init(prompt:audios:)`.")
+        guard case .chat(let chat) = input.prompt else {
+            XCTFail("prompt convenience init should wrap a chat message")
+            return
+        }
+        XCTAssertEqual(chat.first?.audios.count, 1,
+            "Wrapped chat message must retain audio for structured renderers.")
+    }
+
     /// Mixed prompt + image + video: both media collections populated.
     func testPromptImagesAndVideosInitExposesBoth() {
         let img = dummyImage()
@@ -101,6 +116,18 @@ final class UserInputInitSemanticsTests: XCTestCase {
         let input = UserInput(chat: chat)
         XCTAssertEqual(input.images.count, 1,
             "Chat messages carrying images must be flattened onto self.images.")
+    }
+
+    func testPromptEnumChatInitExtractsMediaFromMessages() {
+        let img = dummyImage()
+        let video = UserInput.Video.url(URL(fileURLWithPath: "/tmp/x.mov"))
+        let audio = UserInput.Audio.samples([0.0, 0.1], sampleRate: 16_000)
+        let input = UserInput(prompt: .chat([
+            .user("media", images: [img], videos: [video], audios: [audio])
+        ]))
+        XCTAssertEqual(input.images.count, 1)
+        XCTAssertEqual(input.videos.count, 1)
+        XCTAssertEqual(input.audios.count, 1)
     }
 
     // MARK: - didSet still fires on subsequent mutations
@@ -146,6 +173,12 @@ final class UserInputInitSemanticsTests: XCTestCase {
         let img = dummyImage()
         let input = UserInput(messages: [], images: [img])
         XCTAssertEqual(input.images.count, 1)
+    }
+
+    func testMessagesInitExposesAudios() {
+        let audio = UserInput.Audio.samples([0.0, 1.0], sampleRate: 16_000)
+        let input = UserInput(messages: [], audios: [audio])
+        XCTAssertEqual(input.audios.count, 1)
     }
 
     // MARK: - init(prompt: Prompt, images:)

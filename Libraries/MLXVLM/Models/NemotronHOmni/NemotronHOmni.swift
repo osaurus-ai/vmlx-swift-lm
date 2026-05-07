@@ -676,19 +676,14 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             media += "</sound>\n"
         }
 
-        // Build messages with media prepended to the LAST user message.
-        var messages = Qwen2VLMessageGenerator().generate(from: input)
+        // Build text-only message dictionaries, then inject the expanded
+        // NVLM placeholder run once. Using Qwen2VLMessageGenerator here
+        // would leave one-token image/video marker parts in earlier chat
+        // messages and add the expanded run again, desynchronizing
+        // placeholder count from the encoded media embeddings.
+        var messages = Self.textOnlyMessages(from: input)
         if !media.isEmpty {
-            for i in (0 ..< messages.count).reversed() {
-                if (messages[i]["role"] as? String) == "user" {
-                    if let oldContent = messages[i]["content"] as? String {
-                        messages[i]["content"] = media + oldContent
-                    } else {
-                        messages[i]["content"] = media
-                    }
-                    break
-                }
-            }
+            Self.prependMedia(media, toLastUserIn: &messages)
         }
 
         let promptTokens = try tokenizer.applyChatTemplate(
@@ -702,5 +697,61 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             image: processedImage,
             video: processedVideo,
             audio: processedAudio)
+    }
+
+    private static func textOnlyMessages(from input: UserInput) -> [Message] {
+        switch input.prompt {
+        case .text(let text):
+            return [["role": "user", "content": text]]
+        case .chat(let chat):
+            return chat.map { defaultMessageDict(for: $0) }
+        case .messages(let rawMessages):
+            return rawMessages.map { raw in
+                var textOnly = raw
+                textOnly["content"] = contentText(from: raw["content"])
+                return textOnly
+            }
+        }
+    }
+
+    private static func prependMedia(_ media: String, toLastUserIn messages: inout [Message]) {
+        guard !messages.isEmpty else {
+            messages = [["role": "user", "content": media]]
+            return
+        }
+        for i in messages.indices.reversed() where (messages[i]["role"] as? String) == "user" {
+            let text = contentText(from: messages[i]["content"])
+            messages[i]["content"] = media + text
+            return
+        }
+        let text = contentText(from: messages[0]["content"])
+        messages[0]["content"] = media + text
+    }
+
+    private static func contentText(from value: (any Sendable)?) -> String {
+        if let text = value as? String {
+            return text
+        }
+        if let parts = value as? [[String: any Sendable]] {
+            return parts.compactMap { part in
+                guard (part["type"] as? String) == "text" else { return nil }
+                return part["text"] as? String
+            }.joined(separator: "\n")
+        }
+        if let parts = value as? [[String: String]] {
+            return parts.compactMap { part in
+                guard part["type"] == "text" else { return nil }
+                return part["text"]
+            }.joined(separator: "\n")
+        }
+        if let parts = value as? [any Sendable] {
+            return parts.compactMap { part in
+                guard let dict = part as? [String: any Sendable],
+                      (dict["type"] as? String) == "text"
+                else { return nil }
+                return dict["text"] as? String
+            }.joined(separator: "\n")
+        }
+        return value.map { String(describing: $0) } ?? ""
     }
 }

@@ -1,6 +1,8 @@
 #include "CmlxGraphShim.h"
 
+#include <cstdlib>
 #include <exception>
+#include <fstream>
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -27,6 +29,12 @@ static int count_substring(const std::string& haystack, const std::string& needl
     return count;
 }
 
+static int count_exact_label(const std::string& text, const std::string& label) {
+    return count_substring(text, "label =\"" + label + "\"")
+        + count_substring(text, "label = \"" + label + "\"")
+        + count_substring(text, "label=\"" + label + "\"");
+}
+
 extern "C" int vmlx_graph_stats(
     VMLXGraphArray array,
     int32_t* node_count,
@@ -38,12 +46,18 @@ extern "C" int vmlx_graph_stats(
         std::ostringstream dot;
         mlx::core::export_to_dot(dot, mlx_array_get_(vmlx_graph_arr(array)));
         const std::string text = dot.str();
+        if (const char* path = std::getenv("VMLX_GRAPH_DOT_PATH")) {
+            std::ofstream file(path, std::ios::out | std::ios::trunc);
+            if (file.is_open()) {
+                file << text;
+            }
+        }
         if (node_count) {
             *node_count = static_cast<int32_t>(
                 count_substring(text, "[label=") + count_substring(text, "[label ="));
         }
         if (astype_count) {
-            *astype_count = static_cast<int32_t>(count_substring(text, "AsType"));
+            *astype_count = static_cast<int32_t>(count_exact_label(text, "AsType"));
         }
         return 0;
     } catch (const std::exception& e) {

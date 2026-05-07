@@ -286,9 +286,9 @@ final class Qwen35GatedDeltaNet: Module {
         if qScaleWeight == nil || qScaleWeight!.dtype != q.dtype {
             let invScale = pow(Float(headKDim), -0.5)
             qScaleWeight = MLXArray.full(
-                [headKDim], values: MLXArray(pow(invScale, 2)), dtype: q.dtype)
+                [headKDim], values: MLXArray(pow(invScale, 2), dtype: q.dtype), dtype: q.dtype)
             kScaleWeight = MLXArray.full(
-                [headKDim], values: MLXArray(invScale), dtype: k.dtype)
+                [headKDim], values: MLXArray(invScale, dtype: k.dtype), dtype: k.dtype)
         }
         let qNormed = MLXFast.rmsNorm(q, weight: qScaleWeight!, eps: 1e-6)
         let kNormed = MLXFast.rmsNorm(k, weight: kScaleWeight!, eps: 1e-6)

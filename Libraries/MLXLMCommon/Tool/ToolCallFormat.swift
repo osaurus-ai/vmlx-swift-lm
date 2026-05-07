@@ -108,6 +108,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// (markers use fullwidth vertical bar U+FF5C, not ASCII `|`).
     case dsml
 
+    /// ZAYA XML function format. The inner function/parameter syntax is the
+    /// same as Qwen/Nemotron XML function calls, but Zyphra wraps calls in
+    /// `<zyphra_tool_call>...</zyphra_tool_call>`.
+    case zayaXml = "zaya_xml"
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -138,6 +143,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return Llama3ToolCallParser()
         case .dsml:
             return DSMLToolCallParser()
+        case .zayaXml:
+            return XMLFunctionParser(
+                startTag: "<zyphra_tool_call>",
+                endTag: "</zyphra_tool_call>")
         }
     }
 
@@ -257,6 +266,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .dsml
         }
 
+        // ZAYA uses Qwen-style XML function bodies with Zyphra-specific
+        // wrapper tags. JANG stamps this as `zaya_xml`; this fallback covers
+        // plain/non-JANG ZAYA configs.
+        if type.hasPrefix("zaya") || type.hasPrefix("zyphra") {
+            return .zayaXml
+        }
+
         return nil
     }
 
@@ -328,6 +344,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // than the parser.
         case "dsml", "deepseek_v4", "deepseekv4":
             return .dsml
+        // ZAYA / Zyphra XML wrapper around the standard XML function body.
+        case "zaya", "zaya_xml", "zyphra", "zyphra_xml":
+            return .zayaXml
         default:
             return nil
         }

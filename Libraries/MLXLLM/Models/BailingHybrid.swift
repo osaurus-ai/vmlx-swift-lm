@@ -534,8 +534,13 @@ class BailingLinearAttention: Module {
             keys = kNorm(keys)
         }
 
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        if let cache {
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        } else {
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+        }
 
         let priorState = cache?[0]
         let (output, newState) = recurrentGLA(
@@ -546,7 +551,11 @@ class BailingLinearAttention: Module {
         // reflects the new context length. Without this RoPE on Turn 2
         // resets to position 0 and the recurrent state is out-of-sync
         // with the positional encoding.
-        cache?.offset += L
+        if let batchCache = cache as? BatchArraysCache {
+            batchCache.advance(by: L)
+        } else {
+            cache?.offset += L
+        }
 
         let flat = output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         let gated = gNorm(flat) * sigmoid(gProj(x))
@@ -665,9 +674,8 @@ class BailingMLAAttention: Module {
         let kNope = kvPartSplit[0]
         var values = kvPartSplit[1]
 
-        let offset = cache?.offset ?? 0
-        qPe = rope(qPe, offset: offset)
-        kPe = rope(kPe, offset: offset)
+        qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
+        kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
         let queries = concatenated([qNope, qPe], axis: -1)
@@ -929,7 +937,8 @@ extension BailingMLAAttention: BailingAttention {
         cache: KVCache?,
         offset: Int
     ) -> MLXArray {
-        // MLA reads cache.offset internally — `offset` arg is ignored.
+        // MLA derives RoPE position from its own cache, including
+        // BatchKVCache.offsetArray for mixed-length B>1 decode.
         callAsFunction(x, mask: attnMask, cache: cache)
     }
 }

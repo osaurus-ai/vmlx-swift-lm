@@ -408,7 +408,7 @@ class Gemma4Router: Module {
         )[.ellipsis, ..<topK]
 
         let topKLogits = takeAlong(expertScores, topKIndices, axis: -1)
-        var topKWeights = softmax(topKLogits, axis: -1)
+        var topKWeights = softmax(topKLogits, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
         return (indices: topKIndices, weights: topKWeights)

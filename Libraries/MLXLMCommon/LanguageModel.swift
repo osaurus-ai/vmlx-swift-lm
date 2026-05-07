@@ -148,6 +148,18 @@ public struct LMInput {
     }
 }
 
+public extension LMInput {
+    /// True when this prompt carries model-side media embeddings.
+    ///
+    /// Cache restore paths use this to distinguish ordinary text prefixes
+    /// from prompts whose placeholder-token span is backed by image, video,
+    /// or audio tensors. Partial cache hits that split that span must fall
+    /// back to full prefill.
+    var hasMediaContent: Bool {
+        image != nil || video != nil || audio != nil
+    }
+}
+
 /// ``LanguageModel`` step output. This is consumed internally
 /// by the ``TokenIterator``.
 public struct LMOutput {

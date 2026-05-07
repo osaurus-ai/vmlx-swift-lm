@@ -3,7 +3,7 @@
 //
 // ZAYA1-8B port — single model class, three MoE backends.
 //
-// Architecture from /Users/eric/jang/research/ZAYA1-8B-RUNTIME-PREP-2026-05-06.md:
+// Architecture summary:
 //   - 80 decoder layers, alternating: even = CCA-attention, odd = MoE
 //   - Hidden 2048, 16 query heads, 2 KV heads, head_dim 128, cca_num_q_heads 8
 //   - CCA attention: linear_q (→1024), linear_k (→256), val_proj1+val_proj2
@@ -16,6 +16,53 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+
+private let zayaDebugLayerStats =
+    ProcessInfo.processInfo.environment["VMLX_ZAYA_LAYER_STATS"] == "1"
+private let zayaDebugLayerLimit =
+    Int(ProcessInfo.processInfo.environment["VMLX_ZAYA_LAYER_LIMIT"] ?? "6") ?? 6
+
+private func zayaPrintLayerStats(_ label: String, _ h: MLXArray) {
+    guard zayaDebugLayerStats else { return }
+    let last = h[0, h.dim(1) - 1, 0...].asType(.float32)
+    let l2 = sqrt((last * last).sum()).item(Float.self)
+    let mean = last.mean().item(Float.self)
+    let centered = last - mean
+    let std = sqrt((centered * centered).mean()).item(Float.self)
+    let first = (0..<min(4, last.size)).map { i in
+        String(format: "%.6f", last[i].item(Float.self))
+    }.joined(separator: ",")
+    FileHandle.standardError.write(Data(
+        String(format: "[ZAYA_STATS] %@ shape=%@ last_l2=%.4f last_mean=%.6f last_std=%.6f first4=[%@]\n",
+            label, "\(h.shape)", l2, mean, std, first).utf8))
+}
+
+private func zayaScaledL2Normalize(_ x: MLXArray, scale: Float) -> MLXArray {
+    let xf = x.asType(.float32)
+    let norm = sqrt((xf * xf).sum(axis: -1, keepDims: true) + 1e-6)
+    return (xf * (scale / norm)).asType(x.dtype)
+}
+
+// MARK: - Norm utilities
+
+/// ZAYA RMSNorm mirrors the Zyphra reference: compute variance in fp32,
+/// multiply by the learned weight directly, then cast back to input dtype.
+final class ZayaRMSNorm: Module, UnaryLayer {
+    let weight: MLXArray
+    let eps: Float
+
+    init(dimensions: Int, eps: Float = 1e-6) {
+        self.weight = MLXArray.ones([dimensions])
+        self.eps = eps
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let xf = x.asType(.float32)
+        let variance = (xf * xf).mean(axis: -1, keepDims: true)
+        return ((xf * rsqrt(variance + eps)) * weight.asType(.float32)).asType(x.dtype)
+    }
+}
 
 // MARK: - Configuration
 
@@ -37,6 +84,8 @@ public struct ZayaTextConfiguration: Codable, Sendable {
     public var normEpsilon: Float = 1e-6
     public var ffnHiddenSize: Int = 2048
     public var tieWordEmbeddings: Bool = true
+    public var scaleResidualMerge: Bool = true
+    public var residualInFP32: Bool = true
 
     // JANGTQ / quantization knobs (filled by factory after jang_config merge).
     public var weightFormat: String?
@@ -64,6 +113,8 @@ public struct ZayaTextConfiguration: Codable, Sendable {
         case normEpsilon = "norm_epsilon"
         case ffnHiddenSize = "ffn_hidden_size"
         case tieWordEmbeddings = "tie_word_embeddings"
+        case scaleResidualMerge = "scale_residual_merge"
+        case residualInFP32 = "residual_in_fp32"
         case weightFormat = "weight_format"
         case mxtqBits = "mxtq_bits"
         case mxtqGateUpBits = "mxtq_gate_up_bits"
@@ -73,6 +124,19 @@ public struct ZayaTextConfiguration: Codable, Sendable {
     }
 
     public init() {}
+
+    /// ZAYA stores `ffn_hidden_size` as the fused `linear_fc1` output
+    /// width (gate + up). SwitchGLU wants the per-branch intermediate
+    /// width, so the real 8B config's 4096 maps to 2048.
+    var expertIntermediateSize: Int {
+        if ffnHiddenSize == hiddenSize {
+            return ffnHiddenSize
+        }
+        if ffnHiddenSize % 2 == 0 {
+            return ffnHiddenSize / 2
+        }
+        return ffnHiddenSize
+    }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -95,6 +159,8 @@ public struct ZayaTextConfiguration: Codable, Sendable {
         if let v = try c.decodeIfPresent(Float.self, forKey: .normEpsilon) { self.normEpsilon = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .ffnHiddenSize) { self.ffnHiddenSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) { self.tieWordEmbeddings = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .scaleResidualMerge) { self.scaleResidualMerge = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .residualInFP32) { self.residualInFP32 = v }
 
         self.weightFormat = try c.decodeIfPresent(String.self, forKey: .weightFormat)
         // mxtqBits cascade — accept flat int or per-role dict (factory pre-merges
@@ -144,12 +210,15 @@ public enum ZayaMoEContext: Sendable, Equatable {
 
 /// Per-layer residual merge: out = (hidden_states_scale * h + hidden_states_bias)
 ///                              + (residual_scale * x + residual_bias)
-/// Layer 0 has only the (hidden_states_*) pair — `residual_*` is nil there.
+/// Layer 0 has only the (hidden_states_*) pair on disk — sanitize fills the
+/// missing `residual_*` slots with neutral defaults (1.0 / 0.0) so the module
+/// has a uniform parameter set across layers (avoids MLXNN's mismatched-array
+/// container error during quantize-traversal).
 final class ZayaResScale: Module {
     @ModuleInfo(key: "hidden_states_scale") var hiddenScale: MLXArray
     @ModuleInfo(key: "hidden_states_bias") var hiddenBias: MLXArray
-    @ModuleInfo(key: "residual_scale") var residualScale: MLXArray?
-    @ModuleInfo(key: "residual_bias") var residualBias: MLXArray?
+    @ModuleInfo(key: "residual_scale") var residualScale: MLXArray
+    @ModuleInfo(key: "residual_bias") var residualBias: MLXArray
 
     override init() {
         self._hiddenScale.wrappedValue = MLXArray.ones([1])
@@ -159,12 +228,17 @@ final class ZayaResScale: Module {
         super.init()
     }
 
-    func merge(_ h: MLXArray, residual x: MLXArray) -> MLXArray {
-        let scaledH = hiddenScale * h + hiddenBias
-        if let rs = residualScale, let rb = residualBias {
-            return scaledH + (rs * x + rb)
+    func apply(
+        residual: MLXArray?, hiddenStates: MLXArray
+    ) -> (residual: MLXArray?, hiddenStates: MLXArray) {
+        let h = (hiddenStates + hiddenBias.asType(hiddenStates.dtype))
+            * hiddenScale.asType(hiddenStates.dtype)
+        guard let residual else {
+            return (nil, h)
         }
-        return scaledH + x
+        let r = (residual + residualBias.asType(residual.dtype))
+            * residualScale.asType(residual.dtype)
+        return (r, h)
     }
 }
 
@@ -175,6 +249,10 @@ final class ZayaCCAQKV: Module {
     @ModuleInfo(key: "linear_k") var linearK: Linear
     @ModuleInfo(key: "val_proj1") var valProj1: Linear
     @ModuleInfo(key: "val_proj2") var valProj2: Linear
+    /// Two causal Conv1d in series. Bundle ships `conv_qk.0.{weight,bias}`
+    /// and `conv_qk.1.{weight,bias}` — a [Conv1d, Conv1d] array maps cleanly.
+    /// The first kernel mixes channels (in_channels=1, out=1280), the second
+    /// mixes within the head_dim window (in_channels=128, out=1280).
     @ModuleInfo(key: "conv_qk") var convQK: [Conv1d]
     @ModuleInfo(key: "temp") var temp: MLXArray
 
@@ -196,21 +274,49 @@ final class ZayaCCAQKV: Module {
         self._linearK.wrappedValue = Linear(H, kDim, bias: false)
         self._valProj1.wrappedValue = Linear(H, cfg.kvChannels, bias: false)
         self._valProj2.wrappedValue = Linear(H, cfg.kvChannels, bias: false)
-        // Two causal Conv1d in series.
-        // Layer 0: kernel 2, in_channels=1, out_channels=convChannels (per bundle: [1280,1,2]).
-        // Layer 1: kernel 2, in_channels=headDim (128), out_channels=convChannels (per bundle: [1280,128,2]).
+        // conv_qk[0] is depthwise: groups=convChannels (per-channel convolution).
+        // Bundle weight shape `[1280, 1, 2]` decodes as (out=1280, in/groups=1, k=2)
+        // in PyTorch convention; MLX-Swift expects `[out, k, in/groups]` so the
+        // weights are transposed in sanitize.
+        //
+        // conv_qk[1] is head-grouped: groups=convChannels/headDim (per "head").
+        // Bundle weight `[1280, 128, 2]` → MLX shape `[1280, 2, 128]`.
         self._convQK.wrappedValue = [
-            Conv1d(inputChannels: 1, outputChannels: convChannels, kernelSize: 2, bias: true),
-            Conv1d(inputChannels: cfg.kvChannels, outputChannels: convChannels, kernelSize: 2, bias: true),
+            Conv1d(
+                inputChannels: convChannels,
+                outputChannels: convChannels,
+                kernelSize: 2,
+                groups: convChannels,
+                bias: true),
+            Conv1d(
+                inputChannels: convChannels,
+                outputChannels: convChannels,
+                kernelSize: 2,
+                groups: convChannels / cfg.kvChannels,
+                bias: true),
         ]
-        self._temp.wrappedValue = MLXArray.ones([2])
+        self._temp.wrappedValue = MLXArray.zeros([2])
         super.init()
     }
 }
 
+// MARK: - Sub-layer protocol
+
+/// Each ZAYA decoder layer holds either a CCA attention block (even layers)
+/// or an MoE block (odd layers). Both expose `forwardSubLayer(_:cache:)` so
+/// the parent decoder can call them uniformly via a non-optional @ModuleInfo
+/// — matching the pattern used by `BailingDecoderLayer.attention: any BailingAttention`.
+/// Without this uniformity MLXNN's update path fails with `mismatchedContainers`
+/// when the parameter tree contains different per-layer sub-layer keys.
+protocol ZayaSubLayer: Module {
+    func forwardSubLayer(
+        _ x: MLXArray, cache: KVCache?, routerState: MLXArray?
+    ) -> (output: MLXArray, routerState: MLXArray?)
+}
+
 // MARK: - CCA-attention layer
 
-final class ZayaCCAAttention: Module {
+final class ZayaCCAAttention: Module, ZayaSubLayer {
     @ModuleInfo(key: "qkv") var qkv: ZayaCCAQKV
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
@@ -224,9 +330,11 @@ final class ZayaCCAAttention: Module {
     let ropeTheta: Float
     let scale: Float
     let hiddenSize: Int
+    let layerIndex: Int
     let rope: RoPE
 
-    init(_ cfg: ZayaTextConfiguration) {
+    init(_ cfg: ZayaTextConfiguration, layerIndex: Int) {
+        self.layerIndex = layerIndex
         self.qHeads = cfg.ccaNumQHeads
         self.kvHeads = cfg.numQueryGroups
         self.headDim = cfg.kvChannels
@@ -244,21 +352,25 @@ final class ZayaCCAAttention: Module {
         super.init()
     }
 
-    /// Per the runtime contract:
-    /// - q = linear_q(norm_x).reshape([B,T,8,128]).transpose([B,8,T,128])
-    /// - k = linear_k(norm_x).reshape([B,T,2,128]).transpose([B,2,T,128])
-    /// - v = concat(val_proj1, val_proj2, axis=-1).reshape(...) → [B,2,T,128]
-    /// - Apply RoPE (partial_rotary_factor=0.5) on q,k.
-    /// - Concat q,k along feature, transpose to [B, 1280, T].
-    /// - Prepend prior conv_state [B,1280,2] → [B,1280,T+2].
-    /// - conv_qk[0] (kernel 2, in_channels=1, depthwise-style on each channel) → [B,1280,T+1].
-    ///   Apply silu, then conv_qk[1] (kernel 2, in_channels=128) → [B,1280,T].
-    /// - Update conv_state ← out[:, :, -2:].
-    /// - Split out → q (first 1024) and k (last 256), reshape back to [B,H,T,D].
-    /// - KV cache update; repeat KV by 4 for 8 query heads.
-    /// - SDPA(q,k,v) → [B,8,T,128]. Reshape and apply temp[0].
-    /// - o_proj → [B,T,2048]. Residual via res_scale (caller wraps).
-    /// - Update prev_hs ← out[:, -1, :].
+    /// Adapt the heterogeneous cache type passed by the decoder layer.
+    func forwardSubLayer(
+        _ x: MLXArray, cache: KVCache?, routerState: MLXArray?
+    ) -> (output: MLXArray, routerState: MLXArray?) {
+        (
+            callAsFunction(x,
+            cache: cache as? ZayaCCACache,
+            batchCache: cache as? BatchZayaCCACache),
+            nil
+        )
+    }
+
+    /// Mirrors Zyphra's CCA reference:
+    /// - build q/k input frames, plus q/k mean residuals, before any RoPE
+    /// - run the two causal conv_qk kernels over q/k input frames
+    /// - update conv_state with the last two q/k input frames, not conv output
+    /// - use previous normalized hidden state for val_proj2
+    /// - L2-normalize q/k per head, apply temp to keys, then apply RoPE
+    /// - update ordinary KV cache and attention as a standard GQA block
     func callAsFunction(
         _ x: MLXArray,
         cache: ZayaCCACache?,
@@ -267,74 +379,127 @@ final class ZayaCCAAttention: Module {
         let B = x.dim(0)
         let T = x.dim(1)
 
-        // Q/K/V projections.
-        let q0 = qkv.linearQ(x).reshaped([B, T, qHeads, headDim]).transposed(0, 2, 1, 3)  // [B,8,T,128]
-        let k0 = qkv.linearK(x).reshaped([B, T, kvHeads, headDim]).transposed(0, 2, 1, 3)  // [B,2,T,128]
-        let v = concatenated([qkv.valProj1(x), qkv.valProj2(x)], axis: -1)
-                  .reshaped([B, T, kvHeads, headDim])
-                  .transposed(0, 2, 1, 3)                                                    // [B,2,T,128]
+        // Q/K projections in feature form [B,T,C]. CCA conv state stores these
+        // pre-conv input frames, exactly like ZayaDynamicCache.conv_states.
+        let qSeq = qkv.linearQ(x)                                           // [B,T,1024]
+        let kSeq = qkv.linearK(x)                                           // [B,T,256]
+        let qkInput = concatenated([qSeq, kSeq], axis: -1)                  // [B,T,1280]
+        let qkInputCT = qkInput.transposed(0, 2, 1)                         // [B,1280,T]
+        if zayaDebugLayerStats, layerIndex < zayaDebugLayerLimit {
+            zayaPrintLayerStats("CCA\(layerIndex) qSeq", qSeq)
+            zayaPrintLayerStats("CCA\(layerIndex) kSeq", kSeq)
+        }
 
-        // RoPE on partial dims.
-        let offset = cache?.offset ?? batchCache?.offset ?? 0
-        let q1 = rope(q0, offset: offset)
-        let k1 = rope(k0, offset: offset)
+        // Mean residuals from the raw q/k projections.
+        let repeatN = qHeads / kvHeads
+        let queryPre = qSeq.reshaped([B, T, qHeads, headDim])               // [B,T,8,128]
+        let keyPre = kSeq.reshaped([B, T, kvHeads, headDim])                // [B,T,2,128]
+        let keyPreRep = repeated(keyPre, count: repeatN, axis: 2)           // [B,T,8,128]
+        let qkMeanQ = (queryPre + keyPreRep) / MLXArray(2.0, dtype: queryPre.dtype)
+        let qkMeanK = qkMeanQ
+            .reshaped([B, T, kvHeads, repeatN, headDim])
+            .sum(axis: 3) / MLXArray(Float(repeatN), dtype: qkMeanQ.dtype) // [B,T,2,128]
 
-        // Concat q,k along feature dim, then transpose to [B, C, T] for conv.
-        let qSeq = q1.transposed(0, 2, 1, 3).reshaped([B, T, qDim])
-        let kSeq = k1.transposed(0, 2, 1, 3).reshaped([B, T, kDim])
-        let qkFeat = concatenated([qSeq, kSeq], axis: -1).transposed(0, 2, 1)  // [B, 1280, T]
-
-        // Read prior conv state (gathered for batched B>1).
+        // Read prior CCA state (gathered for batched B>1).
         let priorConv: MLXArray
+        let priorPrev: MLXArray
         if let bc = batchCache {
-            priorConv = bc.gatherCCA().conv
+            let gathered = bc.gatherCCA()
+            priorConv = gathered.conv
+            priorPrev = gathered.prev
         } else if let c = cache {
-            priorConv = c.readCCA().conv
+            let state = c.readCCA()
+            priorConv = state.conv
+            priorPrev = state.prev
         } else {
             priorConv = MLXArray.zeros([B, convChannels, 2], dtype: .float32)
+            priorPrev = MLXArray.zeros([B, hiddenSize], dtype: .float32)
         }
-        let qkAug = concatenated([priorConv.asType(qkFeat.dtype), qkFeat], axis: -1)  // [B,1280,T+2]
+        let hasPriorCCA = (cache?.offset ?? batchCache?.offset ?? 0) > 0
+        let qkAug = hasPriorCCA
+            ? concatenated([priorConv.asType(qkInputCT.dtype), qkInputCT], axis: -1)
+            : concatenated([
+                MLXArray.zeros([B, convChannels, 2], dtype: qkInputCT.dtype),
+                qkInputCT,
+            ], axis: -1)                                               // [B,1280,T+2]
 
-        // conv_qk[0]: kernel size 2, channels 1 → 1280 (per-channel). Treat as channel-mixing
-        // convolution. MLX Conv1d expects [N, L, C_in], so transpose, conv, transpose back.
-        let c0in = qkAug.transposed(0, 2, 1)                                          // [B, T+2, 1280]
-        let c0out = qkv.convQK[0](c0in)                                                // [B, T+1, 1280]
-        let c0act = silu(c0out)
-        let c1out = qkv.convQK[1](c0act)                                               // [B, T,   1280]
-        let qkPostConv = c1out.transposed(0, 2, 1)                                     // [B, 1280, T]
+        // MLX Conv1d expects [N,L,C]. ZAYA's reference is an nn.Sequential
+        // of two Conv1d layers with no activation between them.
+        let c0in = qkAug.transposed(0, 2, 1)
+        let c0out = qkv.convQK[0](c0in)
+        let qkPostFeat = qkv.convQK[1](c0out)                               // [B,T,1280]
+        if zayaDebugLayerStats, layerIndex < zayaDebugLayerLimit {
+            zayaPrintLayerStats("CCA\(layerIndex) qkPost", qkPostFeat)
+        }
 
-        // New conv state = last 2 timesteps of conv output. Pad with zeros if T<2.
-        let lastN = qkPostConv.dim(-1)
+        // New conv state = last two q/k input frames. For prefill T>2 this
+        // crops to the final two tokens; for decode it rolls prior+current.
+        let inputStateLen = qkAug.dim(-1)
         let newConv: MLXArray = {
-            if lastN >= 2 {
-                return qkPostConv[0..., 0..., (lastN - 2)..<lastN].asType(.float32)
+            if inputStateLen >= 2 {
+                return qkAug[0..., 0..., (inputStateLen - 2)..<inputStateLen].asType(.float32)
             }
-            // T < 2: pad zeros on the left.
-            let pad = MLXArray.zeros([B, convChannels, 2 - lastN], dtype: qkPostConv.dtype)
-            return concatenated([pad, qkPostConv], axis: -1).asType(.float32)
+            let pad = MLXArray.zeros([B, convChannels, 2 - inputStateLen], dtype: qkAug.dtype)
+            return concatenated([pad, qkAug], axis: -1).asType(.float32)
         }()
 
-        // Split conv output back into q, k.
-        let qkPostFeat = qkPostConv.transposed(0, 2, 1)                                // [B, T, 1280]
-        let qOut = qkPostFeat[0..., 0..., 0..<qDim]
-                     .reshaped([B, T, qHeads, headDim]).transposed(0, 2, 1, 3)         // [B,8,T,128]
-        let kOut = qkPostFeat[0..., 0..., qDim..<(qDim + kDim)]
-                     .reshaped([B, T, kvHeads, headDim]).transposed(0, 2, 1, 3)        // [B,2,T,128]
+        // Split conv output back into q/k and add the q/k mean residual.
+        var qOut = qkPostFeat[0..., 0..., 0..<qDim]
+            .reshaped([B, T, qHeads, headDim]) + qkMeanQ                 // [B,T,8,128]
+        var kOut = qkPostFeat[0..., 0..., qDim..<(qDim + kDim)]
+            .reshaped([B, T, kvHeads, headDim]) + qkMeanK                // [B,T,2,128]
 
-        // KV cache update (per-slot in batched mode via BatchZayaCCACache).
-        var (kFull, vFull) = (kOut, v)
-        if let bc = batchCache {
-            (kFull, vFull) = bc.update(keys: kOut, values: v)
-        } else if let c = cache {
-            (kFull, vFull) = c.update(keys: kOut, values: v)
+        // Values: v1 uses current normalized stream; v2 uses a one-token
+        // delayed stream seeded from prev_hs when the cache is already warm.
+        let hsDelayed: MLXArray = {
+            if hasPriorCCA {
+                let first = priorPrev.asType(x.dtype).expandedDimensions(axis: 1) // [B,1,H]
+                if T == 1 {
+                    return first
+                }
+                return concatenated([first, x[0..., 0..<(T - 1), 0...]], axis: 1)
+            }
+            if T == 1 {
+                return MLXArray.zeros([B, 1, hiddenSize], dtype: x.dtype)
+            }
+            return concatenated([
+                MLXArray.zeros([B, 1, hiddenSize], dtype: x.dtype),
+                x[0..., 0..<(T - 1), 0...],
+            ], axis: 1)
+        }()
+        let v = concatenated([qkv.valProj1(x), qkv.valProj2(hsDelayed)], axis: -1)
+            .reshaped([B, T, kvHeads, headDim])
+            .transposed(0, 2, 1, 3)                                      // [B,2,T,128]
+
+        // L2-normalize q/k per head, scale by sqrt(head_dim), apply per-KV
+        // temperature to keys, then apply partial RoPE.
+        let sqrtHead = Float(headDim).squareRoot()
+        qOut = zayaScaledL2Normalize(qOut, scale: sqrtHead)
+        kOut = zayaScaledL2Normalize(kOut, scale: sqrtHead)
+        kOut = kOut * qkv.temp.asType(kOut.dtype).reshaped([1, 1, kvHeads, 1])
+        if zayaDebugLayerStats, layerIndex < zayaDebugLayerLimit {
+            zayaPrintLayerStats("CCA\(layerIndex) qNorm",
+                qOut.reshaped([B, T, qDim]))
+            zayaPrintLayerStats("CCA\(layerIndex) kNormTemp",
+                kOut.reshaped([B, T, kDim]))
         }
 
-        // Repeat KV to match query heads.
-        let repeatN = qHeads / kvHeads
-        let kRep = repeated(kFull, count: repeatN, axis: 1)
-        let vRep = repeated(vFull, count: repeatN, axis: 1)
+        let qForRoPE = qOut.transposed(0, 2, 1, 3)
+        let kForRoPE = kOut.transposed(0, 2, 1, 3)
+        let qRot: MLXArray
+        let kRot: MLXArray
+        if let bc = batchCache {
+            qRot = rope(qForRoPE, offset: bc.offsetArray)                 // [B,8,T,128]
+            kRot = rope(kForRoPE, offset: bc.offsetArray)                 // [B,2,T,128]
+        } else {
+            let offset = cache?.offset ?? 0
+            qRot = rope(qForRoPE, offset: offset)                         // [B,8,T,128]
+            kRot = rope(kForRoPE, offset: offset)                         // [B,2,T,128]
+        }
 
-        // Mask.
+        // Build the mask before update so batched uneven-length slots use
+        // pre-step offsets. BatchZayaCCACache.update then returns K/V padded
+        // to exactly the same max(offset_i + T) length.
         let mask: MLXFast.ScaledDotProductAttentionMaskMode
         if let bc = batchCache {
             mask = bc.makeMask(n: T, windowSize: nil, returnArray: false)
@@ -346,15 +511,30 @@ final class ZayaCCAAttention: Module {
             mask = .none
         }
 
-        let attn = MLXFast.scaledDotProductAttention(
-            queries: qOut, keys: kRep, values: vRep, scale: scale, mask: mask)
-        let attnFlat = attn.transposed(0, 2, 1, 3).reshaped([B, T, qDim])
-        let scaled = attnFlat * qkv.temp[0]
-        let out = oProj(scaled)
+        // KV cache update (per-slot in batched mode via BatchZayaCCACache).
+        var (kFull, vFull) = (kRot, v)
+        if let bc = batchCache {
+            (kFull, vFull) = bc.update(keys: kRot, values: v)
+        } else if let c = cache {
+            (kFull, vFull) = c.update(keys: kRot, values: v)
+        }
 
-        // New prev_hs = last token's output (post-o_proj, pre-residual). Use x's
-        // hidden representation to get [B, hiddenSize] in float32.
-        let newPrev = out[0..., (T - 1)..<T, 0...]
+        // Repeat KV to match query heads.
+        let kRep = repeated(kFull, count: repeatN, axis: 1)
+        let vRep = repeated(vFull, count: repeatN, axis: 1)
+
+        let attn = MLXFast.scaledDotProductAttention(
+            queries: qRot, keys: kRep, values: vRep, scale: scale, mask: mask)
+        let attnFlat = attn.transposed(0, 2, 1, 3).reshaped([B, T, qDim])
+        let out = oProj(attnFlat)
+        if zayaDebugLayerStats, layerIndex < zayaDebugLayerLimit {
+            zayaPrintLayerStats("CCA\(layerIndex) attnFlat", attnFlat)
+            zayaPrintLayerStats("CCA\(layerIndex) out", out)
+        }
+
+        // New prev_hs = last normalized hidden input, used by val_proj2 on
+        // the next warm pass/decode token.
+        let newPrev = x[0..., (T - 1)..<T, 0...]
                         .reshaped([B, hiddenSize])
                         .asType(.float32)
 
@@ -370,46 +550,79 @@ final class ZayaCCAAttention: Module {
 // MARK: - MoE layer
 
 final class ZayaRouter: Module {
-    @ModuleInfo(key: "rmsnorm_eda") var edaNorm: RMSNorm
-    @ModuleInfo(key: "router_mlp") var routerMLP: [Linear]   // sanitize compresses 0/2/4 → 0/1/2
+    @ModuleInfo(key: "rmsnorm_eda") var edaNorm: ZayaRMSNorm
+    /// Bundle ships `router_mlp.{0,1,2}.{weight,bias}` after sanitize
+    /// compresses the original Sequential indices `{0,2,4}` (with
+    /// implicit ReLUs at 1, 3) to a 3-Linear tuple. This avoids the
+    /// homogeneous-array bias reuse that can incorrectly apply a 256-wide
+    /// bias to the final 17-logit projection.
+    @ModuleInfo(key: "router_mlp") var routerMLP: (Linear, Linear, Linear)
     @ModuleInfo(key: "down_proj") var downProj: Linear
     @ModuleInfo(key: "balancing_biases") var balancingBiases: MLXArray
+    /// Per-channel EDA carry scale applied to the previous MoE router state.
+    /// Bundle ships this for 39/40 MoE layers — the very first MoE block
+    /// (layer 1) has no previous MoE state and omits it. Sanitize fills the
+    /// missing slot with a neutral 1.0 scale of shape [routerHidden] so the
+    /// parameter tree is uniform across all MoE layers.
+    @ModuleInfo(key: "router_states_scale") var routerStatesScale: MLXArray
 
     let numExperts: Int
+    let routerHidden: Int
 
     init(_ cfg: ZayaTextConfiguration) {
         self.numExperts = cfg.numExperts
         let H = cfg.hiddenSize
         let R = 256  // router hidden dim (canonical to ZAYA1; not in config)
-        self._edaNorm.wrappedValue = RMSNorm(dimensions: H, eps: cfg.normEpsilon)
-        self._routerMLP.wrappedValue = [
-            Linear(H, R, bias: true),
+        self.routerHidden = R
+        self._edaNorm.wrappedValue = ZayaRMSNorm(dimensions: R, eps: cfg.normEpsilon)
+        self._routerMLP.wrappedValue = (
             Linear(R, R, bias: true),
-            Linear(R, cfg.numExperts + 1, bias: false),
-        ]
-        self._downProj.wrappedValue = Linear(H, H, bias: true)
-        self._balancingBiases.wrappedValue = MLXArray.zeros([cfg.numExperts])
+            Linear(R, R, bias: true),
+            Linear(R, cfg.numExperts + 1, bias: true)
+        )
+        self._downProj.wrappedValue = Linear(H, R, bias: true)
+        self._balancingBiases.wrappedValue = MLXArray.zeros([cfg.numExperts + 1])
+        // Default neutral scale (router_hidden width) — sanitize replaces
+        // with the bundle value when present.
+        self._routerStatesScale.wrappedValue = MLXArray.ones([R])
         super.init()
     }
 
-    /// Returns: (expertIndices [B*T], expertWeights [B*T], routerSkipDelta [B*T, H])
-    /// where the skip delta is the auxiliary down_proj contribution that gets
-    /// added to the expert output.
-    func route(_ x: MLXArray) -> (idx: MLXArray, weights: MLXArray, aux: MLXArray) {
-        let normed = edaNorm(x)
-        let r0 = relu(routerMLP[0](normed))
-        let r1 = relu(routerMLP[1](r0))
-        let logits = routerMLP[2](r1)                                     // [B*T, E+1]
-        // Take the first E logits and add balancing biases. The 17th
-        // (MOD skip) route is currently not consumed in v1 — top-1 over
-        // experts only. vLLM reference does the same.
-        let routedLogits = logits[0..., 0..<numExperts] + balancingBiases
-        let probs = softmax(routedLogits, axis: -1)                       // [B*T, E]
-        let idx = argMax(probs, axis: -1)                                 // [B*T]
-        let weights = takeAlong(probs, idx.expandedDimensions(axis: -1), axis: -1)
+    /// Returns `(expertIdx, weight, activeMask, nextRouterState)`.
+    ///
+    /// ZAYA's router first projects the 2048-wide residual stream into the
+    /// 256-wide router space, adds the previous MoE router state through EDA,
+    /// then runs RMSNorm + a 3-layer MLP. The final logit is the MOD/skip
+    /// route; when it wins, the expert contribution is zero and the layer
+    /// proceeds through the residual path.
+    func route(
+        _ x: MLXArray, previousRouterState: MLXArray?
+    ) -> (idx: MLXArray, weights: MLXArray, activeMask: MLXArray, nextRouterState: MLXArray) {
+        let projected = downProj(x)                                      // [B*T, 256]
+        let routerState: MLXArray
+        if let previousRouterState {
+            routerState = projected
+                + previousRouterState.asType(projected.dtype)
+                    * routerStatesScale.asType(projected.dtype)
+        } else {
+            routerState = projected
+        }
+
+        let normed = edaNorm(routerState)
+        let r0 = gelu(routerMLP.0(normed))
+        let r1 = gelu(routerMLP.1(r0))
+        let logits = routerMLP.2(r1)                                     // [B*T, E+1]
+
+        let probs = softmax(logits, axis: -1)                            // [B*T, E+1]
+        // Balancing biases affect choice only, not the gathered route prob.
+        let biased = probs.asType(.float32) + balancingBiases.asType(.float32)
+        let idxAll = argMax(biased, axis: -1)                             // [B*T]
+        let weights = takeAlong(probs, idxAll.expandedDimensions(axis: -1), axis: -1)
                         .squeezed(axis: -1)                               // [B*T]
-        let aux = downProj(normed)                                        // [B*T, H]
-        return (idx, weights, aux)
+
+        let activeMask = (idxAll .< Int32(numExperts)).asType(probs.dtype)
+        let idx = minimum(idxAll, MLXArray(Int32(numExperts - 1))).asType(.uint32)
+        return (idx, weights, activeMask, routerState)
     }
 }
 
@@ -426,7 +639,7 @@ final class ZayaExperts: Module {
 
     init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?) {
         let H = cfg.hiddenSize
-        let I = cfg.ffnHiddenSize
+        let I = cfg.expertIntermediateSize
         let E = cfg.numExperts
         switch context {
         case .some(.jangtq(let gateUp, let down, let seed)):
@@ -441,7 +654,7 @@ final class ZayaExperts: Module {
     }
 }
 
-final class ZayaMoEBlock: Module {
+final class ZayaMoEBlock: Module, ZayaSubLayer {
     @ModuleInfo(key: "router") var router: ZayaRouter
     @ModuleInfo(key: "experts") var experts: ZayaExperts
 
@@ -454,16 +667,26 @@ final class ZayaMoEBlock: Module {
         super.init()
     }
 
+    func forwardSubLayer(
+        _ x: MLXArray, cache: KVCache?, routerState: MLXArray?
+    ) -> (output: MLXArray, routerState: MLXArray?) {
+        callAsFunction(x, previousRouterState: routerState)
+    }
+
     /// Given normed input `nx` (the input_norm output of the layer),
     /// runs the router + experts and returns the additive contribution
-    /// (expert output + auxiliary skip). The decoder layer is responsible
-    /// for residual blending via res_scale.
-    func callAsFunction(_ nx: MLXArray) -> MLXArray {
+    /// from the routed expert. The 17th MOD route is a learned skip path:
+    /// the reference uses the normalized hidden state itself as the expert
+    /// output for that route, then multiplies by the selected route prob.
+    func callAsFunction(
+        _ nx: MLXArray, previousRouterState: MLXArray?
+    ) -> (output: MLXArray, routerState: MLXArray) {
         let B = nx.dim(0)
         let T = nx.dim(1)
         let xFlat = nx.reshaped([B * T, hiddenSize])
 
-        let (idx, weights, aux) = router.route(xFlat)            // idx [B*T], weights [B*T], aux [B*T,H]
+        let (idx, weights, activeMask, nextRouterState) = router.route(
+            xFlat, previousRouterState: previousRouterState)
         // SwitchGLU / TurboQuantSwitchGLU expect (x, indices).
         let xIn = xFlat.reshaped([B, T, hiddenSize])
         let idx2D = idx.reshaped([B, T, 1])                       // [B,T,K=1]
@@ -475,46 +698,72 @@ final class ZayaMoEBlock: Module {
         } else {
             expertFlat = expertOut.reshaped([B * T, hiddenSize])
         }
-        let weighted = expertFlat * weights.reshaped([B * T, 1]).asType(expertFlat.dtype)
-        let combined = weighted + aux
-        return combined.reshaped([B, T, hiddenSize])
+        let routeWeights = weights.reshaped([B * T, 1]).asType(expertFlat.dtype)
+        let active = activeMask.reshaped([B * T, 1]).asType(expertFlat.dtype)
+        let modPassThrough = xFlat.asType(expertFlat.dtype)
+        let selectedOutput = expertFlat * active + modPassThrough * (1 - active)
+        let weighted = selectedOutput * routeWeights
+        return (weighted.reshaped([B, T, hiddenSize]), nextRouterState)
     }
 }
 
 // MARK: - Decoder layer
 
 final class ZayaDecoderLayer: Module {
-    @ModuleInfo(key: "input_norm") var inputNorm: RMSNorm
+    @ModuleInfo(key: "input_norm") var inputNorm: ZayaRMSNorm
     @ModuleInfo(key: "res_scale") var resScale: ZayaResScale
-    @ModuleInfo(key: "self_attn") var selfAttn: ZayaCCAAttention?
-    @ModuleInfo(key: "zaya_block") var zayaBlock: ZayaMoEBlock?
+    /// One non-optional sub-layer per Bailing's pattern. The bundle key is
+    /// canonicalized to `sub` in sanitize (was `self_attn` for even layers
+    /// and `zaya_block` for odd). MLXNN's update path needs uniform keys
+    /// across array elements, so this is the structural fix that lets
+    /// quantize traverse the layers array without mismatchedContainers.
+    @ModuleInfo(key: "sub") var sub: any ZayaSubLayer
 
     let isAttention: Bool
+    let layerIndex: Int
+    let scaleResidualMerge: Bool
+    let residualInFP32: Bool
 
     init(_ cfg: ZayaTextConfiguration, layerIdx: Int, context: ZayaMoEContext?) {
         self.isAttention = (layerIdx % 2 == 0)
-        self._inputNorm.wrappedValue = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.normEpsilon)
+        self.layerIndex = layerIdx
+        self.scaleResidualMerge = cfg.scaleResidualMerge
+        self.residualInFP32 = cfg.residualInFP32
+        self._inputNorm.wrappedValue = ZayaRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.normEpsilon)
         self._resScale.wrappedValue = ZayaResScale()
         if isAttention {
-            self._selfAttn.wrappedValue = ZayaCCAAttention(cfg)
+            self._sub.wrappedValue = ZayaCCAAttention(cfg, layerIndex: layerIdx)
         } else {
-            self._zayaBlock.wrappedValue = ZayaMoEBlock(cfg, context: context)
+            self._sub.wrappedValue = ZayaMoEBlock(cfg, context: context)
         }
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, cache: KVCache?) -> MLXArray {
-        let nx = inputNorm(x)
-        let h: MLXArray
-        if isAttention {
-            // Pass either the per-slot ZayaCCACache or the BatchZayaCCACache wrapper.
-            h = selfAttn!(nx,
-                cache: cache as? ZayaCCACache,
-                batchCache: cache as? BatchZayaCCACache)
+    func callAsFunction(
+        _ hiddenStates: MLXArray, residual priorResidual: MLXArray?,
+        cache: KVCache?, routerState: MLXArray?
+    ) -> (hiddenStates: MLXArray, residual: MLXArray, routerState: MLXArray?) {
+        let scaled: (residual: MLXArray?, hiddenStates: MLXArray)
+        if scaleResidualMerge {
+            scaled = resScale.apply(residual: priorResidual, hiddenStates: hiddenStates)
         } else {
-            h = zayaBlock!(nx)
+            scaled = (residual: priorResidual, hiddenStates: hiddenStates)
         }
-        return resScale.merge(h, residual: x)
+        let residual: MLXArray
+        if let r = scaled.residual {
+            residual = scaled.hiddenStates + r
+        } else if residualInFP32 {
+            residual = scaled.hiddenStates.asType(.float32)
+        } else {
+            residual = scaled.hiddenStates
+        }
+        let nx = inputNorm(residual.asType(inputNorm.weight.dtype))
+        if zayaDebugLayerStats, layerIndex < zayaDebugLayerLimit {
+            zayaPrintLayerStats("NX layer\(layerIndex)", nx)
+        }
+        let (h, nextRouterState) = sub.forwardSubLayer(
+            nx, cache: cache, routerState: routerState)
+        return (h, residual, nextRouterState)
     }
 }
 
@@ -522,20 +771,24 @@ final class ZayaDecoderLayer: Module {
 
 public final class ZayaModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    @ModuleInfo(key: "layers") fileprivate var layers: [ZayaDecoderLayer]
-    @ModuleInfo(key: "final_norm") var finalNorm: RMSNorm
+    fileprivate let layers: [ZayaDecoderLayer]
+    @ModuleInfo(key: "final_norm") var finalNorm: ZayaRMSNorm
     @ModuleInfo(key: "res_scale") var resScale: ZayaResScale
 
     let numHiddenLayers: Int
+    let scaleResidualMerge: Bool
+    let residualInFP32: Bool
 
     init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?) {
         self.numHiddenLayers = cfg.numHiddenLayers
+        self.scaleResidualMerge = cfg.scaleResidualMerge
+        self.residualInFP32 = cfg.residualInFP32
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: cfg.vocabSize, dimensions: cfg.hiddenSize)
-        self._layers.wrappedValue = (0 ..< cfg.numHiddenLayers).map { l in
+        self.layers = (0 ..< cfg.numHiddenLayers).map { l in
             ZayaDecoderLayer(cfg, layerIdx: l, context: context)
         }
-        self._finalNorm.wrappedValue = RMSNorm(dimensions: cfg.hiddenSize, eps: cfg.normEpsilon)
+        self._finalNorm.wrappedValue = ZayaRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.normEpsilon)
         self._resScale.wrappedValue = ZayaResScale()
         super.init()
     }
@@ -543,12 +796,64 @@ public final class ZayaModelInner: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let embed = embedTokens(inputs)
         var h = embed
+        zayaPrintLayerStats("HS 0 embed", h)
+        var residual: MLXArray?
+        var routerState: MLXArray?
         for (i, layer) in layers.enumerated() {
-            h = layer(h, cache: cache?[i])
+            let result = layer(
+                h, residual: residual, cache: cache?[i], routerState: routerState)
+            h = result.hiddenStates
+            residual = result.residual
+            if let next = result.routerState {
+                routerState = next
+            }
+            if zayaDebugLayerStats, i + 1 <= zayaDebugLayerLimit {
+                zayaPrintLayerStats("HS \(i + 1) layer\(i)", h)
+            }
         }
-        // Top-level res_scale wraps around the embed→trunk path.
-        h = resScale.merge(h, residual: embed)
-        return finalNorm(h)
+
+        let scaled: (residual: MLXArray?, hiddenStates: MLXArray)
+        if scaleResidualMerge {
+            scaled = resScale.apply(residual: residual, hiddenStates: h)
+        } else {
+            scaled = (residual: residual, hiddenStates: h)
+        }
+        let finalResidual: MLXArray
+        if let r = scaled.residual {
+            finalResidual = scaled.hiddenStates + r
+        } else if residualInFP32 {
+            finalResidual = scaled.hiddenStates.asType(.float32)
+        } else {
+            finalResidual = scaled.hiddenStates
+        }
+        let out = finalNorm(finalResidual.asType(finalNorm.weight.dtype))
+        zayaPrintLayerStats("HS final", out)
+        return out
+    }
+
+    /// Fill array gaps in `layers` before delegating to MLXNN's standard
+    /// update path. ZAYA's MoE layers have no affine-quantized linears —
+    /// the routed experts are TurboQuant codebook and the router is fp16
+    /// passthrough — so the load-time `quantize` updates dict only
+    /// contains entries for even (CCA) layers. Without this fill, MLXNN's
+    /// array recursion sees `.none` values at odd indices and fails with
+    /// `mismatchedContainers`.
+    public override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        var modules = modules
+        if let layersItem = modules["layers"], case .array(let arr) = layersItem {
+            var filled = arr
+            for i in filled.indices {
+                if case .none = filled[i] {
+                    filled[i] = .dictionary([:])
+                }
+            }
+            modules["layers"] = .array(filled)
+        }
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 }
 
@@ -618,20 +923,27 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
             weights[k] = nil
         }
 
-        // Compress router_mlp.{0,2,4} → router_mlp.{0,1,2}. The bundle ships
-        // a Sequential(Linear, ReLU, Linear, ReLU, Linear); the Swift
-        // module declares 3 Linears in a [Linear] array with explicit ReLU.
+        // Conv1d weights ship in PyTorch order `[out, in/groups, kernel]` but
+        // MLX-Swift's Conv1d expects `[out, kernel, in/groups]`. Swap axes 1↔2
+        // for any conv_qk weight (3-D tensor whose last dim isn't already
+        // the kernel size). Mirrors the conv1d permute in Qwen35JANGTQ.sanitize.
+        for k in Array(weights.keys) where k.contains(".conv_qk.") && k.hasSuffix(".weight") {
+            guard let w = weights[k], w.ndim == 3 else { continue }
+            // PyTorch shape [out, in/groups, kernel=2] → MLX [out, kernel, in/groups]
+            if w.dim(-1) != 2 { continue }   // already in MLX order or unexpected layout
+            weights[k] = w.movedAxis(source: 2, destination: 1)
+        }
+
+        // Canonicalize the per-layer sub-block key. The bundle ships
+        // `model.layers.{L}.self_attn.*` for even (CCA) layers and
+        // `model.layers.{L}.zaya_block.*` for odd (MoE) layers. The Swift
+        // module declares a single `sub` field per layer (Bailing pattern)
+        // so MLXNN's array-update path sees uniform keys across all 80
+        // layers and doesn't fail with mismatchedContainers.
         for k in Array(weights.keys) {
-            guard k.contains(".router_mlp.") else { continue }
-            // Match exactly ".router_mlp.0." / ".router_mlp.2." / ".router_mlp.4."
-            let renames: [(String, String)] = [
-                (".router_mlp.0.", ".router_mlp.0."),    // unchanged
-                (".router_mlp.2.", ".router_mlp.1."),
-                (".router_mlp.4.", ".router_mlp.2."),
-            ]
-            for (from, to) in renames {
-                if k.contains(from), from != to {
-                    let newKey = k.replacingOccurrences(of: from, with: to)
+            for needle in [".self_attn.", ".zaya_block."] {
+                if let r = k.range(of: needle) {
+                    let newKey = k.replacingCharacters(in: r, with: ".sub.")
                     weights[newKey] = weights[k]
                     weights[k] = nil
                     break
@@ -639,12 +951,76 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        // Per-MoE-layer layout sniff.
+        // Layer 0's res_scale on disk has only hidden_states_{scale,bias} —
+        // fill in neutral residual_{scale,bias} (1.0 / 0.0) so the module
+        // structure is uniform across all 80 layers (avoids the same
+        // mismatchedContainers issue at the res_scale child level).
+        for layer in 0 ..< configuration.textConfig.numHiddenLayers {
+            let prefix = "model.layers.\(layer).res_scale"
+            if weights["\(prefix).residual_scale"] == nil {
+                weights["\(prefix).residual_scale"] = MLXArray.ones([1], dtype: .float32)
+            }
+            if weights["\(prefix).residual_bias"] == nil {
+                weights["\(prefix).residual_bias"] = MLXArray.zeros([1], dtype: .float32)
+            }
+        }
+
+        // Layer 1's router has no `router_states_scale` in the bundle
+        // (39/40 MoE layers ship it; first MoE block omits it). Fill the
+        // missing slot with a neutral [routerHidden]=256 1.0 vector so all
+        // MoE routers have uniform parameter shapes.
+        let routerHidden = 256  // canonical to ZAYA1
+        for layer in stride(from: 1, to: configuration.textConfig.numHiddenLayers, by: 2) {
+            let key = "model.layers.\(layer).sub.router.router_states_scale"
+            if weights[key] == nil {
+                weights[key] = MLXArray.ones([routerHidden], dtype: .float32)
+            }
+        }
+
+        // Compress router_mlp.{0,2,4} -> router_mlp.{0,1,2}. The bundle
+        // ships a Sequential(Linear, ReLU, Linear, ReLU, Linear); the Swift
+        // module declares 3 Linears in a tuple with explicit activations.
+        // Do this as a two-phase rewrite so `.4 -> .2` cannot overwrite the
+        // source `.2` tensor before it is copied to `.1`.
+        var routerDeletes: [String] = []
+        var routerRewrites: [(String, MLXArray)] = []
+        for k in Array(weights.keys) {
+            guard k.contains(".router_mlp."), let value = weights[k] else { continue }
+            let renames: [(String, String)] = [
+                (".router_mlp.2.", ".router_mlp.1."),
+                (".router_mlp.4.", ".router_mlp.2."),
+            ]
+            for (from, to) in renames where k.contains(from) {
+                routerDeletes.append(k)
+                routerRewrites.append((k.replacingOccurrences(of: from, with: to), value))
+                break
+            }
+        }
+        for k in routerDeletes {
+            weights[k] = nil
+        }
+        for (k, value) in routerRewrites {
+            weights[k] = value
+        }
+
+        // Source ZAYA has bias on router_mlp.0/2 but not on router_mlp.4
+        // (after compression: 0/1 but not 2). Fill a zero final bias so the
+        // Swift Linear preserves source math while keeping uniform keys.
+        for layer in stride(from: 1, to: configuration.textConfig.numHiddenLayers, by: 2) {
+            let key = "model.layers.\(layer).sub.router.router_mlp.2.bias"
+            if weights[key] == nil {
+                weights[key] = MLXArray.zeros(
+                    [configuration.textConfig.numExperts + 1], dtype: .float32)
+            }
+        }
+
+        // Per-MoE-layer layout sniff. Note: by this point sub-block keys
+        // have already been canonicalized from `.zaya_block.*` to `.sub.*`.
         let cfg = configuration.textConfig
         let H = cfg.hiddenSize
         let E = cfg.numExperts
         for layer in stride(from: 1, to: cfg.numHiddenLayers, by: 2) {
-            let prefix = "model.layers.\(layer).zaya_block.experts"
+            let prefix = "model.layers.\(layer).sub.experts"
             let stackedTQProbe = "\(prefix).switch_mlp.gate_proj.tq_packed"
             let stackedAffineProbe = "\(prefix).switch_mlp.gate_proj.weight"
             let perExpertProbe = "\(prefix).local_experts.0.linear_fc1.weight"
@@ -681,6 +1057,6 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
 
 extension ZayaModel: LoRAModel {
     public var loraLayers: [Module] {
-        model.layers
+        model.layers as [Module]
     }
 }

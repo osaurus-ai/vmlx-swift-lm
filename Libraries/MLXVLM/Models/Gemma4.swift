@@ -244,7 +244,7 @@ public struct Gemma4Configuration: Codable, Sendable {
 
 private func rotateHalf(_ x: MLXArray) -> MLXArray {
     let half = x.dim(-1) / 2
-    return concatenated([MLXArray(0) - x[.ellipsis, half...], x[.ellipsis, ..<half]], axis: -1)
+    return concatenated([-x[.ellipsis, half...], x[.ellipsis, ..<half]], axis: -1)
 }
 
 private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, base: Float) -> MLXArray {
@@ -611,8 +611,8 @@ private class TextRouter: Module {
     }
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         var h = rmsNormNoScale(x, eps: eps) * rs * sc
-        let s = proj(h); let p = softmax(s, axis: -1)
-        let ti = argPartition(MLXArray(0) - s, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+        let s = proj(h); let p = softmax(s, axis: -1, precise: true)
+        let ti = argPartition(-s, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         var tw = takeAlong(p, ti, axis: -1); tw = tw / tw.sum(axis: -1, keepDims: true); tw = tw * pes[ti]
         return (ti, tw)
     }

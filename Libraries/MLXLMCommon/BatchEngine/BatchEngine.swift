@@ -869,11 +869,11 @@ public actor BatchEngine {
                     // full prefill rather than feed "remaining" tokens into
                     // model.prepare — correctness over speed in both cases:
                     //
-                    // 1. VL content: `mergeInputIdsWithImageFeatures` aligns
-                    //    vision tokens by count against `imageFeatures[]`.
-                    //    Splitting the vision-token region across a cache
-                    //    boundary makes MLX trap `SmallVector out of range`.
-                    //    Detect via `slot.originalInput.image/video` presence.
+                    // 1. Media content: model-side media splice code aligns
+                    //    placeholder token spans against image/video/audio
+                    //    embedding tensors. Splitting that region across a
+                    //    cache boundary can make the splice path crash or
+                    //    attach the wrong media state.
                     //
                     // 2. Hybrid SSM: the Mamba/SSM branch's recurrence is
                     //    path-dependent. Restoring SSM state that was
@@ -883,9 +883,7 @@ public actor BatchEngine {
                     //    prefill would produce — model output degrades.
                     //    Detect by checking cache for MambaCache/ArraysCache
                     //    layers.
-                    let hasVisualContent =
-                        slot.originalInput.image != nil ||
-                        slot.originalInput.video != nil
+                    let hasMediaContent = slot.originalInput.hasMediaContent
                     let hasSSMLayer = slot.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache
                     }
@@ -900,11 +898,11 @@ public actor BatchEngine {
                     // Same SSM-state path-dependence rationale as the
                     // remaining.nonEmpty case below.
                     let unsafePartial = !remaining.isEmpty &&
-                        (hasVisualContent || hasSSMLayer)
+                        (hasMediaContent || hasSSMLayer)
                     let unsafeFullHit = remaining.isEmpty && hasSSMLayer
                     if unsafePartial || unsafeFullHit {
                         let why: String
-                        if hasVisualContent { why = "VL vision-token region can't be split" }
+                        if hasMediaContent { why = "media token region can't be split" }
                         else if unsafeFullHit { why = "hybrid SSM full disk hit — re-feeding last token would double-count SSM state" }
                         else                { why = "hybrid SSM recurrence path-dependent on full prefix" }
                         let slotIDStr = slot.id.description

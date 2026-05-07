@@ -61,6 +61,31 @@ struct BatchZayaCCACacheIsolationTests {
         #expect(updatedOffsets == [6, 4])
     }
 
+    @Test("Mask built before update matches padded K/V length for uneven offsets")
+    func maskBeforeUpdateMatchesPaddedKeyLength() {
+        let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
+        let s1 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
+        _ = s0.update(
+            keys: MLXArray.ones([1, 1, 31, 4], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, 31, 4], dtype: .bfloat16))
+        _ = s1.update(
+            keys: MLXArray.ones([1, 1, 32, 4], dtype: .bfloat16),
+            values: MLXArray.ones([1, 1, 32, 4], dtype: .bfloat16))
+
+        let batch = BatchZayaCCACache(slotCaches: [s0, s1])
+        let mask = batch.makeMask(n: 1, windowSize: nil, returnArray: false)
+        let (keys, _) = batch.update(
+            keys: MLXArray.ones([2, 1, 1, 4], dtype: .bfloat16),
+            values: MLXArray.ones([2, 1, 1, 4], dtype: .bfloat16))
+
+        guard case .array(let arr) = mask else {
+            Issue.record("BatchZayaCCACache mask should be an array")
+            return
+        }
+        #expect(arr.shape == [2, 1, 1, 33])
+        #expect(keys.shape == [2, 1, 33, 4])
+    }
+
     @Test("scatterCCA after gather preserves per-slot identity for non-mutated slot")
     func scatterCCAPreservesNonMutatedSlot() {
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)

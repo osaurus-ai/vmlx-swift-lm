@@ -128,6 +128,35 @@ struct BatchKVCacheTests {
     }
 }
 
+@Suite("BatchArraysCache")
+struct BatchArraysCacheTests {
+    @Test("preserves per-slot offsets for one-slot ArraysCache")
+    func preservesOneSlotOffsets() {
+        let cache0 = ArraysCache(size: 1)
+        let cache1 = ArraysCache(size: 1)
+        cache0.offset = 5
+        cache1.offset = 3
+        cache0[0] = MLXArray.ones([1, 2, 4, 4], dtype: .float32)
+        cache1[0] = MLXArray.ones([1, 2, 4, 4], dtype: .float32) * 7
+
+        let batch = BatchArraysCache(slotCaches: [cache0, cache1])
+        #expect(batch.offset == 5)
+        #expect(batch.offsetArray.asArray(Int32.self) == [5, 3])
+        #expect(batch[0]?.shape == [2, 2, 4, 4])
+
+        batch[0] = MLXArray.ones([2, 2, 4, 4], dtype: .float32) * 11
+        batch.advance(by: 1)
+        batch.splitBack()
+
+        #expect(batch.offset == 6)
+        #expect(batch.offsetArray.asArray(Int32.self) == [6, 4])
+        #expect(cache0.offset == 6)
+        #expect(cache1.offset == 4)
+        #expect(cache0[0]?.shape == [1, 2, 4, 4])
+        #expect(cache1[0]?.shape == [1, 2, 4, 4])
+    }
+}
+
 // MARK: - Batch Causal Mask Tests
 
 @Suite("BatchCausalMask")

@@ -550,6 +550,32 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("AI news"))
     }
 
+    // MARK: - ZAYA XML Format Tests
+
+    @Test("Test ZAYA XML Function Parser")
+    func testZayaXMLFunctionParser() throws {
+        let processor = ToolCallProcessor(format: .zayaXml)
+        let chunks = [
+            "Before\n",
+            "<zyphra_tool_call>\n<function=search_web>\n<parameter=query>\n",
+            "ZAYA CCA cache\n</parameter>\n</function>\n</zyphra_tool_call>\nAfter",
+        ]
+
+        var visible = ""
+        for chunk in chunks {
+            if let out = processor.processChunk(chunk) {
+                visible += out
+            }
+        }
+
+        #expect(visible.contains("Before"))
+        #expect(visible.contains("After"))
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "search_web")
+        #expect(toolCall.function.arguments["query"] == .string("ZAYA CCA cache"))
+    }
+
     // MARK: - ToolCallFormat Serialization Tests
 
     @Test("Test ToolCallFormat Raw Values for Serialization")
@@ -563,6 +589,7 @@ struct ToolTests {
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
         #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
         #expect(ToolCallFormat.mistral.rawValue == "mistral")
+        #expect(ToolCallFormat.zayaXml.rawValue == "zaya_xml")
 
         // Test round-trip via raw value
         for format in ToolCallFormat.allCases {
@@ -606,6 +633,12 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
         #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
         #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
+
+        // ZAYA / Zyphra models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "zaya") == .zayaXml)
+        #expect(ToolCallFormat.infer(from: "ZAYA") == .zayaXml)
+        #expect(ToolCallFormat.infer(from: "zaya_text") == .zayaXml)
+        #expect(ToolCallFormat.infer(from: "zyphra_zaya") == .zayaXml)
 
         // Unknown models should return nil (use default JSON format)
         #expect(ToolCallFormat.infer(from: "llama") == nil)

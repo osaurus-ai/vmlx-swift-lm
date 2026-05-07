@@ -54,5 +54,8 @@ public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
     if let batchCache = cache as? BatchKVCache {
         return batchCache.offsetArray
     }
+    if let batchArrays = cache as? BatchArraysCache {
+        return batchArrays.offsetArray
+    }
     return nil
 }

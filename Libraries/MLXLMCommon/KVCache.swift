@@ -1133,6 +1133,8 @@ public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
 
+    public var slotCount: Int { cache.count }
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }

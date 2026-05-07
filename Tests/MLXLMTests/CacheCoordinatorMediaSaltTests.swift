@@ -227,4 +227,40 @@ final class CacheCoordinatorMediaSaltTests: XCTestCase {
             "Same bytes, different shape — must still produce different salts " +
             "so rank-2 [3, 448*448] doesn't collide with rank-4 [1, 3, 448, 448].")
     }
+
+    func testComputeMediaSaltIncludesAudioWaveformAndSampleRate() {
+        let w1 = MLXArray([Float](repeating: 0.25, count: 32)).reshaped([1, 32])
+        let w2 = MLXArray([Float](repeating: -0.25, count: 32)).reshaped([1, 32])
+        realize(w1, w2)
+        let a1 = LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            audio: .init(waveform: w1, sampleRate: 16_000))
+        let a2 = LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            audio: .init(waveform: w2, sampleRate: 16_000))
+        let a3 = LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            audio: .init(waveform: w1, sampleRate: 8_000))
+        XCTAssertNotNil(computeMediaSalt(for: a1))
+        XCTAssertNotEqual(computeMediaSalt(for: a1), computeMediaSalt(for: a2),
+            "Different audio waveform bytes must produce different salts.")
+        XCTAssertNotEqual(computeMediaSalt(for: a1), computeMediaSalt(for: a3),
+            "Same waveform bytes at different sample rates are different inputs.")
+    }
+
+    func testLMInputHasMediaContentCoversAllModalities() {
+        let pixels = MLXArray((0..<48).map { Float($0) }).reshaped([1, 3, 4, 4])
+        let waveform = MLXArray([Float](repeating: 0.0, count: 8)).reshaped([1, 8])
+        realize(pixels, waveform)
+        XCTAssertFalse(LMInput(text: .init(tokens: MLXArray([Int32(1)]))).hasMediaContent)
+        XCTAssertTrue(LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            image: .init(pixels: pixels)).hasMediaContent)
+        XCTAssertTrue(LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            video: .init(pixels: pixels)).hasMediaContent)
+        XCTAssertTrue(LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            audio: .init(waveform: waveform)).hasMediaContent)
+    }
 }

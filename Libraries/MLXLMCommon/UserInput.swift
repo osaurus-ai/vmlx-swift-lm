@@ -225,7 +225,7 @@ public struct UserInput {
         additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = .chat([
-            .user(prompt, images: images, videos: videos)
+            .user(prompt, images: images, videos: videos, audios: audios)
         ])
         self.tools = tools
         self.additionalContext = additionalContext
@@ -268,6 +268,7 @@ public struct UserInput {
     ///   - messages: array of dictionaries representing the prompt in a model specific format
     ///   - images: optional images
     ///   - videos: optional videos
+    ///   - audios: optional audio resources
     ///   - tools: optional tool specifications
     ///   - additionalContext: optional context (model specific)
     /// ### See Also
@@ -275,12 +276,14 @@ public struct UserInput {
     /// - ``init(chat:tools:additionalContext:)``
     public init(
         messages: [Message], images: [Image] = [Image](), videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = .messages(messages)
         self.images = images
         self.videos = videos
+        self.audios = audios
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -340,6 +343,7 @@ public struct UserInput {
     ///   - prompt: the prompt
     ///   - images: optional images
     ///   - videos: optional videos
+    ///   - audios: optional audio resources
     ///   - tools: optional tool specifications
     ///   - processing: optional processing to be applied to media
     ///   - additionalContext: optional context (model specific)
@@ -350,6 +354,7 @@ public struct UserInput {
         prompt: Prompt,
         images: [Image] = [Image](),
         videos: [Video] = [Video](),
+        audios: [Audio] = [Audio](),
         processing: Processing = .init(),
         tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) {
@@ -358,8 +363,17 @@ public struct UserInput {
         case .text, .messages:
             self.images = images
             self.videos = videos
-        case .chat:
-            break
+            self.audios = audios
+        case .chat(let messages):
+            self.images = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.images)
+            }
+            self.videos = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.videos)
+            }
+            self.audios = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.audios)
+            }
         }
         self.processing = processing
         self.tools = tools

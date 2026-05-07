@@ -295,6 +295,13 @@ struct ToolCallEdgeCasesTests {
         #expect(ToolCallFormat.fromCapabilityName("mistral4") == .mistral)
     }
 
+    @Test("fromCapabilityName maps ZAYA / Zyphra family")
+    func testJANGStampZaya() {
+        for stamp in ["zaya", "zaya_xml", "zyphra", "zyphra_xml"] {
+            #expect(ToolCallFormat.fromCapabilityName(stamp) == .zayaXml)
+        }
+    }
+
     @Test("fromCapabilityName returns nil for unknown + empty")
     func testJANGStampUnknownReturnsNil() {
         #expect(ToolCallFormat.fromCapabilityName(nil) == nil)

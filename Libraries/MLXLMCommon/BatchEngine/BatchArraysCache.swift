@@ -40,11 +40,21 @@ public final class BatchArraysCache: MambaCache {
     /// The original per-sequence caches this batch was merged from.
     private let slotCaches: [ArraysCache]
 
+    /// Per-sequence logical positions before/after this batched step.
+    private var offsets: [Int]
+
     /// Number of sequences in this batch.
     public let batchSize: Int
 
-    /// Number of state slots (2 for MambaCache: conv + hidden).
+    /// Number of state slots in the wrapped per-sequence cache.
     private let numSlots: Int
+
+    /// Per-sequence position offsets as `[B]`.
+    ///
+    /// Ling/Bailing linear attention applies RoPE before recurrent state update.
+    /// Mixed-length B>1 decode must use these per-slot positions; the scalar
+    /// `offset` remains the maximum only for legacy sizing/fallback paths.
+    public private(set) var offsetArray: MLXArray
 
     /// Create a batched SSM cache by merging N per-sequence caches.
     ///
@@ -52,17 +62,26 @@ public final class BatchArraysCache: MambaCache {
     ///   model layer. Must not be empty. All must have the same number of state slots.
     public init(slotCaches: [ArraysCache]) {
         precondition(!slotCaches.isEmpty, "BatchArraysCache requires at least one slot cache")
+        let numSlots = slotCaches[0].slotCount
+        precondition(
+            slotCaches.allSatisfy { $0.slotCount == numSlots },
+            "BatchArraysCache requires all slot caches to have the same slot count")
+        precondition(
+            numSlots <= 2,
+            "BatchArraysCache currently supports ArraysCache/MambaCache layouts with at most 2 slots")
         self.slotCaches = slotCaches
         self.batchSize = slotCaches.count
-        self.numSlots = 2  // MambaCache always has 2 slots
+        self.numSlots = numSlots
+        self.offsets = slotCaches.map(\.offset)
+        self.offsetArray = MLXArray(offsets.map { Int32($0) })
 
         super.init()
 
         // Merge states: concatenate each slot along batch dim 0
         mergeStates()
 
-        // Use max offset across sequences
-        self.offset = slotCaches.map(\.offset).max() ?? 0
+        // Use max offset across sequences for scalar compatibility only.
+        self.offset = offsets.max() ?? 0
     }
 
     /// Merge per-sequence states into batched states.
@@ -87,8 +106,19 @@ public final class BatchArraysCache: MambaCache {
             guard let merged = self[i] else { continue }
             for (j, slotCache) in slotCaches.enumerated() {
                 slotCache[i] = merged[j ..< j + 1]
-                slotCache.offset = self.offset
+                slotCache.offset = offsets[j]
             }
         }
+    }
+
+    /// Advance every wrapped sequence by the same number of processed tokens.
+    ///
+    /// Recurrent layers do not call `update(keys:values:)`, so the batch wrapper
+    /// needs an explicit offset advance after the model writes the merged state.
+    public func advance(by tokenCount: Int) {
+        guard tokenCount != 0 else { return }
+        offsets = offsets.map { $0 + tokenCount }
+        offsetArray = MLXArray(offsets.map { Int32($0) })
+        offset = offsets.max() ?? 0
     }
 }

@@ -684,7 +684,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt token IDs captured at init for cache store after generation.
     let promptTokenIds: [Int]
 
-    /// Stable fingerprint of any VLM image/video content in the input.
+    /// Stable fingerprint of any VLM image/video/audio content in the input.
     /// `nil` for text-only inputs. Mixed into cache-coordinator keys so
     /// VLM multi-turn conversations can cache-hit on identical media,
     /// and won't collide with text-only entries. See `computeMediaSalt`.
@@ -788,7 +788,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.promptTokenIds = []
         }
 
-        // Compute a stable fingerprint of any image/video content once at
+        // Compute a stable fingerprint of any image/video/audio content once at
         // init, so both the pre-prepare fetch below and the post-generation
         // store see the same salt. Text-only inputs get nil here, which
         // preserves the exact pre-existing text-only cache hashing.
@@ -797,11 +797,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.
         //
-        // VLM inputs (image/video) are now supported: the mediaSalt computed
+        // VLM inputs (image/video/audio) are now supported: the mediaSalt computed
         // above is mixed into the cache keys by the coordinator, so "same
-        // text prefix + same image" hits while "same text + different image"
-        // misses. Previously any image/video bypassed the cache entirely,
-        // wasting a full vision-tower encode and prefill on every turn.
+        // text prefix + same media" hits while "same text + different media"
+        // misses. Previously image/video bypassed the cache entirely,
+        // wasting a full media encoder pass and prefill on every turn.
         var inputForPrepare = input
         // SLIDING-1 (2026-04-15): the legacy guard `!hasRotatingCache` was
         // removed once `TQDiskSerializer` v2 + `restoreRotatingLayer` /
@@ -872,31 +872,54 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
 
                 if restored {
-                    // Rebuild inputForPrepare with tokens shaped as `[1, T]`
-                    // (2D batch-first). Some model forward paths — notably
-                    // the Qwen3.5 VLM `Qwen35Language.LanguageModel` which
-                    // reads `inputs.dim(1)` to compute position-ids — crash
-                    // with MLX's `SmallVector out of range` (array.cpp:335)
-                    // when fed a 1D tensor. Emitting 2D works uniformly
-                    // because all `callAsFunction` paths either broadcast
-                    // 2D already or tolerate the extra leading axis.
-                    if remainingTokens.isEmpty, let last = promptTokenIds.last {
-                        // Full cache hit — feed just the last token to seed decode.
-                        // prepare() needs at least 1 token to produce initial logits.
-                        // `let last` defensively guards the "shouldn't happen" case
-                        // where the coordinator hands back .hit with empty tokens;
-                        // falling through to the remaining branch preserves safety.
-                        let lastToken = MLXArray([Int32(last)])
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: lastToken),
-                            image: nil, video: nil)
+                    let hasMediaContent = input.hasMediaContent
+                    let hasSSMLayer = self.cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache
+                    }
+                    let unsafePartial = !remainingTokens.isEmpty &&
+                        (hasMediaContent || hasSSMLayer)
+                    let unsafeFullHit = remainingTokens.isEmpty && hasSSMLayer
+                    if unsafePartial || unsafeFullHit {
+                        let why: String
+                        if hasMediaContent {
+                            why = "media token region can't be split"
+                        } else if unsafeFullHit {
+                            why = "hybrid SSM full cache hit would double-count SSM state"
+                        } else {
+                            why = "hybrid SSM recurrence path-dependent on full prefix"
+                        }
+                        Self.logger.info(
+                            "TokenIterator: cache hit rolling back to full prefill (\(why))"
+                        )
+                        self.cache = self.model.newCache(parameters: parameters)
+                        inputForPrepare = input
                     } else {
-                        let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
-                            .expandedDimensions(axis: 0)
-                        inputForPrepare = LMInput(
-                            text: LMInput.Text(tokens: remainingArray),
-                            image: nil, video: nil)
+                        // Rebuild inputForPrepare with tokens shaped as `[1, T]`
+                        // (2D batch-first). Some model forward paths — notably
+                        // the Qwen3.5 VLM `Qwen35Language.LanguageModel` which
+                        // reads `inputs.dim(1)` to compute position-ids — crash
+                        // with MLX's `SmallVector out of range` (array.cpp:335)
+                        // when fed a 1D tensor. Emitting 2D works uniformly
+                        // because all `callAsFunction` paths either broadcast
+                        // 2D already or tolerate the extra leading axis.
+                        if remainingTokens.isEmpty, let last = promptTokenIds.last {
+                            // Full cache hit — feed just the last token to seed decode.
+                            // prepare() needs at least 1 token to produce initial logits.
+                            // `let last` defensively guards the "shouldn't happen" case
+                            // where the coordinator hands back .hit with empty tokens;
+                            // falling through to the remaining branch preserves safety.
+                            let lastToken = MLXArray([Int32(last)])
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: lastToken),
+                                image: nil, video: nil)
+                        } else {
+                            let remainingArray = MLXArray(remainingTokens.map { Int32($0) })
+                                .expandedDimensions(axis: 0)
+                            inputForPrepare = LMInput(
+                                text: LMInput.Text(tokens: remainingArray),
+                                image: nil, video: nil)
+                        }
                     }
                 }
             case .miss:

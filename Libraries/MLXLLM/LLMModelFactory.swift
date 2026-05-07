@@ -980,27 +980,31 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     let configuration: ModelConfiguration
     let modelType: String?
     let messageGenerator: MessageGenerator
+    let defaultAdditionalContext: [String: any Sendable]?
 
     internal init(
         tokenizer: any Tokenizer, configuration: ModelConfiguration,
         modelType: String?,
-        messageGenerator: MessageGenerator
+        messageGenerator: MessageGenerator,
+        defaultAdditionalContext: [String: any Sendable]? = nil
     ) {
         self.tokenizer = tokenizer
         self.configuration = configuration
         self.modelType = modelType
         self.messageGenerator = messageGenerator
+        self.defaultAdditionalContext = defaultAdditionalContext
     }
 
     func prepare(input: UserInput) throws -> LMInput {
+        let additionalContext = mergedAdditionalContext(input.additionalContext)
         let messages = BailingThinkingTemplateContext.apply(
             to: messageGenerator.generate(from: input),
             modelType: modelType,
-            additionalContext: input.additionalContext
+            additionalContext: additionalContext
         )
         do {
             let promptTokens = try tokenizer.applyChatTemplate(
-                messages: messages, tools: input.tools, additionalContext: input.additionalContext)
+                messages: messages, tools: input.tools, additionalContext: additionalContext)
 
             return LMInput(tokens: MLXArray(promptTokens))
         } catch TokenizerError.missingChatTemplate {
@@ -1014,6 +1018,42 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             let promptTokens = tokenizer.encode(text: prompt)
             return LMInput(tokens: MLXArray(promptTokens))
         }
+    }
+
+    private func mergedAdditionalContext(
+        _ requestContext: [String: any Sendable]?
+    ) -> [String: any Sendable]? {
+        guard defaultAdditionalContext != nil || requestContext != nil else {
+            return nil
+        }
+        var merged: [String: any Sendable] = defaultAdditionalContext ?? [:]
+        if let requestContext {
+            for (key, value) in requestContext {
+                merged[key] = value
+            }
+        }
+        return merged.isEmpty ? nil : merged
+    }
+
+    static func defaultContext(
+        modelType: String?,
+        capabilities: JangCapabilities?
+    ) -> [String: any Sendable]? {
+        var context: [String: any Sendable] = [:]
+        let type = modelType?.lowercased() ?? ""
+
+        // Model metadata can declare that a template understands the
+        // thinking toggle while the converted/runtime bundle is not ready
+        // to expose thinking as a production mode. Seed the template with
+        // the safe default, but leave explicit per-request overrides intact
+        // for diagnostics.
+        if capabilities?.supportsThinking == false {
+            context["enable_thinking"] = false
+        } else if type.hasPrefix("zaya") || type.hasPrefix("zyphra") {
+            context["enable_thinking"] = false
+        }
+
+        return context.isEmpty ? nil : context
     }
 }
 
@@ -1431,7 +1471,10 @@ public final class LLMModelFactory: ModelFactory {
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,
             modelType: baseConfig.modelType,
-            messageGenerator: messageGenerator)
+            messageGenerator: messageGenerator,
+            defaultAdditionalContext: LLMUserInputProcessor.defaultContext(
+                modelType: baseConfig.modelType,
+                capabilities: jangConfig?.capabilities))
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

@@ -115,6 +115,7 @@ public final class CompilableTurboQuantKVCache: TurboQuantKVCache, @unchecked Se
         self.prefixTokenCount = tq.prefixTokenCount
         self.windowOffset = tq.windowOffset
         self.encoderState = tq.encoderState
+        self.valueEncoderState = tq.valueEncoderState
 
         // Promote phase via restoreCompressed's side effects would
         // re-allocate unifiedKeys. Instead, flip phase directly via the

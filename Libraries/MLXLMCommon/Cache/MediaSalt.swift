@@ -1,6 +1,6 @@
 // Copyright © 2026 Osaurus AI
 //
-// Media salt: a stable fingerprint of VLM image/video inputs for cache keying.
+// Media salt: a stable fingerprint of VLM image/video/audio inputs for cache keying.
 //
 // Problem
 // -------
@@ -19,8 +19,8 @@
 //
 // Fix
 // ---
-// Compute a SHA256 fingerprint of the raw pixel bytes + shape + dtype of any
-// image/video input, and pass it alongside the token list to the cache tiers.
+// Compute a SHA256 fingerprint of the raw pixel/audio bytes + shape + dtype of
+// any image/video/audio input, and pass it alongside the token list to the cache tiers.
 // Each tier mixes the salt into its internal hash (same way modelKey is
 // mixed), so "same text prefix + same image" cache-hits while "same text +
 // different image" misses, as required.
@@ -36,8 +36,8 @@ import MLX
 
 /// Computes a stable fingerprint for the media portion of an ``LMInput``.
 ///
-/// Returns `nil` when the input has no image and no video — callers can then
-/// fall through the cache coordinator exactly as they did for text-only
+/// Returns `nil` when the input has no image, video, or audio — callers can
+/// then fall through the cache coordinator exactly as they did for text-only
 /// inputs, preserving byte-for-byte behavior on text-only paths.
 ///
 /// The fingerprint is a lowercase hex SHA256 of:
@@ -45,6 +45,8 @@ import MLX
 ///   shape, dtype, and raw contiguous pixel bytes
 /// - The literal UTF-8 tag `"video:"` (if a video is present) followed by
 ///   shape, dtype, and raw contiguous pixel bytes
+/// - The literal UTF-8 tag `"audio:"` (if audio is present) followed by
+///   sample rate, shape, dtype, and raw contiguous waveform bytes
 ///
 /// Shape + dtype are hashed before bytes so different-shaped tensors with
 /// identical bytes never collide. Ordering is deterministic: image before

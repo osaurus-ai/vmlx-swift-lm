@@ -310,6 +310,7 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXHuggingFace",
+                "BenchmarkHelpers",
             ],
             path: "Tests/MLXLMTests",
             exclude: [

@@ -54,6 +54,21 @@ struct BatchKVCacheWithTQSlotsTests {
             simple, keyBits: 3, valueBits: 3, sinkTokens: 4)
     }
 
+    /// Build a compressed cache with MLA-style asymmetric K/V widths.
+    /// Ling/Bailing global MLA stores K as no-PE + RoPE (`192`) while V stays
+    /// at `128`; TurboQuant must not reuse the key encoder state for values.
+    private func makeCompressedAsymmetricTQCache(
+        tokens: Int, H: Int = 4, keyD: Int = 192, valueD: Int = 128
+    ) -> TurboQuantKVCache {
+        let simple = KVCacheSimple()
+        let k = MLXArray.ones([1, H, tokens, keyD])
+        let v = MLXArray.ones([1, H, tokens, valueD])
+        _ = simple.update(keys: k, values: v)
+        #expect(simple.offset == tokens)
+        return TurboQuantKVCache.fromSimpleCache(
+            simple, keyBits: 4, valueBits: 4, sinkTokens: 4)
+    }
+
     @Test("BatchKVCache wraps two TQ slot caches at different offsets")
     func testWrapTwoTQSlotsDifferentOffsets() {
         let tq0 = makeCompressedTQCache(tokens: 12)
@@ -110,6 +125,29 @@ struct BatchKVCacheWithTQSlotsTests {
         #expect(ks.shape == [1, 4, 11, 64])
         #expect(vs.shape == [1, 4, 11, 64])
         #expect(tq.offset == 11)
+    }
+
+    @Test("asymmetric K/V head dimensions use separate TurboQuant encoder states")
+    func testAsymmetricKeyValueDimensions() {
+        let tq = makeCompressedAsymmetricTQCache(tokens: 12)
+        #expect(tq.phase == .compressed)
+
+        let k = MLXArray.ones([1, 4, 1, 192])
+        let v = MLXArray.ones([1, 4, 1, 128])
+        let (ks, vs) = tq.update(keys: k, values: v)
+        MLX.eval(ks, vs)
+
+        #expect(ks.shape == [1, 4, 13, 192])
+        #expect(vs.shape == [1, 4, 13, 128])
+        #expect(tq.offset == 13)
+
+        let batchCache = BatchKVCache(slotCaches: [tq as KVCache])
+        let (batchK, batchV) = batchCache.update(keys: k, values: v)
+        MLX.eval(batchK, batchV)
+
+        #expect(batchK.shape == [1, 4, 14, 192])
+        #expect(batchV.shape == [1, 4, 14, 128])
+        #expect(batchCache.offset == 14)
     }
 
     @Test("mixed TQ + KVCacheSimple slot caches work via shared shape contract")
