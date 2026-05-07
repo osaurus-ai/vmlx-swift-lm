@@ -696,7 +696,7 @@ public actor BatchEngine {
                     // `.heterogeneous` models that mix attention +
                     // rotating (Gemma-4) from being misflagged.
                     let hasSSM = cache.contains { layer in
-                        layer is MambaCache || layer is ArraysCache
+                        layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
                     if hasSSM {
                         coordinator.setHybrid(true)
@@ -724,7 +724,8 @@ public actor BatchEngine {
             // rotating-cache payloads.
             if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
                 let hasRotating = cache.contains { $0 is RotatingKVCache || $0 is RotatingKVCacheWrapper }
-                if hasHybridPool || hasRotating {
+                let hasZayaCCA = cache.contains { $0 is ZayaCCACache }
+                if hasHybridPool || hasRotating || hasZayaCCA {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
                         "Coordinator flipped to isPagedIncompatible=true on first paged-incompatible slot admission"
@@ -1363,13 +1364,17 @@ public actor BatchEngine {
                 "Slot \(slotIDString, privacy: .public): promoted to compiled decode via .cacheList family"
             )
 
-        case .mamba, .heterogeneous:
+        case .mamba, .zayaCCA, .heterogeneous:
             // Stage 4 pending (hybrid trace grouping is its own spec).
             //
             // Gemma3/Gemma4 hit this branch via `.heterogeneous` because
             // their cache mixes KVCacheSimple (full_attention) +
             // RotatingKVCache (sliding_attention). Decode runs through
             // the existing uncompiled BatchKVCache path.
+            //
+            // ZAYA1 (`.zayaCCA`) is also intentionally uncompiled in v1 —
+            // CCA conv_qk + state writeback would need its own compilable
+            // variant before joining the trace cache. Future Stage 6 work.
             Self.logger.debug(
                 "Slot \(slotIDString, privacy: .public): compile skipped — family=\(family.description) (stage pending or heterogeneous)"
             )
@@ -1453,6 +1458,11 @@ public actor BatchEngine {
                     let batchAC = BatchArraysCache(slotCaches: arraysCaches)
                     layerCaches.append(batchAC)
                     batchArraysCaches.append(batchAC)
+                } else if let _ = representative as? ZayaCCACache {
+                    // ZAYA CCA-attention layers — gather/scatter conv_state +
+                    // prev_hs alongside the standard KV split/pad/stack.
+                    let zayaCaches = slotCachesForLayer.map { $0 as! ZayaCCACache }
+                    layerCaches.append(BatchZayaCCACache(slotCaches: zayaCaches))
                 } else {
                     layerCaches.append(BatchKVCache(slotCaches: slotCachesForLayer))
                 }

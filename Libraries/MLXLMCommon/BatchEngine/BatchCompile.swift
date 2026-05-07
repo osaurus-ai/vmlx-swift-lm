@@ -58,6 +58,13 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
     /// All layers are `CacheList` (composite — FalconH1, BaichuanM1). Stage 5.
     case cacheList
 
+    /// Per-decoder-layer mix of `ZayaCCACache` (CCA-attention layers) and
+    /// `KVCacheSimple` no-op stubs (MoE layers). ZAYA1's 80-layer trunk is
+    /// 40 even CCA + 40 odd MoE; the MoE forward never touches its slot.
+    /// Currently not compile-eligible — conv_qk + CCA-state writeback
+    /// would need its own compilable variant (Stage 4-equivalent).
+    case zayaCCA
+
     /// Mixed cache types within one slot — currently untraceable. Falls back
     /// to the uncompiled `BatchKVCache` / `BatchArraysCache` / `BatchCacheList`
     /// path. Stage 4's `BatchArraysCache.splitBack` already handles this
@@ -71,6 +78,7 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
         case .rotating:       return "rotating"
         case .mamba:          return "mamba"
         case .cacheList:      return "cacheList"
+        case .zayaCCA:        return "zayaCCA"
         case .heterogeneous:  return "heterogeneous"
         }
     }
@@ -84,6 +92,7 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
         case .rotating:       return true   // Stage 3 (iter 13 wiring)
         case .mamba:          return false  // Stage 4 pending (hybrid trace grouping needed)
         case .cacheList:      return true   // Stage 5 (iter 22 wiring)
+        case .zayaCCA:        return false  // future Stage 6 — CompilableZayaCCACache not built yet
         case .heterogeneous:  return false  // never — by definition
         }
     }
@@ -118,6 +127,21 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
     public static func classify(_ cache: [KVCache]) -> CacheFamily {
         precondition(!cache.isEmpty, "CacheFamily.classify requires non-empty cache array")
 
+        // ZAYA1 special case: the model returns 80 entries, even=ZayaCCACache
+        // (CCA-attention layers), odd=KVCacheSimple (MoE no-op stubs that the
+        // forward never writes to). Treat the whole array as the `.zayaCCA`
+        // family so diagnostics + future CompilableZayaCCACache wiring see a
+        // coherent label instead of `.heterogeneous`.
+        let hasZayaCCA = cache.contains { $0 is ZayaCCACache }
+        if hasZayaCCA {
+            let onlyZayaOrSimple = cache.allSatisfy {
+                $0 is ZayaCCACache || $0 is KVCacheSimple
+            }
+            if onlyZayaOrSimple {
+                return .zayaCCA
+            }
+        }
+
         var seen: Set<CacheFamily> = []
         for layer in cache {
             let fam = perLayerFamily(layer)
@@ -142,6 +166,7 @@ public enum CacheFamily: Hashable, Sendable, CustomStringConvertible {
         if cache is TurboQuantKVCache { return .turboQuant }
         if cache is CompilableKVCache { return .simple }
         if cache is KVCacheSimple   { return .simple }
+        if cache is ZayaCCACache    { return .zayaCCA }
         // QuantizedKVCache (affine) and any bespoke BaseKVCache subclass:
         // not supported in compile path.
         return .heterogeneous
