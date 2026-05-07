@@ -543,6 +543,76 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertEqual(completedCount, 4, "All 4 requests should complete")
     }
 
+    /// Test: runtime maxBatchSize updates immediately admit queued work.
+    func testUpdateMaxBatchSizeAdmitsQueuedRequests() async throws {
+        let engine = makeEngine(maxBatchSize: 1)
+        let initialMaxBatchSize = await engine.maxBatchSize
+        XCTAssertEqual(initialMaxBatchSize, 1)
+
+        let params = GenerateParameters(maxTokens: 25, temperature: 0)
+        var streams = [AsyncStream<BatchGeneration>]()
+        for _ in 0 ..< 3 {
+            let (_, stream) = await engine.submit(
+                input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(4))),
+                parameters: params)
+            streams.append(stream)
+        }
+
+        try await engine.updateMaxBatchSize(3)
+
+        let resizedMaxBatchSize = await engine.maxBatchSize
+        let pendingCount = await engine.pendingCount
+        let activeCount = await engine.activeCount
+        XCTAssertEqual(resizedMaxBatchSize, 3)
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertLessThanOrEqual(activeCount, 3)
+
+        for stream in streams {
+            let result = await collectTokens(from: stream)
+            XCTAssertNotNil(result.info, "Resized engine should finish every stream")
+        }
+    }
+
+    /// Test: invalid runtime maxBatchSize updates fail without mutating state.
+    func testUpdateMaxBatchSizeRejectsInvalidValue() async throws {
+        let engine = makeEngine(maxBatchSize: 1)
+
+        do {
+            try await engine.updateMaxBatchSize(0)
+            XCTFail("Expected invalidMaxBatchSize")
+        } catch BatchEngineConfigurationError.invalidMaxBatchSize(let value) {
+            XCTAssertEqual(value, 0)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let currentMaxBatchSize = await engine.maxBatchSize
+        XCTAssertEqual(currentMaxBatchSize, 1)
+    }
+
+    /// Test: runtime maxBatchSize updates fail once shutdown owns the engine.
+    func testUpdateMaxBatchSizeAfterShutdownFailsClosed() async throws {
+        let engine = makeEngine(maxBatchSize: 1)
+
+        await engine.shutdown()
+
+        do {
+            try await engine.updateMaxBatchSize(2)
+            XCTFail("Expected engineShutdown")
+        } catch BatchEngineConfigurationError.engineShutdown {
+            // Expected: a stale engine handle cannot be made configurable again.
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let currentMaxBatchSize = await engine.maxBatchSize
+        let accepting = await engine.isAcceptingRequests
+        let shutdown = await engine.isShutdown
+        XCTAssertEqual(currentMaxBatchSize, 1)
+        XCTAssertFalse(accepting)
+        XCTAssertTrue(shutdown)
+    }
+
     /// Test: batch throughput vs serial — measures actual tok/s
     func testBatchThroughput() async throws {
         let maxTokens = 20
@@ -618,6 +688,82 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssert(r1.info != nil || r2.info != nil, "Shutdown should finish streams")
     }
 
+    /// Test: shutdown closes the high-level generate() stream without hanging.
+    func testShutdownDuringGenerateStreamFinishesTextPath() async throws {
+        let engine = makeEngine(maxBatchSize: 1)
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 1000, temperature: 0)
+        )
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await engine.shutdown()
+
+        let result = await collectGenerations(from: stream)
+        XCTAssertNotNil(result.info, "generate() should emit completion info on shutdown")
+        XCTAssertEqual(result.info?.stopReason, .cancelled)
+
+        let pendingCount = await engine.pendingCount
+        let activeCount = await engine.activeCount
+        let isRunning = await engine.isRunning
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(activeCount, 0)
+        XCTAssertFalse(isRunning)
+    }
+
+    /// Test: shutdown is terminal, so stale engine handles cannot restart GPU work.
+    func testSubmitAfterShutdownRejectsWithoutRestartingEngine() async throws {
+        let engine = makeEngine(maxBatchSize: 2)
+
+        await engine.shutdown()
+
+        let accepting = await engine.isAcceptingRequests
+        let shutdown = await engine.isShutdown
+        XCTAssertFalse(accepting)
+        XCTAssertTrue(shutdown)
+
+        let (_, stream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(4))),
+            parameters: GenerateParameters(maxTokens: 10, temperature: 0)
+        )
+        let result = await collectTokens(from: stream)
+
+        XCTAssertTrue(result.tokens.isEmpty)
+        XCTAssertEqual(result.info?.promptTokenCount, 3)
+        XCTAssertEqual(result.info?.generationTokenCount, 0)
+        XCTAssertEqual(result.info?.stopReason, .cancelled)
+        let pendingCount = await engine.pendingCount
+        let activeCount = await engine.activeCount
+        let isRunning = await engine.isRunning
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(activeCount, 0)
+        XCTAssertFalse(isRunning)
+    }
+
+    /// Test: high-level text generate() also rejects stale post-shutdown handles.
+    func testGenerateAfterShutdownRejectsWithoutRestartingEngine() async throws {
+        let engine = makeEngine(maxBatchSize: 2)
+
+        await engine.shutdown()
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 10, temperature: 0)
+        )
+        let result = await collectGenerations(from: stream)
+
+        XCTAssertTrue(result.chunks.isEmpty)
+        XCTAssertEqual(result.info?.promptTokenCount, 4)
+        XCTAssertEqual(result.info?.generationTokenCount, 0)
+        XCTAssertEqual(result.info?.stopReason, .cancelled)
+        let pendingCount = await engine.pendingCount
+        let activeCount = await engine.activeCount
+        let isRunning = await engine.isRunning
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertEqual(activeCount, 0)
+        XCTAssertFalse(isRunning)
+    }
+
     // MARK: - Helpers
 
     private func collectTokens(from stream: AsyncStream<BatchGeneration>)
@@ -634,5 +780,25 @@ class BatchEngineIntegrationTests: XCTestCase {
             }
         }
         return (tokens, info)
+    }
+
+    private func collectGenerations(from stream: AsyncStream<Generation>)
+        async -> (chunks: [String], info: GenerateCompletionInfo?)
+    {
+        var chunks = [String]()
+        var info: GenerateCompletionInfo?
+        for await event in stream {
+            switch event {
+            case .chunk(let text):
+                chunks.append(text)
+            case .info(let i):
+                info = i
+            case .reasoning, .toolCall:
+                break
+            @unknown default:
+                break
+            }
+        }
+        return (chunks, info)
     }
 }

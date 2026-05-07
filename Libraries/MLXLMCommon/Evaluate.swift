@@ -115,6 +115,14 @@ public struct GenerateParameters: Sendable {
     public var enableCompiledDecode: Bool = false
     public var compiledMaxCacheLength: Int? = nil
 
+    /// Runtime accelerator selection for generation.
+    ///
+    /// Defaults to `VMLINUX_ACCELERATOR` when present, otherwise `.metal`.
+    /// `ane-coreml` is a fail-closed request: it is accepted only when the
+    /// selected runtime surface has a validated Core ML island. Text decode
+    /// currently has no such island, so it stays on MLX/Metal.
+    public var accelerationMode: AccelerationMode = .metal
+
     /// Enable `compile()` tracing for BATCHED decode. Opt-in; default false.
     ///
     /// When true, the `BatchEngine` routes decode steps through `BatchCompile`
@@ -221,6 +229,7 @@ public struct GenerateParameters: Sendable {
         kvMode: KVQuantizationMode = .none,
         enableCompiledDecode: Bool = false,
         compiledMaxCacheLength: Int? = nil,
+        accelerationMode: AccelerationMode? = nil,
         enableCompiledBatchDecode: Bool = false,
         compiledBatchBuckets: [Int] = [1, 2, 4],
         temperature: Float = 0.6,
@@ -244,6 +253,8 @@ public struct GenerateParameters: Sendable {
         self.kvMode = kvMode
         self.enableCompiledDecode = enableCompiledDecode
         self.compiledMaxCacheLength = compiledMaxCacheLength
+        self.accelerationMode =
+            accelerationMode ?? AccelerationRuntime.requestedMode()
         self.enableCompiledBatchDecode = enableCompiledBatchDecode
         self.compiledBatchBuckets = compiledBatchBuckets
         self.temperature = temperature
@@ -721,6 +732,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         prompt: MLXArray, model: any LanguageModel, cache: [KVCache]? = nil,
         parameters: GenerateParameters
     ) throws {
+        _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+
         self.model = model
         self.y = .init(tokens: prompt)
         self.cache = cache ?? model.newCache(parameters: parameters)
@@ -766,6 +779,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         cacheCoordinator: CacheCoordinator? = nil
     ) throws {
+        _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+
         self.model = model
         self.y = input.text
         self.cache = cache ?? model.newCache(parameters: parameters)
@@ -1276,6 +1291,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         numDraftTokens: Int
     ) throws {
+        _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+
         self.y = input.text
         self.draftY = input.text
         self.mainModel = mainModel
@@ -1874,6 +1891,8 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     cacheCoordinator: CacheCoordinator? = nil
 ) throws -> AsyncStream<Generation> {
+    _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+
     context.jangPressRuntime.recordPromptTokenActivity(
         input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -2400,11 +2419,6 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             handler.onGenerationEnd(emit: continuation.yield)
 
-            // Multi-tier cache: store prompt state after generation completes.
-            if let cacheStoreAction = cacheStoreAction {
-                cacheStoreAction()
-            }
-
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
 
@@ -2416,6 +2430,15 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 stopReason: stopReason ?? .cancelled
             )
             _ = continuation.yield(handler.infoEvent(info))
+
+            // Multi-tier cache: store prompt state after completion info is
+            // visible to stream consumers, but keep the store serialized on
+            // this generation task. Detached SSM re-derive previously raced
+            // Metal command encoders; yielding `.info` first removes the UI
+            // end-of-stream wait without reintroducing concurrent model use.
+            if let cacheStoreAction = cacheStoreAction {
+                cacheStoreAction()
+            }
 
             // Synchronize with the stream to ensure tasks are completed
             Stream().synchronize()

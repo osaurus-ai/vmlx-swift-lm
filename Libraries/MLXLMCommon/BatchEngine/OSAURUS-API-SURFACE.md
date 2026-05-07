@@ -30,6 +30,7 @@ on 2026-04-19. Every row is a live import in one of those branches.
 | `ModelContainer.cacheCoordinator: CacheCoordinator?` | Read in `MLXGenerationEngine.swift:160`. Package-level multi-tier KV cache handle. |
 | `ModelContainer.enableCaching(config: CacheCoordinatorConfig = .init())` + `enableCachingAsync()` | Called by osaurus's `installCacheCoordinator` to wire paged + disk caches at load time. |
 | `ModelContainer.makeBatchEngine(maxBatchSize: Int = 8, memoryPurgeInterval: Int = 256) async -> BatchEngine` | Osaurus's `BatchEngineAdapter.swift:59` → `container.makeBatchEngine(maxBatchSize: maxBatchSize)`. |
+| `BatchEngine.updateMaxBatchSize(_:) async throws` | Runtime admission-limit update. Increasing admits queued work immediately; decreasing waits for active slots to drain below the new limit. Throws after terminal shutdown. |
 | `public struct ModelContext: Sendable` | `configuration: ModelConfiguration`, `model: any LanguageModel`, `tokenizer: any Tokenizer`, `processor: any UserInputProcessor`. |
 
 ## 3. Configuration
@@ -115,6 +116,8 @@ public actor BatchEngine {
                 memoryPurgeInterval: Int = 256,
                 cacheCoordinator: CacheCoordinator? = nil)
 
+    public func updateMaxBatchSize(_ newMaxBatchSize: Int) throws
+
     @discardableResult
     public func submit(input: consuming sending LMInput,
                        parameters: GenerateParameters)
@@ -130,12 +133,22 @@ public actor BatchEngine {
     public var pendingCount: Int { get }
     public var activeCount: Int { get }
     public var isRunning: Bool { get }
+    public var isShutdown: Bool { get }
+    public var isAcceptingRequests: Bool { get }
 }
 
 public struct BatchRequestID: Hashable, Sendable, CustomStringConvertible
 ```
 
 Osaurus's `BatchEngineAdapter.swift:152` uses `.submit` + its own `StreamAccumulator` wrapper today. `BatchEngine.generate` is the higher-level path that handles detokenization + reasoning strip + tool-call extraction internally — osaurus can migrate to it to drop app-layer tool parsing.
+
+`shutdown()` is terminal. Once shutdown begins, `isShutdown == true`,
+`isAcceptingRequests == false`, and later `submit`/`generate` calls return a
+completed `.info(.cancelled)` stream without re-entering the scheduling loop.
+`updateMaxBatchSize(_:)` also rejects the stale handle. This lets host
+registries fail closed if a stale engine handle escapes during model unload.
+The decode loop yields at bounded intervals even for B=1, so `shutdown()` and
+`cancel(_:)` are not starved behind a long single-slot decode.
 
 ## 9. Cache coordinator
 

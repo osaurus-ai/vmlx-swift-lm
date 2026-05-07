@@ -155,9 +155,10 @@ await engine.shutdown()
 | `init(context:maxBatchSize:memoryPurgeInterval:)` | Create engine from a `ModelContext` |
 | `generate(input:parameters:) -> AsyncStream<Generation>` | Submit request, get text chunks back (same type as `ModelContainer.generate()`) |
 | `submit(input:parameters:) -> (id, AsyncStream<BatchGeneration>)` | Low-level: raw token IDs + request ID for cancellation |
+| `updateMaxBatchSize(_:)` | Change the actor's admission limit without evicting/recreating the loaded model; fails after terminal shutdown |
 | `cancel(_:)` | Cancel a specific request by ID |
-| `shutdown()` | Stop all requests, close all streams |
-| `pendingCount` / `activeCount` / `isRunning` | Engine status |
+| `shutdown()` | Terminal shutdown: stop all requests, close all streams, reject future submissions with `.info(.cancelled)` |
+| `pendingCount` / `activeCount` / `isRunning` / `isShutdown` / `isAcceptingRequests` | Engine status |
 
 ### ModelContainer Extension
 
@@ -246,9 +247,18 @@ submit(input, params) ─or─ generate(input, params)
   model([B,1], cache: batchCaches) → logits [B, 1, V]
   After forward: BatchArraysCache.splitBack() writes SSM states back
   Sample per sequence, check EOS before yielding
-  Finished → .info(completionInfo) → stream closed
+  Finished → .info(completionInfo) → cache store → stream closed
   Slot removed, next request admitted from queue
 ```
+
+After `shutdown()`, the engine does not restart. Any stale handle that calls
+`submit` or `generate` receives a completed cancelled stream, with no queue
+admission and no model forward pass. Runtime reconfiguration is also rejected
+after shutdown, so a stale handle cannot be made to look like a live engine.
+
+Long B=1 decodes yield back to the actor executor at bounded intervals. This
+keeps the hot path from paying a yield every token while still allowing
+`cancel`, `shutdown`, and `updateMaxBatchSize` to run before `maxTokens`.
 
 ### Cache Wrappers
 
@@ -1933,10 +1943,12 @@ See `Tests/MLXLMTests/BatchEngineTurboQuantTests.swift` (15 tests):
    synchronous `extractSSMStates` / `restoreSSMStates` helpers in
    `Cache/CacheHelpers.swift`, the `SSMStateCache` L2 layer, and the
    prompt-boundary fresh pass in
-   `reDeriveAndStoreSSMStatesForPromptBoundaries(...)`. Production keeps
-   that pass enabled with `CacheCoordinatorConfig.enableSSMReDerive`.
-   Disable it only for matrix rows that intentionally prove the fallback
-   full-prefill path.
+   `reDeriveAndStoreSSMStatesForPromptBoundaries(...)`. Completion `.info`
+   is yielded before that cache store/re-derive pass so hosts can end their
+   spinner without reintroducing detached model work. Production keeps that
+   pass enabled with `CacheCoordinatorConfig.enableSSMReDerive`. Disable it
+   only for matrix rows that intentionally prove the fallback full-prefill
+   path.
 
 ## Audit — 2026-04-19 (iter 28)
 

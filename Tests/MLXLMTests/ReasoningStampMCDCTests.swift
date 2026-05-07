@@ -7,7 +7,10 @@
 //   D1: modelType != nil ∧ !modelType.isEmpty
 //     ↓ false → return "none"
 //     ↓ true
-//   D2: t.hasPrefix("gemma4")
+//   D2a: t.hasPrefix("gemma4")
+//     ↓ true  → return "harmony"
+//     ↓ false
+//   D2b: t.hasPrefix("gpt_oss")
 //     ↓ true  → return "harmony"
 //     ↓ false
 //   D3: thinkXmlPrefixes.contains(where: t.hasPrefix)
@@ -18,7 +21,8 @@
 // MC/DC requirements:
 //
 //  - D1 (∧): need (T,T)→T, (F,T), (T,F) — 3 cases.
-//  - D2 (single condition): 2 cases, T and F.
+//  - D2a/D2b (single-prefix harmony branches): 2 true cases plus false
+//    fall-through coverage.
 //  - D3 (∨ over 9 prefixes): each prefix must independently flip the
 //    decision. Need 1 all-false case + 9 cases each with exactly one
 //    matching prefix and all 8 others non-matching = 10 cases.
@@ -51,7 +55,7 @@ struct ReasoningStampMCDCTests {
         #expect(reasoningStampFromModelType("qwen3") == "think_xml")
     }
 
-    // MARK: - D2: gemma4 prefix branch
+    // MARK: - D2: harmony prefix branches
 
     @Test("D2 T (gemma4) → 'harmony'")
     func d2_gemma4_true() {
@@ -68,6 +72,12 @@ struct ReasoningStampMCDCTests {
         // Gemma 3 has no harmony channel → not "harmony".
         // Also not in think_xml list → "none".
         #expect(reasoningStampFromModelType("gemma3") == "none")
+    }
+
+    @Test("D2 T (gpt_oss) → 'harmony'")
+    func d2_gptOss_true() {
+        #expect(reasoningStampFromModelType("gpt_oss") == "harmony")
+        #expect(reasoningStampFromModelType("gpt_oss_120b") == "harmony")
     }
 
     // MARK: - D3: think_xml prefix disjunction
@@ -155,7 +165,6 @@ struct ReasoningStampMCDCTests {
             "starcoder2",
             "openelm",
             "internlm2",
-            "gpt_oss",
             "nanochat",
             "mistral",       // Mistral 3 / 4 — no <think>
             "ministral3",    // Mistral 3.5 inner — no <think>

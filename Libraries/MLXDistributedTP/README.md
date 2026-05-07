@@ -30,8 +30,8 @@ rollout. Phase 5 of the spec at `docs/superpowers/specs/2026-05-02-distributed-i
   tree. Requires a Swift equivalent of `tree_map_with_path`; deferred
   until a real model wrapper needs it (Phase 6).
 - **Multi-rank correctness tests** — only single-rank reduction is
-  exercised here. Real multi-rank verification needs Phase 6's
-  TB5-cabled cluster.
+  exercised here. Real multi-rank verification requires explicitly
+  configured hosts and should not be inferred from these tests.
 
 ## Architecture
 
@@ -67,7 +67,7 @@ rollout. Phase 5 of the spec at `docs/superpowers/specs/2026-05-02-distributed-i
 
 ## Tests
 
-19 tests pass on a single-rank build:
+Single-rank tests:
 
 ```sh
 swift test --filter "GroupTests|CollectivesSingleRankTests|LinearLayersSingleRankTests|ShardingHelperTests"

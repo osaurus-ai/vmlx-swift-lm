@@ -520,8 +520,8 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
 
     // Default: no reasoning envelope. Output flows as plain `.chunk`
     // events with zero `.reasoning` leakage. Covers LFM2, LLaMA,
-    // Phi 3/MoE, StarCoder2, Cohere, OpenELM, InternLM2, GPT-OSS,
-    // NanoChat, BitNet, Mistral 3/4, Gemma 2/3/3n, plus any new
+    // Phi 3/MoE, StarCoder2, Cohere, OpenELM, InternLM2, NanoChat,
+    // BitNet, Mistral 3/4, Gemma 2/3/3n, plus any new
     // model_type that lands in LLMModelFactory without an explicit
     // reasoning stamp.
     return "none"

@@ -18,9 +18,15 @@ struct ZayaSmokeJANGTQ2Tests {
            !override.isEmpty {
             return override
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("jang/models/Zyphra")
-            .path
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent("jang/models/Zyphra"),
+            home.appendingPathComponent("models/Zyphra"),
+        ]
+        return candidates.first {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("ZAYA1-8B-JANGTQ2/config.json").path)
+        }?.path ?? candidates[0].path
     }()
     static let bundlePath = bundleRoot + "/ZAYA1-8B-JANGTQ2"
     static let jangTQ4BundlePath = bundleRoot + "/ZAYA1-8B-JANGTQ4"

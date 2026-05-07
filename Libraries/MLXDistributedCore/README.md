@@ -1,20 +1,21 @@
 # MLXDistributedCore
 
-Phase-1A skeleton for the multi-host distributed inference system specified in
+Core planning layer for the multi-host distributed inference system specified in
 [`docs/superpowers/specs/2026-05-02-distributed-inference-engine-design.md`](../../docs/superpowers/specs/2026-05-02-distributed-inference-engine-design.md).
 
 This target intentionally has **no MLX/MLXLLM dependencies** — it defines the
 public types, the `DiscoveryProvider` protocol, the canonical TXT-record codec,
-a default Bonjour discovery implementation, and `ClusterSession` (single-node
-path only in Phase 1A). The actual generation execution is injected via
+a default Bonjour discovery implementation, peer eligibility helpers, and
+`ClusterSession`. The actual generation execution is injected via
 `LocalGenerator`, so the same target can be linked into any host that brings
 its own runtime: `osaurus`, `RunBench`, or third-party SDK consumers.
 
-## What's here (Phase 1A)
+## What's here
 
 | File | Responsibility |
 |------|----------------|
 | `Peer.swift` | `Peer`, `Endpoint`, `PeerCapabilities`, `ModelHashSet` — wire-side identity types |
+| `PeerEligibility.swift` | Mode/model/endpoint eligibility checks for distributed placements |
 | `Mode.swift` | `Mode`, `TrustPolicy`, `DistributionError` — caller-facing knobs + errors |
 | `DiscoveryProvider.swift` | Pluggable discovery protocol |
 | `Generation.swift` | `ModelHandle`, `GenerateRequest`, `Token`, `LocalGenerator`, `ParallelPlan` |
@@ -22,12 +23,27 @@ its own runtime: `osaurus`, `RunBench`, or third-party SDK consumers.
 | `BonjourDiscoveryProvider.swift` | Default `DiscoveryProvider` over Foundation `NetService` |
 | `ClusterSession.swift` | User-facing entry point |
 
-## What's NOT here (later phases)
+## Current distributed behavior
 
-- **Replica routing** — happens inside osaurus's `ChatEngine` via the
-  `OsaurusBonjourBridge: DiscoveryProvider`. See Plan 1B.
-- **TLS-NIO transport for PP** — Phase 2.
-- **Per-family sharding plans** — Phase 3.
+- `.auto` and `.localOnly` return local plans.
+- `.replica` requires a configured `ReplicaTransport` and an eligible static
+  peer. Eligibility currently means advertised replica mode, matching model
+  hash or overflow model list, and a TLS endpoint.
+- `.pipelined` requires a configured `PipelinedTransport` and an eligible
+  static peer. Eligibility currently means advertised pipelined mode, matching
+  model hash or overflow model list, and a TLS endpoint.
+- `.wired` still throws `notImplementedYet`.
+
+See [`DISTRIBUTED-INFERENCE-ROADMAP.md`](DISTRIBUTED-INFERENCE-ROADMAP.md)
+for the cache, batching, and model-family rollout plan.
+
+## What's NOT here yet
+
+- **Replica transport implementation** — `MLXDistributedCore` exposes the
+  hook, but osaurus owns the HTTP/SSE implementation over its chat endpoint.
+- **Full activation pipeline runtime** — current TLS path is a two-rank
+  prompt/token transport, not full layer activations.
+- **Per-family sharding plans** — later TP phases.
 - **JACCL / RDMA bindings** — Phases 4–6.
 - **Failure / replan / heartbeats** — Phase 7.
 

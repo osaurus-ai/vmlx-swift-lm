@@ -38,11 +38,11 @@
 // the stripped prompt hash key exactly — no contamination, no offset
 // mismatch, and the next turn can cache-hit cleanly.
 //
-// Called synchronously from `cacheStoreAction` at turn-end, right
-// after the normal `storeAfterGeneration`. By then the stream has
-// already yielded the last visible token, so the user doesn't see
-// the re-derive latency as "thinking" time — they see it as a
-// brief pause before the next input box goes live.
+// Called synchronously from `cacheStoreAction` at turn-end after the
+// stream has yielded completion `.info`. The user does not pay this as
+// an end-of-stream spinner, but the work remains serialized with the
+// generation task because the old detached async helper was reverted after
+// a Metal command-encoder race.
 //
 // Cost: one extra chunked-prefill pass over the prompt (no decode
 // loop, no sampling). On a 2K prompt at ~1000 prefill tok/s that's

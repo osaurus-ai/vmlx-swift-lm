@@ -10,9 +10,11 @@ struct TestTokenizer: MLXLMCommon.Tokenizer {
     let length = 8
     let maxLength = 50
 
-    /// a token outside the range that the model will generate, see vocabularySize
-    let _eosTokenId = 101
-    let _unknownTokenId = 102
+    /// Tokens outside the range tiny synthetic models generate. BatchEngine
+    /// widens the stop set from tokenizer metadata, so these must not collide
+    /// with test-model vocabularies.
+    let _eosTokenId = 1_000_001
+    let _unknownTokenId = 1_000_002
 
     let vocabularySize: Int
     let vocabulary: [Int: String]
@@ -49,7 +51,10 @@ struct TestTokenizer: MLXLMCommon.Tokenizer {
     }
 
     func convertTokenToId(_ token: String) -> Int? {
-        Int.random(in: 1 ..< vocabularySize)
+        if token == "EOS" {
+            return _eosTokenId
+        }
+        return vocabulary.first { $0.value == token }?.key
     }
 
     func convertIdToToken(_ id: Int) -> String? {

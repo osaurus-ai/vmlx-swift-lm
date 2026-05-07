@@ -12,11 +12,17 @@ struct ZayaCCACacheDiskRoundTripTests {
 
     @Test("LayerKind.zayaCCA exists with rawValue 9")
     func layerKindEnumIsRegistered() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         #expect(TQDiskSerializer.LayerKind.zayaCCA.rawValue == 9)
     }
 
     @Test("serialize emits zaya_{i}_{keys,values,conv_state,prev_hs} + meta + kind tag")
     func serializeEmitsAllFourArrays() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let z = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         _ = z.update(
             keys: MLXArray.ones([1, 1, 3, 8], dtype: .bfloat16),
@@ -44,6 +50,9 @@ struct ZayaCCACacheDiskRoundTripTests {
 
     @Test("Round-trip preserves all 4 state arrays byte-identical with offset")
     func roundTripPreservesByteIdentity() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         _ = src.update(
             keys: MLXArray.ones([1, 1, 3, 8], dtype: .bfloat16),
@@ -78,6 +87,9 @@ struct ZayaCCACacheDiskRoundTripTests {
 
     @Test("Empty source cache round-trips cleanly via zero-seq sentinel")
     func emptyKVRoundTrip() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         // Source has no prefill — only the always-populated CCA state.
         let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         src.writeCCA(
@@ -100,6 +112,9 @@ struct ZayaCCACacheDiskRoundTripTests {
 
     @Test("Mixed per-layer round-trip: KVCacheSimple + ZayaCCACache + RotatingKVCache")
     func mixedPerLayerArrayRoundTrip() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let l0 = KVCacheSimple()
         _ = l0.update(
             keys: MLXArray.ones([1, 1, 2, 8], dtype: .bfloat16),

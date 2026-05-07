@@ -11,6 +11,9 @@ struct ZayaCCACacheStateRoundTripTests {
 
     @Test("Empty cache reports zero offset and four-slot state with shapes")
     func emptyCacheShape() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let c = ZayaCCACache(batchSize: 1, convChannels: 1280, hiddenSize: 2048)
         #expect(c.offset == 0)
         #expect(c.state.count == 4)
@@ -24,6 +27,9 @@ struct ZayaCCACacheStateRoundTripTests {
 
     @Test("State setter accepts four-slot array and round-trips all values")
     func stateRoundTripPreservesAll4() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         _ = src.update(
             keys: MLXArray.ones([1, 1, 3, 8], dtype: .bfloat16),
@@ -52,6 +58,9 @@ struct ZayaCCACacheStateRoundTripTests {
 
     @Test("metaState round-trips kv tag plus ZAYA trailer")
     func metaStateRoundTrip() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         let meta = src.metaState
         // Trailer: "zaya_cca_v1", convChannels, hiddenSize, batchSize
@@ -68,6 +77,9 @@ struct ZayaCCACacheStateRoundTripTests {
 
     @Test("copy() produces a deep clone — mutating src does not touch dst")
     func copyDoesNotShareState() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let src = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         src.writeCCA(
             conv: MLXArray.ones([1, 4, 2], dtype: .float32) * 3,
@@ -87,6 +99,9 @@ struct ZayaCCACacheStateRoundTripTests {
 
     @Test("update() returns the full accumulated keys/values")
     func updateReturnsFullSlice() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let c = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         let (k1, v1) = c.update(
             keys: MLXArray.ones([1, 1, 2, 8], dtype: .bfloat16),

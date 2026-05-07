@@ -19,6 +19,256 @@ Ling MXFP4 affine decode after removing the oversized fused gate/up cache. Do
 not block integration on speed unless product policy requires a token/s
 threshold.
 
+## Current Validation - 2026-05-07
+
+Current commit under test: `88fc352`.
+
+### Stop-hook full matrix - 2026-05-07 14:45 PDT
+
+This is the newest local evidence set and supersedes older provisional or
+background-active speed rows below. The pass used the current release
+`RunBench` and one model process at a time.
+
+Strict speed/graph rows that are green:
+
+- Qwen3.5-35B-A3B 4bit:
+  `/tmp/vmlx_stop_hook_seq_qwen35_20260507.log`, TTFT 62 ms, 97.5 tok/s,
+  3854 graph nodes, 90 `AsType`, no loop/leak.
+- Gemma4 E2B:
+  `/tmp/vmlx_stop_hook_seq_gemma4_e2b_20260507.log`, TTFT 32 ms,
+  164.9 tok/s, 1704 graph nodes, 89 `AsType`, no loop/leak.
+- Gemma4 26B A4B:
+  `/tmp/vmlx_stop_hook_seq_gemma4_26b_20260507.log`, TTFT 85 ms,
+  86.8 tok/s, 3274 graph nodes, 151 `AsType`, no loop/leak. It passes the
+  explicit >80 tok/s target, but `AsType` cleanup remains.
+
+Functional rows with open speed or `AsType` work:
+
+- Gemma4 E4B: 106.4 tok/s, 2210 graph nodes, 112 `AsType`.
+- Nemotron Cascade: 114.1 tok/s, 2062 graph nodes, 161 `AsType`.
+- Nemotron Super: 42.2 tok/s, 3599 graph nodes, 280 `AsType`.
+- Ling JANGTQ2: 35.4 tok/s, 5 graph nodes, 3 `AsType`.
+- Ling legacy JANGTQ: 35.8 tok/s, 5 graph nodes, 3 `AsType`.
+- Ling MXFP4: 9.9 tok/s, 5 graph nodes, 3 `AsType`.
+- ZAYA JANGTQ2: 55.6 tok/s, 8831 graph nodes, 1365 `AsType`.
+- ZAYA JANGTQ4: 53.7 tok/s, 8831 graph nodes, 1365 `AsType`.
+- ZAYA MXFP4: 65.0 tok/s, 8791 graph nodes, 1285 `AsType`.
+
+ZAYA and Ling library integration status:
+
+- ZAYA JANGTQ2/JANGTQ4/MXFP4 contract rows pass. The tested bundles advertise
+  `cacheSubtype=zaya_cca`, hybrid cache, expected EOS/template metadata, and
+  the expected TQ sidecar state for JANGTQ rows.
+- ZAYA template smoke passes. `enable_thinking=false` closes the think block
+  while tools remain enabled through `zaya_xml`.
+- ZAYA disk restore passes with a fresh coordinator disk hit and
+  `ssm_companion`. ZAYA paged-prefix cache correctly reports not applicable
+  because CCA topology is paged-incompatible.
+- Ling JANGTQ2 passes compile off/on multi-turn recall, paged-prefix HIT,
+  disk restore with `ssm_companion`, and TurboQuant B=2 isolation.
+- Gemma4 E2B BatchEngine B=2 and B=4 concurrent rows pass; B=4 slot 0 matched
+  the B=1 solo reference exactly.
+
+VL status:
+
+- The hook-listed Qwen3.5 VL 35B/122B and Gemma4 VL bundles are not locally
+  loadable on this machine. The Qwen VL HF cache entries on the mounted
+  migration volume are only tiny metadata snapshots with no safetensor shards.
+- Available local Nemotron-Omni VL substitutes pass structured chat/cache on
+  JANGTQ, JANGTQ4, and MXFP4 rows. The full Omni matrix passes 17/17, covering
+  text, image, video encoder, audio encoder, media salt isolation, reasoning
+  toggle, hybrid SSM warm pass, and BatchEngine text/image/audio rows.
+
+Missing or incomplete hook rows:
+
+- `~/models/Mistral-Small-4-119B-JANG_2L` is present but incomplete: config,
+  template, images, and cache metadata exist, but no safetensor shards or
+  `model.safetensors.index.json` are present.
+- `~/.mlxstudio/models/Qwen3.5-VL-35B-A3B-JANG_4K-CRACK`,
+  `~/.mlxstudio/models/Qwen3.5-VL-122B-A10B-JANG_4K-CRACK`, and
+  `~/.mlxstudio/models/MiniMax-M2.5-JANG_2L-CRACK` are missing.
+- Gemma4 E2B/E4B VL and ZAYA BF16 source were not found under the audited local
+  model roots. Converted ZAYA bundles were tested from `~/models/Zyphra`.
+
+Do not expose the following as default Osaurus behavior from this evidence:
+
+- ZAYA paged-prefix hits, compiled decode, reasoning-on/max defaults, or
+  TurboQuant KV defaults.
+- Global TurboQuant KV defaulting. TQ KV remains functionally stable in the
+  tested rows but fails the within-5-percent speed target on Qwen35, Gemma4
+  E2B, and Nemotron Cascade long-context comparisons.
+- A global "all models meet Python speed" claim. Several rows are functional
+  but still below speed or `AsType` targets.
+
+### Stability re-audit - 2026-05-07 14:15 PDT
+
+This pass focused on the Osaurus-facing stability surface rather than raw
+token/s: reasoning on/off recognition, chat-template routing, prefix/paged/L2
+cache behavior, BatchEngine shutdown/admission semantics, and ZAYA/Ling hybrid
+cache contracts.
+
+Two false-positive sources were found and corrected before declaring the
+surface clean:
+
+- `gpt_oss` is now a Harmony-reasoning family. Older reasoning audit tests still
+  classified it as `"none"`; the tests and comments now match the runtime
+  contract (`reasoningStampFromModelType("gpt_oss") == "harmony"`).
+- The synthetic `TestTokenizer` returned a random ID for every unknown special
+  token and used EOS/unknown IDs inside tiny test model vocabularies. That made
+  BatchEngine tests nondeterministically stop on ordinary generated tokens. The
+  fixture now maps only known tokens and keeps EOS/unknown outside generated
+  vocab ranges.
+
+Fresh verification from the current tree:
+
+| Surface | Result |
+|---|---|
+| Release `RunBench` build | PASS. `/tmp/vmlx_release_runbench_build_stability_ready_20260507.log`. |
+| Reasoning parser/stamp/prompt-tail matrix | PASS. 33 Swift Testing/XCTest rows, including GPT-OSS Harmony, Bailing/Ling `think_xml`, ZAYA/Zyphra tool format, prompt-tail open/closed think detection. `/tmp/vmlx_reasoning_parser_surface_after_fixture_20260507.log`. |
+| BatchEngine + CacheCoordinator unit/integration surface | PASS. 35 rows covering resize/shutdown, TQ B=2 isolation, multi-turn plain/TQ cache hits, prompt extension, no cross-prompt contamination, media salt, and KV policy defaults. `/tmp/vmlx_cache_batch_surface_after_fixture_20260507.log`. |
+| Cross-prompt cache contamination flake check | PASS 10/10 isolated repeats after fixing `TestTokenizer`. `/tmp/vmlx_repeat_no_cross_prompt_summary_20260507.log`. |
+| ZAYA focused real-bundle suite | PASS. 33 rows covering real JANGTQ2/JANGTQ4/MXFP4 load+forward, CCA cache state/disk round-trip, B=2 CCA isolation, ZAYA XML parser, and BatchEngine B=2 visible chunks. `/tmp/vmlx_zaya_focused_after_stability_fixture_20260507.log`. |
+| Ling/Bailing unit + real-bundle processor toggle | PASS. Bailing directive unit tests plus real Ling JANGTQ2 load through `LLMUserInputProcessor`; default/off render `detailed thinking off`, explicit `enable_thinking=true` renders `detailed thinking on`. `/tmp/vmlx_ling_processor_toggle_real_bundle_20260507.log`. |
+
+Fresh live model rows:
+
+| Model | Current status |
+|---|---|
+| ZAYA1-8B JANGTQ2 contract | PASS. `cacheSubtype=zaya_cca`, `cacheType=hybrid`, 40 CCA layers, 120 TQ groups, sidecar present, effective EOS `[106]`, template present. `/tmp/vmlx_live_zaya_jangtq2_contract_ready_20260507.log`. |
+| ZAYA1-8B JANGTQ2 template | PASS. `enable_thinking=false` closes `<think></think>` and keeps tool rows; explicit thinking-on opens the tail for diagnostics. `/tmp/vmlx_live_zaya_jangtq2_template_ready_20260507.log`. |
+| ZAYA1-8B JANGTQ2 BatchEngine chat | PASS runtime; compile off/on both emit visible chunks without raw thinking markers. Generic favorite-color recall remains weak model behavior, not a cache/runtime failure. `/tmp/vmlx_live_zaya_jangtq2_batch_chat_ready_20260507.log`. |
+| ZAYA1-8B JANGTQ2 paged prefix | PASS as not-applicable. ZAYA CCA is paged-incompatible by design; Osaurus should not expect paged-prefix hits for ZAYA. `/tmp/vmlx_live_zaya_jangtq2_cache_hit_ready_20260507.log`. |
+| ZAYA1-8B JANGTQ2 disk restore | PASS. Fresh coordinator hit L2 disk, `matched=142/142`, `diskArrays=yes`, `ssm_companion` present. `/tmp/vmlx_live_zaya_jangtq2_disk_restore_ready_20260507.log`. |
+| Ling 2.6 Flash JANGTQ2 config/template | PASS. `modelType=bailing_hybrid`, sidecar present, effective EOS/BOS covered. Raw tokenizer smoke is stable; production thinking toggle is verified by the processor test above. `/tmp/vmlx_live_ling_jangtq2_config_ready_20260507.log`, `/tmp/vmlx_live_ling_jangtq2_template_ready_20260507.log`. |
+| Ling 2.6 Flash JANGTQ2 BatchEngine chat | PASS. Compile off/on both recall the multi-turn blue/cool prompts with visible chunks. `/tmp/vmlx_live_ling_jangtq2_batch_chat_ready_20260507.log`. |
+| Ling 2.6 Flash JANGTQ2 paged prefix | PASS. Paged tier hit `matched=128/166`; hybrid partial-hit rollback is expected and correct. `/tmp/vmlx_live_ling_jangtq2_cache_hit_ready_20260507.log`. |
+| Ling 2.6 Flash JANGTQ2 disk restore | PASS. Fresh coordinator hit L2 disk, `matched=143/143`, `diskArrays=yes`, `ssm_companion` present. `/tmp/vmlx_live_ling_jangtq2_disk_restore_ready_20260507.log`. |
+| Ling 2.6 Flash JANGTQ2 TQ B=2 | PASS. Plain slot beside TQ neighbor matched the B=1 reference exactly; both TQ slots completed coherent output. `/tmp/vmlx_live_ling_jangtq2_tq_b2_ready_20260507.log`. |
+
+Osaurus guidance from this pass:
+
+- Use `UserInput(chat:)` through the production processor. Do not render raw
+  tokenizer templates in Osaurus and expect Bailing/Ling thinking directives to
+  be injected.
+- ZAYA is production-safe for default thinking-off chat, ZAYA XML tool parsing,
+  B=2 isolation, and L2 disk restore. Paged-prefix hits are intentionally
+  disabled for its CCA cache topology.
+- Ling is production-safe for default thinking-off chat, explicit thinking
+  toggle prompt rendering, paged-prefix hits, L2 disk restore, and B=2/TQ
+  isolation. Speed is still optimization work.
+- TurboQuant KV remains opt-in/diagnostic for speed. It is functionally stable
+  in the rows above, but the broader hook sweep still showed TQ slower than
+  float KV on Qwen/Gemma/Nemotron rows.
+- The huge mixed `swift test --filter ...` runner can still make SwiftPM's
+  testing helper unstable when XCTest and Swift Testing MLX-heavy suites are
+  interleaved. Split the stability surface into the focused commands above.
+
+Correction: some token/s rows in this subsection were captured while separate
+MiniMax and/or Osaurus model jobs were active. Treat the speed values here as
+provisional except where superseded by the clean rebench rows below. The
+functional pass/fail, cache behavior, graph stats, stop reasons, and
+missing-path audits remain useful because they exercised the current runtime,
+but do not use provisional token/s numbers as production targets.
+
+| Row | Current result |
+|---|---|
+| Qwen3.5-35B-A3B 4bit | PASS. 93.9 tok/s cold single run, 105.3 tok/s in the later float-KV comparison, TTFT 56-64 ms, `decodeNodes=3854`, `asType=90`, no loop/leak. |
+| Gemma4 E2B 4bit | PASS. 155.2 tok/s cold hook row; 184.1 tok/s in the later float-KV comparison, `decodeNodes=1704`, `asType=89`, no loop/leak. |
+| Gemma4 E4B 4bit | PASS. 102.5 tok/s, TTFT 50 ms, `decodeNodes=2210`, `asType=112`, no loop/leak. |
+| Gemma4 26B A4B 4bit | PASS after background-job cleanup. 82.4 tok/s, TTFT 92 ms, `decodeNodes=3274`, `asType=151`, no loop/leak. |
+| Nemotron Cascade JANG_2L | PASS but slower than the earlier clean hook row. 59.9 tok/s, `decodeNodes=2062`, `asType=161`, visible coherent text. |
+| Nemotron Super JANG_2L | PASS functionally, speed/graph cleanup remains. 35.7 tok/s, `decodeNodes=3599`, `asType=280`. Generic coherent bench routes recall into `.reasoning` with empty visible chunks. |
+| MiniMax M2.7 JANGTQ | PARTIAL. TokenIterator path works at 38.2 tok/s for 32 tokens, `decodeNodes=4045`, `asType=372`, coherent text. BatchEngine perf path hit a Metal GPU timeout and is a production blocker for this bundle/path. MiniMax is standard KV/MoE, not a hybrid SSM/CCA model. |
+| Ling JANGTQ2 | PASS functionally. 31.3 tok/s, `decodeNodes=5`, `asType=3`, multi-turn recall passes compile off/on. Paged-prefix hit, disk L2 restore with `ssm_companion`, and TurboQuant KV B=2 isolation pass. Speed target remains open. |
+| Ling legacy JANGTQ | PASS functionally. 29.4 tok/s, `decodeNodes=5`, `asType=3`, coherent short decode. |
+| Ling MXFP4 | PASS functionally but not production-preferred. 9.9 tok/s, coherent short decode, high memory/low speed. |
+| ZAYA JANGTQ2 | PASS contract/cache/decode, weak generic chat recall. Contract sees `cacheSubtype=zaya_cca`, 40 CCA layers, 120 TQ groups, sidecar present. 62.4 tok/s, `decodeNodes=8831`, `asType=1365`. Disk L2 restore passes; paged-prefix cache correctly reports not applicable. Generic favorite-color multi-turn ends cleanly but does not recall the color. |
+| ZAYA JANGTQ4 | PASS short decode. 55.5 tok/s, `decodeNodes=8831`, `asType=1365`. |
+| ZAYA MXFP4 | PASS short decode. 62.2 tok/s, `decodeNodes=8791`, `asType=1285`. |
+| ZAYA BF16 source | NOT TESTED. No local `ZAYA1-8B` source bundle was found under the audited ZAYA roots in this pass. |
+| Nemotron Omni Nano JANGTQ | PASS. Text row 73.7 tok/s, `decodeNodes=1947`, `asType=46`; structured VL cache matrix passed; full Omni matrix passed 17/17 including text, image, video encoder, audio encoder, reasoning toggle, media-salt isolation, hybrid SSM warm-pass, and BatchEngine text/image/audio rows. |
+| DSV4 Flash JANGTQ | PASS production gate. Template kwargs pass. Chat recall, reasoning off/on/max, and 5,568-token long-context semantic recall all pass with `unclosedReasoning=false`. Short perf is 13.2 tok/s, `decodeNodes=30143`, `asType=1325`; disk L2 restore passes; paged-prefix cache correctly reports not applicable. |
+
+Clean rebench rows from 2026-05-07 10:52 PDT, current `RunBench`, one vmlx
+model process at a time. These supersede the matching token/s values above:
+
+| Row | Clean result |
+|---|---|
+| Qwen3.5-35B-A3B 4bit | PASS. 91.5 tok/s, TTFT 73 ms, `decodeNodes=3854`, `asType=90`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_qwen35_35b_20260507_105241.log`. |
+| Gemma4 E2B 4bit | PASS. 149.8 tok/s, TTFT 36 ms, `decodeNodes=1704`, `asType=89`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_gemma4_e2b_20260507_105241.log`. |
+| Gemma4 E4B 4bit | PASS. 97.4 tok/s, TTFT 50 ms, `decodeNodes=2210`, `asType=112`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_gemma4_e4b_20260507_105241.log`. |
+| Gemma4 26B A4B 4bit | PASS. 77.9 tok/s, TTFT 90 ms, `decodeNodes=3274`, `asType=151`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_gemma4_26b_20260507_105241.log`. |
+| Nemotron Cascade JANG_2L | PASS. 99.2 tok/s, TTFT 100 ms, `decodeNodes=2062`, `asType=161`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_nemotron_cascade_20260507_105241.log`. |
+| Nemotron Super JANG_2L | PASS functionally. 28.4 tok/s, TTFT 221 ms, `decodeNodes=3599`, `asType=280`, coherent, no loop/leak; speed/AsType cleanup remains. Log: `/tmp/vmlx_rebench_clean_nemotron_super_20260507_105241.log`. |
+| MiniMax M2.7 JANGTQ | PASS functionally on iterator path. 26.5 tok/s, TTFT 688 ms, `decodeNodes=4045`, `asType=372`, coherent, no loop/leak; BatchEngine timeout/speed cleanup remains. Log: `/tmp/vmlx_rebench_clean_minimax_m27_20260507_105241.log`. |
+| Ling JANGTQ2 | PASS functionally. 22.2 tok/s, TTFT 258 ms, `decodeNodes=5`, `asType=3`, coherent, no loop/leak; speed target remains open. Log: `/tmp/vmlx_rebench_clean_ling_jangtq2_20260507_105241.log`. |
+| ZAYA JANGTQ2 | PASS short decode. 49.4 tok/s, TTFT 74 ms, `decodeNodes=8831`, `asType=1365`, coherent, no loop/leak; chat-quality and AsType cleanup remain. Log: `/tmp/vmlx_rebench_clean_zaya_jangtq2_20260507_105241.log`. |
+| Nemotron Omni Nano JANGTQ | PASS. 59.6 tok/s, TTFT 137 ms, `decodeNodes=1947`, `asType=46`, coherent, no loop/leak. Log: `/tmp/vmlx_rebench_clean_omni_jangtq_20260507_105241.log`. |
+| DSV4 Flash JANGTQ | Not rerun in the 10:52 clean speed set. Use the production gate row above until a later clean DSV4 rebench is recorded. |
+
+Current missing/incomplete hook rows:
+
+- `~/models/Mistral-Small-4-119B-JANG_2L` is an incomplete local download:
+  config/template/images plus incomplete cache blobs, no weights/index.
+- `~/.mlxstudio/models/Qwen3.5-VL-35B-A3B-JANG_4K-CRACK` is not present.
+- `~/.mlxstudio/models/Qwen3.5-VL-122B-A10B-JANG_4K-CRACK` is not present.
+- `~/.mlxstudio/models/MiniMax-M2.5-JANG_2L-CRACK` is not present; local
+  MiniMax M2.7 was tested instead.
+- Gemma4 E2B/E4B VL bundles were not found under the audited local model roots.
+- The hook's old `~/jang/models/Zyphra/ZAYA1-8B*` paths are stale/missing on
+  this host. The valid converted ZAYA bundles are under `~/models/Zyphra`.
+
+TurboQuant KV status from the current pass:
+
+| Model | Float KV | TQ33 | TQ44 | Status |
+|---|---:|---:|---:|---|
+| Qwen3.5-35B-A3B 4bit | 105.3 tok/s | 45.7 tok/s | 45.9 tok/s | Functionally coherent, not speed-valid. |
+| Gemma4 E2B 4bit | 184.1 tok/s | 144.0 tok/s | 141.9 tok/s | Functionally coherent, slower than the 5% target. |
+| Nemotron Omni Nano JANGTQ | 73.7 tok/s | 70.1 tok/s | 69.6 tok/s | TQ33 is within about 5%; TQ44 is slightly slower than target. |
+| Gemma4 E2B long prompt | 5,220 prompt tokens; float, TQ33, and TQ44 all completed coherently with no loop/leak. |
+
+Batching status from the current pass:
+
+- Gemma4 E2B `BENCH_BATCH=1`: B=1, compile, TurboQuant, and B=2 smoke passed.
+- Gemma4 E2B `BENCH_BATCH_CONCURRENT=1`: B=2 concurrent passed with isolated
+  prompt outputs.
+- Gemma4 E2B `BENCH_BATCH_B4=1`: B=4 concurrent stress passed; slot 0 matched
+  the B=1 solo reference exactly.
+
+Open production blockers found in this pass:
+
+- MiniMax M2.7 BatchEngine perf can GPU-timeout on Metal. The iterator path is
+  coherent, so this is a BatchEngine/model-profile/runtime issue, not missing
+  weights.
+- Qwen/Nemotron/MiniMax generic coherent bench can route useful recall into
+  `.reasoning` with empty visible `.chunk` when thinking is enabled by the
+  template/profile. Osaurus must use explicit reasoning-off profiles for normal
+  chat and handle reasoning-only/length finishes deliberately.
+- ZAYA JANGTQ2 is cache/runtime-ready with thinking off, but the generic
+  multi-turn chat-quality row is weak. Do not expose ZAYA reasoning-on/max,
+  paged-prefix hits, compiled decode, or TurboQuant KV defaults yet.
+- TurboQuant KV is not uniformly speed-valid. It works functionally on tested
+  normal KV models, but Qwen and Gemma are materially slower than float KV.
+
+Background-active rebench note: at user direction, additional rows were run
+while leaving a concurrent MiniMax evaluation and Osaurus runtime alone. These
+are useful only to prove functional output under contention; they are not clean
+token/s baselines.
+
+| Row | Background-active result |
+|---|---|
+| Qwen3.5-35B-A3B 4bit | Coherent, no loop/leak, `asType=90`, but only 12.5 tok/s with TTFT 4.7 s. |
+| Gemma4 E2B 4bit | Coherent, no loop/leak, `asType=89`, 133.7 tok/s, below the clean target because the host was busy. |
+| Gemma4 E4B 4bit | Coherent, no loop/leak, `asType=112`, 42.0 tok/s under contention. |
+| Gemma4 26B A4B 4bit | Coherent, no loop/leak, `asType=151`, 31.3 tok/s under contention. |
+| ZAYA JANGTQ2 | Coherent short decode, no loop/leak, `asType=1365`, 21.8 tok/s under contention. |
+| Ling JANGTQ2 | Coherent short decode, no loop/leak, `asType=3`, 12.4 tok/s under contention. |
+| Nemotron Omni Nano JANGTQ | Coherent short decode, no loop/leak, `asType=46`, 23.5 tok/s under contention. |
+
+Do not compare these background-active rows against Python or product speed
+targets. Use them only as proof that current runtime paths still complete
+without loops while another large model job is present.
+
 ## Focus Status - MiniMax, Ling, ZAYA
 
 These are the current rows to use when deciding what belongs in the first
@@ -378,8 +628,9 @@ This recheck was run in `~/vmlx-swift-lm` after the Ling
 Runtime change made in this pass: `CacheCoordinatorConfig.enableSSMReDerive`
 now gates the extra synchronous prompt-boundary SSM companion rederive/store
 pass in both `Evaluate` and `BatchEngine`. Direct prompt-end SSM seed handling
-remains enabled for correctness. Detached async SSM rederive is still not a
-production path.
+remains enabled for correctness. Completion `.info` now emits before the
+cache store/re-derive pass; detached async SSM rederive is still not a
+production path because the prior async helper raced Metal command encoders.
 
 ### 2026-05-06 Live Model Continuation
 
@@ -1059,7 +1310,7 @@ Tier behavior:
 |---|---|---|
 | Paged L1 | Shared-prefix reuse for ordinary KV models | Exact block prefix hits. Unsafe partial hits roll back for VL/SSM. Disabled for DSV4 hybrid-pool caches. |
 | Disk L2 | Session replay/restart and long-lived prefix cache | Uses TQDiskSerializer. DSV4 and SSM companion state serialize here. |
-| SSM companion | Mamba/Arrays hidden-state sidecar | Stores prompt-boundary and block-boundary states so KV hits do not lose SSM recurrence state. Controlled by `enableSSMReDerive`; detached async rederive is not used. |
+| SSM companion | Mamba/Arrays hidden-state sidecar | Stores prompt-boundary and block-boundary states so KV hits do not lose SSM recurrence state. Controlled by `enableSSMReDerive`; completion `.info` is yielded before store/re-derive, and detached async rederive is not used. |
 | TurboQuant KV | Optional compressed KV cache | Batch path supports `.turboQuant(keyBits:valueBits:)`; disk round-trip covered by stability and batch probes. |
 
 Cache semantics:

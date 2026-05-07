@@ -12,6 +12,9 @@ struct BatchZayaCCACacheIsolationTests {
 
     @Test("gatherCCA stacks slot-local state along batch dim")
     func gatherStacksSlots() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         let s1 = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
         s0.writeCCA(
@@ -34,6 +37,9 @@ struct BatchZayaCCACacheIsolationTests {
 
     @Test("B=2 update at independent offsets keeps slot histories independent")
     func b2UpdateIndependentOffsets() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         let s1 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         // Pre-fill different offsets via separate updates
@@ -63,6 +69,9 @@ struct BatchZayaCCACacheIsolationTests {
 
     @Test("Mask built before update matches padded K/V length for uneven offsets")
     func maskBeforeUpdateMatchesPaddedKeyLength() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         let s1 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         _ = s0.update(
@@ -88,6 +97,9 @@ struct BatchZayaCCACacheIsolationTests {
 
     @Test("scatterCCA after gather preserves per-slot identity for non-mutated slot")
     func scatterCCAPreservesNonMutatedSlot() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         let s1 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         s0.writeCCA(
@@ -113,6 +125,9 @@ struct BatchZayaCCACacheIsolationTests {
 
     @Test("Cross-slot conv state never leaks: write 0 to slot 1 leaves slot 0's state alone")
     func crossSlotIsolation() {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
         let s0 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         let s1 = ZayaCCACache(batchSize: 1, convChannels: 2, hiddenSize: 4)
         s0.writeCCA(

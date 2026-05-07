@@ -1,9 +1,12 @@
 # MLXDistributedTransport
 
-Phase 2 of the multi-host distributed inference rollout. Adds the
-TLS-backed pipeline-parallel transport that turns `Mode.pipelined` from a
-`notImplementedYet` stub in `MLXDistributedCore` into a working two-rank
-PP path over the network.
+TLS-backed pipeline transport for the multi-host distributed inference
+rollout. `Mode.pipelined` is explicit opt-in from `MLXDistributedCore` and
+currently supports a two-rank prompt/token path over the network.
+
+Replica fan-out is not implemented in this target. The core exposes
+`ReplicaTransport`; osaurus should back it with the existing chat-completion
+HTTP/SSE endpoint.
 
 This target depends on `MLXDistributedCore` plus the SwiftNIO stack
 (`NIOCore`, `NIOPosix`, `NIOSSL`, `NIOHTTP2`) and `swift-certificates` /
@@ -11,22 +14,24 @@ This target depends on `MLXDistributedCore` plus the SwiftNIO stack
 runtime that consumes activations / produces tokens is injected by the
 caller (osaurus or RunBench), same pattern as Phase 1A.
 
-## What's here so far (Phase 2 in progress)
+## What's here
 
 | File | Purpose |
 |------|---------|
 | `ActivationFrame.swift` | 24-byte big-endian envelope for PP wire frames |
 | `CertificateBundle.swift` | Self-signed cert generator (P256/ECDSA, swift-certificates) |
 | `TrustVerifier.swift` | Consults `TrustPolicy` (TOFU / allowlist / denyAll) |
+| `PipelineStageServer.swift` | TLS listener that accepts inbound stage handoffs |
+| `PipelineStageClient.swift` | TLS client for outbound stage calls |
+| `StageHandler.swift` | Consumer-supplied stage execution protocol |
+| `TLSPipelinedTransport.swift` | `PipelinedTransport` implementation used by `ClusterSession` |
 
-## What's coming (Phase 2 remaining)
+## What's coming
 
-- `PipelineStageServer` — TLS listener that accepts inbound stage handoffs.
-- `PipelineStageClient` — TLS client that opens / multiplexes outbound streams.
-- `PipelineRuntime` — wires `ClusterSession.Mode.pipelined` to the above.
-- `StageHandler` — protocol for the consumer-supplied stage execution unit.
-- Integration test: two `ClusterSession`s in the same process round-trip a
-  token stream over loopback TLS (gated on `VMLX_RUN_NIO_TESTS=1`).
+- Activation frames with shape, dtype, layer-range, and cache identity.
+- Multi-stage runtime beyond the current first remote stage.
+- Backpressure, heartbeat, timeout, and retry policy.
+- Cache-aware admission from the distributed planner.
 
 ## Wire-frame format
 

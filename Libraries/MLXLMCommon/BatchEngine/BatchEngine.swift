@@ -6,6 +6,52 @@ import MLX
 import MLXNN
 import os
 
+/// Errors thrown by mutable ``BatchEngine`` configuration APIs.
+public enum BatchEngineConfigurationError: Error, LocalizedError, Sendable {
+    case invalidMaxBatchSize(Int)
+    case engineShutdown
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidMaxBatchSize(let value):
+            return "BatchEngine maxBatchSize must be greater than zero, got \(value)"
+        case .engineShutdown:
+            return "BatchEngine is shut down and cannot be reconfigured"
+        }
+    }
+}
+
+private func cancelledBatchStream(
+    promptTokenCount: Int
+) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
+    let id = BatchRequestID()
+    let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
+    continuation.yield(.info(GenerateCompletionInfo(
+        promptTokenCount: promptTokenCount,
+        generationTokenCount: 0,
+        promptTime: 0,
+        generationTime: 0,
+        stopReason: .cancelled
+    )))
+    continuation.finish()
+    return (id, stream)
+}
+
+private func cancelledGenerationStream(
+    promptTokenCount: Int
+) -> AsyncStream<Generation> {
+    let (stream, continuation) = AsyncStream<Generation>.makeStream()
+    continuation.yield(.info(GenerateCompletionInfo(
+        promptTokenCount: promptTokenCount,
+        generationTokenCount: 0,
+        promptTime: 0,
+        generationTime: 0,
+        stopReason: .cancelled
+    )))
+    continuation.finish()
+    return stream
+}
+
 private final class BatchStreamTerminationState: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -99,7 +145,7 @@ public actor BatchEngine {
 
     /// Maximum number of sequences decoded simultaneously in one batch.
     /// Additional requests are queued until a slot opens.
-    public let maxBatchSize: Int
+    public private(set) var maxBatchSize: Int
 
     /// Number of iterations between GPU memory cache purges.
     /// Matches the 256-token interval used by ``TokenIterator``.
@@ -130,8 +176,20 @@ public actor BatchEngine {
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
+    /// Terminal lifecycle flag. Once shutdown begins, stale engine handles
+    /// reject future submissions instead of restarting GPU work.
+    public private(set) var isShutdown: Bool = false
+
     /// Total decode steps since last memory purge.
     private var stepsSinceMemoryPurge: Int = 0
+
+    /// Decode steps since the actor last yielded for control-plane work.
+    /// Keep B=1 hot-path yields sparse for throughput, but do not let a long
+    /// decode starve `cancel`, `shutdown`, or runtime configuration updates.
+    private var stepsSinceControlPlaneYield: Int = 0
+
+    /// Maximum B=1 decode steps before yielding back to the actor executor.
+    private let controlPlaneYieldInterval: Int = 8
 
     // MARK: - Initialization
 
@@ -151,6 +209,7 @@ public actor BatchEngine {
         memoryPurgeInterval: Int = 256,
         cacheCoordinator: CacheCoordinator? = nil
     ) {
+        precondition(maxBatchSize > 0, "BatchEngine maxBatchSize must be greater than zero")
         self.context = context
         self.maxBatchSize = maxBatchSize
         self.memoryPurgeInterval = memoryPurgeInterval
@@ -205,6 +264,38 @@ public actor BatchEngine {
 
     // MARK: - Public API
 
+    /// Change the active-slot admission limit for future scheduling ticks.
+    ///
+    /// If the limit is increased, queued requests are admitted immediately up
+    /// to the new capacity. If the limit is decreased below the current active
+    /// slot count, no active request is cancelled; the engine simply stops
+    /// admitting new work until active slots fall below the new limit.
+    ///
+    /// - Parameter newMaxBatchSize: New maximum number of active slots. Must be
+    ///   greater than zero.
+    public func updateMaxBatchSize(_ newMaxBatchSize: Int) throws {
+        guard newMaxBatchSize > 0 else {
+            throw BatchEngineConfigurationError.invalidMaxBatchSize(newMaxBatchSize)
+        }
+        guard !isShutdown else {
+            throw BatchEngineConfigurationError.engineShutdown
+        }
+        guard newMaxBatchSize != maxBatchSize else { return }
+
+        let old = maxBatchSize
+        maxBatchSize = newMaxBatchSize
+        Self.logger.info(
+            "Updated maxBatchSize from \(old, privacy: .public) to \(newMaxBatchSize, privacy: .public)"
+        )
+
+        if newMaxBatchSize > old {
+            admitPendingRequests()
+            if !activeSlots.isEmpty {
+                ensureLoopRunning()
+            }
+        }
+    }
+
     /// Submit a generation request, returning raw token events.
     ///
     /// This is the low-level API. For text output, use ``generate(input:parameters:)``
@@ -220,6 +311,19 @@ public actor BatchEngine {
         input: consuming sending LMInput,
         parameters: GenerateParameters
     ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
+        guard !isShutdown else {
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
+
+        do {
+            _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+        } catch {
+            Self.logger.error(
+                "Rejected acceleration request: \(error.localizedDescription, privacy: .public)"
+            )
+            return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
+        }
+
         context.jangPressRuntime.recordPromptTokenActivity(
             input.text.tokens.reshaped(-1).asArray(Int.self))
 
@@ -263,6 +367,19 @@ public actor BatchEngine {
         input: consuming sending LMInput,
         parameters: GenerateParameters
     ) -> AsyncStream<Generation> {
+        guard !isShutdown else {
+            return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+        }
+
+        do {
+            _ = try AccelerationRuntime.resolveTextDecode(parameters.accelerationMode)
+        } catch {
+            Self.logger.error(
+                "Rejected acceleration request: \(error.localizedDescription, privacy: .public)"
+            )
+            return cancelledGenerationStream(promptTokenCount: input.text.tokens.size)
+        }
+
         // Block-diffusion speculative decoding dispatch. When
         // parameters.draftStrategy is .dflash or .ddtree AND the
         // target model conforms to HiddenStateCaptureModel +
@@ -526,6 +643,9 @@ public actor BatchEngine {
     /// Pending requests receive a `.info` with `.cancelled` stop reason.
     /// Active slots are allowed to complete their current step before finishing.
     public func shutdown() {
+        guard !isShutdown else { return }
+        isShutdown = true
+
         loopTask?.cancel()
         loopTask = nil
 
@@ -557,6 +677,9 @@ public actor BatchEngine {
 
     /// Whether the engine is currently running (has active or pending work).
     public var isRunning: Bool { loopTask != nil }
+
+    /// Whether the engine still accepts new generation requests.
+    public var isAcceptingRequests: Bool { !isShutdown }
 
     // MARK: - Scheduling Loop
 
@@ -592,18 +715,19 @@ public actor BatchEngine {
                 stepsSinceMemoryPurge = 0
             }
 
-            // 5. Yield to allow submit() calls and stream consumers to
-            //    run. `Task.yield()` in the hot decode path costs
-            //    ~1-2ms per token on Apple M-series (a full scheduler
-            //    round-trip). At B == 1 steady state with no pending
-            //    work, the continuation.yield(.token) we already do
-            //    above is a non-blocking enqueue and the consumer Task
-            //    runs in parallel on the async executor — we don't
-            //    need the extra yield. Only yield when there's work
-            //    that could be starved (new admissions waiting or
-            //    multi-slot fan-out where the scheduler needs to
-            //    interleave with submit() on the actor).
-            if !waitQueue.isEmpty || activeSlots.count > 1 {
+            // 5. Yield to allow submit/cancel/shutdown/configuration calls
+            //    and stream consumers to run. Yielding every token on the B=1
+            //    hot path costs measurable throughput, but never yielding lets
+            //    a long decode monopolize the actor until max_tokens. Keep the
+            //    fairness yield sparse while yielding immediately for queued
+            //    admissions or multi-slot fan-out.
+            stepsSinceControlPlaneYield += 1
+            let shouldYieldForControlPlane =
+                stepsSinceControlPlaneYield >= controlPlaneYieldInterval
+            if shouldYieldForControlPlane {
+                stepsSinceControlPlaneYield = 0
+            }
+            if !waitQueue.isEmpty || activeSlots.count > 1 || shouldYieldForControlPlane {
                 await Task.yield()
             }
         }
@@ -1560,6 +1684,20 @@ public actor BatchEngine {
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
         let decodeTime = slot.decodeStartTime.map { now.timeIntervalSince($0) } ?? 0
+        let completionInfo = GenerateCompletionInfo(
+            promptTokenCount: slot.promptTokenCount,
+            generationTokenCount: slot.generatedTokenCount,
+            promptTime: prefillTime,
+            generationTime: decodeTime,
+            stopReason: reason
+        )
+
+        // Surface completion before the cache store. The store may include a
+        // synchronous hybrid-SSM prompt-boundary re-derive; running it before
+        // `.info` makes hosts look frozen at end-of-stream. Keep the work
+        // serialized here rather than detached because prior async re-derive
+        // paths raced Metal command encoders on shared model state.
+        slot.continuation.yield(.info(completionInfo))
 
         // Store prompt cache state for completed (non-cancelled) generations.
         //
@@ -1577,13 +1715,6 @@ public actor BatchEngine {
                 Self.logger.error(
                     "Slot \(slot.id.description, privacy: .public): skipped cache store because no prompt-boundary snapshot exists for hybrid-pool cache"
                 )
-                slot.continuation.yield(.info(GenerateCompletionInfo(
-                    promptTokenCount: slot.promptTokenCount,
-                    generationTokenCount: slot.generatedTokenCount,
-                    promptTime: prefillTime,
-                    generationTime: decodeTime,
-                    stopReason: reason
-                )))
                 slot.continuation.finish()
                 return
             }
@@ -1611,13 +1742,6 @@ public actor BatchEngine {
             )
         }
 
-        slot.continuation.yield(.info(GenerateCompletionInfo(
-            promptTokenCount: slot.promptTokenCount,
-            generationTokenCount: slot.generatedTokenCount,
-            promptTime: prefillTime,
-            generationTime: decodeTime,
-            stopReason: reason
-        )))
         slot.continuation.finish()
 
         // Long-context pressure relief: the global memoryPurgeInterval (256

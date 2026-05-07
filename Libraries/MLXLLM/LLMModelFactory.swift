@@ -1391,7 +1391,7 @@ public final class LLMModelFactory: ModelFactory {
         // to `"think_xml"`. `think_xml` starts with `startInReasoning: true`
         // to match Qwen's `<think>`-prefilled prompt tail — so for every
         // non-reasoning family (LFM2, LLaMA, Phi, StarCoder2, Cohere,
-        // OpenELM, InternLM2, GPT-OSS, NanoChat, …) every decoded chunk
+        // OpenELM, InternLM2, NanoChat, …) every decoded chunk
         // came out as `Generation.reasoning(_)` and osaurus rendered the
         // entire answer into the thinking block. Fixed by flipping to an
         // explicit allowlist of the model_types that ACTUALLY emit a

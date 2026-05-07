@@ -1,12 +1,14 @@
 import Foundation
 
-/// User-facing distributed inference session. Phase 1A implemented the
-/// single-node path; Phase 2 wires `Mode.pipelined` to a caller-supplied
-/// `PipelinedTransport`. `Mode.replica` (Phase 1B in osaurus) and
-/// `Mode.wired` (Phase 6 JACCL) still throw `notImplementedYet`.
+/// User-facing distributed inference session. The default path remains
+/// single-node. `Mode.pipelined` is explicit opt-in and only plans against
+/// peers that advertise a matching model plus a TLS pipeline endpoint.
+/// `Mode.replica` is request-level fan-out through an injected transport.
+/// `Mode.wired` still throws `notImplementedYet`.
 public struct ClusterSession: Sendable {
     private let discovery: any DiscoveryProvider
     private let localGenerator: any LocalGenerator
+    private let replicaTransport: (any ReplicaTransport)?
     private let pipelinedTransport: (any PipelinedTransport)?
     private let mode: Mode
     private let trust: TrustPolicy
@@ -15,6 +17,7 @@ public struct ClusterSession: Sendable {
     public init(
         discovery: any DiscoveryProvider,
         localGenerator: any LocalGenerator,
+        replicaTransport: (any ReplicaTransport)? = nil,
         pipelinedTransport: (any PipelinedTransport)? = nil,
         mode: Mode = .auto,
         trust: TrustPolicy = .tofu,
@@ -22,6 +25,7 @@ public struct ClusterSession: Sendable {
     ) async throws {
         self.discovery = discovery
         self.localGenerator = localGenerator
+        self.replicaTransport = replicaTransport
         self.pipelinedTransport = pipelinedTransport
         self.mode = mode
         self.trust = trust
@@ -32,11 +36,12 @@ public struct ClusterSession: Sendable {
     /// the full current peer set; consumers diff against their previous view.
     public var peers: AsyncStream<[Peer]> { discovery.peerStream() }
 
-    /// Decide how to run a model. Phase 1A: local for `.localOnly` and for
-    /// `.auto` (since no other transport exists yet). Phase 2: `.pipelined`
-    /// returns `.pipelinedOver(stagePeerIDs)` when a `PipelinedTransport`
-    /// is configured AND there is at least one peer; otherwise throws so
-    /// the caller can surface a "no eligible peers" error.
+    /// Decide how to run a model. `.localOnly` and `.auto` are intentionally
+    /// local until dynamic discovery, health, and replan policy are wired.
+    /// `.replica` selects one request-level peer. `.pipelined` currently
+    /// selects a single remote stage because
+    /// `TLSPipelinedTransport` is a two-rank prompt/token path, not a
+    /// full multi-stage activation runtime yet.
     public func plan(model: ModelHandle) async throws -> ParallelPlan {
         switch mode {
         case .localOnly, .auto:
@@ -46,15 +51,28 @@ public struct ClusterSession: Sendable {
             guard pipelinedTransport != nil else {
                 throw DistributionError.notImplementedYet(.pipelined)
             }
-            guard !staticPeers.isEmpty else {
+            guard let stage = staticPeers.first(where: {
+                $0.isEligibleForPipelined(model: model)
+            }) else {
                 throw DistributionError.noEligiblePeers
             }
             return ParallelPlan(
-                placement: .pipelinedOver(staticPeers.map(\.id)),
+                placement: .pipelinedOver([stage.id]),
                 model: model)
 
         case .replica:
-            throw DistributionError.notImplementedYet(.replica)
+            guard replicaTransport != nil else {
+                throw DistributionError.notImplementedYet(.replica)
+            }
+            guard let peer = staticPeers.first(where: {
+                $0.isEligibleForReplica(model: model)
+            }) else {
+                throw DistributionError.noEligiblePeers
+            }
+            return ParallelPlan(
+                placement: .replicaOnPeer(peer.id),
+                model: model)
+
         case .wired:
             throw DistributionError.notImplementedYet(.wired)
         }
@@ -76,14 +94,29 @@ public struct ClusterSession: Sendable {
                 return Self.endStream(.error(
                     "pipelinedOver placement requires a PipelinedTransport"))
             }
-            let stages = staticPeers.filter { ids.contains($0.id) }
+            var peersByID: [UUID: Peer] = [:]
+            for peer in staticPeers where peersByID[peer.id] == nil {
+                peersByID[peer.id] = peer
+            }
+            let stages = ids.compactMap { peersByID[$0] }
             guard stages.count == ids.count else {
                 return Self.endStream(.error(
                     "plan referenced peers not in current peer set"))
             }
             return transport.generate(request, stages: stages)
 
-        case .replicaOnPeer, .wiredOver:
+        case .replicaOnPeer(let id):
+            guard let transport = replicaTransport else {
+                return Self.endStream(.error(
+                    "replicaOnPeer placement requires a ReplicaTransport"))
+            }
+            guard let peer = staticPeers.first(where: { $0.id == id }) else {
+                return Self.endStream(.error(
+                    "plan referenced peer not in current peer set"))
+            }
+            return transport.generate(request, peer: peer)
+
+        case .wiredOver:
             return Self.endStream(.error(
                 "remote placement not implemented in this engine version"))
         }

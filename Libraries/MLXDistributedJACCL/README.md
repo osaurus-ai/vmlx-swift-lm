@@ -3,7 +3,7 @@
 Swift binding to MLX's JACCL distributed backend (RDMA over Thunderbolt 5
 on Apple Silicon, macOS 26.3+).
 
-## Phase 4 status (2026-05-02)
+## Phase 4 status (2026-05-07)
 
 **`JACCL.isAvailable()` returns true on macOS 26.3.2 / M5 Max.** Smoke
 tests pass. The full upstream MLX C++ JACCL backend compiles cleanly
@@ -14,12 +14,18 @@ This target ships only the capability probe in Phase 4. The real
 collective bindings (`Group`, `allSum`, `allGather`, `send`, `recv`,
 `sumScatter`) land in **Phase 5**, on top of this foundation.
 
-## Required upstream change in `osaurus-ai/mlx-swift`
+## Current bridge
 
-`MLXDistributedJACCL` works in this repo today because we patch the
-mlx-swift checkout's `Package.swift` locally. To make it durable across
-`swift package resolve` cycles, the following diff needs to land in
-the `osaurus-ai/mlx-swift` fork (the package vmlx-swift-lm depends on):
+`MLXDistributedJACCL` builds in this repo through
+`CmlxDistributedShim`, which vendors the small mlx-c distributed source files
+that the current `osaurus-ai/mlx-swift` package does not expose as a public
+SwiftPM product. That keeps this repo buildable without patching files inside
+`.build/checkouts`.
+
+## Future upstream cleanup in `osaurus-ai/mlx-swift`
+
+The durable cleanup is to build the real MLX distributed sources directly from
+the fork and expose `Cmlx` as a public product. The desired diff shape is:
 
 ```diff
         // example code + mlx-c distributed
@@ -59,8 +65,8 @@ shims:
     ],
 ```
 
-After both changes land, this Swift binding can `import Cmlx` directly
-and drop the `@_silgen_name` declarations in `JACCL.swift`.
+After both changes land, this Swift binding can `import Cmlx` directly, drop
+the shim target, and remove the `@_silgen_name` declarations in `JACCL.swift`.
 
 ## Usage
 
@@ -84,6 +90,5 @@ fails (older macOS, Linux without RDMA stack, sandboxed CI).
 
 ## Hardware checked
 
-- M5 Max MacBook Pro, macOS 26.3.2 (Darwin 25.3.0): ✅
-- M4 Max MacBook Pro (`oldmbp`), macOS 26.3: not yet smoke-tested.
-- Linux/InfiniBand: out of scope (Apple Silicon target).
+- Local M5 Max MacBook Pro: availability smoke has passed in prior runs.
+- Linux/InfiniBand: out of scope for this Apple Silicon target.

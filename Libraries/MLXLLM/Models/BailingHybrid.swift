@@ -372,17 +372,112 @@ func gleLinearAttentionSlopes(
     return MLXArray(neg)
 }
 
-/// Spec §4: per-token recurrent gated linear attention.
+private func makeBailingGLAKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / H;
+            auto h_idx = n % H;
+            constexpr int n_per_t = D / 32;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            auto q_base = q + ((b_idx * H + h_idx) * T) * D;
+            auto k_base = k + ((b_idx * H + h_idx) * T) * D;
+            auto v_base = v + ((b_idx * H + h_idx) * T) * D;
+            auto y_base = y + ((b_idx * H + h_idx) * T) * D + dv_idx;
+
+            auto state_base = state_in + ((b_idx * H + h_idx) * D * D);
+            auto state_out_base = state_out + ((b_idx * H + h_idx) * D * D);
+            float decay = exp(static_cast<float>(g[h_idx]));
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(state_base[s_idx * D + dv_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              auto q_t = q_base + t * D;
+              auto k_t = k_base + t * D;
+              auto v_t = v_base + t * D;
+              float v_col = static_cast<float>(v_t[dv_idx]);
+              float out = 0.0f;
+
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[i] = state[i] * decay
+                  + static_cast<float>(k_t[s_idx]) * v_col;
+                out += static_cast<float>(q_t[s_idx]) * state[i];
+              }
+              out = simd_sum(out);
+              if (thread_index_in_simdgroup == 0) {
+                y_base[t * D] = static_cast<float>(out);
+              }
+            }
+
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state_out_base[s_idx * D + dv_idx] = static_cast<float>(state[i]);
+            }
+        """
+
+    return MLXFast.metalKernel(
+        name: "bailing_recurrent_gla",
+        inputNames: ["q", "k", "v", "g", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source)
+}
+
+private final class BailingGLAKernelManager: @unchecked Sendable {
+    static let shared = BailingGLAKernelManager()
+    let kernel: MLXFast.MLXFastKernel?
+
+    private init() {
+        kernel = makeBailingGLAKernel()
+    }
+}
+
+private func recurrentGLAKernel(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    g: MLXArray, scale: Float,
+    h: MLXArray?
+) -> (MLXArray, MLXArray)? {
+    let B = q.dim(0)
+    let H = q.dim(1)
+    let T = q.dim(2)
+    let D = q.dim(3)
+
+    guard D % 32 == 0, let kernel = BailingGLAKernelManager.shared.kernel else {
+        return nil
+    }
+
+    let qF = q.asType(.float32) * scale
+    let kF = k.asType(.float32)
+    let vF = v.asType(.float32)
+    let gF = g.asType(.float32)
+    let state = h?.asType(.float32)
+        ?? MLXArray.zeros([B, H, D, D], dtype: .float32)
+
+    let outputs = kernel(
+        [qF, kF, vF, gF, state, MLXArray(T)],
+        template: [
+            ("D", D),
+            ("H", H),
+        ],
+        grid: (32, D, B * H),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, H, T, D], [B, H, D, D]],
+        outputDTypes: [.float32, .float32])
+
+    return (outputs[0], outputs[1])
+}
+
+/// Reference implementation for Bailing/Ling recurrent GLA.
 ///
-/// State `S` of shape `[B, H, K, K]`. For each timestep `t`:
-///   `S = exp(g) * S + k_t.T @ v_t`
-///   `y_t = q_t @ S * scale`
-///
-/// This is the simple O(L) recurrence — fine for decode (1 step at a
-/// time). Prefill prefers a chunked variant (~200 LOC of CUDA in the
-/// flash-linear-attention reference); for the first port we use the
-/// straight loop.
-func recurrentGLA(
+/// Kept separate from ``recurrentGLA`` so tests can compare the Metal kernel
+/// against the direct MLX graph for small deterministic inputs.
+func recurrentGLAReference(
     q: MLXArray, k: MLXArray, v: MLXArray,
     g: MLXArray, scale: Float,
     h: MLXArray?
@@ -444,6 +539,28 @@ func recurrentGLA(
     let finalState = state!
     MLX.eval(out, finalState)
     return (out, finalState)
+}
+
+/// Spec §4: per-token recurrent gated linear attention.
+///
+/// State `S` of shape `[B, H, K, K]`. For each timestep `t`:
+///   `S = exp(g) * S + k_t.T @ v_t`
+///   `y_t = q_t @ S * scale`
+///
+/// Prefill uses a fused Metal kernel to keep the whole recurrent loop inside
+/// one command instead of dispatching `L * layers` small MLX graphs. The direct
+/// MLX implementation remains the reference path for unusual head dimensions.
+func recurrentGLA(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    g: MLXArray, scale: Float,
+    h: MLXArray?
+) -> (MLXArray, MLXArray) {
+    if let accelerated = recurrentGLAKernel(
+        q: q, k: k, v: v, g: g, scale: scale, h: h)
+    {
+        return accelerated
+    }
+    return recurrentGLAReference(q: q, k: k, v: v, g: g, scale: scale, h: h)
 }
 
 class BailingLinearAttention: Module {

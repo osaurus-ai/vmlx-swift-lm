@@ -84,3 +84,14 @@ public protocol PipelinedTransport: Sendable {
         stages: [Peer]
     ) -> AsyncStream<Token>
 }
+
+/// Transport hook for `Mode.replica`. Osaurus will back this with its
+/// existing OpenAI-compatible TLS chat endpoint; standalone consumers can
+/// inject their own HTTP/SSE bridge. Kept separate from pipelined transport
+/// because replica fan-out is request-level, not activation-level.
+public protocol ReplicaTransport: Sendable {
+    func generate(
+        _ request: GenerateRequest,
+        peer: Peer
+    ) -> AsyncStream<Token>
+}

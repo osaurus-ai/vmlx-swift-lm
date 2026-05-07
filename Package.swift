@@ -46,6 +46,9 @@ let package = Package(
         .library(
             name: "MLXDistributedTP",
             targets: ["MLXDistributedTP"]),
+        .executable(
+            name: "ANEProbe",
+            targets: ["ANEProbe"]),
     ],
     dependencies: [
         // 2026-05-04 reverted to 0a56f90 (was a21d2af). The advance to
@@ -282,6 +285,11 @@ let package = Package(
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "Tools/TPRankWorker"
+        ),
+        .executableTarget(
+            name: "ANEProbe",
+            dependencies: ["MLXLMCommon"],
+            path: "Tools/ANEProbe"
         ),
         .executableTarget(
             name: "RunBench",

@@ -210,7 +210,7 @@ struct InterleavedReasoningLeakTests {
         #expect(reasoningStampFromModelType("ministral3") == "none")
         #expect(reasoningStampFromModelType("mistral4") == "none")
         #expect(reasoningStampFromModelType("lfm2") == "none")
-        #expect(reasoningStampFromModelType("gpt_oss") == "none")
+        #expect(reasoningStampFromModelType("gpt_oss") == "harmony")
         #expect(reasoningStampFromModelType("phi") == "none")
 
         // Harmony channel (Gemma-4)
