@@ -20,7 +20,7 @@ Existing upstream consumers don't need to change anything — every upstream API
 
 ## Performance
 
-Speed + model attention-architecture research by **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team**. Numbers from M4 Max 128 GB with all other inference processes killed before each run.
+Speed + model attention-architecture research by **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team**. The Swift-runtime-for-pure-speed thesis that motivated this fork is **[t@osaurus.ai](mailto:t@osaurus.ai)** (tpae)'s. Numbers from M4 Max 128 GB with all other inference processes killed before each run.
 
 ### Single-stream decode (sustained tok/s)
 
@@ -285,7 +285,7 @@ if await container.isVLM {
 
 ## Why this fork is faster on MoE / MLA / hybrid models
 
-Root-cause investigation + per-architecture fixes by **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team**.
+The "Swift native runtime as the pure-speed lane for MLX inference" thesis is **[t@osaurus.ai](mailto:t@osaurus.ai)** (tpae)'s — pursuing the Swift library specifically for runtime speed is what justified investing in this fork in the first place. Root-cause investigation + per-architecture fixes by **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team**.
 
 Both Python `mlx-lm` and Swift `mlx-swift-lm` use the same C++ / Metal backend (`libmlx`, same shaders, same GPU). The speed gap is entirely about how many kernel dispatches happen per token — and Swift's graph was 2× larger than Python's because Python's `pybind11` bindings infer scalar dtypes from context while Swift defaults `MLXArray(0.5)` to `float32`, which then forces an `AsType` cast when multiplied against bfloat16 tensors.
 
@@ -401,6 +401,7 @@ Based on [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm) by Apple's M
 
 ## Acknowledgments
 
+- **[t@osaurus.ai](mailto:t@osaurus.ai)** (tpae) — originated the "Swift library as the pure-speed runtime lane for MLX inference" thesis that justified investing in this fork; the dispatch-count work below is the answer to that question
 - **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team** — speed + model attention-architecture research, MoE / MLA / hybrid SSM dispatch reduction, JANG mixed-precision integration, BatchEngine / multi-tier cache / TurboQuant / SpecDec, and the per-family native runtime work for Gemma 4, Mistral Small 4, Qwen 3.5 / 3.6, ZAYA, NemotronH, Hy3
 - [Apple ML Explore](https://github.com/ml-explore) — MLX and mlx-swift-lm
 - [JANG](https://jangq.ai) — mixed-precision quantization format
