@@ -1,0 +1,38 @@
+[STDERR] Bench main() started
+
+=== BatchEngine TurboQuant B=2 (iter 38) ===
+Loading with real HuggingFace tokenizer...
+Load: 8.27s
+Model: MiniMaxJANGTQModel
+
+[Reference] slot 0 plain KV, solo (B=1)
+  reference plain solo: 64 tokens, first 8: [758, 3100, 20886, 58, 494, 2696, 5231, 11667]
+    BEGIN_FULL_TEXT[TQ reference plain solo]
+The user asks: "List five distinct countries in Europe, one per line." This is a straightforward request for a list of five European countries. No policy violation. The user wants a list. The assistant can comply. The user is not asking for anything disallowed. The content is not disallowed. The assistant can provide a
+    END_FULL_TEXT[TQ reference plain solo]
+
+[Pass A] slot 0 = plain KV, slot 1 = TurboQuant(4,4)
+  TQ B=2 pass A: active-slot overlap confirmed (active=2, pending=0)
+  Slot 0 (plain) : 64 tokens, first 8: [758, 3100, 20886, 58, 494, 2696, 5231, 11667]
+    BEGIN_FULL_TEXT[TQ pass A slot 0 plain]
+The user asks: "List five distinct countries in Europe, one per line." This is a straightforward request for a list of five European countries. No policy violation. The user wants a list. The assistant can comply. The user didn't ask for any additional context. The assistant can just list five distinct European countries, one
+    END_FULL_TEXT[TQ pass A slot 0 plain]
+  Slot 1 (TQ(4,4)) : 64 tokens, first 8: [758, 3100, 20886, 58, 494, 51589, 640, 5231]
+    BEGIN_FULL_TEXT[TQ pass A slot 1 TQ(4,4)]
+The user asks: "Give me five adjectives that describe a summer morning." This is a request for adjectives. The user is not asking for any disallowed content. It's a simple request. The model can comply. The user wants five adjectives that describe a summer morning. The model can provide a list of adjectives that are appropriate
+    END_FULL_TEXT[TQ pass A slot 1 TQ(4,4)]
+
+[Pass B] slot 0 = TurboQuant(4,4), slot 1 = TurboQuant(4,4)
+  TQ B=2 pass B: active-slot overlap confirmed (active=2, pending=0)
+  Slot 0 (TQ) : 64 tokens, first 8: [758, 3100, 20886, 58, 494, 2696, 5231, 11667]
+    BEGIN_FULL_TEXT[TQ pass B slot 0]
+The user asks: "List five distinct countries in Europe, one per line." This is a straightforward request for a list of five European countries. No policy violation. The user wants a list. The assistant can comply. The user didn't ask for any additional context. The answer: "France, Germany, Italy, Spain
+    END_FULL_TEXT[TQ pass B slot 0]
+  Slot 1 (TQ) : 64 tokens, first 8: [758, 3100, 20886, 58, 494, 51589, 640, 5231]
+    BEGIN_FULL_TEXT[TQ pass B slot 1]
+The user asks: "Give me five adjectives that describe a summer morning." This is a request for adjectives. The user is not asking for any disallowed content. It's a simple request. The model can comply. The user wants five adjectives that describe a summer morning. The model can provide a list of adjectives that are appropriate
+    END_FULL_TEXT[TQ pass B slot 1]
+
+  Slot 0 plain with TQ neighbour vs plain-solo reference: DIVERGED ✗ (64 vs 64 tokens)
+[TQ B=2] FAIL: slot 0 plain output drifted from the solo reference when slot 1 ran TurboQuant concurrently. Cross-slot corruption.
+  first divergence index = 46

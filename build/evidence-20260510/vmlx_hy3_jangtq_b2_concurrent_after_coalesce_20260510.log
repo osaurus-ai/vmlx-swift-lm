@@ -1,0 +1,22 @@
+[STDERR] Bench main() started
+
+=== BatchEngine B=2 concurrent (iter 33) ===
+Loading with real HuggingFace tokenizer...
+Load: 29.49s
+Model: Hy3Model
+  ConcurrentBatch B=2: active-slot overlap confirmed (active=2, pending=0)
+  Slot 0 prompt: "What is the capital of France?"
+    tokens: 8, first 12: [628, 6801, 279, 9391, 316, 1970, 66410, 53342]
+    BEGIN_FULL_TEXT[ConcurrentBatch slot 0]
+The capital of France is **Paris**.
+    END_FULL_TEXT[ConcurrentBatch slot 0]
+  Slot 1 prompt: "List two prime numbers greater than 10."
+    tokens: 16, first 12: [15942, 5746, 2931, 4925, 1134, 206, 605, 431, 25, 286, 16, 13]
+    BEGIN_FULL_TEXT[ConcurrentBatch slot 1]
+Two prime numbers greater than 10 are:
+
+1. **11**
+2
+    END_FULL_TEXT[ConcurrentBatch slot 1]
+  total wall time: 71.68s (both slots)
+=== BatchEngine B=2 concurrent: passed ===

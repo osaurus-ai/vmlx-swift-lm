@@ -1,0 +1,10 @@
+[STDERR] Bench main() started
+[NemotronH.sanitize] stacked 92 JANGTQ tensor groups (per-expert tq_packed/tq_norms → switch_mlp.{fc1,fc2}.{tq_*})
+[Load] JANG shape walk produced 118 per-layer quant override(s) over default (bits=2, gs=64)
+  PERF_RUN label=run0 ttft_ms=87 genTokens=96 genSec=0.819 tokps=117.3 stop=length unclosedReasoning=NO textChars=512 reasoningChars=0 toolCalls=0 loop=NO leaks=none
+    TEXT_PREVIEW "\nOcean waves are dynamic, three-dimensional phenomena resulting from the transfer of energy from the atmosphere to the water surface, governed by complex fluid dynamics and influenced by a range of environmental parameters. These waves exh..."
+  PERF_RUN label=run1 ttft_ms=86 genTokens=96 genSec=0.802 tokps=119.8 stop=length unclosedReasoning=NO textChars=512 reasoningChars=0 toolCalls=0 loop=NO leaks=none
+    TEXT_PREVIEW "\nOcean waves are dynamic, three-dimensional phenomena resulting from the transfer of energy from the atmosphere to the water surface, governed by complex fluid dynamics and influenced by a range of environmental parameters. These waves exh..."
+  PERF_RUN label=run2 ttft_ms=92 genTokens=96 genSec=0.862 tokps=111.4 stop=length unclosedReasoning=NO textChars=512 reasoningChars=0 toolCalls=0 loop=NO leaks=none
+    TEXT_PREVIEW "\nOcean waves are dynamic, three-dimensional phenomena resulting from the transfer of energy from the atmosphere to the water surface, governed by complex fluid dynamics and influenced by a range of environmental parameters. These waves exh..."
+PERF model=Nemotron-Omni-Nano-JANGTQ-CRACK variant=proving path=batch kvMode=none jangpress=off mmap=on commit=b9da180 loadSec=1.74 promptTokens=30 graphNodes=na asType=na genTokens=96 genSec=0.862 tokps_median=117.3 tokps_best=119.8 runs=117.3,119.8,111.4 stop=length unclosedReasoning=NO loop=NO leaks=none

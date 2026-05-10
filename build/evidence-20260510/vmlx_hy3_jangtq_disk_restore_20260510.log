@@ -1,0 +1,18 @@
+[STDERR] Bench main() started
+
+=== BatchEngine disk-restore verification (iter 35) ===
+Loading with real HuggingFace tokenizer...
+Load: 28.06s
+Model: Hy3Model
+  Session 1 (cold, wrote disk): prompt=140, promptTime=72.348s, genTokens=5, wall=73.55s
+    BEGIN_FULL_TEXT[DiskRestore session 1 cold]
+The sky is blue.
+    END_FULL_TEXT[DiskRestore session 1 cold]
+  Disk dir contents: ["cache_index.db", "cache_index.db-shm", "cache_index.db-wal", "cf211e275a6587cce2536b7dbe164133.safetensors", "ssm_companion"]
+  Coord B probe: HIT (disk, matched=140/140, diskArrays=yes)
+  Session 2 (warm from disk): prompt=140, promptTime=0.099s, genTokens=5, wall=0.56s
+    BEGIN_FULL_TEXT[DiskRestore session 2 warm]
+The sky is blue.
+    END_FULL_TEXT[DiskRestore session 2 warm]
+  ratio (session2/session1) = 0.00 (informational only)
+=== BatchEngine disk-restore: passed (disk hit fired, both sessions completed) ===

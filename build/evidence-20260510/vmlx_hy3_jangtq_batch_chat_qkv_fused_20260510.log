@@ -1,0 +1,30 @@
+[STDERR] Bench main() started
+
+=== BatchEngine multi-turn chat (iter 26, simplified iter 27) ===
+Loading with real HuggingFace tokenizer...
+Load: 27.79s
+Model: Hy3Model
+
+[compile OFF] BatchEngine 3-turn chat
+  Turn 1 [uncomp]:
+    TTFT 59446ms, total 60.20s
+    "That's a nice color choice! Blue is calming and popular."
+  Turn 2 [uncomp]:
+    TTFT 878ms, total 1.23s
+    "Your favorite color is blue."
+  Turn 3 [uncomp]:
+    TTFT 1192ms, total 1.48s
+    "Blue is a cool color."
+
+[compile ON] BatchEngine 3-turn chat
+  Turn 1 [compile]:
+    TTFT 674ms, total 1.34s
+    "That's a nice color choice! Blue is calming and popular."
+  Turn 2 [compile]:
+    TTFT 819ms, total 1.16s
+    "Your favorite color is blue."
+  Turn 3 [compile]:
+    TTFT 1216ms, total 1.49s
+    "Blue is a cool color."
+
+=== BatchEngine multi-turn done ===

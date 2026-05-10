@@ -1,0 +1,20 @@
+[STDERR] Bench main() started
+
+=== BatchEngine cache-hit verification (iter 34) ===
+Loading with real HuggingFace tokenizer...
+Load: 27.76s
+Model: Hy3Model
+  Turn 1 (cold cache) : prompt=140 tokens, promptTime=66.057s, genTokens=5, wall=66.85s
+    BEGIN_FULL_TEXT[CacheHit Turn 1 (cold cache)]
+The sky is blue.
+    END_FULL_TEXT[CacheHit Turn 1 (cold cache)]
+  turn1.count=140, turn2.count=163, turn2 starts with turn1? yes
+  Coordinator probe: HIT (paged tier, matched=128/163, remaining=35)
+  Turn 2 (warm cache) : prompt=163 tokens, promptTime=0.470s, genTokens=8, wall=1.03s
+    BEGIN_FULL_TEXT[CacheHit Turn 2 (warm cache)]
+?
+
+The sky is blue.
+    END_FULL_TEXT[CacheHit Turn 2 (warm cache)]
+  ratio (turn2/turn1) = 0.01
+=== BatchEngine cache-hit: passed ===

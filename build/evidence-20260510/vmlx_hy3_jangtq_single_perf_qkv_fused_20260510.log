@@ -1,0 +1,5 @@
+[STDERR] Bench main() started
+GRAPH_STATS decodeNodes=6684 asType=1258
+  PERF_RUN label=run0 ttft_ms=663 genTokens=64 genSec=4.293 tokps=14.9 stop=length unclosedReasoning=NO textChars=348 reasoningChars=0 toolCalls=0 loop=NO leaks=none
+    TEXT_PREVIEW "Ocean waves are generated when wind transfers kinetic energy to the water's surface, creating oscillating swells that travel across the sea. As a wave approaches the shore, its orbital motion interacts with the shallow seafloor, causing the..."
+PERF model=Hy3-preview-JANGTQ variant=hy3-jangtq-current-qkv-fused path=batch kvMode=none jangpress=off mmap=on commit=b9da180 loadSec=27.39 promptTokens=26 graphNodes=6684 asType=1258 genTokens=64 genSec=4.293 tokps_median=14.9 tokps_best=14.9 runs=14.9 stop=length unclosedReasoning=NO loop=NO leaks=none
