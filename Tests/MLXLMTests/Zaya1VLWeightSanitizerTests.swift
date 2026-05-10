@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 @testable import MLXVLM
 import Testing
 
@@ -46,8 +47,10 @@ struct Zaya1VLWeightSanitizerTests {
             encoding: .utf8)
 
         #expect(source.contains("public enum Zaya1VLWeightSanitizer"))
+        #expect(source.contains("language_model.model."))
+        #expect(source.contains("language_model.lm_head."))
         #expect(source.contains("model.layers.\\(layer).zaya_block.experts.switch_mlp."))
-        #expect(source.contains("model.layers.\\(layer).mlp.zaya_block.experts.switch_mlp."))
+        #expect(source.contains("language_model.model.layers.\\(layer).mlp.zaya_block.experts.switch_mlp."))
         #expect(source.contains("key.hasSuffix(\".tq_bits\")"))
         #expect(source.contains("value.movedAxis(source: 2, destination: 1)"))
         #expect(source.contains("compressRouterMLPSequentialIndices"))
@@ -75,6 +78,24 @@ struct Zaya1VLWeightSanitizerTests {
 
             #expect(keys.contains(
                 "model.layers.0.zaya_block.experts.switch_mlp.gate_proj.tq_packed"))
+            let config = try JSONDecoder.json5().decode(
+                Zaya1VLConfiguration.self,
+                from: Data(contentsOf: URL(fileURLWithPath: Self.bundlePath(bundle))
+                    .appendingPathComponent("config.json")))
+            let sanitized = Zaya1VLWeightSanitizer.sanitize(
+                weights: [
+                    "model.layers.0.zaya_block.experts.switch_mlp.gate_proj.tq_packed":
+                        MLXArray.zeros([1]),
+                    "model.layers.0.mlp.zaya_block.router.router_mlp.4.weight":
+                        MLXArray.zeros([17, 256]),
+                    "lm_head.weight": MLXArray.zeros([1]),
+                ],
+                configuration: config)
+            #expect(sanitized[
+                "language_model.model.layers.0.mlp.zaya_block.experts.switch_mlp.gate_proj.tq_packed"
+            ] != nil)
+            #expect(sanitized["language_model.model.layers.0.mlp.zaya_block.router.router_mlp.2.weight"] != nil)
+            #expect(sanitized["language_model.lm_head.weight"] == nil)
             #expect(!keys.contains(
                 "model.layers.0.mlp.zaya_block.experts.switch_mlp.gate_proj.tq_packed"))
             #expect(keys.contains("model.layers.0.attn.self_attn.qkv.conv_qk.0.weight"))
@@ -99,6 +120,22 @@ struct Zaya1VLWeightSanitizerTests {
 
         #expect(keys.contains(
             "model.layers.0.zaya_block.experts.switch_mlp.gate_proj.weight"))
+        let config = try JSONDecoder.json5().decode(
+            Zaya1VLConfiguration.self,
+            from: Data(contentsOf: URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-MXFP4"))
+                .appendingPathComponent("config.json")))
+        let sanitized = Zaya1VLWeightSanitizer.sanitize(
+            weights: [
+                "model.layers.0.zaya_block.experts.switch_mlp.gate_proj.weight":
+                    MLXArray.zeros([1]),
+                "model.layers.0.mlp.zaya_block.router.router_mlp.4.weight":
+                    MLXArray.zeros([17, 256]),
+            ],
+            configuration: config)
+        #expect(sanitized[
+            "language_model.model.layers.0.mlp.zaya_block.experts.switch_mlp.gate_proj.weight"
+        ] != nil)
+        #expect(sanitized["language_model.model.layers.0.mlp.zaya_block.router.router_mlp.2.weight"] != nil)
         #expect(!keys.contains(
             "model.layers.0.mlp.zaya_block.experts.switch_mlp.gate_proj.weight"))
         #expect(keys.contains("model.layers.0.mlp.zaya_block.router.router_mlp.4.weight"))

@@ -901,7 +901,9 @@ public struct TokenIterator: TokenIteratorProtocol {
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(diskArrays, into: self.cache)
                     if diskRestored > 0 {
-                        if let ssm = ssmStates {
+                        if let ssm = ssmStates,
+                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                        {
                             restoreSSMStates(ssm, into: self.cache)
                         }
                         restored = true
@@ -2110,7 +2112,11 @@ public func generateTask(
         nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
         nonisolated(unsafe) let modelCapture = model
         return {
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(promptCacheCapture)
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                coordinator.config.enableSSMReDerive &&
+                !requiresDiskBackedRestore
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: modelCapture,
@@ -2328,7 +2334,11 @@ public func generateTokenTask(
         nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
         nonisolated(unsafe) let modelCapture = model
         return {
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(promptCacheCapture)
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                coordinator.config.enableSSMReDerive &&
+                !requiresDiskBackedRestore
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: modelCapture,

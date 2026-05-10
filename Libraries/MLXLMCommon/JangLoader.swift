@@ -679,6 +679,85 @@ public struct JangLoader: Sendable {
         return modelDirectory
     }
 
+    /// Some VLM bundles carry the production multimodal chat template in a
+    /// sibling `chat_template.json` file while `tokenizer_config.json` contains
+    /// a text-only fallback template. The HuggingFace tokenizer loader only
+    /// reads `tokenizer_config.json`, so those bundles silently lose image
+    /// placeholders unless we materialize a tokenizer shim whose
+    /// `chat_template` field points at the sidecar template.
+    ///
+    /// This is intentionally data-driven, not family-name driven:
+    ///
+    /// - `chat_template.json` must exist and contain a string `chat_template`.
+    /// - The sidecar template must contain a vision placeholder marker.
+    /// - The current tokenizer config must not already contain a vision
+    ///   placeholder marker.
+    ///
+    /// If any condition is not met, returns `directory` unchanged.
+    public static func resolveChatTemplateSidecarSubstitution(
+        for directory: URL,
+        fileManager: FileManager = .default
+    ) -> URL {
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        let sidecarURL = directory.appendingPathComponent("chat_template.json")
+        guard fileManager.fileExists(atPath: configURL.path),
+              fileManager.fileExists(atPath: sidecarURL.path),
+              let configData = try? Data(contentsOf: configURL),
+              var configJSON = try? JSONSerialization.jsonObject(with: configData)
+                as? [String: Any],
+              let sidecarData = try? Data(contentsOf: sidecarURL),
+              let sidecarJSON = try? JSONSerialization.jsonObject(with: sidecarData)
+                as? [String: Any],
+              let sidecarTemplate = sidecarJSON["chat_template"] as? String
+        else {
+            return directory
+        }
+
+        guard isVisionChatTemplate(sidecarTemplate) else {
+            return directory
+        }
+        if let currentTemplate = configJSON["chat_template"] as? String,
+           isVisionChatTemplate(currentTemplate)
+        {
+            return directory
+        }
+
+        configJSON["chat_template"] = sidecarTemplate
+
+        let shimDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "vmlx-chat-template-shim-\(UUID().uuidString)")
+        do {
+            try fileManager.createDirectory(
+                at: shimDir, withIntermediateDirectories: true)
+            let rewritten = try JSONSerialization.data(
+                withJSONObject: configJSON, options: [.prettyPrinted, .sortedKeys])
+            try rewritten.write(to: shimDir.appendingPathComponent("tokenizer_config.json"))
+
+            let entries = (try? fileManager.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)) ?? []
+            for entry in entries where entry.lastPathComponent != "tokenizer_config.json" {
+                let dest = shimDir.appendingPathComponent(entry.lastPathComponent)
+                let real = (try? fileManager.destinationOfSymbolicLink(atPath: entry.path))
+                    .flatMap { relative in
+                        URL(fileURLWithPath: relative, relativeTo: entry.deletingLastPathComponent())
+                            .standardizedFileURL
+                    } ?? entry
+                try? fileManager.createSymbolicLink(at: dest, withDestinationURL: real)
+            }
+            return shimDir
+        } catch {
+            return directory
+        }
+    }
+
+    private static func isVisionChatTemplate(_ template: String) -> Bool {
+        template.contains("<|vision_start|>")
+            || template.contains("<|image_pad|>")
+            || template.contains("<|video_pad|>")
+            || template.contains("<|image|>")
+            || template.contains("<image>")
+    }
+
     /// Check whether a directory already has the files that the HuggingFace
     /// tokenizer loader needs. Used by `resolveTokenizerDirectory(for:)`.
     public static func hasTokenizerFiles(

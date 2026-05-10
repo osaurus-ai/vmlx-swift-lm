@@ -125,7 +125,7 @@ public enum VLMTypeRegistry {
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "zaya": dispatchZayaUnsupported,
-        "zaya1_vl": dispatchZaya1VLUnsupported,
+        "zaya1_vl": dispatchZaya1VL,
     ]
 
     private static func dispatchZayaUnsupported(data _: Data) throws -> any LanguageModel {
@@ -134,11 +134,9 @@ public enum VLMTypeRegistry {
         )
     }
 
-    private static func dispatchZaya1VLUnsupported(data: Data) throws -> any LanguageModel {
-        _ = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
-        throw VLMError.processing(
-            "ZAYA1-VL native adapter is not ready: port must wire the Qwen2.5-VL vision tower, vision LoRA image-mask gates, attention-then-MoE Zaya CCA trunk, image-token embedding merge, and cache/B>1 restore validation before this model can run."
-        )
+    private static func dispatchZaya1VL(data: Data) throws -> any LanguageModel {
+        let configuration = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
+        return try Zaya1VL(configuration)
     }
 
     /// Shared dispatch for Mistral 3 / 3.5 VLM bundles, registered under
@@ -536,8 +534,10 @@ public final class VLMModelFactory: ModelFactory {
         // original directory unchanged.
         let jangResolvedDir = JangLoader.resolveTokenizerDirectory(
             for: configuration.tokenizerDirectory)
-        let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
+        let templateResolvedDir = JangLoader.resolveChatTemplateSidecarSubstitution(
             for: jangResolvedDir)
+        let tokenizerDirectory = JangLoader.resolveTokenizerClassSubstitution(
+            for: templateResolvedDir)
         async let tokenizerTask = tokenizerLoader.load(from: tokenizerDirectory)
         async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
 

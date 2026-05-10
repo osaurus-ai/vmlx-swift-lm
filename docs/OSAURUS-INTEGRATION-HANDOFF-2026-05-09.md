@@ -161,7 +161,7 @@ so Swift Jinja and the cache-key salt see the same mode.
 | Family | Runtime policy | Osaurus wiring |
 |---|---|---|
 | ZAYA text | Reasoning-capable. Correct bundle stamp is `supports_thinking=true`, `think_in_template=false`, `reasoning_parser=qwen3`. Runtime does not auto-repair stale ZAYA stamps. | Expose reasoning toggle once real on/off rows pass. Pass `enable_thinking` from the request; include `cacheScopeSalt(from:)` in `LMInput`. |
-| ZAYA1-VL | Native generation still open. Do not claim image reasoning until the ZAYA1-VL model trunk, LoRA gates, image generation, and multi-turn cache rows pass. | Keep adapter-pending status in UI/API. Do not emulate with text-only ZAYA. |
+| ZAYA1-VL | Native image/text generation is wired. Current proof covers JANGTQ2 image->text + text follow-up, same-media disk HIT, different-image MISS, TokenIterator/BatchEngine byte identity, plus JANGTQ4/MXFP4 disk-backed cache restore. | Route through VLM factory, pass images as structured `UserInput`, and keep conservative CCA cache policy: disk-backed v2 restore only, no paged-prefix claim, no TurboQuant-KV mapping. B>1 media isolation, cancellation, longer semantic rows, video, and any reasoning-on image rows remain open. |
 | Ling/Bailing | Production default is non-thinking. Stamps should be `supports_thinking=false`; Swift seeds `enable_thinking=false` for these capability stamps. | Do not expose a normal reasoning toggle unless a future model-specific diagnostic path is intentionally added and tested. Still pass the default through `additionalContext` so salts stay explicit. |
 | Qwen/Nemotron/DSV/Kimi/MiniMax reasoning families | Capability/model-type parser selects the reasoning parser. | Wire toggle per model support and run mixed-turn cache rows before product exposure. |
 
@@ -224,7 +224,9 @@ No changes; both default-off.
   fragment.
 - ZAYA/ZAYA1-VL use Zaya CCA/path-dependent cache state. Do not route them
   through a TurboQuant-KV-only cache path; JANGTQ2/4 are weight formats, not KV
-  cache formats.
+  cache formats. For ZAYA1-VL the proven cache path is disk-backed
+  TQDiskSerializer v2 restore keyed by media/request salt, carrying KV plus
+  `conv_state` and `prev_hs`; paged-prefix restore stays disabled.
 - Ling/Bailing hybrid recurrent state must be treated like other
   path-dependent families: default no-thinking, disk-backed coordinator
   restore where enabled, and no paged-prefix claim unless the topology reports

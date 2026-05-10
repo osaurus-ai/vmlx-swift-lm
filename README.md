@@ -12,7 +12,7 @@ It tracks upstream's full model surface and adds:
 - **Speculative decoding** — classic AR drafter, DFlash, DDTree
 - **JANG mixed-precision** — per-layer attention/MLP/expert bit widths from `jang_config.json`
 - **MoE / hybrid SSM dispatch reduction** — 2-4× decode speedup vs upstream on routed-MoE and recurrent-attention models
-- **Models added on top of upstream**: Gemma 4, Mistral Small 4, Qwen 3.5 / 3.6 (text + VL), DeepSeek-V4, NemotronH, Hunyuan v3 (Hy3), ZAYA / ZAYA1-VL (component surfaces), and the JANGTQ variants of all of the above
+- **Models added on top of upstream**: Gemma 4, Mistral Small 4, Qwen 3.5 / 3.6 (text + VL), DeepSeek-V4, NemotronH, Hunyuan v3 (Hy3), ZAYA / ZAYA1-VL, and the JANGTQ variants of all of the above
 
 Existing upstream consumers don't need to change anything — every upstream API is preserved.
 
@@ -195,9 +195,9 @@ Llama, Mistral, Phi, Phi-3, Phi-MoE, Gemma 2 / 3 / 3n / **4**, Qwen2 / 3 / 3-MoE
 
 ### VLMs
 
-PaliGemma, Qwen2-VL / 2.5-VL / 3-VL / 3.5 / 3.5-MoE, Gemma 3, **Gemma 4**, SmolVLM2, FastVLM, Pixtral, **Mistral Small 4** (MLA + Pixtral), Mistral3, LFM2-VL, GLM-OCR, Idefics3, NemotronH-Omni.
+PaliGemma, Qwen2-VL / 2.5-VL / 3-VL / 3.5 / 3.5-MoE, Gemma 3, **Gemma 4**, SmolVLM2, FastVLM, Pixtral, **Mistral Small 4** (MLA + Pixtral), Mistral3, LFM2-VL, GLM-OCR, Idefics3, NemotronH-Omni, **ZAYA1-VL**.
 
-**Phase A component surfaces (bundle/sanitizer/processor proven, native generation in progress):** **ZAYA1-VL** — see [`docs/ZAYA1-VL-PRODUCTION-GAP-LEDGER-2026-05-10.md`](docs/ZAYA1-VL-PRODUCTION-GAP-LEDGER-2026-05-10.md).
+**ZAYA1-VL status:** native image/text generation and disk-backed CCA cache restore are proven on local JANGTQ2/JANGTQ4/MXFP4 bundles. It intentionally uses `ZayaCCACache` with media/request cache salt, not TurboQuant KV and not paged-prefix restore. B>1 media isolation and longer visual-semantic rows remain open; see [`docs/ZAYA1-VL-PRODUCTION-GAP-LEDGER-2026-05-10.md`](docs/ZAYA1-VL-PRODUCTION-GAP-LEDGER-2026-05-10.md).
 
 ### Embedders
 
@@ -317,7 +317,7 @@ If you're on upstream `2.x`, also see the version 3 migration notes below.
 ## Known limitations
 
 - **Hy3** — native text decode is functional on the local JANGTQ2 bundle, including B=2 overlap, 3-turn chat, paged-prefix cache, and L2 disk restore. It remains speed-open and MTP speculative decode is preserved-disabled. Tracked in `docs/PRODUCTION-READINESS-MATRIX-2026-05-09.md` and `the production-readiness matrix`.
-- **ZAYA1-VL** — bundle / sanitizer / processor / LoRA-namespace component surfaces are tested; runnable native generation (40-block trunk + LoRA call-sites + factory dispatch) is in progress per the gap ledger.
+- **ZAYA1-VL** — native generation is wired and tested on local bundles. Current proof includes image->text, text follow-up, same-media disk-backed cache HIT, different-image MISS, TokenIterator/BatchEngine byte identity, and JANGTQ2/JANGTQ4/MXFP4 cache restore rows. Still open: B>1 media isolation, cancellation, longer semantic rows, and video.
 - **Audio** — Gemma 4 supports audio natively, but the audio encoder is not yet implemented; `Gemma4.prepare` throws `VLMError.processing` on `LMInput.audio`.
 - **Speculative decoding + RotatingKVCache** — speculative decoding requires trimmable caches and is not compatible after the ring wraps.
 - **Raw HuggingFace checkpoints** — JANG and pre-converted mlx-community models are supported. Raw HF `transformers` checkpoints with fused `gate_up_proj` need conversion first.

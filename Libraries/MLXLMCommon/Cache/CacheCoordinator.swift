@@ -201,8 +201,25 @@ public final class CacheCoordinator: @unchecked Sendable {
     ///   - mediaSalt: Optional VLM media fingerprint; `nil` for text-only.
     /// - Returns: A ``CacheFetchResult`` describing the outcome.
     public func fetch(tokens: [Int], mediaSalt: String? = nil) -> CacheFetchResult {
-        func hasRequiredHybridSSM(_ states: [MLXArray]?) -> Bool {
-            !isHybrid || !(states?.isEmpty ?? true)
+        func hasRequiredHybridSSM(
+            _ states: [MLXArray]?,
+            diskArrays: [String: MLXArray]? = nil
+        ) -> Bool {
+            if !isHybrid {
+                return true
+            }
+            if !(states?.isEmpty ?? true) {
+                return true
+            }
+            // Format-v2 disk payloads carry first-class layer state for
+            // path-dependent caches such as MambaCache and ZayaCCACache.
+            // Requiring a separate SSM companion entry would falsely reject
+            // VLM ZAYA hits: those CCA states are already in diskArrays and
+            // re-deriving them from text-only tokens cannot replay images.
+            if let diskArrays, TQDiskSerializer.formatVersion(of: diskArrays) >= 2 {
+                return true
+            }
+            return false
         }
 
         // 2026-05-04: skip the paged tier entirely for paged-incompatible
@@ -253,7 +270,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                     boundary: tokens.count,
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
-                if hasRequiredHybridSSM(ssmStates) {
+                if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     return .hit(
                         matchedTokens: tokens.count,
                         remainingTokens: [],
@@ -273,7 +290,7 @@ public final class CacheCoordinator: @unchecked Sendable {
                         boundary: shorter.count,
                         diskArrays: arrays,
                         mediaSalt: mediaSalt)
-                    if hasRequiredHybridSSM(ssmStates) {
+                    if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                         return .hit(
                             matchedTokens: shorter.count,
                             remainingTokens: [tokens.last!],

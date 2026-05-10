@@ -2,10 +2,13 @@ import Foundation
 import CoreImage
 import CoreMedia
 import MLX
+import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 @testable import MLXVLM
 import Testing
+@preconcurrency import Tokenizers
+import XCTest
 
 @Suite("ZAYA1-VL registration and metadata", .serialized)
 struct Zaya1VLRegistrationTests {
@@ -37,7 +40,7 @@ struct Zaya1VLRegistrationTests {
         try Data(contentsOf: URL(fileURLWithPath: bundlePath(bundle)).appendingPathComponent(file))
     }
 
-    struct VisionPadTokenizer: Tokenizer {
+    struct VisionPadTokenizer: MLXLMCommon.Tokenizer {
         var forcedImageCount: Int? = nil
         var bosToken: String? = nil
         var eosToken: String? = nil
@@ -102,8 +105,8 @@ struct Zaya1VLRegistrationTests {
         }
     }
 
-    struct TrapTokenizerLoader: TokenizerLoader {
-        func load(from directory: URL) async throws -> any Tokenizer {
+    struct TrapTokenizerLoader: MLXLMCommon.TokenizerLoader {
+        func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
             Issue.record("ZAYA1-VL unsupported load gate should fire before tokenizer or weight load")
             return VisionPadTokenizer()
         }
@@ -192,46 +195,43 @@ struct Zaya1VLRegistrationTests {
         }
         """.data(using: .utf8)!
 
-        do {
-            _ = try await VLMTypeRegistry.shared.createModel(
-                configuration: data, modelType: "zaya1_vl")
-            Issue.record("zaya1_vl must not return a fake model before the native adapter exists")
-        } catch let error as VLMError {
-            guard case .processing(let message) = error else {
-                Issue.record("Expected a precise ZAYA1-VL processing gate, got \(error)")
-                return
-            }
-            #expect(message.contains("ZAYA1-VL"))
-            #expect(message.contains("vision LoRA"))
-            #expect(message.contains("image-mask"))
-            #expect(message.contains("attention-then-MoE"))
-            #expect(message.contains("Zaya CCA"))
-        } catch {
-            Issue.record("Expected a precise ZAYA1-VL processing gate, got \(error)")
-        }
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: "zaya1_vl")
+        #expect(model is Zaya1VL)
     }
 
-    @Test("VLM factory load refuses ZAYA1-VL before tokenizer and weight loading",
-          .enabled(if: FileManager.default.fileExists(
-              atPath: bundlePath("ZAYA1-VL-8B-JANGTQ2") + "/config.json")))
-    func factoryLoadFailsAtRecognitionGateBeforeWeights() async throws {
-        let directory = URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-JANGTQ2"))
-
-        do {
-            _ = try await VLMModelFactory.shared.loadContainer(
-                from: directory, using: TrapTokenizerLoader())
-            Issue.record("zaya1_vl must not load a fake native model before the adapter exists")
-        } catch let error as VLMError {
-            guard case .processing(let message) = error else {
-                Issue.record("Expected precise ZAYA1-VL processing gate, got \(error)")
-                return
-            }
-            #expect(message.contains("ZAYA1-VL"))
-            #expect(message.contains("image-mask"))
-            #expect(message.contains("attention-then-MoE"))
-        } catch {
-            Issue.record("Expected precise ZAYA1-VL processing gate, got \(error)")
+    @Test("ZAYA1-VL native model exposes one CCA cache per sequential VL block")
+    func nativeModelUsesZayaCCACachesForEveryBlock() async throws {
+        let data = """
+        {
+          "model_type": "zaya1_vl",
+          "architectures": ["Zaya1VLForConditionalGeneration"],
+          "hidden_size": 2048,
+          "num_hidden_layers": 40,
+          "num_attention_heads": 8,
+          "num_key_value_heads": 2,
+          "vocab_size": 262272,
+          "image_token_id": 262147,
+          "vision_start_token_id": 255999,
+          "vision_end_token_id": 256000,
+          "vision_lora": true,
+          "vision_config": {
+            "model_type": "qwen2_5_vl",
+            "hidden_size": 1280,
+            "out_hidden_size": 2048,
+            "spatial_patch_size": 14,
+            "temporal_patch_size": 1,
+            "in_chans": 3
+          }
         }
+        """.data(using: .utf8)!
+
+        let model = try #require(try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: "zaya1_vl") as? Zaya1VL)
+        let caches = model.newCache(parameters: nil)
+
+        #expect(caches.count == 40)
+        #expect(caches.allSatisfy { $0 is ZayaCCACache })
     }
 
     @Test("Zaya1VLProcessor uses ZAYA image placeholders with Qwen2.5-VL image geometry")
@@ -355,6 +355,59 @@ struct Zaya1VLRegistrationTests {
             #expect(input.text.tokens.shape == [16])
             #expect(input.cacheScopeSalt == "reasoning=off")
             #expect(computeMediaSalt(for: input) != nil)
+        }
+    }
+
+    @Test("Real ZAYA1-VL tokenizer renders image placeholders from sidecar template")
+    func realTokenizerRendersImagePlaceholderFromSidecarTemplate() async throws {
+        let dir = URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-JANGTQ2"))
+        guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path)
+        else {
+            throw XCTSkip("local ZAYA1-VL bundle not available")
+        }
+
+        let tokenizerDir = JangLoader.resolveTokenizerClassSubstitution(
+            for: JangLoader.resolveChatTemplateSidecarSubstitution(
+                for: JangLoader.resolveTokenizerDirectory(for: dir)))
+        let tokenizer = try await #huggingFaceTokenizerLoader().load(from: tokenizerDir)
+        let messages = Qwen2VLMessageGenerator().generate(from: UserInput(
+            prompt: "Describe this image.",
+            images: [.ciImage(Self.solidImage(width: 56, height: 56, color: .red))]))
+        let tokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: nil, additionalContext: ["enable_thinking": false])
+        let decoded = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+
+        #expect(decoded.contains("<|vision_start|>"), "decoded prompt: \(decoded)")
+        #expect(decoded.contains("<image>") || tokens.contains(262_147),
+            "decoded prompt: \(decoded)")
+    }
+
+    @Test("Real ZAYA1-VL processor expands sidecar-rendered image placeholders")
+    func realProcessorExpandsSidecarRenderedImagePlaceholder() async throws {
+        try await MLXMetalTestLock.withLock {
+            let dir = URL(fileURLWithPath: Self.bundlePath("ZAYA1-VL-8B-JANGTQ2"))
+            guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("tokenizer.json").path)
+            else {
+                throw XCTSkip("local ZAYA1-VL bundle not available")
+            }
+
+            let tokenizerDir = JangLoader.resolveTokenizerClassSubstitution(
+                for: JangLoader.resolveChatTemplateSidecarSubstitution(
+                    for: JangLoader.resolveTokenizerDirectory(for: dir)))
+            let tokenizer = try await #huggingFaceTokenizerLoader().load(from: tokenizerDir)
+            let configData = try Data(
+                contentsOf: dir.appendingPathComponent("preprocessor_config.json"))
+            let config = try JSONDecoder.json5().decode(
+                Qwen25VLProcessorConfiguration.self, from: configData)
+            let processor = Zaya1VLProcessor(config, tokenizer: tokenizer)
+
+            let input = try await processor.prepare(input: UserInput(
+                prompt: "Describe this image.",
+                images: [.ciImage(Self.solidImage(width: 56, height: 56, color: .red))],
+                additionalContext: ["enable_thinking": false]))
+            let processed = try #require(input.image)
+            #expect(processed.frames?.count == 1)
+            #expect(input.text.tokens.size > 3)
         }
     }
 
@@ -503,9 +556,10 @@ struct Zaya1VLRegistrationTests {
                 inputEmbeds: inputEmbeds,
                 imageFeatures: imageFeatures,
                 imageTokenId: 262147)
+            let imageMask = try #require(merged.imageMask)
 
-            #expect(merged.imageMask.shape == [4])
-            #expect(merged.imageMask.asArray(Bool.self) == [false, true, false, true])
+            #expect(imageMask.shape == [4])
+            #expect(imageMask.asArray(Bool.self) == [false, true, false, true])
             #expect(merged.embeddings.shape == [1, 4, 3])
             #expect(merged.embeddings.asArray(Float.self) == [
                 1, 2, 3,
@@ -560,9 +614,10 @@ struct Zaya1VLRegistrationTests {
                 inputEmbeds: inputEmbeds,
                 imageFeatures: imageFeatures,
                 imageTokenId: 262147)
+            let imageMask = try #require(merged.imageMask)
 
-            #expect(merged.imageMask.shape == [2, 3])
-            #expect(merged.imageMask.asArray(Bool.self) == [
+            #expect(imageMask.shape == [2, 3])
+            #expect(imageMask.asArray(Bool.self) == [
                 false, true, false,
                 true, false, false,
             ])

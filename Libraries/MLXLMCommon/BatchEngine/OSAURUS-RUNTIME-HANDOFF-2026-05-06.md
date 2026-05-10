@@ -1,5 +1,17 @@
 # Osaurus Runtime Handoff - 2026-05-06
 
+> ⚠️ **DEPRECATED 2026-05-10.** Superseded by [`docs/OSAURUS-INTEGRATION-HANDOFF-2026-05-09.md`](../../../docs/OSAURUS-INTEGRATION-HANDOFF-2026-05-09.md).
+>
+> **Read the 2026-05-09 handoff first.** It covers the current pin (`7273ba2`),
+> ZAYA reasoning-split correction (this doc still describes ZAYA as
+> "served as non-reasoning" — that framing was corrected), Hy3 native
+> runtime, ZAYA1-VL native-adapter status, cache-scope salt, generation_config
+> defaults, JANGTQ top-k override plumbing, and B>1 admission coalescing.
+>
+> Kept here as a historical record for the DSV4 / Ling / Bailing / Gemma /
+> Laguna / Qwen / MiniMax / Nemotron-Omni cache-tier and TurboQuant KV
+> notes that were accurate at 2026-05-06.
+
 Audience: osaurus agents wiring `vmlx-swift-lm` into the production runtime.
 
 Scope: text runtime, chat templates, reasoning streams, DSV4, Ling/Bailing,

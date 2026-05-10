@@ -248,6 +248,50 @@ final class JangTokenizerFallbackTests: XCTestCase {
             "A generated tokenizer.json in the local overlay should remain the preferred path.")
     }
 
+    // MARK: - chat_template.json sidecar substitution
+
+    func testResolveChatTemplateSidecarPrefersVisionTemplate() throws {
+        let dir = tmpRoot.appendingPathComponent("zaya1-vl")
+        try writeFile(at: dir.appendingPathComponent("tokenizer.json"))
+        try writeFile(
+            at: dir.appendingPathComponent("tokenizer_config.json"),
+            contents: #"{"tokenizer_class":"Qwen2Tokenizer","chat_template":"user: {{ message.content }}"}"#)
+        try writeFile(
+            at: dir.appendingPathComponent("chat_template.json"),
+            contents: #"{"chat_template":"{% for message in messages %}<|vision_start|><image><|vision_end|>{% endfor %}"}"#)
+
+        let resolved = JangLoader.resolveChatTemplateSidecarSubstitution(for: dir)
+        XCTAssertNotEqual(
+            resolved.resolvingSymlinksInPath().path,
+            dir.resolvingSymlinksInPath().path,
+            "A VL sidecar template should materialize a tokenizer shim.")
+
+        let data = try Data(
+            contentsOf: resolved.appendingPathComponent("tokenizer_config.json"))
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["tokenizer_class"] as? String, "Qwen2Tokenizer")
+        XCTAssertTrue((json["chat_template"] as? String)?.contains("<|vision_start|><image><|vision_end|>") == true)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: resolved.appendingPathComponent("tokenizer.json").path),
+            "The shim must still expose tokenizer.json via symlink.")
+    }
+
+    func testResolveChatTemplateSidecarLeavesNonVisionSidecarUnchanged() throws {
+        let dir = tmpRoot.appendingPathComponent("text-model")
+        try writeFile(at: dir.appendingPathComponent("tokenizer.json"))
+        try writeFile(
+            at: dir.appendingPathComponent("tokenizer_config.json"),
+            contents: #"{"tokenizer_class":"Qwen2Tokenizer","chat_template":"{{ messages }}"}"#)
+        try writeFile(
+            at: dir.appendingPathComponent("chat_template.json"),
+            contents: #"{"chat_template":"{{ messages[-1]['content'] }}"}"#)
+
+        let resolved = JangLoader.resolveChatTemplateSidecarSubstitution(for: dir)
+        assertSamePath(resolved, dir)
+    }
+
     // MARK: - resolveTokenizerDirectory — defensive fallbacks
 
     func testResolveReturnsSelfWhenSourceModelMissingOrg() throws {

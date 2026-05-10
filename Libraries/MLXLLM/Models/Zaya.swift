@@ -47,17 +47,17 @@ func zayaScaledL2Normalize(_ x: MLXArray, scale: Float) -> MLXArray {
 
 /// ZAYA RMSNorm mirrors the Zyphra reference: compute variance in fp32,
 /// multiply by the learned weight directly, then cast back to input dtype.
-final class ZayaRMSNorm: Module, UnaryLayer {
-    let weight: MLXArray
+public final class ZayaRMSNorm: Module, UnaryLayer {
+    public let weight: MLXArray
     let eps: Float
 
-    init(dimensions: Int, eps: Float = 1e-6) {
+    public init(dimensions: Int, eps: Float = 1e-6) {
         self.weight = MLXArray.ones([dimensions])
         self.eps = eps
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let xf = x.asType(.float32)
         let variance = (xf * xf).mean(axis: -1, keepDims: true)
         return ((xf * rsqrt(variance + eps)) * weight.asType(.float32)).asType(x.dtype)
@@ -214,13 +214,13 @@ public enum ZayaMoEContext: Sendable, Equatable {
 /// missing `residual_*` slots with neutral defaults (1.0 / 0.0) so the module
 /// has a uniform parameter set across layers (avoids MLXNN's mismatched-array
 /// container error during quantize-traversal).
-final class ZayaResScale: Module {
+public final class ZayaResScale: Module {
     @ModuleInfo(key: "hidden_states_scale") var hiddenScale: MLXArray
     @ModuleInfo(key: "hidden_states_bias") var hiddenBias: MLXArray
     @ModuleInfo(key: "residual_scale") var residualScale: MLXArray
     @ModuleInfo(key: "residual_bias") var residualBias: MLXArray
 
-    override init() {
+    public override init() {
         self._hiddenScale.wrappedValue = MLXArray.ones([1])
         self._hiddenBias.wrappedValue = MLXArray.zeros([1])
         self._residualScale.wrappedValue = MLXArray.ones([1])
@@ -228,7 +228,7 @@ final class ZayaResScale: Module {
         super.init()
     }
 
-    func apply(
+    public func apply(
         residual: MLXArray?, hiddenStates: MLXArray
     ) -> (residual: MLXArray?, hiddenStates: MLXArray) {
         let h = (hiddenStates + hiddenBias.asType(hiddenStates.dtype))
@@ -549,7 +549,7 @@ final class ZayaCCAAttention: Module, ZayaSubLayer {
 
 // MARK: - MoE layer
 
-final class ZayaRouter: Module {
+public final class ZayaRouter: Module {
     @ModuleInfo(key: "rmsnorm_eda") var edaNorm: ZayaRMSNorm
     /// Bundle ships `router_mlp.{0,1,2}.{weight,bias}` after sanitize
     /// compresses the original Sequential indices `{0,2,4}` (with
@@ -569,7 +569,7 @@ final class ZayaRouter: Module {
     let numExperts: Int
     let routerHidden: Int
 
-    init(_ cfg: ZayaTextConfiguration) {
+    public init(_ cfg: ZayaTextConfiguration) {
         self.numExperts = cfg.numExperts
         let H = cfg.hiddenSize
         let R = 256  // router hidden dim (canonical to ZAYA1; not in config)
@@ -595,7 +595,7 @@ final class ZayaRouter: Module {
     /// then runs RMSNorm + a 3-layer MLP. The final logit is the MOD/skip
     /// route; when it wins, the expert contribution is zero and the layer
     /// proceeds through the residual path.
-    func route(
+    public func route(
         _ x: MLXArray, previousRouterState: MLXArray?
     ) -> (idx: MLXArray, weights: MLXArray, activeMask: MLXArray, nextRouterState: MLXArray) {
         let projected = downProj(x)                                      // [B*T, 256]
@@ -634,10 +634,10 @@ public protocol ZayaSwitchPrimitive: Module {
 extension SwitchGLU: ZayaSwitchPrimitive {}
 extension TurboQuantSwitchGLU: ZayaSwitchPrimitive {}
 
-final class ZayaExperts: Module {
+public final class ZayaExperts: Module {
     @ModuleInfo(key: "switch_mlp") var switchMLP: ZayaSwitchPrimitive
 
-    init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?, layerIdx: Int? = nil) {
+    public init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?, layerIdx: Int? = nil) {
         let H = cfg.hiddenSize
         let I = cfg.expertIntermediateSize
         let E = cfg.numExperts
@@ -658,6 +658,10 @@ final class ZayaExperts: Module {
                 inputDims: H, hiddenDims: I, numExperts: E)
         }
         super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        switchMLP(x, indices)
     }
 }
 

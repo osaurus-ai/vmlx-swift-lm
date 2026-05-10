@@ -972,7 +972,9 @@ public actor BatchEngine {
                 if let diskArrays, !restored {
                     let diskRestored = restoreFromDiskArrays(diskArrays, into: slot.cache)
                     if diskRestored > 0 {
-                        if let ssm = ssmStates {
+                        if let ssm = ssmStates,
+                           TQDiskSerializer.formatVersion(of: diskArrays) < 2
+                        {
                             restoreSSMStates(ssm, into: slot.cache)
                         }
                         // 2026-04-27 fix: materialize restored cache state
@@ -1740,7 +1742,11 @@ public actor BatchEngine {
                 return
             }
             let perLayerData = extractLayerData(from: promptCacheSnapshot)
-            let ssmStates: [MLXArray]? = coordinator.isHybrid && coordinator.config.enableSSMReDerive
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
+            let ssmStates: [MLXArray]? = coordinator.isHybrid &&
+                coordinator.config.enableSSMReDerive &&
+                !requiresDiskBackedRestore
                 ? reDeriveAndStoreSSMStatesForPromptBoundaries(
                     coordinator: coordinator,
                     model: context.model,

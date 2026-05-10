@@ -334,7 +334,7 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
 public enum Zaya1VLRuntimeSupport {
     public struct ImageMergeResult {
         public let embeddings: MLXArray
-        public let imageMask: MLXArray
+        public let imageMask: MLXArray?
     }
 
     /// Apply a LoRA/additive branch only at image-token positions.
@@ -444,12 +444,42 @@ public enum Zaya1VLWeightSanitizer {
         weights input: [String: MLXArray],
         configuration: Zaya1VLConfiguration
     ) -> [String: MLXArray] {
-        var weights = input
+        var weights: [String: MLXArray] = [:]
+        weights.reserveCapacity(input.count)
+        for (rawKey, rawValue) in input {
+            var key = rawKey
+            var value = rawValue
+
+            if key.hasPrefix("model.") {
+                key = "language_model.model." + String(key.dropFirst("model.".count))
+            } else if key.hasPrefix("lm_head.") {
+                key = "language_model.lm_head." + String(key.dropFirst("lm_head.".count))
+            }
+
+            if key.contains(".layers.") && key.contains(".zaya_block.")
+                && !key.contains(".mlp.zaya_block.")
+            {
+                key = key.replacingOccurrences(of: ".zaya_block.", with: ".mlp.zaya_block.")
+            }
+
+            key = canonicalizeLowRankSequentialKey(key)
+            key = canonicalizeLocalExpertKey(key, expertCount: configuration.numExperts)
+
+            if key.hasSuffix("patch_embed.proj.weight")
+                && value.ndim == 5
+                && [1, 3].contains(value.dim(1))
+                && ![1, 3].contains(value.dim(-1))
+            {
+                value = value.transposed(0, 2, 3, 4, 1)
+            }
+
+            weights[key] = value
+        }
 
         if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-            weights["lm_head.scales"] = nil
-            weights["lm_head.biases"] = nil
+            weights["language_model.lm_head.weight"] = nil
+            weights["language_model.lm_head.scales"] = nil
+            weights["language_model.lm_head.biases"] = nil
         }
 
         for key in Array(weights.keys) where key.hasSuffix(".tq_bits") {
@@ -466,8 +496,8 @@ public enum Zaya1VLWeightSanitizer {
         }
 
         for layer in 0 ..< configuration.numHiddenLayers {
-            let from = "model.layers.\(layer).zaya_block.experts.switch_mlp."
-            let to = "model.layers.\(layer).mlp.zaya_block.experts.switch_mlp."
+            let from = "language_model.model.layers.\(layer).zaya_block.experts.switch_mlp."
+            let to = "language_model.model.layers.\(layer).mlp.zaya_block.experts.switch_mlp."
             for key in Array(weights.keys) where key.hasPrefix(from) {
                 let suffix = String(key.dropFirst(from.count))
                 weights[to + suffix] = weights[key]
@@ -476,22 +506,22 @@ public enum Zaya1VLWeightSanitizer {
 
             fillResidualScaleDefaults(
                 in: &weights,
-                prefix: "model.layers.\(layer).attn.res_scale")
+                prefix: "language_model.model.layers.\(layer).attn.res_scale")
             fillResidualScaleDefaults(
                 in: &weights,
-                prefix: "model.layers.\(layer).mlp.res_scale")
+                prefix: "language_model.model.layers.\(layer).mlp.res_scale")
         }
 
         compressRouterMLPSequentialIndices(in: &weights, layers: configuration.numHiddenLayers)
 
         let routerHidden = configuration.zayaMLPExpansion
         for layer in 0 ..< configuration.numHiddenLayers {
-            let key = "model.layers.\(layer).mlp.zaya_block.router.router_states_scale"
+            let key = "language_model.model.layers.\(layer).mlp.zaya_block.router.router_states_scale"
             if weights[key] == nil {
                 weights[key] = MLXArray.ones([routerHidden], dtype: .float32)
             }
 
-            let finalBias = "model.layers.\(layer).mlp.zaya_block.router.router_mlp.2.bias"
+            let finalBias = "language_model.model.layers.\(layer).mlp.zaya_block.router.router_mlp.2.bias"
             if weights[finalBias] == nil {
                 weights[finalBias] = MLXArray.zeros(
                     [configuration.numExperts + 1], dtype: .float32)
@@ -513,12 +543,38 @@ public enum Zaya1VLWeightSanitizer {
         }
     }
 
+    private static func canonicalizeLowRankSequentialKey(_ key: String) -> String {
+        var result = key
+        for name in [
+            "lora_linear_q", "lora_linear_k", "lora_val_proj1",
+            "lora_val_proj2", "lora_linear_o", "lora_fc1", "lora_fc2",
+        ] {
+            result = result.replacingOccurrences(
+                of: ".\(name).0.weight",
+                with: ".\(name).down.weight")
+            result = result.replacingOccurrences(
+                of: ".\(name).1.weight",
+                with: ".\(name).up.weight")
+        }
+        return result
+    }
+
+    private static func canonicalizeLocalExpertKey(_ key: String, expertCount: Int) -> String {
+        var result = key
+        for expertID in 0 ..< expertCount {
+            result = result.replacingOccurrences(
+                of: ".local_experts.\(expertID).",
+                with: ".local_experts.expert_\(expertID).")
+        }
+        return result
+    }
+
     private static func compressRouterMLPSequentialIndices(
         in weights: inout [String: MLXArray],
         layers: Int
     ) {
         for layer in 0 ..< layers {
-            let prefix = "model.layers.\(layer).mlp.zaya_block.router.router_mlp."
+            let prefix = "language_model.model.layers.\(layer).mlp.zaya_block.router.router_mlp."
             let renames: [(String, String)] = [
                 ("\(prefix)2.", "\(prefix)1."),
                 ("\(prefix)4.", "\(prefix)2."),
@@ -551,8 +607,8 @@ public enum Zaya1VLWeightSanitizer {
 /// `lora_linear_q.0.weight` is `[rank=8, hidden=2048]` and
 /// `lora_linear_q.1.weight` is `[out=1024, rank=8]`.
 public final class Zaya1VLLowRankAdapter: Module {
-    @ModuleInfo(key: "0") private var down: Linear
-    @ModuleInfo(key: "1") private var up: Linear
+    @ModuleInfo(key: "down") private var down: Linear
+    @ModuleInfo(key: "up") private var up: Linear
 
     public init(inputDimensions: Int, rank: Int, outputDimensions: Int) {
         self._down.wrappedValue = Linear(inputDimensions, rank, bias: false)
@@ -675,26 +731,32 @@ public final class Zaya1VLExpertLoRAAdapters: Module {
     public func fc2(_ input: MLXArray, base: MLXArray, imageMask: MLXArray?) throws -> MLXArray {
         try fc2Adapter(input, base: base, imageMask: imageMask)
     }
+
+    public func callAsFunction(_ input: MLXArray) -> MLXArray {
+        let gateUp = fc1Adapter(input)
+        let chunks = split(gateUp, parts: 2, axis: -1)
+        return fc2Adapter(silu(chunks[0]) * chunks[1])
+    }
 }
 
 /// Container for `mlp.zaya_block.experts.local_experts.{0...15}` LoRA sidecars.
 public final class Zaya1VLLocalExpertLoRAAdapters: Module {
-    @ModuleInfo(key: "0") private var expert0: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "1") private var expert1: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "2") private var expert2: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "3") private var expert3: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "4") private var expert4: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "5") private var expert5: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "6") private var expert6: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "7") private var expert7: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "8") private var expert8: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "9") private var expert9: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "10") private var expert10: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "11") private var expert11: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "12") private var expert12: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "13") private var expert13: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "14") private var expert14: Zaya1VLExpertLoRAAdapters
-    @ModuleInfo(key: "15") private var expert15: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_0") private var expert0: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_1") private var expert1: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_2") private var expert2: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_3") private var expert3: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_4") private var expert4: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_5") private var expert5: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_6") private var expert6: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_7") private var expert7: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_8") private var expert8: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_9") private var expert9: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_10") private var expert10: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_11") private var expert11: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_12") private var expert12: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_13") private var expert13: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_14") private var expert14: Zaya1VLExpertLoRAAdapters
+    @ModuleInfo(key: "expert_15") private var expert15: Zaya1VLExpertLoRAAdapters
 
     public init(_ config: Zaya1VLConfiguration) {
         self._expert0.wrappedValue = Zaya1VLExpertLoRAAdapters(config)
@@ -787,6 +849,712 @@ public final class Zaya1VLInputEmbeddingAdapter: Module {
             throw VLMError.processing(
                 "ZAYA1-VL image pixels and frame metadata must be provided together")
         }
+    }
+}
+
+private final class Zaya1VLCCAQKV: Module {
+    @ModuleInfo(key: "linear_q") private var linearQ: Linear
+    @ModuleInfo(key: "linear_k") private var linearK: Linear
+    @ModuleInfo(key: "val_proj1") private var value1: Linear
+    @ModuleInfo(key: "val_proj2") private var value2: Linear
+    @ModuleInfo(key: "conv_qk") fileprivate var convQK: [Conv1d]
+    @ModuleInfo(key: "temp") fileprivate var temp: MLXArray
+    @ModuleInfo(key: "lora_linear_q") private var loraQ: Zaya1VLLowRankAdapter?
+    @ModuleInfo(key: "lora_linear_k") private var loraK: Zaya1VLLowRankAdapter?
+    @ModuleInfo(key: "lora_val_proj1") private var loraV1: Zaya1VLLowRankAdapter?
+    @ModuleInfo(key: "lora_val_proj2") private var loraV2: Zaya1VLLowRankAdapter?
+
+    let qDim: Int
+    let kDim: Int
+    let headDim: Int
+    let convChannels: Int
+
+    init(_ config: Zaya1VLConfiguration) {
+        let qDim = config.numAttentionHeads * config.headDim
+        let kDim = config.numKeyValueHeads * config.headDim
+        let valueHalf = kDim / 2
+        self.qDim = qDim
+        self.kDim = kDim
+        self.headDim = config.headDim
+        self.convChannels = qDim + kDim
+        self._linearQ.wrappedValue = Linear(config.hiddenSize, qDim, bias: false)
+        self._linearK.wrappedValue = Linear(config.hiddenSize, kDim, bias: false)
+        self._value1.wrappedValue = Linear(config.hiddenSize, valueHalf, bias: false)
+        self._value2.wrappedValue = Linear(config.hiddenSize, valueHalf, bias: false)
+        self._convQK.wrappedValue = [
+            Conv1d(
+                inputChannels: qDim + kDim,
+                outputChannels: qDim + kDim,
+                kernelSize: 2,
+                groups: qDim + kDim,
+                bias: true),
+            Conv1d(
+                inputChannels: qDim + kDim,
+                outputChannels: qDim + kDim,
+                kernelSize: 2,
+                groups: (qDim + kDim) / config.headDim,
+                bias: true),
+        ]
+        self._temp.wrappedValue = MLXArray.zeros([config.numKeyValueHeads])
+        if config.visionLora {
+            let rank = config.visionLoraRankAttn ?? 8
+            self._loraQ.wrappedValue = Zaya1VLLowRankAdapter(
+                inputDimensions: config.hiddenSize,
+                rank: rank,
+                outputDimensions: qDim)
+            self._loraK.wrappedValue = Zaya1VLLowRankAdapter(
+                inputDimensions: config.hiddenSize,
+                rank: rank,
+                outputDimensions: kDim)
+            self._loraV1.wrappedValue = Zaya1VLLowRankAdapter(
+                inputDimensions: config.hiddenSize,
+                rank: rank,
+                outputDimensions: valueHalf)
+            self._loraV2.wrappedValue = Zaya1VLLowRankAdapter(
+                inputDimensions: config.hiddenSize,
+                rank: rank,
+                outputDimensions: valueHalf)
+        }
+        super.init()
+    }
+
+    func query(_ input: MLXArray, imageMask: MLXArray?) throws -> MLXArray {
+        try loraQ.map { try $0(input, base: linearQ(input), imageMask: imageMask) }
+            ?? linearQ(input)
+    }
+
+    func key(_ input: MLXArray, imageMask: MLXArray?) throws -> MLXArray {
+        try loraK.map { try $0(input, base: linearK(input), imageMask: imageMask) }
+            ?? linearK(input)
+    }
+
+    func value1(_ input: MLXArray, imageMask: MLXArray?) throws -> MLXArray {
+        try loraV1.map { try $0(input, base: value1(input), imageMask: imageMask) }
+            ?? value1(input)
+    }
+
+    func value2(_ input: MLXArray, imageMask: MLXArray?) throws -> MLXArray {
+        try loraV2.map { try $0(input, base: value2(input), imageMask: imageMask) }
+            ?? value2(input)
+    }
+}
+
+private final class Zaya1VLCCAAttention: Module {
+    @ModuleInfo(key: "qkv") private var qkv: Zaya1VLCCAQKV
+    @ModuleInfo(key: "o_proj") private var output: Linear
+    @ModuleInfo(key: "lora_linear_o") private var outputAdapter: Zaya1VLLowRankAdapter?
+
+    let qHeads: Int
+    let kvHeads: Int
+    let headDim: Int
+    let qDim: Int
+    let kDim: Int
+    let convChannels: Int
+    let hiddenSize: Int
+    let scale: Float
+    let rope: RoPE
+
+    init(_ config: Zaya1VLConfiguration) {
+        self.qHeads = config.numAttentionHeads
+        self.kvHeads = config.numKeyValueHeads
+        self.headDim = config.headDim
+        self.qDim = config.numAttentionHeads * config.headDim
+        self.kDim = config.numKeyValueHeads * config.headDim
+        self.convChannels = qDim + kDim
+        self.hiddenSize = config.hiddenSize
+        self.scale = 1.0 / Float(config.headDim).squareRoot()
+        let rotaryDim = max(0, min(
+            config.headDim,
+            Int((Float(config.headDim) * config.ropePct).rounded(.toNearestOrEven))))
+        self.rope = RoPE(dimensions: rotaryDim, traditional: false, base: Float(config.rotaryBase))
+        self._qkv.wrappedValue = Zaya1VLCCAQKV(config)
+        self._output.wrappedValue = Linear(qDim, config.hiddenSize, bias: false)
+        if config.visionLora {
+            self._outputAdapter.wrappedValue = Zaya1VLLowRankAdapter(
+                inputDimensions: qDim,
+                rank: config.visionLoraRankAttn ?? 8,
+                outputDimensions: config.hiddenSize)
+        }
+        super.init()
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        cache: KVCache?,
+        imageMask: MLXArray?
+    ) throws -> MLXArray {
+        let B = x.dim(0)
+        let T = x.dim(1)
+        let zayaCache = cache as? ZayaCCACache
+        let batchCache = cache as? BatchZayaCCACache
+
+        let qSeq = try qkv.query(x, imageMask: imageMask)
+        let kSeq = try qkv.key(x, imageMask: imageMask)
+        let qkInput = concatenated([qSeq, kSeq], axis: -1)
+        let qkInputCT = qkInput.transposed(0, 2, 1)
+
+        let repeatN = qHeads / kvHeads
+        let queryPre = qSeq.reshaped([B, T, qHeads, headDim])
+        let keyPre = kSeq.reshaped([B, T, kvHeads, headDim])
+        let keyPreRep = repeated(keyPre, count: repeatN, axis: 2)
+        let qkMeanQ = (queryPre + keyPreRep) / MLXArray(2.0, dtype: queryPre.dtype)
+        let qkMeanK = qkMeanQ
+            .reshaped([B, T, kvHeads, repeatN, headDim])
+            .sum(axis: 3) / MLXArray(Float(repeatN), dtype: qkMeanQ.dtype)
+
+        let priorConv: MLXArray
+        let priorPrev: MLXArray
+        if let batchCache {
+            let gathered = batchCache.gatherCCA()
+            priorConv = gathered.conv
+            priorPrev = gathered.prev
+        } else if let zayaCache {
+            let state = zayaCache.readCCA()
+            priorConv = state.conv
+            priorPrev = state.prev
+        } else {
+            priorConv = MLXArray.zeros([B, convChannels, 2], dtype: .float32)
+            priorPrev = MLXArray.zeros([B, hiddenSize], dtype: .float32)
+        }
+
+        let hasPriorCCA = (zayaCache?.offset ?? batchCache?.offset ?? 0) > 0
+        let qkAug = hasPriorCCA
+            ? concatenated([priorConv.asType(qkInputCT.dtype), qkInputCT], axis: -1)
+            : concatenated([
+                MLXArray.zeros([B, convChannels, 2], dtype: qkInputCT.dtype),
+                qkInputCT,
+            ], axis: -1)
+
+        let qkPostFeat = qkv.convQK[1](qkv.convQK[0](qkAug.transposed(0, 2, 1)))
+        let inputStateLen = qkAug.dim(-1)
+        let newConv: MLXArray = {
+            if inputStateLen >= 2 {
+                return qkAug[0..., 0..., (inputStateLen - 2)..<inputStateLen].asType(.float32)
+            }
+            let pad = MLXArray.zeros([B, convChannels, 2 - inputStateLen], dtype: qkAug.dtype)
+            return concatenated([pad, qkAug], axis: -1).asType(.float32)
+        }()
+
+        var qOut = qkPostFeat[0..., 0..., 0..<qDim]
+            .reshaped([B, T, qHeads, headDim]) + qkMeanQ
+        var kOut = qkPostFeat[0..., 0..., qDim..<(qDim + kDim)]
+            .reshaped([B, T, kvHeads, headDim]) + qkMeanK
+
+        let hsDelayed: MLXArray = {
+            if hasPriorCCA {
+                let first = priorPrev.asType(x.dtype).expandedDimensions(axis: 1)
+                if T == 1 { return first }
+                return concatenated([first, x[0..., 0..<(T - 1), 0...]], axis: 1)
+            }
+            if T == 1 {
+                return MLXArray.zeros([B, 1, hiddenSize], dtype: x.dtype)
+            }
+            return concatenated([
+                MLXArray.zeros([B, 1, hiddenSize], dtype: x.dtype),
+                x[0..., 0..<(T - 1), 0...],
+            ], axis: 1)
+        }()
+        let v = try concatenated([
+            qkv.value1(x, imageMask: imageMask),
+            qkv.value2(hsDelayed, imageMask: imageMask),
+        ], axis: -1)
+            .reshaped([B, T, kvHeads, headDim])
+            .transposed(0, 2, 1, 3)
+
+        let sqrtHead = Float(headDim).squareRoot()
+        qOut = zaya1VLScaledL2Normalize(qOut, scale: sqrtHead)
+        kOut = zaya1VLScaledL2Normalize(kOut, scale: sqrtHead)
+        kOut = kOut * qkv.temp.asType(kOut.dtype).reshaped([1, 1, kvHeads, 1])
+
+        let qForRoPE = qOut.transposed(0, 2, 1, 3)
+        let kForRoPE = kOut.transposed(0, 2, 1, 3)
+        let qRot: MLXArray
+        let kRot: MLXArray
+        if let batchCache {
+            qRot = rope(qForRoPE, offset: batchCache.offsetArray)
+            kRot = rope(kForRoPE, offset: batchCache.offsetArray)
+        } else {
+            let offset = zayaCache?.offset ?? 0
+            qRot = rope(qForRoPE, offset: offset)
+            kRot = rope(kForRoPE, offset: offset)
+        }
+
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode
+        if let batchCache {
+            mask = batchCache.makeMask(n: T, windowSize: nil, returnArray: false)
+        } else if let zayaCache {
+            mask = zayaCache.makeMask(n: T, windowSize: nil, returnArray: false)
+        } else if T > 1 {
+            mask = .causal
+        } else {
+            mask = .none
+        }
+
+        var (kFull, vFull) = (kRot, v)
+        if let batchCache {
+            (kFull, vFull) = batchCache.update(keys: kRot, values: v)
+        } else if let zayaCache {
+            (kFull, vFull) = zayaCache.update(keys: kRot, values: v)
+        }
+
+        let attn = MLXFast.scaledDotProductAttention(
+            queries: qRot,
+            keys: repeated(kFull, count: repeatN, axis: 1),
+            values: repeated(vFull, count: repeatN, axis: 1),
+            scale: scale,
+            mask: mask)
+        let attnFlat = attn.transposed(0, 2, 1, 3).reshaped([B, T, qDim])
+        let projected = output(attnFlat)
+        let out = try outputAdapter.map {
+            try $0(attnFlat, base: projected, imageMask: imageMask)
+        } ?? projected
+
+        let newPrev = x[0..., (T - 1)..<T, 0...]
+            .reshaped([B, hiddenSize])
+            .asType(.float32)
+        if let batchCache {
+            batchCache.scatterCCA(conv: newConv, prev: newPrev)
+        } else if let zayaCache {
+            zayaCache.writeCCA(conv: newConv, prev: newPrev)
+        }
+        return out
+    }
+}
+
+private func zaya1VLScaledL2Normalize(_ x: MLXArray, scale: Float) -> MLXArray {
+    let xf = x.asType(.float32)
+    let norm = sqrt((xf * xf).sum(axis: -1, keepDims: true) + 1e-6)
+    return (xf * (scale / norm)).asType(x.dtype)
+}
+
+private final class Zaya1VLAttentionBlock: Module {
+    @ModuleInfo(key: "input_norm") private var inputNorm: ZayaRMSNorm
+    @ModuleInfo(key: "res_scale") private var resScale: ZayaResScale
+    @ModuleInfo(key: "self_attn") private var attention: Zaya1VLCCAAttention
+
+    init(_ config: Zaya1VLConfiguration) {
+        self._inputNorm.wrappedValue = ZayaRMSNorm(
+            dimensions: config.hiddenSize, eps: config.normEpsilon)
+        self._resScale.wrappedValue = ZayaResScale()
+        self._attention.wrappedValue = Zaya1VLCCAAttention(config)
+        super.init()
+    }
+
+    func callAsFunction(
+        _ hiddenStates: MLXArray,
+        residual priorResidual: MLXArray?,
+        cache: KVCache?,
+        imageMask: MLXArray?,
+        residualInFP32: Bool,
+        scaleResidualMerge: Bool
+    ) throws -> (hiddenStates: MLXArray, residual: MLXArray) {
+        let scaled = scaleResidualMerge
+            ? resScale.apply(residual: priorResidual, hiddenStates: hiddenStates)
+            : (residual: priorResidual, hiddenStates: hiddenStates)
+        let residual: MLXArray
+        if let r = scaled.residual {
+            residual = scaled.hiddenStates + r
+        } else if residualInFP32 {
+            residual = scaled.hiddenStates.asType(.float32)
+        } else {
+            residual = scaled.hiddenStates
+        }
+        let normed = inputNorm(residual.asType(inputNorm.weight.dtype))
+        return (try attention(normed, cache: cache, imageMask: imageMask), residual)
+    }
+}
+
+private final class Zaya1VLExperts: Module {
+    @ModuleInfo(key: "switch_mlp") private var switchMLP: ZayaSwitchPrimitive
+    @ModuleInfo(key: "local_experts") private var localExpertAdapters: Zaya1VLLocalExpertLoRAAdapters?
+
+    let numExperts: Int
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?, layerIdx: Int) {
+        self.numExperts = config.numExperts
+        let hiddenSize = config.hiddenSize
+        let intermediateSize =
+            config.ffnHiddenSize == config.hiddenSize
+            ? config.ffnHiddenSize
+            : config.ffnHiddenSize / 2
+        let numExperts = config.numExperts
+        switch context {
+        case .some(.jangtq(let gateUp, let down, let seed)):
+            if JANGTQStreamingExperts.isEnabled {
+                self._switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                    inputDims: hiddenSize,
+                    hiddenDims: intermediateSize,
+                    numExperts: numExperts,
+                    gateUpBits: gateUp,
+                    downBits: down,
+                    seed: seed,
+                    layerIdx: layerIdx)
+            } else {
+                self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                    inputDims: hiddenSize,
+                    hiddenDims: intermediateSize,
+                    numExperts: numExperts,
+                    gateUpBits: gateUp,
+                    downBits: down,
+                    seed: seed)
+            }
+        case .some(.affine), .some(.bf16), nil:
+            self._switchMLP.wrappedValue = SwitchGLU(
+                inputDims: hiddenSize,
+                hiddenDims: intermediateSize,
+                numExperts: numExperts)
+        }
+        if config.visionLora {
+            self._localExpertAdapters.wrappedValue = Zaya1VLLocalExpertLoRAAdapters(config)
+        }
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        switchMLP(x, indices)
+    }
+
+    func adapter(for expertID: Int) throws -> Zaya1VLExpertLoRAAdapters {
+        guard let localExpertAdapters else {
+            throw NSError(
+                domain: "Zaya1VL",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "ZAYA1-VL local expert LoRA adapters are not initialized"])
+        }
+        return try localExpertAdapters.adapter(for: expertID)
+    }
+}
+
+private final class Zaya1VLMoEBlock: Module {
+    @ModuleInfo(key: "router") private var router: ZayaRouter
+    @ModuleInfo(key: "experts") private var experts: Zaya1VLExperts
+
+    let hiddenSize: Int
+    let numExperts: Int
+    let visionLora: Bool
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?, layerIdx: Int) {
+        let textConfig = config.makeZayaTextConfiguration()
+        self.hiddenSize = config.hiddenSize
+        self.numExperts = config.numExperts
+        self.visionLora = config.visionLora
+        self._router.wrappedValue = ZayaRouter(textConfig)
+        self._experts.wrappedValue = Zaya1VLExperts(
+            config, context: context, layerIdx: layerIdx)
+        super.init()
+    }
+
+    func callAsFunction(
+        _ x: MLXArray,
+        previousRouterState: MLXArray?,
+        imageMask: MLXArray?
+    ) throws -> (output: MLXArray, routerState: MLXArray) {
+        let B = x.dim(0)
+        let T = x.dim(1)
+        let xFlat = x.reshaped([B * T, hiddenSize])
+        let routed = router.route(xFlat, previousRouterState: previousRouterState)
+        let idx2D = routed.idx.reshaped([B, T, 1])
+        let expertOut = experts(x, idx2D)
+        let expertFlat = (expertOut.ndim == 4 ? expertOut.sum(axis: 2) : expertOut)
+            .reshaped([B * T, hiddenSize])
+        let routeWeights = routed.weights.reshaped([B * T, 1]).asType(expertFlat.dtype)
+        let active = routed.activeMask.reshaped([B * T, 1]).asType(expertFlat.dtype)
+        let selectedOutput = expertFlat * active + xFlat.asType(expertFlat.dtype) * (1 - active)
+        var weighted = selectedOutput * routeWeights
+
+        if let imageMask, visionLora {
+            let imageFlat = imageMask.reshaped([B * T])
+            let activeFlat = routed.activeMask.reshaped([B * T]).asType(.bool)
+            let idxFlat = routed.idx.reshaped([B * T])
+            var loraOut = MLXArray.zeros(like: weighted)
+            let maxExperts = min(numExperts, 16)
+            for expertID in 0 ..< maxExperts {
+                let adapter = try experts.adapter(for: expertID)
+                let tokenMask = (idxFlat .== Int32(expertID)) & imageFlat & activeFlat
+                let addon = adapter(xFlat) * routeWeights
+                loraOut = MLX.where(tokenMask.expandedDimensions(axis: -1), addon, loraOut)
+            }
+            weighted = weighted + loraOut.asType(weighted.dtype)
+        }
+
+        return (weighted.reshaped([B, T, hiddenSize]), routed.nextRouterState)
+    }
+}
+
+private final class Zaya1VLMLPBlock: Module {
+    @ModuleInfo(key: "input_norm") private var inputNorm: ZayaRMSNorm
+    @ModuleInfo(key: "res_scale") private var resScale: ZayaResScale
+    @ModuleInfo(key: "zaya_block") private var zayaBlock: Zaya1VLMoEBlock
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?, layerIdx: Int) {
+        self._inputNorm.wrappedValue = ZayaRMSNorm(
+            dimensions: config.hiddenSize, eps: config.normEpsilon)
+        self._resScale.wrappedValue = ZayaResScale()
+        self._zayaBlock.wrappedValue = Zaya1VLMoEBlock(
+            config, context: context, layerIdx: layerIdx)
+        super.init()
+    }
+
+    func callAsFunction(
+        _ hiddenStates: MLXArray,
+        residual priorResidual: MLXArray?,
+        routerState: MLXArray?,
+        imageMask: MLXArray?,
+        residualInFP32: Bool,
+        scaleResidualMerge: Bool
+    ) throws -> (hiddenStates: MLXArray, residual: MLXArray, routerState: MLXArray) {
+        let scaled = scaleResidualMerge
+            ? resScale.apply(residual: priorResidual, hiddenStates: hiddenStates)
+            : (residual: priorResidual, hiddenStates: hiddenStates)
+        let residual: MLXArray
+        if let r = scaled.residual {
+            residual = scaled.hiddenStates + r
+        } else if residualInFP32 {
+            residual = scaled.hiddenStates.asType(.float32)
+        } else {
+            residual = scaled.hiddenStates
+        }
+        let normed = inputNorm(residual.asType(inputNorm.weight.dtype))
+        let moe = try zayaBlock(
+            normed, previousRouterState: routerState, imageMask: imageMask)
+        return (moe.output, residual, moe.routerState)
+    }
+}
+
+private final class Zaya1VLDecoderLayer: Module {
+    @ModuleInfo(key: "attn") private var attention: Zaya1VLAttentionBlock
+    @ModuleInfo(key: "mlp") private var mlp: Zaya1VLMLPBlock
+
+    let residualInFP32: Bool
+    let scaleResidualMerge: Bool
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?, layerIdx: Int) {
+        self.residualInFP32 = config.residualInFP32
+        self.scaleResidualMerge = config.scaleResidualMerge
+        self._attention.wrappedValue = Zaya1VLAttentionBlock(config)
+        self._mlp.wrappedValue = Zaya1VLMLPBlock(config, context: context, layerIdx: layerIdx)
+        super.init()
+    }
+
+    func callAsFunction(
+        _ hiddenStates: MLXArray,
+        residual: MLXArray?,
+        cache: KVCache?,
+        routerState: MLXArray?,
+        imageMask: MLXArray?
+    ) throws -> (hiddenStates: MLXArray, residual: MLXArray, routerState: MLXArray) {
+        let attn = try attention(
+            hiddenStates,
+            residual: residual,
+            cache: cache,
+            imageMask: imageMask,
+            residualInFP32: residualInFP32,
+            scaleResidualMerge: scaleResidualMerge)
+        return try mlp(
+            attn.hiddenStates,
+            residual: attn.residual,
+            routerState: routerState,
+            imageMask: imageMask,
+            residualInFP32: residualInFP32,
+            scaleResidualMerge: scaleResidualMerge)
+    }
+}
+
+private final class Zaya1VLTextModel: Module {
+    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    fileprivate let layers: [Zaya1VLDecoderLayer]
+    @ModuleInfo(key: "res_scale") private var resScale: ZayaResScale
+    @ModuleInfo(key: "final_norm") private var finalNorm: ZayaRMSNorm
+
+    let hiddenSize: Int
+    let residualInFP32: Bool
+    let scaleResidualMerge: Bool
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?) {
+        self.hiddenSize = config.hiddenSize
+        self.residualInFP32 = config.residualInFP32
+        self.scaleResidualMerge = config.scaleResidualMerge
+        self._embedTokens.wrappedValue = Embedding(
+            embeddingCount: config.vocabSize,
+            dimensions: config.hiddenSize)
+        self.layers = (0 ..< config.numHiddenLayers).map {
+            Zaya1VLDecoderLayer(config, context: context, layerIdx: $0)
+        }
+        self._resScale.wrappedValue = ZayaResScale()
+        self._finalNorm.wrappedValue = ZayaRMSNorm(
+            dimensions: config.hiddenSize, eps: config.normEpsilon)
+        super.init()
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray?,
+        cache: [KVCache]?,
+        inputEmbedding: MLXArray? = nil,
+        imageMask: MLXArray? = nil
+    ) throws -> MLXArray {
+        guard let inputEmbedding = inputEmbedding ?? inputs.map({ embedTokens($0) }) else {
+            throw VLMError.processing("ZAYA1-VL text trunk requires tokens or input embeddings")
+        }
+        var h = inputEmbedding
+        var residual: MLXArray?
+        var routerState: MLXArray?
+        for (idx, layer) in layers.enumerated() {
+            let result = try layer(
+                h,
+                residual: residual,
+                cache: cache?[idx],
+                routerState: routerState,
+                imageMask: imageMask)
+            h = result.hiddenStates
+            residual = result.residual
+            routerState = result.routerState
+        }
+        let scaled = scaleResidualMerge
+            ? resScale.apply(residual: residual, hiddenStates: h)
+            : (residual: residual, hiddenStates: h)
+        let finalResidual: MLXArray
+        if let r = scaled.residual {
+            finalResidual = scaled.hiddenStates + r
+        } else if residualInFP32 {
+            finalResidual = scaled.hiddenStates.asType(.float32)
+        } else {
+            finalResidual = scaled.hiddenStates
+        }
+        return finalNorm(finalResidual.asType(finalNorm.weight.dtype))
+    }
+}
+
+private final class Zaya1VLLanguageModel: Module {
+    @ModuleInfo(key: "model") fileprivate var model: Zaya1VLTextModel
+    @ModuleInfo(key: "lm_head") private var lmHead: Linear?
+
+    let tieWordEmbeddings: Bool
+
+    init(_ config: Zaya1VLConfiguration, context: ZayaMoEContext?) {
+        self.tieWordEmbeddings = config.tieWordEmbeddings
+        self._model.wrappedValue = Zaya1VLTextModel(config, context: context)
+        if !config.tieWordEmbeddings {
+            self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
+        }
+        super.init()
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray?,
+        cache: [KVCache]?,
+        inputEmbedding: MLXArray? = nil,
+        imageMask: MLXArray? = nil
+    ) throws -> MLXArray {
+        let h = try model(
+            inputs,
+            cache: cache,
+            inputEmbedding: inputEmbedding,
+            imageMask: imageMask)
+        if let lmHead {
+            return lmHead(h)
+        }
+        return model.embedTokens.asLinear(h)
+    }
+}
+
+/// Native ZAYA1-VL VLM.
+///
+/// The text trunk is not routed through text-only `ZayaModel`: each of the 40
+/// VL layers runs CCA attention and then ZAYA MoE in the same block, matching
+/// the `../jang` runtime and the shipped bundle namespace. Cache slots are one
+/// `ZayaCCACache` per block, so CCA path-dependent state is restored together
+/// with KV for multi-turn and B>1 paths.
+public final class Zaya1VL: Module, VLMModel {
+    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen25Vision.VisionModel
+    @ModuleInfo(key: "language_model") private var languageModel: Zaya1VLLanguageModel
+
+    public let configuration: Zaya1VLConfiguration
+    private let context: ZayaMoEContext?
+
+    public var vocabularySize: Int { configuration.vocabSize }
+    public var loraLayers: [Module] { languageModel.model.layers }
+
+    public init(_ configuration: Zaya1VLConfiguration) throws {
+        self.configuration = configuration
+        self.context = Self.makeMoEContext(configuration)
+        self._visionModel.wrappedValue = Qwen25Vision.VisionModel(
+            try configuration.makeQwen25VisionConfiguration())
+        self._languageModel.wrappedValue = Zaya1VLLanguageModel(
+            configuration,
+            context: Self.makeMoEContext(configuration))
+        super.init()
+    }
+
+    private static func makeMoEContext(_ config: Zaya1VLConfiguration) -> ZayaMoEContext? {
+        let format = config.weightFormat?.lowercased()
+        let routedBits = config.routedExpertBits
+        let isJANGTQ =
+            format == "mxtq" || format == "jangtq2" || format == "jangtq4" || routedBits != nil
+        guard isJANGTQ else {
+            if format == "mxfp4" {
+                return .affine(bits: 4, groupSize: 64)
+            }
+            return nil
+        }
+        return .jangtq(gateUpBits: routedBits ?? 2, downBits: routedBits ?? 2, seed: 42)
+    }
+
+    public func newCache(parameters _: GenerateParameters?) -> [KVCache] {
+        let convChannels =
+            configuration.numAttentionHeads * configuration.headDim
+            + configuration.numKeyValueHeads * configuration.headDim
+        return (0 ..< configuration.numHiddenLayers).map { _ in
+            ZayaCCACache(
+                batchSize: 1,
+                convChannels: convChannels,
+                hiddenSize: configuration.hiddenSize)
+        }
+    }
+
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize _: Int?) throws
+        -> PrepareResult
+    {
+        guard input.video == nil else {
+            throw VLMError.processing("ZAYA1-VL video input is not implemented")
+        }
+
+        let inputIds = input.text.tokens.ndim == 1
+            ? input.text.tokens.expandedDimensions(axis: 0)
+            : input.text.tokens
+        let inputEmbeds = languageModel.model.embedTokens(inputIds)
+
+        let merged: Zaya1VLRuntimeSupport.ImageMergeResult
+        if let pixels = input.image?.pixels, let frames = input.image?.frames {
+            let dtype = visionModel.patchEmbed.proj.weight.dtype
+            var imageFeatures = visionModel(pixels.asType(dtype), frames: frames)
+            if imageFeatures.ndim == 3 {
+                imageFeatures = imageFeatures.reshaped([-1, imageFeatures.dim(-1)])
+            }
+            merged = try Zaya1VLRuntimeSupport.mergeImageFeatures(
+                inputIds: inputIds,
+                inputEmbeds: inputEmbeds,
+                imageFeatures: imageFeatures,
+                imageTokenId: configuration.imageTokenId)
+        } else {
+            merged = .init(embeddings: inputEmbeds, imageMask: nil)
+        }
+
+        let logits = try languageModel(
+            nil,
+            cache: cache,
+            inputEmbedding: merged.embeddings,
+            imageMask: merged.imageMask)
+        return .logits(.init(logits: logits))
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let inputIds = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        return try! languageModel(inputIds, cache: cache, imageMask: nil)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        Zaya1VLWeightSanitizer.sanitize(weights: weights, configuration: configuration)
     }
 }
 

@@ -119,6 +119,59 @@ import Testing
     }
 }
 
+@Test func coordinatorHybridZayaCCADiskHitDoesNotRequireSeparateSSMCompanion() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("zaya-cca-disk-tier-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let config = CacheCoordinatorConfig(
+        usePagedCache: true,
+        enableDiskCache: true,
+        pagedBlockSize: 4,
+        maxCacheBlocks: 20,
+        diskCacheMaxGB: 1.0,
+        diskCacheDir: tmp,
+        modelKey: "zaya-cca-cache-contract-test"
+    )
+    let coordinator = CacheCoordinator(config: config)
+    coordinator.setHybrid(true)
+    coordinator.setPagedIncompatible(true)
+
+    let tokens = [201, 202, 203, 204]
+    let cache = ZayaCCACache(batchSize: 1, convChannels: 4, hiddenSize: 8)
+    _ = cache.update(
+        keys: MLXArray.ones([1, 1, tokens.count, 8], dtype: .bfloat16),
+        values: MLXArray.ones([1, 1, tokens.count, 8], dtype: .bfloat16) * 2)
+    cache.writeCCA(
+        conv: MLXArray.ones([1, 4, 2], dtype: .float32) * 3,
+        prev: MLXArray.ones([1, 8], dtype: .float32) * 4)
+
+    coordinator.storeAfterGeneration(
+        promptTokens: tokens,
+        perLayerData: extractLayerData(from: [cache]),
+        ssmStates: nil,
+        cache: [cache])
+
+    switch coordinator.fetch(tokens: tokens) {
+    case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
+        #expect(matchedTokens == tokens.count)
+        #expect(remainingTokens.isEmpty)
+        #expect(detail == .disk)
+        #expect(blocks.isEmpty)
+        #expect(diskArrays?["zaya_0_conv_state"] != nil)
+        #expect(diskArrays?["zaya_0_prev_hs"] != nil)
+    case .miss:
+        Issue.record(
+            """
+            ZayaCCACache v2 disk payload already contains path-dependent state; \
+            it must not require a separate SSM companion entry to hit.
+            """)
+    }
+}
+
 @Test func coordinatorMiss() {
     let config = CacheCoordinatorConfig(
         usePagedCache: true,
