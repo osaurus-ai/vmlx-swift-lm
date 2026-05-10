@@ -100,6 +100,18 @@ Hy3 JANGTQ2 now has a current B=2 proof on the Swift engine: active-slot overlap
 
 The MiniMax M2.7 B=2 cross-slot row in [`build/evidence-20260509/minimax_m27_tq_b2.log`](build/evidence-20260509/minimax_m27_tq_b2.log) currently shows a TurboQuant cross-slot drift — that family's B>1 production claim is gated on closing that row.
 
+**MiniMax M2.7 Osaurus speed update (2026-05-10):** the app-path 30 tok/s
+regression was traced to two engine issues: the pinned source was missing the
+documented single-slot `BatchEngine.generate` fast path, and the JANGTQ
+Hadamard/meta optimization was not actually in the source despite stale notes
+claiming it was. This tree restores both. Fresh Release `RunBench` rows on this
+machine show `MiniMax-M2.7-JANGTQ` at 46.6 tok/s through
+`BatchEngine.generate`, and 46.4 tok/s with a production-style
+`CacheCoordinator` attached. Both rows are coherent and stop cleanly. See
+[`docs/MINIMAX-OSAURUS-DECODE-SPEED-DISCREPANCY-2026-05-10.md`](docs/MINIMAX-OSAURUS-DECODE-SPEED-DISCREPANCY-2026-05-10.md).
+The 74 GB `JANGTQ_K` / CRACK rows still need a follow-up run in a clear memory
+window.
+
 The 2026-04-13 multi-turn benchmark numbers above are still representative for those exact models at commits `cf55f6d` / `21176a4`. Re-running them against `main` is a periodic exercise — open follow-up.
 
 ---

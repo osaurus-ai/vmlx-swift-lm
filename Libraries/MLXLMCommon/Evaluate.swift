@@ -2445,7 +2445,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             if stopReason == nil {
                 if Task.isCancelled {
                     stopReason = .cancelled
-                } else if let maxTokens = iterator.maxTokens, iterator.tokenCount >= maxTokens {
+                } else if let maxTokens = iterator.maxTokens, tokenCount >= maxTokens {
                     stopReason = .length
                 } else {
                     stopReason = .cancelled

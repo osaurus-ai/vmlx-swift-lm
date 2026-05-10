@@ -38,8 +38,9 @@ What is NOT proven on current tree (B>1):
 
 | Fix | Where | Net effect | Status |
 |---|---|---|---|
-| Hadamard scratch `newv[64]→newv[8]` | `Libraries/MLXLMCommon/JANGTQKernels.swift` (`kHadamardMultiblockSource`) | MiniMax M2.7 JANGTQ family went 30 → 46-49 tok/s on solo `BatchEngine.generate`. Likely benefits Laguna/Ling/DSV4/Mistral 3.5 too at the kernel level (smoke verified, head-to-head delta unproven). | ✅ Source landed, ✅ proven on MiniMax solo |
+| Hadamard scratch `newv[64]→newv[8]` | `Libraries/MLXLMCommon/JANGTQKernels.swift` (`kHadamardMultiblockSource`) | MiniMax M2.7 JANGTQ went 30 → 46 tok/s on the Osaurus-style `BatchEngine.generate` path. Likely benefits Laguna/Ling/DSV4/Mistral 3.5 too at the kernel level (smoke verified, head-to-head delta unproven). | ✅ Source landed, ✅ proven on MiniMax B=1 + production coordinator |
 | `cachedJANGTQMeta` per-dispatch meta-array cache | `JANGTQKernels.swift:31-49` + every `JANGTQKernelLibrary.*` launcher | Eliminates per-step MLXArray allocation for kernel meta tensors. Compounding effect with the Hadamard fix; together responsible for the 30 → 46-49 jump. | ✅ Source landed, ✅ proven |
+| `BatchEngine.generate` B=1 fast path | `Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift` | Osaurus default `maxBatchSize == 1` traffic now uses the same TokenIterator-backed single-slot path as the fast CLI row, while queued/overlapping requests stay on the continuous-batching scheduler. | ✅ Source landed, ✅ tested, ✅ proven on MiniMax with coordinator |
 | Hadamard fast-path fp32 pre-cast removal | `JANGTQKernels.swift:496-499` | Saved ~10% graph nodes on MiniMax decode (4045 → 3673). Marginal speed contribution; correctness-equivalent. | ✅ Source landed |
 | MiniMax router env alias | `Libraries/MLXLLM/Models/MiniMaxJANGTQ.swift:30-49` | Canonical `VMLX_MINIMAX_ROUTER_COMPILE` now works (was previously inert; only the typo `VMLINUX_*` was read). Legacy typo still works for backwards compat. | ✅ Source landed |
 | Bench-side stop-token fix ("stopfix2") | `RunBench/Bench.swift` (verifier path; NOT model code) | Bench harness no longer drops `LMInput.cacheScopeSalt` on raw-token replay. Production is unaffected — this was a verifier bug. | ✅ Local-only; not osaurus-side |
@@ -94,7 +95,12 @@ These are the actual edits in the worktree as of 2026-05-09 16:35 PDT (uncommitt
 ## §2 No-action-needed (auto-engages on pin update)
 
 osaurus does NOTHING and gets:
-- MiniMax M2.7 JANGTQ family at 46-49 tok/s on solo `BatchEngine.generate` (verified bundles: `MiniMax-M2.7-JANGTQ_K`, `-Small-JANGTQ`, `-JANGTQ`, `-JANGTQ_K-CRACK`).
+- MiniMax M2.7 JANGTQ at 46.4 tok/s on the Osaurus-style
+  `BatchEngine.generate` + `CacheCoordinator` path. Current proof logs:
+  `build/minimax-osaurus-discrepancy-20260510/full-batch-newv8-meta.log` and
+  `full-batch-newv8-meta-prodcoord.log`. `MiniMax-M2.7-Small-JANGTQ` also
+  reaches 46.8 tok/s on the same engine path. The 74 GB `JANGTQ_K` / CRACK
+  bundles still need a follow-up rerun when memory is clear.
 - Reduced AsType count + dispatch count across all JANGTQ models on the Hadamard kernel paths.
 - Cache identity correctness for reasoning + media when `LMInput.cacheScopeSalt` is set by callers (see §3.1).
 - ~~Warm-session live-cache restore-skip optimization on coordinator hits~~ **NOT IN THIS PIN** — `planLiveCacheReuse` was previously claimed landed; verified absent on 2026-05-10. The ~50ms warm-session savings are still on the roadmap, not in the inheritable surface.

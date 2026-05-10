@@ -29,6 +29,27 @@
 import Foundation
 import MLX
 
+private struct JANGTQMetaCacheKey: Hashable {
+    let kind: String
+    let values: [UInt32]
+}
+
+private nonisolated(unsafe) var jangtqMetaCache: [JANGTQMetaCacheKey: MLXArray] = [:]
+private let jangtqMetaCacheLock = NSLock()
+
+private func cachedJANGTQMeta(kind: String, values: [UInt32]) -> MLXArray {
+    let key = JANGTQMetaCacheKey(kind: kind, values: values)
+    jangtqMetaCacheLock.lock()
+    if let cached = jangtqMetaCache[key] {
+        jangtqMetaCacheLock.unlock()
+        return cached
+    }
+    let meta = MLXArray(values)
+    jangtqMetaCache[key] = meta
+    jangtqMetaCacheLock.unlock()
+    return meta
+}
+
 // MARK: - Hadamard multiblock
 
 private let kHadamardMultiblockSource = """
@@ -81,12 +102,13 @@ private let kHadamardMultiblockSource = """
             uint h = 1u << stage;
             uint two_h = 2u * h;
 
-            // Stack buffer per thread for butterfly-stage values. For the
-            // 8192 block + 1024 threads-per-tg this needs ≥ 8 entries;
-            // smaller threads_per_tg → larger ept. Python reference uses
-            // 64 for safety — match it.
-            float newv[64];
-            for (uint k = 0; k < 64; k++) newv[k] = 0.0f;
+            // Stack buffer per thread for butterfly-stage values. The
+            // launcher uses tgSize=min(1024, max(32, maxBlock)), so the
+            // maximum in-shmem 8192 block needs at most 8 entries/thread.
+            // Keeping this at 8 avoids register pressure on MiniMax-sized
+            // JANGTQ decode while preserving the Mistral 3.5 8192-block fix.
+            float newv[8];
+            for (uint k = 0; k < 8; k++) newv[k] = 0.0f;
             for (uint k = 0; k < ept; k++) {
                 uint i_local = tid * ept + k;
                 if (i_local < d_b) {
@@ -461,7 +483,7 @@ public enum JANGTQKernels {
             meta.append(UInt32(d))
             meta.append(UInt32(d.trailingZeroBitCount))
         }
-        return MLXArray(meta)
+        return cachedJANGTQMeta(kind: "hadamard", values: meta)
     }
 
     /// Hadamard rotate `x` (any batch shape with `dim` last). Returns fp32.
@@ -589,7 +611,7 @@ public enum JANGTQKernels {
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         let nDispatches = batchTokens * K
         let limitQ1000 = UInt32(max(0, Int((swigluLimit * 1000.0).rounded())))
-        let meta = MLXArray([
+        let meta = cachedJANGTQMeta(kind: "fusedGateUpSwiGLU", values: [
             UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
             limitQ1000,
@@ -623,7 +645,7 @@ public enum JANGTQKernels {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         // Per-row: K_meta = 1, so token_idx = dispatch_idx, k_idx = 0.
-        let meta = MLXArray([
+        let meta = cachedJANGTQMeta(kind: "gatherTQ", values: [
             UInt32(1), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
         ])
@@ -656,7 +678,7 @@ public enum JANGTQKernels {
         let valsPerU32 = 32 / bits
         let packedCols = (inFeatures + valsPerU32 - 1) / valsPerU32
         let nDispatches = batchTokens * K
-        let meta = MLXArray([
+        let meta = cachedJANGTQMeta(kind: "gatherTQTopK", values: [
             UInt32(K), UInt32(inFeatures), UInt32(outFeatures),
             UInt32(packedCols), UInt32(bits),
         ])

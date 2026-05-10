@@ -176,6 +176,15 @@ public actor BatchEngine {
     /// Background scheduling loop task handle.
     private var loopTask: Task<Void, Never>?
 
+    /// Direct single-request generation task for `generate(...)` when the
+    /// engine is configured as B=1 and no queued/active batch work exists.
+    ///
+    /// This routes Osaurus's default single-stream path through the same
+    /// `TokenIterator` loop as `ModelContainer.generate(...)`, while keeping
+    /// `submit(...)` and maxBatchSize > 1 on the continuous-batching scheduler.
+    private var soloFastPathTask: Task<Void, Never>?
+    private var soloFastPathID: UUID?
+
     /// Terminal lifecycle flag. Once shutdown begins, stale engine handles
     /// reject future submissions instead of restarting GPU work.
     public private(set) var isShutdown: Bool = false
@@ -296,7 +305,7 @@ public actor BatchEngine {
             "Updated maxBatchSize from \(old, privacy: .public) to \(newMaxBatchSize, privacy: .public)"
         )
 
-        if newMaxBatchSize > old {
+        if newMaxBatchSize > old && soloFastPathTask == nil {
             admitPendingRequests()
             if !activeSlots.isEmpty {
                 ensureLoopRunning()
@@ -332,9 +341,6 @@ public actor BatchEngine {
             return cancelledBatchStream(promptTokenCount: input.text.tokens.size)
         }
 
-        context.jangPressRuntime.recordPromptTokenActivity(
-            input.text.tokens.reshaped(-1).asArray(Int.self))
-
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let request = BatchPendingRequest(
             input: input,
@@ -342,7 +348,9 @@ public actor BatchEngine {
             continuation: continuation
         )
         waitQueue.append(request)
-        ensureLoopRunning()
+        if soloFastPathTask == nil {
+            ensureLoopRunning()
+        }
         return (request.id, stream)
     }
 
@@ -429,6 +437,13 @@ public actor BatchEngine {
         // we have the tokenizer on hand.
         let promptTail = _decodePromptTail(
             input: input, tokenizer: tokenizer, tokens: 64)
+
+        if canStartSoloFastPath {
+            return startSoloFastPath(
+                input: input,
+                parameters: parameters,
+                promptTail: promptTail)
+        }
 
         let (requestId, tokenStream) = submit(input: input, parameters: parameters)
 
@@ -615,6 +630,82 @@ public actor BatchEngine {
         return outStream
     }
 
+    private var canStartSoloFastPath: Bool {
+        maxBatchSize == 1 &&
+            waitQueue.isEmpty &&
+            activeSlots.isEmpty &&
+            loopTask == nil &&
+            soloFastPathTask == nil &&
+            !isShutdown
+    }
+
+    private func startSoloFastPath(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        promptTail: String?
+    ) -> AsyncStream<Generation> {
+        let promptTokenCount = input.text.tokens.size
+        let fastPathID = UUID()
+        var soloParameters = parameters
+        if soloParameters.enableCompiledBatchDecode && !soloParameters.enableCompiledDecode {
+            soloParameters.enableCompiledDecode = true
+        }
+        if let coordinator = cacheCoordinator {
+            let (effMode, effMax) = coordinator.config.resolveKVPolicy(
+                kvMode: soloParameters.kvMode,
+                maxKVSize: soloParameters.maxKVSize,
+                promptTokenCount: promptTokenCount
+            )
+            soloParameters.kvMode = effMode
+            soloParameters.maxKVSize = effMax
+        }
+        context.jangPressRuntime.recordPromptTokenActivity(
+            input.text.tokens.reshaped(-1).asArray(Int.self))
+
+        let sourceStream: AsyncStream<Generation>
+        let generationTask: Task<Void, Never>
+        do {
+            let iterator = try TokenIterator(
+                input: input,
+                model: context.model,
+                cache: nil,
+                parameters: soloParameters,
+                cacheCoordinator: cacheCoordinator)
+            (sourceStream, generationTask) = generateTask(
+                promptTokenCount: promptTokenCount,
+                modelConfiguration: context.configuration,
+                tokenizer: context.tokenizer,
+                iterator: iterator,
+                extraStopStrings: soloParameters.extraStopStrings,
+                promptTail: promptTail)
+        } catch {
+            Self.logger.error(
+                "Solo fast path setup failed: \(error.localizedDescription, privacy: .public)"
+            )
+            return cancelledGenerationStream(promptTokenCount: promptTokenCount)
+        }
+
+        soloFastPathID = fastPathID
+        soloFastPathTask = generationTask
+
+        Task {
+            await generationTask.value
+            self.finishSoloFastPath(id: fastPathID)
+        }
+
+        return sourceStream
+    }
+
+    private func finishSoloFastPath(id: UUID) {
+        guard soloFastPathID == id else { return }
+        Stream().synchronize()
+        soloFastPathID = nil
+        soloFastPathTask = nil
+        if !isShutdown && !waitQueue.isEmpty {
+            ensureLoopRunning()
+        }
+    }
+
     /// Cancel a specific request by ID.
     ///
     /// If the request is still in the wait queue, it is removed immediately.
@@ -656,6 +747,9 @@ public actor BatchEngine {
 
         loopTask?.cancel()
         loopTask = nil
+        soloFastPathTask?.cancel()
+        soloFastPathTask = nil
+        soloFastPathID = nil
 
         // Finish all pending requests
         for request in waitQueue {
@@ -681,10 +775,12 @@ public actor BatchEngine {
     public var pendingCount: Int { waitQueue.count }
 
     /// The number of sequences currently being generated.
-    public var activeCount: Int { activeSlots.count }
+    public var activeCount: Int { activeSlots.count + (soloFastPathTask == nil ? 0 : 1) }
 
     /// Whether the engine is currently running (has active or pending work).
-    public var isRunning: Bool { loopTask != nil }
+    public var isRunning: Bool { loopTask != nil || soloFastPathTask != nil }
+
+    var isSoloFastPathActiveForTesting: Bool { soloFastPathTask != nil }
 
     /// Whether the engine still accepts new generation requests.
     public var isAcceptingRequests: Bool { !isShutdown }
@@ -758,6 +854,8 @@ public actor BatchEngine {
     private func admitPendingRequests() {
         while activeSlots.count < maxBatchSize && !waitQueue.isEmpty {
             var request = waitQueue.removeFirst()
+            context.jangPressRuntime.recordPromptTokenActivity(
+                request.input.text.tokens.reshaped(-1).asArray(Int.self))
 
             // LONG-CTX (2026-04-21): apply the coordinator's KV-sizing
             // defaults before we allocate the slot's cache.

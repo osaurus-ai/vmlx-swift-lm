@@ -11,6 +11,17 @@
 > Kept here as a historical record for the DSV4 / Ling / Bailing / Gemma /
 > Laguna / Qwen / MiniMax / Nemotron-Omni cache-tier and TurboQuant KV
 > notes that were accurate at 2026-05-06.
+>
+> **MiniMax speed supersession 2026-05-10:** `a5a0e37` had no committed
+> `soloFastPath*` branch and routed `BatchEngine.generate` through
+> actor-managed `submit(...)`. It also lacked the JANGTQ Hadamard `newv[8]`
+> and cached-meta optimization that stale notes claimed were already present.
+> Both are restored in the current working tree. Fresh Release rows show
+> `MiniMax-M2.7-JANGTQ` at 46.6 tok/s through `BatchEngine.generate`, and
+> 46.4 tok/s with a production-style `CacheCoordinator` attached. See
+> `docs/MINIMAX-OSAURUS-DECODE-SPEED-DISCREPANCY-2026-05-10.md`. The
+> 74 GB `JANGTQ_K` / CRACK rows still need a follow-up run in a clear memory
+> window.
 
 Audience: osaurus agents wiring `vmlx-swift-lm` into the production runtime.
 

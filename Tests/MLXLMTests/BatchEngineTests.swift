@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXLLM
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXNN
 import Testing
 import XCTest
@@ -772,6 +772,111 @@ class BatchEngineIntegrationTests: XCTestCase {
         XCTAssertEqual(pendingCount, 0)
         XCTAssertEqual(activeCount, 0)
         XCTAssertFalse(isRunning)
+    }
+
+    /// Regression for the Osaurus MiniMax speed path: the high-level
+    /// `generate(...)` API should use the direct TokenIterator loop when the
+    /// engine is configured as B=1 and no other work is queued. That keeps the
+    /// app's default single-request path aligned with the proven CLI path while
+    /// leaving `submit(...)` and maxBatchSize > 1 on the batching scheduler.
+    func testGenerateUsesSoloFastPathWhenEngineIsIdleAndBOne() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 1)
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 20, temperature: 0)
+        )
+
+        let soloActive = await engine.isSoloFastPathActiveForTesting
+        let activeCount = await engine.activeCount
+        XCTAssertTrue(soloActive, "Idle B=1 generate() should use the direct solo fast path")
+        XCTAssertEqual(activeCount, 1, "solo fast path should count as active work")
+
+        await engine.shutdown()
+        let result = await collectGenerations(from: stream)
+        XCTAssertEqual(result.info?.stopReason, .cancelled)
+    }
+
+    func testGenerateSoloFastPathCompletesWithoutQueuedWork() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 1)
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+
+        let soloActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActive)
+
+        let result = await collectGenerations(from: stream)
+        XCTAssertEqual(
+            result.info?.stopReason, .length,
+            "info=\(String(describing: result.info)), chunks=\(result.chunks.count)")
+        let finalSoloActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertFalse(finalSoloActive)
+    }
+
+    /// If a raw `submit(...)` arrives while the direct B=1 `generate(...)`
+    /// path owns the model, it must queue without starting the actor decode
+    /// loop. Starting both would create two concurrent MLX paths over the same
+    /// model/cache objects.
+    func testSubmitQueuesBehindActiveSoloFastPath() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 1)
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 20, temperature: 0)
+        )
+        let soloActiveBeforeSubmit = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActiveBeforeSubmit)
+
+        let generatedTask = Task { @Sendable [stream] in
+            var chunks = [String]()
+            var info: GenerateCompletionInfo?
+            for await event in stream {
+                switch event {
+                case .chunk(let text):
+                    chunks.append(text)
+                case .info(let i):
+                    info = i
+                case .reasoning, .toolCall:
+                    break
+                @unknown default:
+                    break
+                }
+            }
+            return (chunks: chunks, info: info)
+        }
+
+        let (_, queuedStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(8) ..< Int32(12))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+
+        let pendingCount = await engine.pendingCount
+        XCTAssertEqual(pendingCount, 1)
+        let running = await engine.isRunning
+        let soloStillActive = await engine.isSoloFastPathActiveForTesting
+        let schedulerOnlyRunning = running && !soloStillActive
+        XCTAssertFalse(schedulerOnlyRunning,
+            "batch scheduler should not run concurrently with the solo fast path")
+
+        let generated = await generatedTask.value
+        let queued = await collectTokens(from: queuedStream)
+        XCTAssertEqual(
+            generated.info?.stopReason, .length,
+            "info=\(String(describing: generated.info)), chunks=\(generated.chunks.count)")
+        XCTAssertEqual(queued.info?.stopReason, .length)
+        let finalPendingCount = await engine.pendingCount
+        let finalSoloActive = await engine.isSoloFastPathActiveForTesting
+        XCTAssertEqual(finalPendingCount, 0)
+        XCTAssertFalse(finalSoloActive)
     }
 
     /// Test: shutdown is terminal, so stale engine handles cannot restart GPU work.
