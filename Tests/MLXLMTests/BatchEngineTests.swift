@@ -435,6 +435,39 @@ class BatchEngineIntegrationTests: XCTestCase {
         return BatchEngine(context: context, maxBatchSize: maxBatchSize)
     }
 
+    private func makeEngineWithCoordinator(
+        vocabSize: Int = 200,
+        maxBatchSize: Int = 1
+    ) -> (BatchEngine, CacheCoordinator) {
+        let config = LlamaConfiguration(
+            hiddenSize: 64, hiddenLayers: 4, intermediateSize: 128,
+            attentionHeads: 8, rmsNormEps: 1e-5, vocabularySize: vocabSize, kvHeads: 4)
+        let model = LlamaModel(config)
+        quantize(model: model, groupSize: 64, bits: 4)
+        MLX.eval(model)
+
+        let processor = TestInputProcessor()
+        nonisolated(unsafe) let context = ModelContext(
+            configuration: processor.configuration,
+            model: model,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let coordinator = CacheCoordinator(config: CacheCoordinatorConfig(
+            usePagedCache: true,
+            enableDiskCache: false,
+            pagedBlockSize: 4,
+            maxCacheBlocks: 256
+        ))
+        return (
+            BatchEngine(
+                context: context,
+                maxBatchSize: maxBatchSize,
+                cacheCoordinator: coordinator),
+            coordinator
+        )
+    }
+
     /// Regression for long-prefill admission starvation. A large model can spend
     /// seconds in prefill after the first submit. The engine must still leave a
     /// control-plane turn for the immediately following submit to enqueue a
@@ -877,6 +910,116 @@ class BatchEngineIntegrationTests: XCTestCase {
         let finalSoloActive = await engine.isSoloFastPathActiveForTesting
         XCTAssertEqual(finalPendingCount, 0)
         XCTAssertFalse(finalSoloActive)
+    }
+
+    /// Regression coverage for the app Stop-button symptom: if the client
+    /// stops reading the high-level B=1 stream, the direct TokenIterator task
+    /// must cancel, release solo ownership, and let queued engine work run.
+    func testGenerateSoloFastPathConsumerCancellationReleasesQueuedSubmit() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 1)
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0)
+        )
+        let soloActiveBeforeSubmit = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActiveBeforeSubmit)
+
+        let (_, queuedStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(9) ..< Int32(13))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+        let pendingAfterSubmit = await engine.pendingCount
+        XCTAssertEqual(pendingAfterSubmit, 1)
+
+        let sawEvent = await Task { @Sendable [stream] in
+            for await _ in stream {
+                return true
+            }
+            return false
+        }.value
+        XCTAssertTrue(sawEvent)
+
+        let queued = await collectTokens(from: queuedStream)
+        XCTAssertEqual(queued.info?.stopReason, .length)
+        let finalPendingCount = await engine.pendingCount
+        let finalSoloActive = await engine.isSoloFastPathActiveForTesting
+        let finalRunning = await engine.isRunning
+        XCTAssertEqual(finalPendingCount, 0)
+        XCTAssertFalse(finalSoloActive)
+        XCTAssertFalse(finalRunning)
+    }
+
+    /// Runtime resizing must not wake the batch scheduler while a B=1 direct
+    /// generate owns the model. The queued request can start only after the
+    /// solo task drains or cancels.
+    func testUpdateMaxBatchSizeDoesNotWakeSchedulerDuringSoloFastPath() async throws {
+        let engine = makeSlowPrefillEngine(
+            prefillDelayMicroseconds: 20_000,
+            maxBatchSize: 1)
+
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(5))),
+            parameters: GenerateParameters(maxTokens: 1_000, temperature: 0)
+        )
+        let soloActiveBeforeSubmit = await engine.isSoloFastPathActiveForTesting
+        XCTAssertTrue(soloActiveBeforeSubmit)
+
+        let (_, queuedStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(9) ..< Int32(13))),
+            parameters: GenerateParameters(maxTokens: 2, temperature: 0)
+        )
+        let pendingAfterSubmit = await engine.pendingCount
+        XCTAssertEqual(pendingAfterSubmit, 1)
+
+        try await engine.updateMaxBatchSize(2)
+
+        let soloActiveAfterResize = await engine.isSoloFastPathActiveForTesting
+        let pendingAfterResize = await engine.pendingCount
+        let activeAfterResize = await engine.activeCount
+        XCTAssertTrue(soloActiveAfterResize)
+        XCTAssertEqual(pendingAfterResize, 1)
+        XCTAssertEqual(activeAfterResize, 1)
+
+        let generated = await collectGenerations(from: stream)
+        XCTAssertEqual(generated.info?.stopReason, .length)
+
+        let queued = await collectTokens(from: queuedStream)
+        XCTAssertEqual(queued.info?.stopReason, .length)
+        let finalSoloActive = await engine.isSoloFastPathActiveForTesting
+        let finalPendingCount = await engine.pendingCount
+        XCTAssertFalse(finalSoloActive)
+        XCTAssertEqual(finalPendingCount, 0)
+    }
+
+    /// The single-request fast path must still participate in prompt-cache
+    /// storage. This covers the app default B=1 path, not the lower-level
+    /// `submit(...)` scheduler path covered by compile/coordinator tests.
+    func testGenerateSoloFastPathStoresIntoCacheCoordinator() async throws {
+        let mlxTestLock = lockSerializedMLXTest()
+        defer { mlxTestLock.unlock() }
+
+        let (engine, coordinator) = makeEngineWithCoordinator(maxBatchSize: 1)
+        let promptTokens: [Int32] = [3, 7, 11, 13, 17, 19, 23, 29]
+        let stream = await engine.generate(
+            input: LMInput(tokens: MLXArray(promptTokens)),
+            parameters: GenerateParameters(maxTokens: 3, temperature: 0)
+        )
+
+        let result = await collectGenerations(from: stream)
+        XCTAssertEqual(result.info?.stopReason, .length)
+
+        let expectedTokens = promptTokens.map { Int($0) }
+        switch coordinator.fetch(tokens: expectedTokens, mediaSalt: nil) {
+        case .hit(let matchedTokens, let remainingTokens, let detail, _, _, _):
+            XCTAssertEqual(matchedTokens, expectedTokens.count)
+            XCTAssertTrue(remainingTokens.isEmpty)
+            XCTAssertEqual(detail.rawValue, CacheDetail.paged.rawValue)
+        case .miss:
+            XCTFail("B=1 generate fast path should populate the cache coordinator")
+        }
     }
 
     /// Test: shutdown is terminal, so stale engine handles cannot restart GPU work.
