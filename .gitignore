@@ -96,6 +96,8 @@ iOSInjectionProject/
 .vscode
 
 # Local development — never commit to public repo
+AGENTS.md
+.agents/
 .claude/
 .sisyphus/
 TestRunner/

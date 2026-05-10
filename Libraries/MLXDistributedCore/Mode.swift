@@ -4,7 +4,7 @@ import Foundation
 /// (`replica`, `pipelined`, `wired`) round-trip through the wire schema;
 /// `auto` and `localOnly` are caller-side selections that never appear
 /// in `dist.modes` TXT keys.
-public enum Mode: String, Sendable, Hashable, CaseIterable {
+public enum Mode: String, Codable, Sendable, Hashable, CaseIterable {
     case auto
     case localOnly
     case replica

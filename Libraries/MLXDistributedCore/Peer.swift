@@ -3,7 +3,7 @@ import Foundation
 /// Stable identity for a discovered peer. Equality and hashing are id-only;
 /// hostname / endpoints / capabilities can change across re-resolution
 /// without the peer becoming a "different" peer.
-public struct Peer: Sendable, Equatable, Hashable {
+public struct Peer: Codable, Sendable, Equatable, Hashable {
     public let id: UUID
     public let hostname: String
     public let capabilities: PeerCapabilities
@@ -35,7 +35,7 @@ public struct Peer: Sendable, Equatable, Hashable {
 }
 
 /// What a peer is willing to participate in.
-public struct PeerCapabilities: Sendable, Equatable, Hashable {
+public struct PeerCapabilities: Codable, Sendable, Equatable, Hashable {
     public let modes: Set<Mode>
 
     public init(modes: Set<Mode>) {
@@ -48,7 +48,7 @@ public struct PeerCapabilities: Sendable, Equatable, Hashable {
 }
 
 /// A reachable transport endpoint advertised by a peer.
-public enum Endpoint: Sendable, Equatable, Hashable {
+public enum Endpoint: Codable, Sendable, Equatable, Hashable {
     case tls(host: String, port: UInt16, fingerprintSHA256: String)
     case rdma(gid: String, devices: [String])
 }
@@ -57,7 +57,7 @@ public enum Endpoint: Sendable, Equatable, Hashable {
 /// The sentinel means the peer has too many models to fit in the TXT record;
 /// callers must fetch the full list via `/v1/dist/models` over TLS (engine
 /// spec §10).
-public enum ModelHashSet: Sendable, Equatable, Hashable {
+public enum ModelHashSet: Codable, Sendable, Equatable, Hashable {
     case explicit([String])
     case overflow
 }
