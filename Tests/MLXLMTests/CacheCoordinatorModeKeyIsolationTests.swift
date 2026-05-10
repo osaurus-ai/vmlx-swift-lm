@@ -151,6 +151,52 @@ final class CacheCoordinatorModeKeyIsolationTests: XCTestCase {
         }
     }
 
+    func testCacheScopeSaltIncludesReasoningEffortOnlyForSemanticKeys() {
+        XCTAssertEqual(
+            cacheScopeSalt(from: ["reasoning_effort": "high"]),
+            "effort=high")
+        XCTAssertEqual(
+            cacheScopeSalt(from: ["reasoning_effort": " No_Think "]),
+            "effort=no_think")
+        XCTAssertEqual(
+            cacheScopeSalt(from: [
+                "enable_thinking": true,
+                "reasoning_effort": "low",
+            ]),
+            "reasoning=on|effort=low")
+        XCTAssertEqual(
+            cacheScopeSalt(from: [
+                "enable_thinking": false,
+                "reasoning_effort": "max",
+            ]),
+            "reasoning=off|effort=max")
+        XCTAssertNil(cacheScopeSalt(from: [
+            "ui_panel": "visible",
+            "temperature_source": "default",
+        ]))
+    }
+
+    func testReasoningEffortChangesDynamicCacheSalt() {
+        let tokenArray = MLXArray([Int32(601), Int32(602), Int32(603)])
+            .expandedDimensions(axis: 0)
+        let text = LMInput.Text(tokens: tokenArray)
+
+        let noThink = computeCacheSalt(for: LMInput(
+            text: text,
+            cacheScopeSalt: cacheScopeSalt(from: ["reasoning_effort": "no_think"])))
+        let high = computeCacheSalt(for: LMInput(
+            text: text,
+            cacheScopeSalt: cacheScopeSalt(from: ["reasoning_effort": "high"])))
+        let unrelated = computeCacheSalt(for: LMInput(
+            text: text,
+            cacheScopeSalt: cacheScopeSalt(from: ["unrelated": "value"])))
+
+        XCTAssertNotNil(noThink)
+        XCTAssertNotNil(high)
+        XCTAssertNotEqual(noThink, high)
+        XCTAssertNil(unrelated)
+    }
+
     private func makeDiskCoordinator(dir: URL, modeKey: String) -> CacheCoordinator {
         CacheCoordinator(config: CacheCoordinatorConfig(
             usePagedCache: false,

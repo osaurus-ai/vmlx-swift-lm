@@ -115,11 +115,12 @@ osaurus's existing `BatchEnginePlan.openBlockers` should remain `[]` — both `k
 // Build additionalContext that the chat-template + cache-key pipeline understands.
 let additionalContext: [String: any Sendable] = [
     "enable_thinking": req.reasoningOn,           // recognized scope key
-    // future scope flags can be added here without changing this call site
+    "reasoning_effort": req.reasoningEffort,      // e.g. Hy3 no_think|low|high, DSV4 max
 ]
 
 // Helper at `Libraries/MLXLMCommon/Cache/MediaSalt.swift:cacheScopeSalt(from:)`
-// returns "reasoning=on" / "reasoning=off" / nil per the recognized-key contract.
+// returns "reasoning=on" / "reasoning=off" / "effort=<value>" /
+// "reasoning=on|effort=<value>" / nil per the recognized-key contract.
 let salt: String? = cacheScopeSalt(from: additionalContext)
 
 // `text` here is `LMInput.Text` (struct wrapping tokens + optional mask),
@@ -148,7 +149,7 @@ public func computeCacheSalt(for input: LMInput) -> String?
 public func computeMediaSalt(for input: LMInput) -> String?
 ```
 
-`cacheScopeSalt(from:)` decides what additionalContext keys are recognized (currently just `enable_thinking`); unrelated keys deliberately return `nil` so they do NOT fragment cache keys. `computeCacheSalt(for:)` is internal call-site machinery — most callers only need `cacheScopeSalt(from:)` + the `LMInput.cacheScopeSalt:` initializer parameter.
+`cacheScopeSalt(from:)` decides what additionalContext keys are recognized (currently `enable_thinking` and `reasoning_effort`); unrelated keys deliberately return `nil` so they do NOT fragment cache keys. `computeCacheSalt(for:)` is internal call-site machinery — most callers only need `cacheScopeSalt(from:)` + the `LMInput.cacheScopeSalt:` initializer parameter.
 
 **Real-model proof status:** UNIT-PROVEN (mode + media salt key isolation in `CacheCoordinatorModeKeyIsolationTests`). REAL-MODEL multi-turn proof is OPEN per CODEX matrix. osaurus may want to add its own e2e proof on the request flow before flipping reasoning toggles in production.
 
@@ -164,6 +165,7 @@ so Swift Jinja and the cache-key salt see the same mode.
 | ZAYA1-VL | Native image/text generation is wired. Current proof covers JANGTQ2 image->text + text follow-up, same-media disk HIT, different-image MISS, TokenIterator/BatchEngine byte identity, plus JANGTQ4/MXFP4 disk-backed cache restore. | Route through VLM factory, pass images as structured `UserInput`, and keep conservative CCA cache policy: disk-backed v2 restore only, no paged-prefix claim, no TurboQuant-KV mapping. B>1 media isolation, cancellation, longer semantic rows, video, and any reasoning-on image rows remain open. |
 | Ling/Bailing | Production default is non-thinking. Stamps should be `supports_thinking=false`; Swift seeds `enable_thinking=false` for these capability stamps. | Do not expose a normal reasoning toggle unless a future model-specific diagnostic path is intentionally added and tested. Still pass the default through `additionalContext` so salts stay explicit. |
 | Qwen/Nemotron/DSV/Kimi/MiniMax reasoning families | Capability/model-type parser selects the reasoning parser. | Wire toggle per model support and run mixed-turn cache rows before product exposure. |
+| Hy3 / Hunyuan v3 | Uses `reasoning_effort` (`no_think`, `low`, `high`) rather than a boolean-only template. Default is `no_think`; `low`/`high` open `<think>`. | Expose native effort values, pass `additionalContext["reasoning_effort"]`, and ensure the resulting `LMInput.cacheScopeSalt` includes the effort so L2/paged cache cannot alias no-think and high-effort turns. |
 
 Do not add Osaurus-side family-name rewrites for ZAYA. If a local user model
 has stale ZAYA `supports_thinking=false`, surface it as a bundle validation
