@@ -64,7 +64,7 @@ struct Zaya1VLNativeAdapterSourceCoverageTests {
         #expect(mediaSaltSource.contains("let scope = input.cacheScopeSalt"))
     }
 
-    @Test("Vision LoRA adapter matches shipped two-linear tensor contract")
+    @Test("Vision LoRA adapter matches canonicalized two-linear tensor contract")
     func visionLoRAAdapterSourceContract() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -79,14 +79,19 @@ struct Zaya1VLNativeAdapterSourceCoverageTests {
             encoding: .utf8)
 
         #expect(source.contains("public final class Zaya1VLLowRankAdapter: Module"))
-        #expect(source.contains("@ModuleInfo(key: \"0\")"))
-        #expect(source.contains("@ModuleInfo(key: \"1\")"))
+        #expect(source.contains("@ModuleInfo(key: \"down\")"))
+        #expect(source.contains("@ModuleInfo(key: \"up\")"))
+        #expect(source.contains("canonicalizeLowRankSequentialKey"))
+        #expect(source.contains("of: \".\\(name).0.weight\""))
+        #expect(source.contains("with: \".\\(name).down.weight\""))
+        #expect(source.contains("of: \".\\(name).1.weight\""))
+        #expect(source.contains("with: \".\\(name).up.weight\""))
         #expect(source.contains("Linear(inputDimensions, rank, bias: false)"))
         #expect(source.contains("Linear(rank, outputDimensions, bias: false)"))
         #expect(source.contains("Zaya1VLRuntimeSupport.applyImageMaskedAdd("))
     }
 
-    @Test("Vision LoRA module namespaces match shipped attention and expert sidecars")
+    @Test("Vision LoRA module namespaces match canonicalized attention and expert sidecars")
     func visionLoRAModuleNamespaceContract() throws {
         let repo = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -112,8 +117,10 @@ struct Zaya1VLNativeAdapterSourceCoverageTests {
         #expect(source.contains("@ModuleInfo(key: \"lora_fc1\")"))
         #expect(source.contains("@ModuleInfo(key: \"lora_fc2\")"))
         #expect(source.contains("public final class Zaya1VLLocalExpertLoRAAdapters: Module"))
-        #expect(source.contains("@ModuleInfo(key: \"0\") private var expert0"))
-        #expect(source.contains("@ModuleInfo(key: \"15\") private var expert15"))
+        #expect(source.contains("@ModuleInfo(key: \"expert_0\") private var expert0"))
+        #expect(source.contains("@ModuleInfo(key: \"expert_15\") private var expert15"))
+        #expect(source.contains("canonicalizeLocalExpertKey"))
+        #expect(source.contains("with: \".local_experts.expert_\\(expertID).\")"))
         #expect(source.contains("public func adapter(for expertIndex: Int) throws"))
         #expect(source.contains("config.numAttentionHeads * config.headDim"))
         #expect(source.contains("config.numKeyValueHeads * config.headDim"))

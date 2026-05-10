@@ -1,5 +1,17 @@
 # CHANGELOG — vmlx-swift-lm (osaurus-ai/vmlx-swift-lm)
 
+## [2026-05-10] — B=1 lifecycle, streaming experts, and VLM cache offsets
+
+- `BatchEngine.generate` now clears the B=1 solo fast-path lifecycle before the returned stream finishes. This removes the race where callers could receive completion while the engine still reported active solo work.
+- `JANGTQStreamingExperts` now indexes pre-stacked `switch_mlp.{gate,up,down}_proj.{tq_packed,tq_norms}` tensors in addition to legacy per-expert tensors, and slices the selected expert rows at load time.
+- Qwen3.5-VL gated-delta layers now advance `MambaCache.offset` when writing recurrent state, so session startup and subsequent SSM masks see the true token position.
+- ZAYA1-VL source-contract coverage now asserts the canonicalized LoRA module names (`down`/`up`, `expert_N`) and the sanitizer rewrites from shipped sidecar keys.
+
+**Verification:**
+- 6/6 solo fast-path lifecycle tests pass.
+- 8/8 focused regression tests pass for streaming experts, Qwen3.5-VL gated-delta cache offset, and ZAYA1-VL source contracts.
+- Broad serialized runtime matrix passes: 603 tests in 89 suites, covering batch/cache/KV/TurboQuant/SSM/JANGTQ/runtime/reasoning/templates/tools/VLM/ZAYA/Hy3/Gemma/Kimi/Laguna/Bailing/DeepSeek/Nemotron.
+
 ## [2026-04-21] — Coordinator-owned KV sizing + BatchEngine decode perf
 
 ### Feature: `CacheCoordinator` now owns KV sizing end-to-end

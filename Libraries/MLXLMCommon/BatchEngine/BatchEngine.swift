@@ -688,12 +688,19 @@ public actor BatchEngine {
         soloFastPathID = fastPathID
         soloFastPathTask = generationTask
 
+        let (outStream, continuation) = AsyncStream<Generation>.makeStream()
+        continuation.onTermination = { @Sendable _ in
+            generationTask.cancel()
+        }
         Task {
-            await generationTask.value
+            for await generation in sourceStream {
+                continuation.yield(generation)
+            }
             self.finishSoloFastPath(id: fastPathID)
+            continuation.finish()
         }
 
-        return sourceStream
+        return outStream
     }
 
     private func finishSoloFastPath(id: UUID) {

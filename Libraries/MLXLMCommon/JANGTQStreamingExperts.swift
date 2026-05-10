@@ -63,6 +63,7 @@ private struct StreamingExpertRef {
 
 private struct StreamingLayerRef {
     var experts: [Int: StreamingExpertRef]
+    var stacked: [StreamingProjection: [StreamingSuffix: StreamingTensorRef]]
 }
 
 private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
@@ -88,26 +89,38 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
         for file in files {
             let header = try readSafetensorsHeader(file)
             for (key, value) in header.tensors {
-                guard let match = matchPerExpertTQKey(key),
-                      let dtype = value["dtype"] as? String,
+                guard let dtype = value["dtype"] as? String,
                       let shape = value["shape"] as? [Int],
                       let offsets = value["data_offsets"] as? [UInt64],
                       offsets.count == 2,
                       offsets[1] >= offsets[0]
                 else { continue }
 
-                var layer = layers[match.layer] ?? StreamingLayerRef(experts: [:])
-                var expert = layer.experts[match.expert] ?? StreamingExpertRef(tensors: [:])
-                var projection = expert.tensors[match.projection] ?? [:]
-                projection[match.suffix] = StreamingTensorRef(
+                let ref = StreamingTensorRef(
                     fileURL: file,
                     offset: header.dataBase + offsets[0],
                     byteCount: Int(offsets[1] - offsets[0]),
                     dtype: dtype,
                     shape: shape)
-                expert.tensors[match.projection] = projection
-                layer.experts[match.expert] = expert
-                layers[match.layer] = layer
+
+                if let match = matchPerExpertTQKey(key) {
+                    var layer = layers[match.layer] ?? StreamingLayerRef(experts: [:], stacked: [:])
+                    var expert = layer.experts[match.expert] ?? StreamingExpertRef(tensors: [:])
+                    var projection = expert.tensors[match.projection] ?? [:]
+                    projection[match.suffix] = ref
+                    expert.tensors[match.projection] = projection
+                    layer.experts[match.expert] = expert
+                    layers[match.layer] = layer
+                    continue
+                }
+
+                if let match = matchStackedTQKey(key) {
+                    var layer = layers[match.layer] ?? StreamingLayerRef(experts: [:], stacked: [:])
+                    var projection = layer.stacked[match.projection] ?? [:]
+                    projection[match.suffix] = ref
+                    layer.stacked[match.projection] = projection
+                    layers[match.layer] = layer
+                }
             }
         }
         return JANGTQStreamingExpertIndex(modelDirectory: modelDirectory, layers: layers)
@@ -156,6 +169,12 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
     private struct KeyMatch {
         var layer: Int
         var expert: Int
+        var projection: StreamingProjection
+        var suffix: StreamingSuffix
+    }
+
+    private struct StackedKeyMatch {
+        var layer: Int
         var projection: StreamingProjection
         var suffix: StreamingSuffix
     }
@@ -209,6 +228,57 @@ private final class JANGTQStreamingExpertIndex: @unchecked Sendable {
                   let suffix = StreamingSuffix(rawValue: String(key[suffixRange]))
             else { continue }
             return KeyMatch(layer: layer, expert: expert, projection: projection, suffix: suffix)
+        }
+        return nil
+    }
+
+    private static func matchStackedTQKey(_ key: String) -> StackedKeyMatch? {
+        let patterns: [(String, [String: StreamingProjection])] = [
+            (
+                #"^(?:language_model\.)?model\.layers\.(\d+)\.(?:mlp|block_sparse_moe)\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
+                [
+                    "gate_proj": .gate,
+                    "up_proj": .up,
+                    "down_proj": .down,
+                ]
+            ),
+            (
+                #"^(?:language_model\.)?model\.layers\.(\d+)\.(?:mlp\.)?zaya_block\.experts\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
+                [
+                    "gate_proj": .gate,
+                    "up_proj": .up,
+                    "down_proj": .down,
+                ]
+            ),
+            (
+                #"^layers\.(\d+)\.ffn\.switch_mlp\.(w1|w2|w3)\.(tq_packed|tq_norms)$"#,
+                [
+                    "w1": .gate,
+                    "w2": .down,
+                    "w3": .up,
+                ]
+            ),
+            (
+                #"^backbone\.layers\.(\d+)\.mixer\.switch_mlp\.(up_proj|down_proj)\.(tq_packed|tq_norms)$"#,
+                [
+                    "up_proj": .up,
+                    "down_proj": .down,
+                ]
+            ),
+        ]
+        for (pattern, projectionMap) in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let nsRange = NSRange(key.startIndex..<key.endIndex, in: key)
+            guard let match = regex.firstMatch(in: key, range: nsRange),
+                  match.numberOfRanges == 4,
+                  let layerRange = Range(match.range(at: 1), in: key),
+                  let projectionRange = Range(match.range(at: 2), in: key),
+                  let suffixRange = Range(match.range(at: 3), in: key),
+                  let layer = Int(key[layerRange]),
+                  let projection = projectionMap[String(key[projectionRange])],
+                  let suffix = StreamingSuffix(rawValue: String(key[suffixRange]))
+            else { continue }
+            return StackedKeyMatch(layer: layer, projection: projection, suffix: suffix)
         }
         return nil
     }
@@ -408,8 +478,9 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         lock.unlock()
         let layers = built.layers.count
         let experts = built.layers.values.map { $0.experts.count }.max() ?? 0
+        let stacked = built.layers.values.filter { !$0.stacked.isEmpty }.count
         FileHandle.standardError.write(Data(
-            "[MLXPressStreaming] indexed active-expert JANGTQ tensors layers=\(layers) experts=\(experts)\n".utf8))
+            "[MLXPressStreaming] indexed active-expert JANGTQ tensors layers=\(layers) experts=\(experts) stackedLayers=\(stacked)\n".utf8))
         return built
     }
 
@@ -419,10 +490,21 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
         projection: StreamingProjection,
         suffix: StreamingSuffix
     ) -> MLXArray? {
-        guard let ref = index()?.layers[layerIdx]?.experts[expertIdx]?.tensors[projection]?[suffix],
+        guard let layer = index()?.layers[layerIdx] else { return nil }
+        if let ref = layer.experts[expertIdx]?.tensors[projection]?[suffix],
               let data = readBytes(from: ref.fileURL, offset: ref.offset, count: ref.byteCount)
+        {
+            return makeArray(data: data, shape: ref.shape, dtype: ref.dtype)
+        }
+
+        guard let ref = layer.stacked[projection]?[suffix],
+              expertIdx >= 0,
+              let expertCount = ref.shape.first,
+              expertIdx < expertCount,
+              let data = readBytes(from: ref.fileURL, offset: ref.offset, count: ref.byteCount),
+              let stacked = makeArray(data: data, shape: ref.shape, dtype: ref.dtype)
         else { return nil }
-        return makeArray(data: data, shape: ref.shape, dtype: ref.dtype)
+        return stacked[expertIdx]
     }
 
     private func readBytes(from url: URL, offset: UInt64, count: Int) -> Data? {
