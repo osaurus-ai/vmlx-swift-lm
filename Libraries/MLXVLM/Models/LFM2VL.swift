@@ -686,9 +686,13 @@ public struct LFM2VLProcessor: UserInputProcessor {
         // Apply user processing if any
         let image = MediaProcessing.apply(image, processing: processing)
 
-        // Get image dimensions
-        let width = Int(image.extent.width)
-        let height = Int(image.extent.height)
+        // Get image dimensions. `QwenVL.intExtent` rejects infinity / NaN /
+        // zero / negative extents (e.g. `CIImage(color:)` without a
+        // `cropped(to:)` rect, which has `extent.size = (.infinity, .infinity)`).
+        // The naïve `Int(image.extent.width)` here would trap with
+        // "Double value cannot be converted to Int because it is either
+        // infinite or NaN" before any guard could fire.
+        let (height, width) = try QwenVL.intExtent(image.extent.size)
 
         // Calculate tile dimensions
         let tileSize = config.tileSize
@@ -754,7 +758,9 @@ public struct LFM2VLProcessor: UserInputProcessor {
 
         // Text-only input
         if input.images.isEmpty {
-            return LMInput(tokens: MLXArray(promptTokens))
+            return LMInput(
+                tokens: MLXArray(promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         // Process images
@@ -826,7 +832,8 @@ public struct LFM2VLProcessor: UserInputProcessor {
             image: LMInput.ProcessedImage(
                 pixels: pixelValuesConcatenated,
                 frames: frames
-            )
+            ),
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }
 }

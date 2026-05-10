@@ -362,12 +362,12 @@ public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes = nil
         }
 
-        let embeddings = getInputEmbeddings(inputIds: inputIds, pixelValues: pixelValues, imageSizes: imageSizes)
+        let embeddings = try getInputEmbeddings(inputIds: inputIds, pixelValues: pixelValues, imageSizes: imageSizes)
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
         return .logits(.init(logits: logits))
     }
 
-    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?, imageSizes: [(Int, Int)]?) -> MLXArray {
+    private func getInputEmbeddings(inputIds: MLXArray?, pixelValues: MLXArray?, imageSizes: [(Int, Int)]?) throws -> MLXArray {
         guard var pixelValues, let imageSizes, let inputIds else {
             return languageModel.embedTokens(inputIds!)
         }
@@ -376,21 +376,25 @@ public class Mistral4VLM: Module, VLMModel, KVCacheDimensionProvider {
         if pixelValues.ndim == 3 { pixelValues = pixelValues.expandedDimensions(axis: 0) }
 
         let (_, _, hiddenStates) = visionTower(pixelValues.transposed(0, 2, 3, 1), outputHiddenStates: true)
-        guard let hiddenStates else { fatalError("Vision model must return hidden states") }
+        guard let hiddenStates else {
+            throw VLMError.processing("Mistral4VLM vision tower returned nil hidden states; bundle may be missing vision_tower weights.")
+        }
 
         let layerIndex = config.visionFeatureLayer < 0 ? hiddenStates.count + config.visionFeatureLayer : config.visionFeatureLayer
         let imageFeatures = multiModalProjector(hiddenStates[layerIndex], imageSizes: imageSizes)
 
-        return mergeImageFeatures(imageFeatures: imageFeatures, inputsEmbeds: inputsEmbeds, inputIds: inputIds)
+        return try mergeImageFeatures(imageFeatures: imageFeatures, inputsEmbeds: inputsEmbeds, inputIds: inputIds)
     }
 
-    private func mergeImageFeatures(imageFeatures: MLXArray, inputsEmbeds: MLXArray, inputIds: MLXArray) -> MLXArray {
+    private func mergeImageFeatures(imageFeatures: MLXArray, inputsEmbeds: MLXArray, inputIds: MLXArray) throws -> MLXArray {
         let numPatches = imageFeatures.dim(1)
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
         let imagePositions = inputIdArray.enumerated().compactMap { $1 == Int32(config.imageTokenIndex) ? $0 : nil }
 
         guard imagePositions.count == numPatches else {
-            fatalError("Image token count (\(imagePositions.count)) != patches (\(numPatches))")
+            throw VLMError.processing(
+                "Mistral4VLM image token count (\(imagePositions.count)) != vision patches (\(numPatches)). "
+                + "Likely processor/preprocessor stamp drift — check the bundle's preprocessor_config.json against the vision tower's actual output token count.")
         }
 
         var segments: [MLXArray] = []

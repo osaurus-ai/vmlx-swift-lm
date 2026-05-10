@@ -115,6 +115,34 @@ public struct QwenVL {
         }
     }
 
+    /// Convert a `CGSize` (typically `CIImage.extent.size`) to a finite
+    /// positive `(height, width)` integer pair, throwing `VLMError.imageProcessingFailure`
+    /// for non-finite or non-positive extents.
+    ///
+    /// Why this exists: `CIImage(color:)` and other procedurally-generated
+    /// images return `extent.size = (.infinity, .infinity)`. The naïve
+    /// `Int(extent.height)` then traps with "Double value cannot be
+    /// converted to Int because it is either infinite or NaN." Same trap
+    /// fires for NaN (e.g. cropped-then-resampled corrupt sources).
+    /// Guarding via `Int(exactly:)` lets us throw a clean
+    /// `VLMError.imageProcessingFailure` instead of aborting the process.
+    static func intExtent(_ size: CGSize) throws -> (height: Int, width: Int) {
+        guard size.height.isFinite, size.width.isFinite else {
+            throw VLMError.imageProcessingFailure(
+                "Image extent is not finite (\(size.width) × \(size.height)); "
+                + "likely a procedurally-generated CIImage (e.g. CIImage(color:)) "
+                + "without a `cropped(to:)` rect.")
+        }
+        guard let h = Int(exactly: size.height.rounded()),
+              let w = Int(exactly: size.width.rounded()),
+              h > 0, w > 0
+        else {
+            throw VLMError.imageProcessingFailure(
+                "Invalid image dimensions \(size.width) × \(size.height); both must be positive finite numbers.")
+        }
+        return (h, w)
+    }
+
     // image_processing_qwen2_vl.smart_resize
     static func targetSize(height: Int, width: Int, factor: Int, minPixels: Int, maxPixels: Int)
         throws

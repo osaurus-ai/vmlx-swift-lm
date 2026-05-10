@@ -696,7 +696,8 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage,
             video: processedVideo,
-            audio: processedAudio)
+            audio: processedAudio,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 
     private static func textOnlyMessages(from input: UserInput) -> [Message] {

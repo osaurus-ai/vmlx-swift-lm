@@ -1041,7 +1041,10 @@ public struct PixtralProcessor: UserInputProcessor {
             let tokens = tokenizer.encode(text: prompt)
             let tokensArray = MLXArray(tokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            return LMInput(
+                text: .init(tokens: tokensArray, mask: mask),
+                image: nil,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         } else {
             guard input.images.count == 1 else {
                 throw VLMError.singleImageAllowed
@@ -1127,7 +1130,8 @@ public struct PixtralProcessor: UserInputProcessor {
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: pixels, frames: [THW(1, paddedHeight, paddedWidth)])
+                image: .init(pixels: pixels, frames: [THW(1, paddedHeight, paddedWidth)]),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         }
     }

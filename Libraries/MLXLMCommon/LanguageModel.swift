@@ -38,6 +38,21 @@ public struct LMInput {
     public let video: ProcessedVideo?
     public let audio: ProcessedAudio?
 
+    /// Optional request-scope cache-key salt independent of media bytes.
+    ///
+    /// Set by VLM/LM processors when the request carries a runtime flag
+    /// that changes prompt rendering or model behavior in a way the
+    /// token list alone cannot distinguish — most importantly the
+    /// reasoning on/off split for thinking-capable bundles. The
+    /// canonical encoding today is `"reasoning=on"` / `"reasoning=off"`,
+    /// but the field is intentionally `String?` so future flags can be
+    /// composed without changing the type.
+    ///
+    /// Combined with the media-bytes fingerprint by
+    /// `computeCacheSalt(for:)` to form the final per-request cache
+    /// salt that the coordinator mixes into its block hash.
+    public let cacheScopeSalt: String?
+
     /// Representation of tokenized input text.
     public struct Text {
 
@@ -132,19 +147,23 @@ public struct LMInput {
         }
     }
 
-    public init(tokens: MLXArray, mask: MLXArray? = nil) {
-        self.init(text: .init(tokens: tokens, mask: mask))
+    public init(tokens: MLXArray, mask: MLXArray? = nil, cacheScopeSalt: String? = nil) {
+        self.init(
+            text: .init(tokens: tokens, mask: mask),
+            cacheScopeSalt: cacheScopeSalt)
     }
 
     public init(
         text: LMInput.Text, image: LMInput.ProcessedImage? = nil,
         video: LMInput.ProcessedVideo? = nil,
-        audio: LMInput.ProcessedAudio? = nil
+        audio: LMInput.ProcessedAudio? = nil,
+        cacheScopeSalt: String? = nil
     ) {
         self.text = text
         self.image = image
         self.video = video
         self.audio = audio
+        self.cacheScopeSalt = cacheScopeSalt
     }
 }
 

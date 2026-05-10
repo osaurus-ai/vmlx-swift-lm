@@ -707,16 +707,16 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray?,
         pixelValues: MLXArray?,
         imageSizes: [(Int, Int)]?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard var pixelValues, let imageSizes else {
             guard let inputIds else {
-                fatalError("Either inputIds or pixelValues must be provided")
+                throw VLMError.processing("Mistral3.getInputEmbeddings: either inputIds or pixelValues must be provided.")
             }
             return languageModel.embedTokens(inputIds)
         }
 
         guard let inputIds else {
-            fatalError("inputIds required when pixelValues provided")
+            throw VLMError.processing("Mistral3.getInputEmbeddings: inputIds required when pixelValues provided.")
         }
 
         let inputsEmbeds = languageModel.embedTokens(inputIds)
@@ -734,7 +734,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
 
         // Select features from specified layer
         guard let hiddenStates else {
-            fatalError("Vision model must return hidden states")
+            throw VLMError.processing("Mistral3 vision tower returned nil hidden states; bundle may be missing vision_tower weights.")
         }
 
         let layerIndex =
@@ -747,7 +747,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         let imageFeatures = multiModalProjector(selectedFeatures, imageSizes: imageSizes)
 
         // Merge embeddings
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageTokenIndex: config.imageTokenIndex,
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
@@ -760,7 +760,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures: MLXArray,
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         let (_, numImagePatches, _) = (
             imageFeatures.dim(0),
             imageFeatures.dim(1),
@@ -773,10 +773,13 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             $1 == Int32(imageTokenIndex) ? $0 : nil
         }
 
-        // Validate that the number of image tokens matches the number of image patches
+        // Validate that the number of image tokens matches the number of image patches.
+        // Mismatch here is config/processor-stamp drift — surface as recoverable error
+        // instead of process abort. See Gemma deep-trace §7.3 for canonical pattern.
         guard imagePositions.count == numImagePatches else {
-            fatalError(
-                "Image token count (\(imagePositions.count)) does not match image patches (\(numImagePatches)). Ensure the processor adds exactly numImagePatches image tokens."
+            throw VLMError.processing(
+                "Mistral3 image token count (\(imagePositions.count)) does not match image patches (\(numImagePatches)). "
+                + "Ensure the processor adds exactly numImagePatches image tokens."
             )
         }
 
@@ -827,7 +830,7 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes = nil
         }
 
-        let embeddings = getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues,
             imageSizes: imageSizes
@@ -1165,7 +1168,10 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
             )
             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            return LMInput(
+                text: .init(tokens: tokensArray, mask: mask),
+                image: nil,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         guard input.images.count == 1 else {
@@ -1252,7 +1258,8 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
-            image: .init(pixels: preprocessResult.pixels, frames: preprocessResult.frames)
+            image: .init(pixels: preprocessResult.pixels, frames: preprocessResult.frames),
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }
 }

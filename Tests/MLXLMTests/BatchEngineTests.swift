@@ -415,6 +415,69 @@ class BatchEngineIntegrationTests: XCTestCase {
         return BatchEngine(context: context, maxBatchSize: maxBatchSize)
     }
 
+    private func makeSlowPrefillEngine(
+        prefillDelayMicroseconds: UInt32 = 800_000,
+        maxBatchSize: Int = 2
+    ) -> BatchEngine {
+        let model = SlowPrefillLanguageModel(prefillDelayMicroseconds: prefillDelayMicroseconds)
+        let tokenizer = TestTokenizer(vocabularySize: model.vocabularySize)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "slow-prefill-test"),
+            messageGenerator: DefaultMessageGenerator()
+        )
+        nonisolated(unsafe) let context = ModelContext(
+            configuration: processor.configuration,
+            model: model,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        return BatchEngine(context: context, maxBatchSize: maxBatchSize)
+    }
+
+    /// Regression for long-prefill admission starvation. A large model can spend
+    /// seconds in prefill after the first submit. The engine must still leave a
+    /// control-plane turn for the immediately following submit to enqueue a
+    /// second request; otherwise B=2 rows falsely run as serial B=1.
+    func testSequentialSubmitDoesNotWaitForLongPrefill() async throws {
+        let engine = makeSlowPrefillEngine()
+        let params = GenerateParameters(maxTokens: 2, temperature: 0)
+
+        let (_, firstStream) = await engine.submit(
+            input: LMInput(tokens: MLXArray(Int32(1) ..< Int32(8))),
+            parameters: params)
+
+        // Give the background scheduler a chance to enter prefill before the
+        // next request arrives. Without an admission-coalescing yield, the
+        // actor is then monopolized by the slow prefill and this submit call
+        // cannot return until the first request has nearly finished.
+        await Task.yield()
+
+        let secondSubmitReturned = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = await engine.submit(
+                    input: LMInput(tokens: MLXArray(Int32(10) ..< Int32(17))),
+                    parameters: params)
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                return false
+            }
+
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+
+        _ = await collectTokens(from: firstStream)
+        await engine.shutdown()
+
+        XCTAssertTrue(
+            secondSubmitReturned,
+            "Second submit should enqueue promptly instead of waiting for first long prefill")
+    }
+
     /// Test: single request through BatchEngine produces tokens
     func testSingleRequest() async throws {
         let engine = makeEngine()
@@ -800,5 +863,28 @@ class BatchEngineIntegrationTests: XCTestCase {
             }
         }
         return (chunks, info)
+    }
+}
+
+private final class SlowPrefillLanguageModel: Module, LanguageModel,
+    KVCacheDimensionProvider, @unchecked Sendable
+{
+    let prefillDelayMicroseconds: UInt32
+    let vocabularySize = 32
+    var kvHeads: [Int] { [1] }
+
+    init(prefillDelayMicroseconds: UInt32) {
+        self.prefillDelayMicroseconds = prefillDelayMicroseconds
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        usleep(prefillDelayMicroseconds)
+        return .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let batch = inputs.shape.first ?? 1
+        let length = inputs.shape.count > 1 ? inputs.shape[1] : inputs.size
+        return MLXArray.zeros([batch, length, vocabularySize], dtype: .float32)
     }
 }

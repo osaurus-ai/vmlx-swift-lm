@@ -115,7 +115,14 @@ public class NemotronHTests: XCTestCase {
     }
 
     func testConfigurationDecodingWithTimeStepLimitArray() throws {
-        // time_step_limit can be an array [min, max]
+        // Canonical mlx-lm form: `time_step_limit: [min, max]` (single key holding
+        // the pair). The test was originally authored against an early decoder
+        // that ALSO accepted `time_step_limit_min: [array]` and skipped the
+        // 0 → 0.001 selective-scan-dt-clamp normalization. The decoder now
+        // matches Python mlx-lm exactly: array form lives under
+        // `.timeStepLimit` (RawCodingKeys), and a min of 0.0 is normalized to
+        // 0.001 before the dt clamp. Test updated to exercise the production
+        // path and assert the post-normalization expectation.
         let json = """
             {
                 "vocab_size": 100,
@@ -134,14 +141,16 @@ public class NemotronHTests: XCTestCase {
                 "n_routed_experts": 4,
                 "num_experts_per_tok": 2,
                 "hybrid_override_pattern": "M*",
-                "time_step_limit_min": [0.0, 1000.0]
+                "time_step_limit": [0.0, 1000.0]
             }
             """
 
         let config = try JSONDecoder().decode(
             NemotronHConfiguration.self, from: json.data(using: .utf8)!)
 
-        XCTAssertEqual(config.timeStepLimitMin, 0.0)
+        // 0.0 → 0.001 (selective-scan dt clamp normalization, see
+        // NemotronH.swift:1178-1184 for rationale + Python ref).
+        XCTAssertEqual(config.timeStepLimitMin, 0.001)
         XCTAssertEqual(config.timeStepLimitMax, 1000.0)
     }
 

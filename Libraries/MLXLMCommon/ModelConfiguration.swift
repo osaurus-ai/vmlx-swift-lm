@@ -112,13 +112,17 @@ public struct ModelConfiguration: Sendable {
     /// - `nil` → no stripping (byte-compatible with upstream default).
     public var reasoningParserName: String?
 
+    /// Optional defaults loaded from `generation_config.json`.
+    public var generationDefaults: GenerationConfigFile?
+
     public init(
         id: String, revision: String = "main",
         tokenizerSource: TokenizerSource? = nil,
         defaultPrompt: String = "",
         extraEOSTokens: Set<String> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningParserName: String? = nil
+        reasoningParserName: String? = nil,
+        generationDefaults: GenerationConfigFile? = nil
     ) {
         self.id = .id(id, revision: revision)
         self.tokenizerSource = tokenizerSource
@@ -126,6 +130,7 @@ public struct ModelConfiguration: Sendable {
         self.extraEOSTokens = extraEOSTokens
         self.toolCallFormat = toolCallFormat
         self.reasoningParserName = reasoningParserName
+        self.generationDefaults = generationDefaults
     }
 
     public init(
@@ -135,7 +140,8 @@ public struct ModelConfiguration: Sendable {
         extraEOSTokens: Set<String> = [],
         eosTokenIds: Set<Int> = [],
         toolCallFormat: ToolCallFormat? = nil,
-        reasoningParserName: String? = nil
+        reasoningParserName: String? = nil,
+        generationDefaults: GenerationConfigFile? = nil
     ) {
         self.id = .directory(directory)
         self.tokenizerSource = tokenizerSource
@@ -144,6 +150,7 @@ public struct ModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningParserName = reasoningParserName
+        self.generationDefaults = generationDefaults
     }
 
     /// Maps this configuration's behavioral properties into a
@@ -162,7 +169,8 @@ public struct ModelConfiguration: Sendable {
             extraEOSTokens: extraEOSTokens,
             eosTokenIds: eosTokenIds,
             toolCallFormat: toolCallFormat,
-            reasoningParserName: reasoningParserName)
+            reasoningParserName: reasoningParserName,
+            generationDefaults: generationDefaults)
     }
 
 }

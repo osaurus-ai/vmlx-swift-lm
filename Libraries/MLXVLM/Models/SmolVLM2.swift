@@ -80,10 +80,19 @@ public struct SmolVLMProcessor: UserInputProcessor {
     private let config: SmolVLMProcessorConfiguration
     private let tokenizer: any Tokenizer
 
-    // FIXME: hardcoded values for now
-
-    // Hardcode this since we can't pass it in or rely on it from the preprocessor config.
-    let imageTokenId = 49190
+    // The string-form special tokens below are stable across SmolVLM /
+    // Idefics3 bundles (they're hard-coded into the Python reference's
+    // `_split_string_into_image_chunks` helper as well), so hard-coding
+    // them in Swift mirrors upstream rather than introducing drift.
+    // The numeric image_token_id is NOT hard-coded here — it lives on
+    // `Idefics3Configuration.imageTokenId` (decoded from config.json
+    // with a `49153` fallback) and the model class reads it from there
+    // when replacing placeholders. Don't add a redundant numeric
+    // constant here without a real consumer; the previous `49190`
+    // constant was dead code (verified by `grep -n imageTokenId
+    // Libraries/MLXVLM/Models/SmolVLM2.swift` returning a single
+    // declaration site with zero readers) and was removed
+    // 2026-05-09.
     let imageToken = "<image>"
     let fakeImageToken = "<fake_token_around_image>"
     let globalImageToken = "<global-img>"
@@ -179,7 +188,17 @@ public struct SmolVLMProcessor: UserInputProcessor {
 
     /// Tile image if it's larger than the maxProcessingImageSize, so the model gets to see more of it
     /// TODO: disable in video mode
-    func tiles(from originalImage: CIImage) -> (tiles: [CIImage], rows: Int, cols: Int) {
+    func tiles(from originalImage: CIImage) throws -> (tiles: [CIImage], rows: Int, cols: Int) {
+        // Validate the original extent up front. A procedurally-generated
+        // CIImage (e.g. `CIImage(color:)` without `cropped(to:)`) has
+        // `extent.size = (.infinity, .infinity)`. `aspectRatioSize` does
+        // `size.width / size.height` and `.bestFit(...)` math that
+        // propagates NaN through to the resampleLanczos output, then the
+        // `Int(ceil(...))` calls below trap with "Double value cannot
+        // be converted to Int because it is either infinite or NaN."
+        // `QwenVL.intExtent` rejects with VLMError.imageProcessingFailure.
+        _ = try QwenVL.intExtent(originalImage.extent.size)
+
         // The original code resizes to maxProcessingImageSize, then resizes again ensuring multiples of fixedImageSize
         // We do both resizes in one go
         let processingSize = aspectRatioSize(
@@ -229,7 +248,10 @@ public struct SmolVLMProcessor: UserInputProcessor {
                 additionalContext: input.additionalContext)
             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            return LMInput(
+                text: .init(tokens: tokensArray, mask: mask),
+                image: nil,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         } else if input.images.count > 0 && input.videos.isEmpty {
             // Single image scenario
             guard input.images.count == 1 else {
@@ -243,7 +265,7 @@ public struct SmolVLMProcessor: UserInputProcessor {
             let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
 
             let image = try input.images[0].asCIImage().toSRGB()
-            let (tiles, imageRows, imageCols) = tiles(from: image)
+            let (tiles, imageRows, imageCols) = try tiles(from: image)
 
             // Append the resized global image
             // Note we are resampling from the original (potentially larger), not the processing size. It shouldn't make much difference.
@@ -278,7 +300,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: pixels)
+                image: .init(pixels: pixels),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         } else {
             // Single video scenario
@@ -359,7 +382,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
             let mask = ones(like: promptArray)
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: transposedFrames, frames: thwFrames)
+                image: .init(pixels: transposedFrames, frames: thwFrames),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         }
     }

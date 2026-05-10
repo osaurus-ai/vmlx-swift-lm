@@ -23,6 +23,9 @@ private func smallKV(seqLen: Int = 8) -> (MLXArray, MLXArray) {
 
 @Test
 func testRoundTripKVCacheSimple() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let cache: [any KVCache] = (0..<3).map { _ in KVCacheSimple() }
     let (k, v) = smallKV()
     for layer in cache { _ = layer.update(keys: k, values: v) }
@@ -48,6 +51,9 @@ func testRoundTripKVCacheSimple() async throws {
 
 @Test
 func testRoundTripMambaCache() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let cache: [any KVCache] = (0..<2).map { _ in MambaCache() }
     let convState = MLXArray.ones([1, 32, 4], dtype: .float32) * Float(0.25)
     let ssmState = MLXArray.ones([1, 32, 16], dtype: .float32) * Float(0.75)
@@ -82,6 +88,9 @@ func testRoundTripMambaCache() async throws {
 
 @Test
 func testRoundTripQuantizedKVCache() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // group_size 32 is the smallest MLX supports; the tensor's last dim
     // must be a multiple of the group size (32 → 32 ✓).
     let cache: [any KVCache] = (0..<2).map { _ in
@@ -120,6 +129,9 @@ func testRoundTripQuantizedKVCache() async throws {
 
 @Test
 func testRoundTripHybridWithSSMState() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // Layer 0: attention KV. Layer 1: Mamba. Layer 2: attention KV.
     let cache: [any KVCache] = [
         KVCacheSimple(),
@@ -179,6 +191,9 @@ func testRoundTripHybridWithSSMState() async throws {
 
 @Test
 func testFormatVersionTaggingV2() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let cache: [any KVCache] = [KVCacheSimple()]
     let (k, v) = smallKV()
     _ = cache[0].update(keys: k, values: v)
@@ -189,6 +204,9 @@ func testFormatVersionTaggingV2() async throws {
 
 @Test
 func testFormatVersionLegacyV1Detection() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // Hand-craft a v1 dict: just the legacy marker + a bare kv pair.
     let dict: [String: MLXArray] = [
         "__tq_native_marker__": MLXArray([Int32(1)]),
@@ -207,6 +225,9 @@ func testFormatVersionLegacyV1Detection() async throws {
 
 @Test
 func testFormatVersionForeignDict() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let dict: [String: MLXArray] = [
         "random_key": MLXArray([Int32(0)])
     ]
@@ -218,6 +239,9 @@ func testFormatVersionForeignDict() async throws {
 
 @Test
 func testRoundTripRotatingKVCache() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // SLIDING-1 (2026-04-15): RotatingKVCache must round-trip via the
     // new `.rotating` LayerKind. Verifies that ring buffer keys/values,
     // wrap state (offset, idx), and config (keep, maxSize, step) all
@@ -264,6 +288,9 @@ func testRoundTripRotatingKVCache() async throws {
 
 @Test
 func testUnknownCacheTypeIsTaggedSkip() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // Sentinel test for an empty RotatingKVCache (pre-prefill). The
     // serializer should tag it `.skip` since `state.count == 0`.
     // After SLIDING-1 a populated RotatingKVCache lands on `.rotating`
@@ -286,6 +313,9 @@ struct TQDiskSerializerCacheListTests {
 
 @Test
 func testRoundTripCacheListMambaPlusKV() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // FalconH1 layout: CacheList(MambaCache, KVCacheSimple). Pre-fix this
     // landed on .skip and dropped multi-turn disk-cache reuse for
     // FalconH1. Verify both sub-caches round-trip through the new
@@ -347,6 +377,9 @@ func testRoundTripCacheListMambaPlusKV() async throws {
 
 @Test
 func testRoundTripCacheListRotatingPlusMamba() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // BaichuanM1 layout: CacheList(RotatingKVCache, MambaCache). Sub-0
     // is a sliding-window attention; sub-1 is SSM. Verify both
     // round-trip through the new .cacheList LayerKind.
@@ -393,6 +426,9 @@ func testRoundTripCacheListRotatingPlusMamba() async throws {
 
 @Test
 func testCacheListEmptyTagsAsSkip() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // CacheList with no populated sub-caches → composite tags as .skip.
     // Restore is a no-op (no per-sub data was written).
     let composite = CacheList(MambaCache(), KVCacheSimple())
@@ -410,6 +446,9 @@ func testCacheListEmptyTagsAsSkip() async throws {
 
 @Test
 func testCacheListSurvivesAlongsidePlainLayers() async throws {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     // Mixed layout: layer 0 = plain KV, layer 1 = CacheList(Mamba, KV),
     // layer 2 = plain Mamba. Verify all three round-trip independently
     // and the kind tags don't collide.

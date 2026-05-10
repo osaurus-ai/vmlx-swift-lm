@@ -337,7 +337,10 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
         self.intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
         self.attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
         self.numExperts = try container.decode(Int.self, forKey: .numExperts)
-        self.numExpertsPerToken = try container.decode(Int.self, forKey: .numExpertsPerToken)
+        self.numExpertsPerToken = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerToken),
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerToken.rawValue)
         self.decoderSparseStep = try container.decode(Int.self, forKey: .decoderSparseStep)
         self.mlpOnlyLayers = try container.decode([Int].self, forKey: .mlpOnlyLayers)
         self.moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)

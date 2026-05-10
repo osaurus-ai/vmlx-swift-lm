@@ -71,112 +71,122 @@ struct BatchKVCacheWithTQSlotsTests {
 
     @Test("BatchKVCache wraps two TQ slot caches at different offsets")
     func testWrapTwoTQSlotsDifferentOffsets() {
-        let tq0 = makeCompressedTQCache(tokens: 12)
-        let tq1 = makeCompressedTQCache(tokens: 9)
+        MLXMetalTestLock.withLock {
+            let tq0 = makeCompressedTQCache(tokens: 12)
+            let tq1 = makeCompressedTQCache(tokens: 9)
 
-        #expect(tq0.phase == .compressed)
-        #expect(tq1.phase == .compressed)
+            #expect(tq0.phase == .compressed)
+            #expect(tq1.phase == .compressed)
 
-        // Upcast to KVCache — exactly what stepBatchDecode does.
-        let batchCache = BatchKVCache(slotCaches: [tq0 as KVCache, tq1 as KVCache])
+            // Upcast to KVCache — exactly what stepBatchDecode does.
+            let batchCache = BatchKVCache(slotCaches: [tq0 as KVCache, tq1 as KVCache])
 
-        #expect(batchCache.batchSize == 2)
-        #expect(batchCache.offset == 12)
-        MLX.eval(batchCache.offsetArray)
-        #expect(batchCache.offsetArray[0].item(Int32.self) == 12)
-        #expect(batchCache.offsetArray[1].item(Int32.self) == 9)
+            #expect(batchCache.batchSize == 2)
+            #expect(batchCache.offset == 12)
+            MLX.eval(batchCache.offsetArray)
+            #expect(batchCache.offsetArray[0].item(Int32.self) == 12)
+            #expect(batchCache.offsetArray[1].item(Int32.self) == 9)
+        }
     }
 
     @Test("update on BatchKVCache over TQ slots returns padded [B, H, maxLen, D]")
     func testUpdatePadsAndStacksOverTQ() {
-        let tq0 = makeCompressedTQCache(tokens: 12)
-        let tq1 = makeCompressedTQCache(tokens: 9)
+        MLXMetalTestLock.withLock {
+            let tq0 = makeCompressedTQCache(tokens: 12)
+            let tq1 = makeCompressedTQCache(tokens: 9)
 
-        let batchCache = BatchKVCache(slotCaches: [tq0 as KVCache, tq1 as KVCache])
+            let batchCache = BatchKVCache(slotCaches: [tq0 as KVCache, tq1 as KVCache])
 
-        let batchKeys = MLXArray.ones([2, 4, 1, 64])
-        let batchValues = MLXArray.ones([2, 4, 1, 64])
-        let (ks, vs) = batchCache.update(keys: batchKeys, values: batchValues)
-        MLX.eval(ks, vs)
+            let batchKeys = MLXArray.ones([2, 4, 1, 64])
+            let batchValues = MLXArray.ones([2, 4, 1, 64])
+            let (ks, vs) = batchCache.update(keys: batchKeys, values: batchValues)
+            MLX.eval(ks, vs)
 
-        // Post-update: tq0 at 13 tokens, tq1 at 10 tokens; padded to maxLen=13
-        #expect(ks.shape == [2, 4, 13, 64])
-        #expect(vs.shape == [2, 4, 13, 64])
+            // Post-update: tq0 at 13 tokens, tq1 at 10 tokens; padded to maxLen=13
+            #expect(ks.shape == [2, 4, 13, 64])
+            #expect(vs.shape == [2, 4, 13, 64])
 
-        MLX.eval(batchCache.offsetArray)
-        #expect(batchCache.offsetArray[0].item(Int32.self) == 13)
-        #expect(batchCache.offsetArray[1].item(Int32.self) == 10)
-        #expect(batchCache.offset == 13)
+            MLX.eval(batchCache.offsetArray)
+            #expect(batchCache.offsetArray[0].item(Int32.self) == 13)
+            #expect(batchCache.offsetArray[1].item(Int32.self) == 10)
+            #expect(batchCache.offset == 13)
+        }
     }
 
     @Test("single-slot BatchKVCache over TQ cache is equivalent to raw TQ update")
     func testSingleSlotTQEquivalence() {
-        let tq = makeCompressedTQCache(tokens: 10)
-        let batchCache = BatchKVCache(slotCaches: [tq as KVCache])
+        MLXMetalTestLock.withLock {
+            let tq = makeCompressedTQCache(tokens: 10)
+            let batchCache = BatchKVCache(slotCaches: [tq as KVCache])
 
-        #expect(batchCache.batchSize == 1)
-        #expect(batchCache.offset == 10)
+            #expect(batchCache.batchSize == 1)
+            #expect(batchCache.offset == 10)
 
-        let k = MLXArray.ones([1, 4, 1, 64])
-        let v = MLXArray.ones([1, 4, 1, 64])
-        let (ks, vs) = batchCache.update(keys: k, values: v)
-        MLX.eval(ks, vs)
+            let k = MLXArray.ones([1, 4, 1, 64])
+            let v = MLXArray.ones([1, 4, 1, 64])
+            let (ks, vs) = batchCache.update(keys: k, values: v)
+            MLX.eval(ks, vs)
 
-        #expect(ks.shape == [1, 4, 11, 64])
-        #expect(vs.shape == [1, 4, 11, 64])
-        #expect(tq.offset == 11)
+            #expect(ks.shape == [1, 4, 11, 64])
+            #expect(vs.shape == [1, 4, 11, 64])
+            #expect(tq.offset == 11)
+        }
     }
 
     @Test("asymmetric K/V head dimensions use separate TurboQuant encoder states")
     func testAsymmetricKeyValueDimensions() {
-        let tq = makeCompressedAsymmetricTQCache(tokens: 12)
-        #expect(tq.phase == .compressed)
+        MLXMetalTestLock.withLock {
+            let tq = makeCompressedAsymmetricTQCache(tokens: 12)
+            #expect(tq.phase == .compressed)
 
-        let k = MLXArray.ones([1, 4, 1, 192])
-        let v = MLXArray.ones([1, 4, 1, 128])
-        let (ks, vs) = tq.update(keys: k, values: v)
-        MLX.eval(ks, vs)
+            let k = MLXArray.ones([1, 4, 1, 192])
+            let v = MLXArray.ones([1, 4, 1, 128])
+            let (ks, vs) = tq.update(keys: k, values: v)
+            MLX.eval(ks, vs)
 
-        #expect(ks.shape == [1, 4, 13, 192])
-        #expect(vs.shape == [1, 4, 13, 128])
-        #expect(tq.offset == 13)
+            #expect(ks.shape == [1, 4, 13, 192])
+            #expect(vs.shape == [1, 4, 13, 128])
+            #expect(tq.offset == 13)
 
-        let batchCache = BatchKVCache(slotCaches: [tq as KVCache])
-        let (batchK, batchV) = batchCache.update(keys: k, values: v)
-        MLX.eval(batchK, batchV)
+            let batchCache = BatchKVCache(slotCaches: [tq as KVCache])
+            let (batchK, batchV) = batchCache.update(keys: k, values: v)
+            MLX.eval(batchK, batchV)
 
-        #expect(batchK.shape == [1, 4, 14, 192])
-        #expect(batchV.shape == [1, 4, 14, 128])
-        #expect(batchCache.offset == 14)
+            #expect(batchK.shape == [1, 4, 14, 192])
+            #expect(batchV.shape == [1, 4, 14, 128])
+            #expect(batchCache.offset == 14)
+        }
     }
 
     @Test("mixed TQ + KVCacheSimple slot caches work via shared shape contract")
     func testMixedTQAndSimpleSlots() {
-        // Represents the heterogeneous state possible mid-run when one slot
-        // has compressed to TQ (long prompt) while another is still simple
-        // (short prompt below TQ threshold). Both slot caches must satisfy
-        // the `update(keys:values:) -> (MLXArray, MLXArray)` contract for
-        // `BatchKVCache.padAndConcatenate` to work.
-        let tq = makeCompressedTQCache(tokens: 10)
+        MLXMetalTestLock.withLock {
+            // Represents the heterogeneous state possible mid-run when one slot
+            // has compressed to TQ (long prompt) while another is still simple
+            // (short prompt below TQ threshold). Both slot caches must satisfy
+            // the `update(keys:values:) -> (MLXArray, MLXArray)` contract for
+            // `BatchKVCache.padAndConcatenate` to work.
+            let tq = makeCompressedTQCache(tokens: 10)
 
-        let simple = KVCacheSimple()
-        for _ in 0 ..< 5 {
-            _ = simple.update(
-                keys: MLXArray.ones([1, 4, 1, 64]),
-                values: MLXArray.ones([1, 4, 1, 64]))
+            let simple = KVCacheSimple()
+            for _ in 0 ..< 5 {
+                _ = simple.update(
+                    keys: MLXArray.ones([1, 4, 1, 64]),
+                    values: MLXArray.ones([1, 4, 1, 64]))
+            }
+            #expect(simple.offset == 5)
+
+            let batchCache = BatchKVCache(slotCaches: [tq as KVCache, simple as KVCache])
+
+            let ks = MLXArray.ones([2, 4, 1, 64])
+            let vs = MLXArray.ones([2, 4, 1, 64])
+            let (returnedK, returnedV) = batchCache.update(keys: ks, values: vs)
+            MLX.eval(returnedK, returnedV)
+
+            // tq -> 11, simple -> 6. Padded to maxLen=11.
+            #expect(returnedK.shape == [2, 4, 11, 64])
+            #expect(returnedV.shape == [2, 4, 11, 64])
         }
-        #expect(simple.offset == 5)
-
-        let batchCache = BatchKVCache(slotCaches: [tq as KVCache, simple as KVCache])
-
-        let ks = MLXArray.ones([2, 4, 1, 64])
-        let vs = MLXArray.ones([2, 4, 1, 64])
-        let (returnedK, returnedV) = batchCache.update(keys: ks, values: vs)
-        MLX.eval(returnedK, returnedV)
-
-        // tq → 11, simple → 6. Padded to maxLen=11.
-        #expect(returnedK.shape == [2, 4, 11, 64])
-        #expect(returnedV.shape == [2, 4, 11, 64])
     }
 }
 
@@ -204,146 +214,160 @@ struct BatchQuantizeHookTests {
 
     @Test("maybeCompress swaps simple to TurboQuant when threshold crossed")
     func testThresholdTriggersSwap() {
-        // 4-layer cache, 10 tokens each — above the TQ minimum threshold of 8.
-        var cache: [KVCache] = (0 ..< 4).map { _ in
-            makePopulatedSimpleCache(tokens: 10)
-        }
-        #expect(cache.allSatisfy { $0 is KVCacheSimple })
+        MLXMetalTestLock.withLock {
+            // 4-layer cache, 10 tokens each — above the TQ minimum threshold of 8.
+            var cache: [KVCache] = (0 ..< 4).map { _ in
+                makePopulatedSimpleCache(tokens: 10)
+            }
+            #expect(cache.allSatisfy { $0 is KVCacheSimple })
 
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
-            temperature: 0
-        )
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+                temperature: 0
+            )
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-        // After hook: every layer must be TurboQuantKVCache in .compressed phase.
-        #expect(cache.allSatisfy { $0 is TurboQuantKVCache })
-        for layer in cache {
-            let tq = layer as! TurboQuantKVCache
-            #expect(tq.phase == .compressed)
-            #expect(tq.offset == 10)
+            // After hook: every layer must be TurboQuantKVCache in .compressed phase.
+            #expect(cache.allSatisfy { $0 is TurboQuantKVCache })
+            for layer in cache {
+                let tq = layer as! TurboQuantKVCache
+                #expect(tq.phase == .compressed)
+                #expect(tq.offset == 10)
+            }
         }
     }
 
     @Test("maybeCompress is a no-op below the threshold")
     func testBelowThresholdNoOp() {
-        // 6 tokens — below the TQ minimum of 8. Should NOT swap.
-        var cache: [KVCache] = (0 ..< 4).map { _ in
-            makePopulatedSimpleCache(tokens: 6)
-        }
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
-            temperature: 0
-        )
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+        MLXMetalTestLock.withLock {
+            // 6 tokens — below the TQ minimum of 8. Should NOT swap.
+            var cache: [KVCache] = (0 ..< 4).map { _ in
+                makePopulatedSimpleCache(tokens: 6)
+            }
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+                temperature: 0
+            )
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-        #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Below threshold, cache must remain uncompressed")
+            #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Below threshold, cache must remain uncompressed")
+        }
     }
 
     @Test("maybeCompress is a no-op when kvMode == .none")
     func testNoneNoOp() {
-        var cache: [KVCache] = (0 ..< 4).map { _ in
-            makePopulatedSimpleCache(tokens: 20)
-        }
-        // Default kvMode is .none.
-        let params = GenerateParameters(maxTokens: 5, temperature: 0)
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+        MLXMetalTestLock.withLock {
+            var cache: [KVCache] = (0 ..< 4).map { _ in
+                makePopulatedSimpleCache(tokens: 20)
+            }
+            // Default kvMode is .none.
+            let params = GenerateParameters(maxTokens: 5, temperature: 0)
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-        #expect(cache.allSatisfy { $0 is KVCacheSimple }, ".none mode must never compress")
+            #expect(cache.allSatisfy { $0 is KVCacheSimple }, ".none mode must never compress")
+        }
     }
 
     @Test("maybeCompress is a no-op when kvMode == .affine (Stage 0 scope)")
     func testAffineNoOp() {
-        // Stage 0 explicitly does NOT run affine compression under batch —
-        // see BatchQuantize.maybeCompress comments. Affine requests run with
-        // float KV and a warning logged at admission.
-        var cache: [KVCache] = (0 ..< 4).map { _ in
-            makePopulatedSimpleCache(tokens: 20)
-        }
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .affine(bits: 4, groupSize: 64),
-            temperature: 0
-        )
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+        MLXMetalTestLock.withLock {
+            // Stage 0 explicitly does NOT run affine compression under batch —
+            // see BatchQuantize.maybeCompress comments. Affine requests run with
+            // float KV and a warning logged at admission.
+            var cache: [KVCache] = (0 ..< 4).map { _ in
+                makePopulatedSimpleCache(tokens: 20)
+            }
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .affine(bits: 4, groupSize: 64),
+                temperature: 0
+            )
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-        #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Stage 0 affine mode must remain uncompressed under batch")
+            #expect(cache.allSatisfy { $0 is KVCacheSimple }, "Stage 0 affine mode must remain uncompressed under batch")
+        }
     }
 
     @Test("maybeCompress is idempotent — second call does not re-process")
     func testIdempotent() {
-        var cache: [KVCache] = (0 ..< 4).map { _ in
-            makePopulatedSimpleCache(tokens: 10)
+        MLXMetalTestLock.withLock {
+            var cache: [KVCache] = (0 ..< 4).map { _ in
+                makePopulatedSimpleCache(tokens: 10)
+            }
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+                temperature: 0
+            )
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+            let afterFirst: [ObjectIdentifier] = cache.map { ObjectIdentifier($0 as AnyObject) }
+
+            // Second call: the internal guard
+            // `!cache.contains(where: { $0 is TurboQuantKVCache })` short-circuits.
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+            let afterSecond: [ObjectIdentifier] = cache.map { ObjectIdentifier($0 as AnyObject) }
+
+            #expect(afterFirst == afterSecond, "Second call must preserve cache object identity")
         }
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
-            temperature: 0
-        )
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
-        let afterFirst: [ObjectIdentifier] = cache.map { ObjectIdentifier($0 as AnyObject) }
-
-        // Second call: the internal guard
-        // `!cache.contains(where: { $0 is TurboQuantKVCache })` short-circuits.
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
-        let afterSecond: [ObjectIdentifier] = cache.map { ObjectIdentifier($0 as AnyObject) }
-
-        #expect(afterFirst == afterSecond, "Second call must preserve cache object identity")
     }
 
     @Test("maybeCompress preserves hybrid layers (MambaCache / SSM state)")
     func testHybridPreservation() {
-        // Mix: 2 KVCacheSimple + 2 MambaCache. `maybeQuantizeKVCache` only
-        // touches KVCacheSimple layers, preserving SSM/state layers for
-        // hybrid models (Qwen3.5 Mamba, Qwen3Next GDN, LFM2, Jamba, etc.).
-        var cache: [KVCache] = [
-            makePopulatedSimpleCache(tokens: 10),
-            MambaCache(),
-            makePopulatedSimpleCache(tokens: 10),
-            MambaCache(),
-        ]
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
-            temperature: 0
-        )
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+        MLXMetalTestLock.withLock {
+            // Mix: 2 KVCacheSimple + 2 MambaCache. `maybeQuantizeKVCache` only
+            // touches KVCacheSimple layers, preserving SSM/state layers for
+            // hybrid models (Qwen3.5 Mamba, Qwen3Next GDN, LFM2, Jamba, etc.).
+            var cache: [KVCache] = [
+                makePopulatedSimpleCache(tokens: 10),
+                MambaCache(),
+                makePopulatedSimpleCache(tokens: 10),
+                MambaCache(),
+            ]
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+                temperature: 0
+            )
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
 
-        #expect(cache[0] is TurboQuantKVCache)
-        #expect(cache[1] is MambaCache, "SSM/state layer must remain untouched")
-        #expect(cache[2] is TurboQuantKVCache)
-        #expect(cache[3] is MambaCache, "SSM/state layer must remain untouched")
+            #expect(cache[0] is TurboQuantKVCache)
+            #expect(cache[1] is MambaCache, "SSM/state layer must remain untouched")
+            #expect(cache[2] is TurboQuantKVCache)
+            #expect(cache[3] is MambaCache, "SSM/state layer must remain untouched")
+        }
     }
 
     @Test("maybeCompress preserves DSV4 hybrid SWA+CSA+HSA cache")
     func testDeepseekV4HybridPreservation() {
-        // DSV4's production cache is already compressed structurally:
-        // cr=0 layers use a 128-token rotating SWA window, and cr>0
-        // layers use DeepseekV4Cache for SWA plus CSA/HSA pool rows.
-        // A global TurboQuant default must not replace that topology.
-        var cache: [KVCache] = [
-            RotatingKVCache(maxSize: 128, keep: 0),
-            DeepseekV4Cache(slidingWindow: 128, compressRatio: 128),
-            DeepseekV4Cache(slidingWindow: 128, compressRatio: 4),
-        ]
-        for layer in cache {
-            _ = layer.update(
-                keys: MLXArray.ones([1, 1, 10, 64]),
-                values: MLXArray.ones([1, 1, 10, 64]))
+        MLXMetalTestLock.withLock {
+            // DSV4's production cache is already compressed structurally:
+            // cr=0 layers use a 128-token rotating SWA window, and cr>0
+            // layers use DeepseekV4Cache for SWA plus CSA/HSA pool rows.
+            // A global TurboQuant default must not replace that topology.
+            var cache: [KVCache] = [
+                RotatingKVCache(maxSize: 128, keep: 0),
+                DeepseekV4Cache(slidingWindow: 128, compressRatio: 128),
+                DeepseekV4Cache(slidingWindow: 128, compressRatio: 4),
+            ]
+            for layer in cache {
+                _ = layer.update(
+                    keys: MLXArray.ones([1, 1, 10, 64]),
+                    values: MLXArray.ones([1, 1, 10, 64]))
+            }
+            let params = GenerateParameters(
+                maxTokens: 5,
+                kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+                temperature: 0)
+
+            BatchQuantize.maybeCompress(cache: &cache, parameters: params)
+
+            #expect(cache[0] is RotatingKVCache)
+            #expect(cache[1] is DeepseekV4Cache)
+            #expect(cache[2] is DeepseekV4Cache)
+            #expect(!cache.contains { $0 is TurboQuantKVCache })
         }
-        let params = GenerateParameters(
-            maxTokens: 5,
-            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
-            temperature: 0)
-
-        BatchQuantize.maybeCompress(cache: &cache, parameters: params)
-
-        #expect(cache[0] is RotatingKVCache)
-        #expect(cache[1] is DeepseekV4Cache)
-        #expect(cache[2] is DeepseekV4Cache)
-        #expect(!cache.contains { $0 is TurboQuantKVCache })
     }
 }
 

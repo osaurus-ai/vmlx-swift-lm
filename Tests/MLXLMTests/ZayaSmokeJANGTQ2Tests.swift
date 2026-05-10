@@ -92,25 +92,28 @@ struct ZayaSmokeJANGTQ2Tests {
         #expect(stamps.reasoning == "qwen3")
     }
 
-    @Test("Converted ZAYA metadata disables production thinking toggle but keeps tools",
+    @Test("Converted ZAYA metadata supports opt-in reasoning while defaulting prompts off",
           .enabled(if: ZayaSmokeJANGTQ2Tests.bundlePresent))
-    func convertedMetadataDisablesThinkingButKeepsTools() throws {
+    func convertedMetadataSupportsOptInReasoningButDefaultsOff() throws {
         for path in [Self.bundlePath, Self.jangTQ4BundlePath, Self.mxfp4BundlePath]
             where FileManager.default.fileExists(atPath: path + "/config.json")
         {
             let url = URL(fileURLWithPath: path)
             let jang = try JangLoader.loadConfig(at: url)
-            #expect(jang.capabilities?.supportsThinking == false)
+            #expect(jang.capabilities?.supportsThinking == true)
+            #expect(jang.capabilities?.thinkInTemplate == false)
             #expect(jang.capabilities?.supportsTools == true)
             #expect(jang.capabilities?.toolParser == "zaya_xml")
             #expect(jang.capabilities?.reasoningParser == "qwen3")
 
+            // Raw converted bundles should be restamped at the source.
+            // Runtime code deliberately trusts ZAYA capabilities instead
+            // of silently repairing them.
             let configURL = url.appendingPathComponent("config.json")
             let configData = try Data(contentsOf: configURL)
             let config = try #require(
                 JSONSerialization.jsonObject(with: configData) as? [String: Any])
             let caps = try #require(config["capabilities"] as? [String: Any])
-            #expect(caps["supports_thinking"] as? Bool == false)
             #expect(caps["supports_tools"] as? Bool == true)
             #expect(caps["tool_parser"] as? String == "zaya_xml")
             #expect(caps["reasoning_parser"] as? String == "qwen3")

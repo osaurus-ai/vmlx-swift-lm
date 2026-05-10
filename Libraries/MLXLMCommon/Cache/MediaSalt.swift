@@ -114,3 +114,56 @@ private func hashMLXArray(_ array: MLXArray, into hasher: inout SHA256) {
     let data = array.asData(access: .noCopyIfContiguous)
     hasher.update(data: data.data)
 }
+
+/// Derive a cache-scope salt string from a request's `additionalContext`.
+///
+/// Today the only recognized scope is the reasoning toggle (`enable_thinking`);
+/// future flags can be composed without changing the call sites.
+///
+/// - Returns:
+///   - `"reasoning=off"` when `enable_thinking == false`
+///   - `"reasoning=on"`  when `enable_thinking == true`
+///   - `nil` when the flag is absent (so unrelated metadata in
+///     `additionalContext` does not fragment cache keys)
+///
+/// VLM/LM processors call this once when constructing `LMInput`, so the
+/// cache coordinator sees the same salt across prefill and every decode
+/// step within the request without re-deriving it.
+public func cacheScopeSalt(from additionalContext: [String: any Sendable]?) -> String? {
+    guard let additionalContext else { return nil }
+    if let thinking = additionalContext["enable_thinking"] as? Bool {
+        return thinking ? "reasoning=on" : "reasoning=off"
+    }
+    return nil
+}
+
+/// Combine the media-bytes fingerprint and the request-scope salt into a
+/// single cache-coordinator salt.
+///
+/// Returns `nil` only when both components are absent — pure text-only
+/// prompts with no scope flags fall through to the legacy text-keyed path
+/// without paying any extra hashing cost.
+///
+/// When either side is present the result is a stable hex SHA256 over a
+/// tag-prefixed concatenation, so:
+/// - identical media + identical scope → identical salt (cache hit),
+/// - identical media + different scope → different salt (key isolation),
+/// - identical scope + different media → different salt (false-positive
+///   protection that already existed via `computeMediaSalt`).
+public func computeCacheSalt(for input: LMInput) -> String? {
+    let media = computeMediaSalt(for: input)
+    let scope = input.cacheScopeSalt
+    if media == nil && scope == nil { return nil }
+
+    var hasher = SHA256()
+    if let media {
+        hasher.update(data: Data("media:".utf8))
+        hasher.update(data: Data(media.utf8))
+    }
+    if let scope {
+        hasher.update(data: Data("scope:".utf8))
+        hasher.update(data: Data(scope.utf8))
+    }
+    let digest = hasher.finalize()
+    return digest.map { String(format: "%02x", $0) }.joined()
+}

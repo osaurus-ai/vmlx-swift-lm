@@ -113,6 +113,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// `<zyphra_tool_call>...</zyphra_tool_call>`.
     case zayaXml = "zaya_xml"
 
+    /// Tencent Hunyuan / Hy3 XML-like tool-call wrapper.
+    /// Example:
+    /// `<tool_calls><tool_call>f<tool_sep><arg_key>k</arg_key><arg_value>v</arg_value></tool_call></tool_calls>`.
+    case hunyuan
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -147,6 +152,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return XMLFunctionParser(
                 startTag: "<zyphra_tool_call>",
                 endTag: "</zyphra_tool_call>")
+        case .hunyuan:
+            return HunyuanToolCallParser()
         }
     }
 
@@ -273,6 +280,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .zayaXml
         }
 
+        // Tencent Hunyuan v3 / Hy3 uses its own XML-like tool wrapper.
+        if type == "hy_v3" || type == "hy-v3" || type.hasPrefix("hy3") {
+            return .hunyuan
+        }
+
         return nil
     }
 
@@ -347,6 +359,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // ZAYA / Zyphra XML wrapper around the standard XML function body.
         case "zaya", "zaya_xml", "zyphra", "zyphra_xml":
             return .zayaXml
+        // Tencent Hunyuan / Hy3 parser aliases. JANG stamps "hunyuan";
+        // vLLM ecosystem examples use "hy_v3"; SGLang uses "hunyuan".
+        case "hunyuan", "tencent", "hy3", "hy_v3", "hy-v3":
+            return .hunyuan
         default:
             return nil
         }

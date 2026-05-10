@@ -778,9 +778,9 @@ public struct GlmOcrProcessor: UserInputProcessor {
     ) {
         let images = images.map { MediaProcessing.apply($0, processing: processing) }
 
-        let size = images[0].extent.size
+        let (extentH, extentW) = try QwenVL.intExtent(images[0].extent.size)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-            height: Int(size.height), width: Int(size.width),
+            height: extentH, width: extentW,
             factor: config.patchSize * config.mergeSize,
             minPixels: config.minPixels, maxPixels: config.maxPixels)
         let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
@@ -831,11 +831,16 @@ public struct GlmOcrProcessor: UserInputProcessor {
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = GlmOcrMessageGenerator().generate(from: input)
 
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext)
 
         // Text-only input
         if input.images.isEmpty, input.videos.isEmpty {
-            return LMInput(tokens: MLXArray(promptTokens))
+            return LMInput(
+                tokens: MLXArray(promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         // Process images
@@ -857,7 +862,8 @@ public struct GlmOcrProcessor: UserInputProcessor {
         let mask = ones(like: promptArray).asType(.int8)
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
-            image: processedImage)
+            image: processedImage,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
 

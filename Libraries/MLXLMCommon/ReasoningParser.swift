@@ -295,7 +295,8 @@ extension ReasoningParser {
         case "think_xml", "qwen3", "qwen3_5", "qwen35", "qwen3_6", "qwen36",
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2",
-            "kimi", "kimi_k2", "kimik2":
+            "kimi", "kimi_k2", "kimik2",
+            "hy3", "hy_v3", "hy-v3", "hunyuan", "tencent":
             // Start inside the reasoning block — matches the Qwen 3.x
             // family's chat-template default (`enable_thinking=true`
             // prefills `<think>\n` at prompt tail).
@@ -513,6 +514,9 @@ public func reasoningStampFromModelType(_ modelType: String?) -> String {
                         // `laguna` model class lands, the reasoning stamp
                         // resolution doesn't need a follow-up edit and
                         // CoT output won't leak into `.chunk` events.
+        "hy3",          // Tencent Hunyuan v3 aliases. Real JANG bundles stamp
+        "hy_v3",        // `capabilities.reasoning_parser = "qwen3"`, but
+        "hy-v3",        // non-JANG/fallback paths should still pick think_xml.
     ]
     if thinkXmlPrefixes.contains(where: t.hasPrefix) {
         return "think_xml"

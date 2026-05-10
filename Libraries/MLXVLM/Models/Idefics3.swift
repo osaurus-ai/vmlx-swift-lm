@@ -840,7 +840,10 @@ public struct Idefics3Processor: UserInputProcessor {
             let tokens = tokenizer.encode(text: prompt)
             let tokensArray = MLXArray(tokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            return LMInput(
+                text: .init(tokens: tokensArray, mask: mask),
+                image: nil,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         } else {
             // Single image scenario
             guard input.images.count == 1 else {
@@ -892,7 +895,8 @@ public struct Idefics3Processor: UserInputProcessor {
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
-                image: .init(pixels: pixels)
+                image: .init(pixels: pixels),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
             )
         }
     }

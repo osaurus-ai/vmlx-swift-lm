@@ -233,7 +233,7 @@ private enum Language {
 
 // MARK: - Vision
 
-private enum Vision {
+enum Qwen25Vision {
 
     static fileprivate func applyMultimodalRotaryPositionEmbedding(
         _ tensor: MLXArray, freqs: MLXArray
@@ -253,7 +253,7 @@ private enum Vision {
         return output.asType(tensor.dtype)
     }
 
-    fileprivate class PatchMerger: Module, UnaryLayer {
+    final class PatchMerger: Module, UnaryLayer {
         let hiddenSize: Int
         @ModuleInfo(key: "ln_q") var layerNormQ: RMSNorm
         @ModuleInfo var mlp: (Linear, GELU, Linear)
@@ -277,7 +277,7 @@ private enum Vision {
         }
     }
 
-    fileprivate class Attention: Module {
+    final class Attention: Module {
 
         let numHeads: Int
         let scale: Float
@@ -328,7 +328,7 @@ private enum Vision {
         }
     }
 
-    fileprivate class MLP: Module, UnaryLayer {
+    final class MLP: Module, UnaryLayer {
 
         @ModuleInfo(key: "gate_proj") var gate: Linear
         @ModuleInfo(key: "up_proj") var up: Linear
@@ -345,7 +345,7 @@ private enum Vision {
         }
     }
 
-    fileprivate class Qwen25VLVisionBlock: Module {
+    final class Qwen25VLVisionBlock: Module {
 
         @ModuleInfo var norm1: RMSNorm
         @ModuleInfo var norm2: RMSNorm
@@ -378,7 +378,7 @@ private enum Vision {
         }
     }
 
-    fileprivate class VisionModel: Module {
+    final class VisionModel: Module {
 
         @ModuleInfo(key: "patch_embed") var patchEmbed: QwenVL.PatchEmbed
         @ModuleInfo(key: "rotary_pos_emb") var rotaryPositionEmbedding: QwenVL.VisionRotaryEmbedding
@@ -687,9 +687,9 @@ public struct Qwen25VLProcessor: UserInputProcessor {
         let images = images.map { MediaProcessing.apply($0, processing: processing) }
 
         // image_processing_qwen2_vl._preprocess
-        let size = images[0].extent.size
+        let (extentH, extentW) = try QwenVL.intExtent(images[0].extent.size)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-            height: Int(size.height), width: Int(size.width),
+            height: extentH, width: extentW,
             factor: config.patchSize * config.mergeSize,
             minPixels: config.size.minPixels, maxPixels: config.size.maxPixels)
         let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
@@ -725,7 +725,9 @@ public struct Qwen25VLProcessor: UserInputProcessor {
 
         // Text-only input
         if input.images.isEmpty, input.videos.isEmpty {
-            return LMInput(tokens: MLXArray(promptTokens))
+            return LMInput(
+                tokens: MLXArray(promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         // Process images if any
@@ -760,9 +762,9 @@ public struct Qwen25VLProcessor: UserInputProcessor {
                     let resizedImage = MediaProcessing.apply(
                         frame.frame, processing: input.processing)
                     if resizedSize == .zero {
-                        let size = resizedImage.extent.size
+                        let (extentH, extentW) = try QwenVL.intExtent(resizedImage.extent.size)
                         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-                            height: Int(size.height), width: Int(size.width),
+                            height: extentH, width: extentW,
                             factor: config.patchSize * config.mergeSize,
                             minPixels: config.minPixels, maxPixels: config.maxPixels)
                         resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
@@ -793,7 +795,8 @@ public struct Qwen25VLProcessor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage,
-            video: processedVideo)
+            video: processedVideo,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
 
@@ -804,7 +807,7 @@ public struct Qwen25VLProcessor: UserInputProcessor {
 /// This is typically created by ``VLMModelFactory``.
 public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
 
-    @ModuleInfo(key: "vision_tower") private var visionModel: Vision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen25Vision.VisionModel
     @ModuleInfo(key: "language_model") private var languageModel: Language.LanguageModel
 
     public let config: Qwen25VLConfiguration
@@ -818,7 +821,7 @@ public class Qwen25VL: Module, VLMModel, KVCacheDimensionProvider {
 
     public init(_ config: Qwen25VLConfiguration) {
         self.config = config
-        self._visionModel.wrappedValue = Vision.VisionModel(config.visionConfiguration)
+        self._visionModel.wrappedValue = Qwen25Vision.VisionModel(config.visionConfiguration)
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 

@@ -30,106 +30,116 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
 }
 
 @Test func maskedScatterMatchingSizes() {
-    // 5 tokens, 2 are image tokens, hiddenSize=4
-    let input = MLXArray.ones([1, 5, 4])
-    let source = MLXArray.zeros([1, 2, 4]) + 42.0
+    MLXMetalTestLock.withLock {
+        // 5 tokens, 2 are image tokens, hiddenSize=4
+        let input = MLXArray.ones([1, 5, 4])
+        let source = MLXArray.zeros([1, 2, 4]) + 42.0
 
-    // Build mask: token positions 1 and 3 are image tokens
-    var maskData = [Int32](repeating: 0, count: 5)
-    maskData[1] = 1; maskData[3] = 1
-    let tokenMask = MLXArray(maskData).reshaped(1, 5).asType(.bool)
-    let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
+        // Build mask: token positions 1 and 3 are image tokens
+        var maskData = [Int32](repeating: 0, count: 5)
+        maskData[1] = 1; maskData[3] = 1
+        let tokenMask = MLXArray(maskData).reshaped(1, 5).asType(.bool)
+        let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
 
-    let result = maskedScatter(input: input, mask: maskExp, source: source)
-    #expect(result != nil, "maskedScatter should succeed with matching sizes")
+        let result = maskedScatter(input: input, mask: maskExp, source: source)
+        #expect(result != nil, "maskedScatter should succeed with matching sizes")
 
-    if let r = result {
-        let flat = r.flattened().asArray(Float.self)
-        // token 0 (non-image): should be 1.0
-        #expect(flat[0] == 1.0)
-        // token 1 (image): should be 42.0
-        #expect(flat[4] == 42.0)
-        // token 2 (non-image): should be 1.0
-        #expect(flat[8] == 1.0)
-        // token 3 (image): should be 42.0
-        #expect(flat[12] == 42.0)
-        // token 4 (non-image): should be 1.0
-        #expect(flat[16] == 1.0)
+        if let r = result {
+            let flat = r.flattened().asArray(Float.self)
+            // token 0 (non-image): should be 1.0
+            #expect(flat[0] == 1.0)
+            // token 1 (image): should be 42.0
+            #expect(flat[4] == 42.0)
+            // token 2 (non-image): should be 1.0
+            #expect(flat[8] == 1.0)
+            // token 3 (image): should be 42.0
+            #expect(flat[12] == 42.0)
+            // token 4 (non-image): should be 1.0
+            #expect(flat[16] == 1.0)
+        }
     }
 }
 
 @Test func maskedScatterEmptyMask() {
-    let input = MLXArray.ones([1, 5, 4])
-    let source = MLXArray.zeros([1, 2, 4])
-    let mask = MLXArray.zeros([1, 5, 4]).asType(.bool)
+    MLXMetalTestLock.withLock {
+        let input = MLXArray.ones([1, 5, 4])
+        let source = MLXArray.zeros([1, 2, 4])
+        let mask = MLXArray.zeros([1, 5, 4]).asType(.bool)
 
-    let result = maskedScatter(input: input, mask: mask, source: source)
-    #expect(result != nil)
-    if let r = result {
-        let diff = abs(r - input).sum().item(Float.self)
-        #expect(diff == 0.0, "Empty mask should return input unchanged")
+        let result = maskedScatter(input: input, mask: mask, source: source)
+        #expect(result != nil)
+        if let r = result {
+            let diff = abs(r - input).sum().item(Float.self)
+            #expect(diff == 0.0, "Empty mask should return input unchanged")
+        }
     }
 }
 
 @Test func maskedScatterSizeMismatchDetected() {
-    // 5 tokens, 3 are image tokens, but source only has 2 features — should fail
-    let input = MLXArray.ones([1, 5, 4])
-    let source = MLXArray.zeros([1, 2, 4]) + 42.0
+    MLXMetalTestLock.withLock {
+        // 5 tokens, 3 are image tokens, but source only has 2 features — should fail
+        let input = MLXArray.ones([1, 5, 4])
+        let source = MLXArray.zeros([1, 2, 4]) + 42.0
 
-    var maskData = [Int32](repeating: 0, count: 5)
-    maskData[1] = 1; maskData[2] = 1; maskData[3] = 1  // 3 image positions
-    let tokenMask = MLXArray(maskData).reshaped(1, 5).asType(.bool)
-    let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
+        var maskData = [Int32](repeating: 0, count: 5)
+        maskData[1] = 1; maskData[2] = 1; maskData[3] = 1  // 3 image positions
+        let tokenMask = MLXArray(maskData).reshaped(1, 5).asType(.bool)
+        let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
 
-    // source has 2*4=8 elements but mask has 3*4=12 positions — mismatch
-    let result = maskedScatter(input: input, mask: maskExp, source: source)
-    #expect(result == nil, "maskedScatter should detect size mismatch")
+        // source has 2*4=8 elements but mask has 3*4=12 positions — mismatch
+        let result = maskedScatter(input: input, mask: maskExp, source: source)
+        #expect(result == nil, "maskedScatter should detect size mismatch")
+    }
 }
 
 @Test func maskedScatterSingleImageToken() {
-    // Edge case: exactly 1 image token
-    let input = MLXArray.ones([1, 3, 2])
-    let source = MLXArray.zeros([1, 1, 2]) + 99.0
+    MLXMetalTestLock.withLock {
+        // Edge case: exactly 1 image token
+        let input = MLXArray.ones([1, 3, 2])
+        let source = MLXArray.zeros([1, 1, 2]) + 99.0
 
-    var maskData = [Int32](repeating: 0, count: 3)
-    maskData[1] = 1
-    let tokenMask = MLXArray(maskData).reshaped(1, 3).asType(.bool)
-    let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
+        var maskData = [Int32](repeating: 0, count: 3)
+        maskData[1] = 1
+        let tokenMask = MLXArray(maskData).reshaped(1, 3).asType(.bool)
+        let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
 
-    let result = maskedScatter(input: input, mask: maskExp, source: source)
-    #expect(result != nil)
-    if let r = result {
-        let flat = r.flattened().asArray(Float.self)
-        #expect(flat[0] == 1.0)   // token 0
-        #expect(flat[2] == 99.0)  // token 1 (image)
-        #expect(flat[4] == 1.0)   // token 2
+        let result = maskedScatter(input: input, mask: maskExp, source: source)
+        #expect(result != nil)
+        if let r = result {
+            let flat = r.flattened().asArray(Float.self)
+            #expect(flat[0] == 1.0)   // token 0
+            #expect(flat[2] == 99.0)  // token 1 (image)
+            #expect(flat[4] == 1.0)   // token 2
+        }
     }
 }
 
 @Test func maskedScatterLargeTokenCount() {
-    // Simulate realistic sizes: 280 image tokens, hidden=16
-    let seqLen = 500; let hiddenSize = 16; let numImageTokens = 280
-    let input = MLXArray.ones([1, seqLen, hiddenSize])
-    let source = MLXArray.zeros([1, numImageTokens, hiddenSize]) + 7.0
+    MLXMetalTestLock.withLock {
+        // Simulate realistic sizes: 280 image tokens, hidden=16
+        let seqLen = 500; let hiddenSize = 16; let numImageTokens = 280
+        let input = MLXArray.ones([1, seqLen, hiddenSize])
+        let source = MLXArray.zeros([1, numImageTokens, hiddenSize]) + 7.0
 
-    var maskData = [Int32](repeating: 0, count: seqLen)
-    for i in 100 ..< (100 + numImageTokens) { maskData[i] = 1 }
-    let tokenMask = MLXArray(maskData).reshaped(1, seqLen).asType(.bool)
-    let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
+        var maskData = [Int32](repeating: 0, count: seqLen)
+        for i in 100 ..< (100 + numImageTokens) { maskData[i] = 1 }
+        let tokenMask = MLXArray(maskData).reshaped(1, seqLen).asType(.bool)
+        let maskExp = MLX.broadcast(expandedDimensions(tokenMask, axis: -1), to: input.shape)
 
-    let result = maskedScatter(input: input, mask: maskExp, source: source)
-    #expect(result != nil, "280 image tokens with 280 features should match")
+        let result = maskedScatter(input: input, mask: maskExp, source: source)
+        #expect(result != nil, "280 image tokens with 280 features should match")
 
-    if let r = result {
-        let flat = r.flattened().asArray(Float.self)
-        // Non-image position
-        #expect(flat[0] == 1.0)
-        // First image position
-        #expect(flat[100 * hiddenSize] == 7.0)
-        // Last image position
-        #expect(flat[(100 + numImageTokens - 1) * hiddenSize] == 7.0)
-        // After image positions
-        #expect(flat[(100 + numImageTokens) * hiddenSize] == 1.0)
+        if let r = result {
+            let flat = r.flattened().asArray(Float.self)
+            // Non-image position
+            #expect(flat[0] == 1.0)
+            // First image position
+            #expect(flat[100 * hiddenSize] == 7.0)
+            // Last image position
+            #expect(flat[(100 + numImageTokens - 1) * hiddenSize] == 7.0)
+            // After image positions
+            #expect(flat[(100 + numImageTokens) * hiddenSize] == 1.0)
+        }
     }
 }
 

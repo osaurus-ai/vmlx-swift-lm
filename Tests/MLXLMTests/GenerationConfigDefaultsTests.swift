@@ -1,0 +1,238 @@
+// Copyright © 2026 osaurus.
+
+import Foundation
+import MLX
+@testable import MLXLMCommon
+import MLXNN
+import XCTest
+
+final class GenerationConfigDefaultsTests: XCTestCase {
+
+    func testDecodesSamplingDefaults() throws {
+        let json = """
+        {
+          "eos_token_id": [1, 128803],
+          "max_new_tokens": 321,
+          "temperature": 0.7,
+          "top_p": 0.95,
+          "top_k": 40,
+          "min_p": 0.05,
+          "repetition_penalty": 1.05,
+          "do_sample": true
+        }
+        """
+
+        let config = try JSONDecoder.json5().decode(
+            GenerationConfigFile.self, from: Data(json.utf8))
+
+        XCTAssertEqual(config.eosTokenIds?.values, [1, 128803])
+        XCTAssertEqual(config.maxNewTokens, 321)
+        XCTAssertEqual(config.temperature, 0.7)
+        XCTAssertEqual(config.topP, 0.95)
+        XCTAssertEqual(config.topK, 40)
+        XCTAssertEqual(config.minP, 0.05)
+        XCTAssertEqual(config.repetitionPenalty, 1.05)
+        XCTAssertEqual(config.doSample, true)
+    }
+
+    func testGenerateParametersApplyConfigDefaultsAndPreserveRuntimeControls() {
+        let fallback = GenerateParameters(
+            maxTokens: 64,
+            maxKVSize: 2048,
+            kvBits: 4,
+            kvGroupSize: 32,
+            quantizedKVStart: 128,
+            kvMode: .turboQuant(keyBits: 3, valueBits: 3),
+            enableCompiledDecode: true,
+            compiledMaxCacheLength: 4096,
+            accelerationMode: .metal,
+            enableCompiledBatchDecode: true,
+            compiledBatchBuckets: [1, 2],
+            temperature: 0.2,
+            topP: 1.0,
+            topK: 0,
+            minP: 0.0,
+            repetitionPenalty: nil,
+            repetitionContextSize: 32,
+            presencePenalty: 0.1,
+            presenceContextSize: 24,
+            frequencyPenalty: 0.2,
+            frequencyContextSize: 25,
+            prefillStepSize: 256,
+            extraStopStrings: ["END"])
+
+        let config = GenerationConfigFile(
+            maxNewTokens: 123,
+            temperature: 0.8,
+            topP: 0.9,
+            topK: 50,
+            minP: 0.02,
+            repetitionPenalty: 1.1,
+            doSample: true)
+
+        let params = GenerateParameters(generationConfig: config, fallback: fallback)
+
+        XCTAssertEqual(params.maxTokens, 123)
+        XCTAssertEqual(params.temperature, 0.8)
+        XCTAssertEqual(params.topP, 0.9)
+        XCTAssertEqual(params.topK, 50)
+        XCTAssertEqual(params.minP, 0.02)
+        XCTAssertEqual(params.repetitionPenalty, 1.1)
+
+        XCTAssertEqual(params.maxKVSize, 2048)
+        XCTAssertEqual(params.kvBits, 4)
+        XCTAssertEqual(params.kvGroupSize, 32)
+        XCTAssertEqual(params.quantizedKVStart, 128)
+        XCTAssertEqual(params.kvMode, .turboQuant(keyBits: 3, valueBits: 3))
+        XCTAssertTrue(params.enableCompiledDecode)
+        XCTAssertEqual(params.compiledMaxCacheLength, 4096)
+        XCTAssertTrue(params.enableCompiledBatchDecode)
+        XCTAssertEqual(params.compiledBatchBuckets, [1, 2])
+        XCTAssertEqual(params.repetitionContextSize, 32)
+        XCTAssertEqual(params.presencePenalty, 0.1)
+        XCTAssertEqual(params.frequencyPenalty, 0.2)
+        XCTAssertEqual(params.prefillStepSize, 256)
+        XCTAssertEqual(params.extraStopStrings, ["END"])
+    }
+
+    func testDoSampleFalseForcesGreedyEvenWhenTemperaturePresent() {
+        let config = GenerationConfigFile(
+            maxNewTokens: 50,
+            temperature: 0.9,
+            topP: 0.95,
+            doSample: false)
+
+        let params = GenerateParameters(generationConfig: config)
+
+        XCTAssertEqual(params.maxTokens, 50)
+        XCTAssertEqual(params.temperature, 0)
+        XCTAssertEqual(params.topP, 0.95)
+        XCTAssertTrue(params.sampler() is ArgMaxSampler)
+    }
+
+    func testModelConfigurationCarriesResolvedGenerationDefaults() {
+        let config = GenerationConfigFile(
+            maxNewTokens: 77,
+            temperature: 0.4,
+            topP: 0.8)
+        let modelConfig = ModelConfiguration(
+            id: "org/model",
+            generationDefaults: config)
+
+        let resolved = modelConfig.resolved(
+            modelDirectory: URL(filePath: "/tmp/model"),
+            tokenizerDirectory: URL(filePath: "/tmp/tokenizer"))
+
+        XCTAssertEqual(resolved.generationDefaults, config)
+        let params = GenerateParameters(generationConfig: resolved.generationDefaults)
+        XCTAssertEqual(params.maxTokens, 77)
+        XCTAssertEqual(params.temperature, 0.4)
+        XCTAssertEqual(params.topP, 0.8)
+    }
+
+    /// Pins `ModelContainer.defaultGenerateParameters(fallback:)` —
+    /// the opt-in convenience that returns a `GenerateParameters`
+    /// initialized from the bundle's stamped `generation_config.json`
+    /// values, with caller-supplied fallback for fields the config did
+    /// not specify. Closes the production gap where the factory-side
+    /// `generationDefaults` storage was wired without any
+    /// ModelContainer-side consumer.
+    func testModelContainerDefaultGenerateParametersAppliesGenerationConfig() async {
+        let config = GenerationConfigFile(
+            maxNewTokens: 222,
+            temperature: 0.6,
+            topP: 0.85,
+            topK: 32,
+            minP: 0.04,
+            repetitionPenalty: 1.07,
+            doSample: true)
+        let modelConfig = ModelConfiguration(
+            id: "org/test-model",
+            generationDefaults: config)
+
+        // Build a minimal ModelContext. We only exercise `configuration`
+        // here, so a placeholder model/processor/tokenizer is fine — the
+        // accessor under test reads `context.configuration.generationDefaults`.
+        let context = ModelContext(
+            configuration: modelConfig,
+            model: TestStubLanguageModel(),
+            processor: TestStubUserInputProcessor(),
+            tokenizer: TestStubTokenizer())
+        let container = ModelContainer(context: context)
+
+        // Default fallback (no fields supplied).
+        let defaults = await container.defaultGenerateParameters()
+        XCTAssertEqual(defaults.maxTokens, 222)
+        XCTAssertEqual(defaults.temperature, 0.6)
+        XCTAssertEqual(defaults.topP, 0.85)
+        XCTAssertEqual(defaults.topK, 32)
+        XCTAssertEqual(defaults.minP, 0.04)
+        XCTAssertEqual(defaults.repetitionPenalty, 1.07)
+
+        // Explicit fallback fields the config does not override survive.
+        let withFallback = await container.defaultGenerateParameters(
+            fallback: GenerateParameters(
+                maxKVSize: 4096,
+                kvBits: 4,
+                kvGroupSize: 32,
+                prefillStepSize: 512))
+        XCTAssertEqual(withFallback.maxTokens, 222) // from config
+        XCTAssertEqual(withFallback.maxKVSize, 4096) // from fallback
+        XCTAssertEqual(withFallback.kvBits, 4)
+        XCTAssertEqual(withFallback.prefillStepSize, 512)
+    }
+
+    /// Pins the contract that a container with NO generation_config.json
+    /// returns a `GenerateParameters` equal to the supplied fallback —
+    /// i.e. the convenience method has no observable side effect for
+    /// bundles that don't ship sampling defaults.
+    func testModelContainerDefaultGenerateParametersFallsBackWhenConfigAbsent() async {
+        let modelConfig = ModelConfiguration(id: "org/no-config-model")
+        let context = ModelContext(
+            configuration: modelConfig,
+            model: TestStubLanguageModel(),
+            processor: TestStubUserInputProcessor(),
+            tokenizer: TestStubTokenizer())
+        let container = ModelContainer(context: context)
+
+        let fallback = GenerateParameters(maxTokens: 99, temperature: 0.33)
+        let result = await container.defaultGenerateParameters(fallback: fallback)
+        XCTAssertEqual(result.maxTokens, 99)
+        XCTAssertEqual(result.temperature, 0.33)
+    }
+}
+
+// MARK: - Test stubs
+
+private final class TestStubLanguageModel: Module, LanguageModel {
+    var kvHeads: [Int] { [] }
+    var vocabularySize: Int { 0 }
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        MLXArray.zeros([1, 1, 1])
+    }
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+}
+
+private struct TestStubUserInputProcessor: UserInputProcessor {
+    func prepare(input: UserInput) async throws -> LMInput {
+        LMInput(tokens: MLXArray([Int32(0)]))
+    }
+}
+
+private struct TestStubTokenizer: Tokenizer {
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}

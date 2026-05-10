@@ -55,6 +55,9 @@ public final class ModelContainer: Sendable {
             // that prevents cross-model poisoning within the same process.
             config.modelKey = "\(ObjectIdentifier(self))"
         }
+        if let modelKey = config.modelKey {
+            config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelKey)
+        }
         let coordinator = CacheCoordinator(config: config)
         _cacheCoordinator.withLock { $0 = coordinator }
     }
@@ -64,12 +67,16 @@ public final class ModelContainer: Sendable {
     public func enableCachingAsync() async {
         var config = CacheCoordinatorConfig()
         let modelConfig = await context.read { $0.configuration }
-        config.modelKey = modelConfig.name
+        config.modelKey = RuntimeMoETopKOverride.cacheScopedModelKey(modelConfig.name)
 
-        // Auto-detect hybrid: check if model creates MambaCache/ArraysCache layers
+        // Auto-detect hybrid: check if model creates MambaCache/ArraysCache/ZayaCCACache layers.
+        // ZAYA1's CCA-attention layers carry path-dependent `conv_state` + `prev_hs` alongside
+        // the KV pair — same multi-turn contamination problem as Mamba SSM state. Including
+        // ZayaCCACache here flips the coordinator's `isHybrid` flag so the SSM state cache /
+        // re-derive plumbing fires for ZAYA models too.
         let isHybrid = await context.read { ctx -> Bool in
             let testCache = ctx.model.newCache(parameters: nil)
-            return testCache.contains { $0 is MambaCache || $0 is ArraysCache }
+            return testCache.contains { $0 is MambaCache || $0 is ArraysCache || $0 is ZayaCCACache }
         }
 
         // 2026-05-05 (Ling-2.6-flash multi-turn fix): hybrid models with
@@ -143,6 +150,30 @@ public final class ModelContainer: Sendable {
         get async {
             await context.read { $0.configuration }
         }
+    }
+
+    /// Build `GenerateParameters` from the bundle's `generation_config.json`
+    /// defaults (when present), falling back to the supplied parameters for
+    /// every field the config did not specify.
+    ///
+    /// Opt-in convenience: `generate()` and `streamGenerate()` do NOT
+    /// consume this automatically — the runtime keeps the explicit
+    /// caller-controlled `GenerateParameters` contract. Callers that want
+    /// the bundle's stamped defaults (max_new_tokens, temperature, top_p,
+    /// top_k, min_p, repetition_penalty, do_sample) should pass the result
+    /// of this method into `generate(...)`.
+    ///
+    /// Merge policy mirrors `GenerateParameters.init(generationConfig:fallback:)`
+    /// at `Libraries/MLXLMCommon/Evaluate.swift:274`:
+    /// fields present in `generationDefaults` override the matching field
+    /// in `fallback`; fields absent use `fallback`; `do_sample == false`
+    /// in the config forces `temperature = 0` even if a temperature is
+    /// also specified.
+    public func defaultGenerateParameters(
+        fallback: GenerateParameters = GenerateParameters()
+    ) async -> GenerateParameters {
+        let config = await context.read { $0.configuration.generationDefaults }
+        return GenerateParameters(generationConfig: config, fallback: fallback)
     }
 
     public var processor: UserInputProcessor {

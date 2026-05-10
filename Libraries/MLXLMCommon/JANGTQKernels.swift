@@ -411,7 +411,8 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
 }
 
 /// Detect routed-MoE codebook bits from a JANG bundle's `profile`
-/// string field (`JANGTQ4` → 4, `JANGTQ2`/`JANGTQ`/`MXTQ` → 2).
+/// string field (`JANGTQ4` → 4, `JANGTQ2`/`JANGTQ`/`MXTQ` → 2,
+/// `JANGTQ1` → 1).
 /// Bundle naming convention is empirically reliable: every JANG /
 /// JANGTQ converter pre-2026-04 stamped the profile this way.
 /// Returns `nil` for unrecognized strings so the caller falls back
@@ -419,6 +420,9 @@ public final class JANGTQRuntimeCache: @unchecked Sendable {
 public func jangtqBitsFromProfile(_ profile: String?) -> Int? {
     guard let profile, !profile.isEmpty else { return nil }
     let p = profile.lowercased()
+    if p.contains("jangtq1") || p.contains("jangtq_1") || p.contains("jangtq-1") {
+        return 1
+    }
     if p.contains("jangtq4") || p.contains("jangtq_4") || p.contains("jangtq-4") {
         return 4
     }

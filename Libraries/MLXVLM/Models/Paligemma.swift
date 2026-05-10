@@ -483,7 +483,10 @@ public struct PaliGemmaProcessor: UserInputProcessor {
 
         let pixels = try prepare(image: input.images[0].asCIImage(), processing: input.processing)
 
-        return LMInput(text: .init(tokens: promptArray, mask: mask), image: .init(pixels: pixels))
+        return LMInput(
+            text: .init(tokens: promptArray, mask: mask),
+            image: .init(pixels: pixels),
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 
     private func prompt(from userInput: UserInput) -> String {

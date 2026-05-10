@@ -94,12 +94,11 @@ struct BatchSlot {
     /// Prefill step size for this request.
     let prefillStepSize: Int
 
-    /// Stable fingerprint of any VLM image/video content in the input.
-    /// `nil` for text-only requests. Computed once at slot construction and
-    /// passed to the cache coordinator on both fetch (prefill) and store
-    /// (finishSlot) so VLM multi-turn traffic can cache-hit on identical
-    /// media without colliding with text-only entries. See
-    /// ``computeMediaSalt(for:)``.
+    /// Stable fingerprint of any request-scope or media content in the input.
+    /// `nil` for ordinary text-only requests. Computed once at slot
+    /// construction and passed to the cache coordinator on both fetch
+    /// (prefill) and store (finishSlot) so reasoning-mode and VLM multi-turn
+    /// traffic can cache-hit without colliding with other modes/media.
     let mediaSalt: String?
 
     /// Compiled forward closure captured when this slot's cache is promoted
@@ -162,7 +161,7 @@ extension BatchSlot {
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize
-        self.mediaSalt = computeMediaSalt(for: request.input)
+        self.mediaSalt = computeCacheSalt(for: request.input)
         self.compiledForward = nil
     }
 }

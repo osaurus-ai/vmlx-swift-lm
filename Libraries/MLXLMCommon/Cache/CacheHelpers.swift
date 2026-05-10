@@ -56,6 +56,45 @@ func makeDiskStoreCache(
         kvMode: parameters.kvMode)
 }
 
+/// True when any cache layer carries path-dependent non-KV recurrent state.
+///
+/// Paged KV blocks store attention KV tensors only. Mamba, linear-attention
+/// arrays, and ZAYA CCA layers also carry state that depends on the exact
+/// prompt path, so a paged-only hit would be a false positive unless a
+/// companion disk restore or re-derive path supplies that state too.
+public func cacheContainsPathDependentState(_ cache: [any KVCache]) -> Bool {
+    cache.contains { layer in
+        if layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache {
+            return true
+        }
+        if let cacheList = layer as? CacheList {
+            for i in 0..<cacheList.count {
+                if cacheContainsPathDependentState([cacheList[i]]) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+}
+
+/// True when cache restore must bypass paged KV blocks and use disk-backed
+/// layer-kind serialization.
+///
+/// This includes path-dependent recurrent caches plus sliding-window /
+/// hybrid-pool layers whose ring or pool metadata is not represented by
+/// plain paged KV blocks.
+public func cacheRequiresDiskBackedCoordinatorRestore(_ cache: [any KVCache]) -> Bool {
+    if cacheContainsPathDependentState(cache) {
+        return true
+    }
+    return cache.contains { layer in
+        layer is HybridPoolCache ||
+            layer is RotatingKVCache ||
+            layer is RotatingKVCacheWrapper
+    }
+}
+
 /// Extract per-layer KV tensors from a model's cache array.
 ///
 /// Returns per-layer `(keys, values)` tuples. SSM/MambaCache layers return `nil`.

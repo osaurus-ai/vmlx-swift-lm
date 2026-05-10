@@ -40,10 +40,10 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             throw VLMError.imageProcessingFailure("No image provided")
         }
 
-        let extent = first.extent.size
+        let (extentH, extentW) = try QwenVL.intExtent(first.extent.size)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-            height: Int(extent.height),
-            width: Int(extent.width),
+            height: extentH,
+            width: extentW,
             factor: config.patchSize * config.mergeSize,
             minPixels: config.size.minPixels,
             maxPixels: config.size.maxPixels)
@@ -80,7 +80,9 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         if input.images.isEmpty, input.videos.isEmpty {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray).asType(.int8)
-            return LMInput(text: .init(tokens: promptArray, mask: mask))
+            return LMInput(
+                text: .init(tokens: promptArray, mask: mask),
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         var processedImage: LMInput.ProcessedImage?
@@ -112,10 +114,10 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
-                        let size = processed.extent.size
+                        let (extentH, extentW) = try QwenVL.intExtent(processed.extent.size)
                         let (height, width) = try QwenVL.targetSize(
-                            height: Int(size.height),
-                            width: Int(size.width),
+                            height: extentH,
+                            width: extentW,
                             factor: config.patchSize * config.mergeSize,
                             minPixels: config.minPixels,
                             maxPixels: config.maxPixels)
@@ -154,7 +156,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
             image: processedImage,
-            video: processedVideo)
+            video: processedVideo,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }
 

@@ -125,11 +125,19 @@ public enum VLMTypeRegistry {
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "zaya": dispatchZayaUnsupported,
+        "zaya1_vl": dispatchZaya1VLUnsupported,
     ]
 
     private static func dispatchZayaUnsupported(data _: Data) throws -> any LanguageModel {
         throw ModelFactoryError.unsupportedModelType(
             "zaya (ZAYA1 CCA hybrid decoder is not implemented in vmlx-swift-lm yet; port requires CCA conv_state/prev_hs cache support, per-slot hybrid batching state, prefix-cache disabled until KV+CCA restore parity is proven, and JANGTQ pre-stacked switch_mlp expert wiring)"
+        )
+    }
+
+    private static func dispatchZaya1VLUnsupported(data: Data) throws -> any LanguageModel {
+        _ = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
+        throw VLMError.processing(
+            "ZAYA1-VL native adapter is not ready: port must wire the Qwen2.5-VL vision tower, vision LoRA image-mask gates, attention-then-MoE Zaya CCA trunk, image-token embedding merge, and cache/B>1 restore validation before this model can run."
         )
     }
 
@@ -210,6 +218,8 @@ public enum VLMProcessorTypeRegistry {
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "NemotronHOmniProcessor": create(
             NemotronHOmniProcessorConfiguration.self, NemotronHOmniProcessor.init),
+        "Zaya1VLProcessor": create(
+            Qwen25VLProcessorConfiguration.self, Zaya1VLProcessor.init),
     ])
 }
 
@@ -455,11 +465,13 @@ public final class VLMModelFactory: ModelFactory {
         // Load EOS token IDs from config.json, with optional override from generation_config.json
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
-        {
+        let generationConfig =
+            if let generationData = try? Data(contentsOf: generationConfigURL) {
+                try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
+            } else {
+                nil as GenerationConfigFile?
+            }
+        if let genEosIds = generationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
         if baseConfig.modelType == "deepseek_v4" {
@@ -577,9 +589,19 @@ public final class VLMModelFactory: ModelFactory {
         let processorType =
             processorTypeOverrides[dispatchModelType] ?? baseProcessorConfig.processorClass
 
-        let processor = try await processorRegistry.createModel(
+        let baseProcessor = try await processorRegistry.createModel(
             configuration: processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
+        let defaultAdditionalContext = VLMDefaultContextUserInputProcessor.defaultContext(
+            capabilities: jangConfig?.capabilities)
+        let processor: any UserInputProcessor =
+            if defaultAdditionalContext != nil {
+                VLMDefaultContextUserInputProcessor(
+                    base: baseProcessor,
+                    defaultAdditionalContext: defaultAdditionalContext)
+            } else {
+                baseProcessor
+            }
 
         // Build a ModelConfiguration for the ModelContext. When the JANG
         // fallback resolved to a different directory than the caller
@@ -596,7 +618,8 @@ public final class VLMModelFactory: ModelFactory {
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
-            reasoningParserName: mutableConfiguration.reasoningParserName)
+            reasoningParserName: mutableConfiguration.reasoningParserName,
+            generationDefaults: generationConfig)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,
@@ -629,6 +652,49 @@ private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         return (data, config)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
+    }
+}
+
+/// Decorates a VLM processor with safe default chat-template context while
+/// preserving explicit caller overrides.
+struct VLMDefaultContextUserInputProcessor: UserInputProcessor {
+    let base: any UserInputProcessor
+    let defaultAdditionalContext: [String: any Sendable]?
+
+    init(base: any UserInputProcessor, defaultAdditionalContext: [String: any Sendable]?) {
+        self.base = base
+        self.defaultAdditionalContext = defaultAdditionalContext
+    }
+
+    static func defaultContext(capabilities: JangCapabilities?) -> [String: any Sendable]? {
+        var context: [String: any Sendable] = [:]
+
+        if capabilities?.supportsThinking == false {
+            context["enable_thinking"] = false
+        }
+
+        return context.isEmpty ? nil : context
+    }
+
+    func prepare(input: UserInput) async throws -> LMInput {
+        guard let defaultAdditionalContext, !defaultAdditionalContext.isEmpty else {
+            return try await base.prepare(input: input)
+        }
+
+        var merged = defaultAdditionalContext
+        for (key, value) in input.additionalContext ?? [:] {
+            merged[key] = value
+        }
+
+        let rewritten = UserInput(
+            prompt: input.prompt,
+            images: input.images,
+            videos: input.videos,
+            audios: input.audios,
+            processing: input.processing,
+            tools: input.tools,
+            additionalContext: merged)
+        return try await base.prepare(input: rewritten)
     }
 }
 

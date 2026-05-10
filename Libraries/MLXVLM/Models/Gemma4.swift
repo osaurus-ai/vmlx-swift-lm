@@ -57,9 +57,8 @@ private class VisionRMSNorm: Module, UnaryLayer {
 }
 
 /// Parameterless RMS normalization
-private func rmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
-    let v = (x * x).mean(axis: -1, keepDims: true)
-    return x * rsqrt(v + eps)
+func rmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
+    MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: eps)
 }
 
 private func visionRmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
@@ -211,12 +210,24 @@ struct G4TextConfig: Codable, Sendable {
         attentionKEqV = try c.decodeIfPresent(Bool.self, forKey: .attentionKEqV) ?? false
         hiddenSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
         vocabSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
+        // PLE coherence: paired E2B/E4B fields. See Gemma4Text.swift / deep-trace §7.6.
+        if (hiddenSizePerLayerInput == 0) != (vocabSizePerLayerInput == 0) {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSizePerLayerInput, in: c,
+                debugDescription:
+                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(hiddenSizePerLayerInput) "
+                    + "and vocab_size_per_layer_input=\(vocabSizePerLayerInput); both must be zero (PLE off) "
+                    + "or both must be positive (PLE on).")
+        }
         numKvSharedLayers = try c.decodeIfPresent(Int.self, forKey: .numKvSharedLayers) ?? 0
         useDoubleWideMlp = try c.decodeIfPresent(Bool.self, forKey: .useDoubleWideMlp) ?? false
         enableMoeBlock = try c.decodeIfPresent(Bool.self, forKey: .enableMoeBlock) ?? false
         moeIntermediateSize = try c.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         numExperts = try c.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
-        topKExperts = try c.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0
+        topKExperts = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try c.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0,
+            modelType: "gemma4_vlm",
+            field: CodingKeys.topKExperts.rawValue)
         ropeTraditional = try c.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
         ropeParameters = try c.decodeIfPresent([String: [String: StringOrNumber]].self, forKey: .ropeParameters) ?? [:]
     }
@@ -774,7 +785,15 @@ private class TextModel: Module {
             else { skv = nil; soff = nil; soffArr = nil }
             let ce = prevIdx == i ? (i < lc.count ? lc[i] : nil) : nil
             let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff, sharedOffsetArray: soffArr)
-            let layerOffArr = (ce as? BatchKVCache)?.offsetArray
+            // Mirror `Libraries/MLXLLM/Models/Gemma4Text.swift:762` — use
+            // `graphOffsetArray(for:)` so KV-sharing layers still receive a
+            // graph-traceable offset under Stage 1B.3 compile (covers
+            // CompilableKVCache / CompilableRotatingKVCache /
+            // CompilableTurboQuantKVCache / BatchKVCache / BatchArraysCache).
+            // The prior `(ce as? BatchKVCache)?.offsetArray` cast missed
+            // every Compilable* path, forcing a host readback of
+            // `cache.offset` on the next shared-KV layer.
+            let layerOffArr = graphOffsetArray(for: ce)
             h = res.h; intermediates[i] = (res.keys, res.values, res.offset, layerOffArr)
         }
         return norm(h)
@@ -813,7 +832,7 @@ private class MultimodalEmbedder: Module {
     func callAsFunction(_ x: MLXArray) -> MLXArray { rmsNormNoScale(proj(x)) }
 }
 
-private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) -> MLXArray {
+private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) throws -> MLXArray {
     let inputShape = input.shape
     let inputFlat = input.flattened()
     let maskFlat = mask.flattened()
@@ -825,11 +844,17 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) ->
     guard !positions.isEmpty else { return input }
 
     let posArray = MLXArray(positions)
+    // Surface the bundle/processor-config mismatch as a recoverable
+    // VLMError instead of an abort. Per `docs/GEMMA4-DEEP-TRACE-2026-05-10.md`
+    // §7.3, a `fatalError` here was never reachable cleanly — a
+    // mis-stamped `imageSeqLength` would crash the whole process on
+    // first image. Throw so the caller (osaurus, JANG Studio, etc.)
+    // can surface the diagnostic without process abort.
     guard sourceFlat.shape[0] == posArray.shape[0] else {
-        fatalError(
+        throw VLMError.processing(
             """
-            Gemma4 maskedScatter: size mismatch between vision features and image token positions.
-            Vision features: \(sourceFlat.shape[0]), image positions: \(posArray.shape[0]).
+            Gemma4 maskedScatter: size mismatch between vision features and image token positions. \
+            Vision features: \(sourceFlat.shape[0]), image positions: \(posArray.shape[0]). \
             Check that imageSeqLength in preprocessor_config matches vision tower output (defaultOutputLength).
             """)
     }
@@ -864,6 +889,21 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+        // Audio guard: Gemma4 VLM does not implement audio.
+        // The `sanitize` path drops `audio_tower.*` and `embed_audio.*`
+        // weights silently (see `Gemma4.sanitize` below), and there is no
+        // audio module wired in `init`. If a caller passes
+        // `LMInput.audio` it would be IGNORED, which means the model
+        // would generate over a prefix that ASSUMES audio embeddings at
+        // certain positions but never received them — a silent
+        // corruption mode that's hard to debug at the call site.
+        // Surface a clean error here instead.
+        if input.audio != nil {
+            throw VLMError.processing(
+                "Gemma4 VLM does not implement audio inputs; LMInput.audio must be nil. " +
+                "Audio-bearing Gemma4 bundles drop `audio_tower.*` and `embed_audio.*` weights " +
+                "during sanitize and have no audio module to consume the waveform.")
+        }
         var emb = languageModel.model.emb(input.text.tokens)
         emb = emb * MLXArray(sqrt(Float(config.textConfig.hiddenSize)), dtype: emb.dtype)
 
@@ -889,7 +929,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
             let imgMask = MLX.equal(input.text.tokens, MLXArray(Int32(config.imageTokenId)))
             let imgMaskExp = MLX.broadcast(expandedDimensions(imgMask, axis: -1), to: emb.shape)
-            emb = maskedScatter(input: emb, mask: imgMaskExp, source: imgFeatures)
+            emb = try maskedScatter(input: emb, mask: imgMaskExp, source: imgFeatures)
         }
 
         let paddedCache = padCache(cache)
@@ -987,7 +1027,14 @@ public struct Gemma4Processor: UserInputProcessor {
             let ps = config.patchSize; let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
             var arrays = try input.images.map { img -> MLXArray in
                 let ci = try img.asCIImage()
-                let (w, h) = (Int(ci.extent.width), Int(ci.extent.height))
+                // Reject zero-area, infinite, and NaN extents explicitly. The
+                // scale-factor math below divides by `w * h`; a CIImage with
+                // a zero extent produces infinite `f` and a NaN trap inside
+                // `Int(floor(.nan))`. A non-finite extent (e.g.
+                // `CIImage(color:)` returns `(.infinity, .infinity)`) traps
+                // even earlier inside `Int(.infinity)`. Both surface as
+                // VLMError.imageProcessingFailure now.
+                let (h, w) = try QwenVL.intExtent(ci.extent.size)
                 let f = sqrt(Float(maxP * ps * ps) / Float(w * h))
                 let sm = config.poolingKernelSize * ps
                 var tH = Int(floor(f * Float(h) / Float(sm))) * sm; var tW = Int(floor(f * Float(w) / Float(sm))) * sm
@@ -1015,14 +1062,27 @@ public struct Gemma4Processor: UserInputProcessor {
                 }
                 processedImage = LMInput.ProcessedImage(pixels: concatenated(stored), frames: imageSizes)
             }
-            // Chat template emits <|image|> which tokenizes to image_token_id (258880).
-            // Expand each single image token into imageSeqLength copies for the vision features.
-            let imgId = tokenizer.encode(text: "<|image|>").last ?? 258880
+            // Chat template emits <|image|> which tokenizes to image_token_id (258880
+            // for shipped Gemma4 bundles). Expand each single image token into
+            // imageSeqLength copies for the vision features.
+            //
+            // Use `convertTokenToId` rather than `encode("<|image|>").last` so the
+            // lookup goes straight through the tokenizer's special-token map and
+            // never picks up an appended BOS/EOS — `encode(text:)` defaults to
+            // `addSpecialTokens: true` (Tokenizer.swift:23-25) which on some
+            // tokenizers prepends BOS, leaving a 2-token result whose `.last`
+            // is still correct but whose first element silently varies. The
+            // 258880 fallback covers tokenizers that don't expose `<|image|>` as
+            // an addable special token.
+            let imgId = tokenizer.convertTokenToId("<|image|>") ?? 258880
             var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
             tokens = exp
         }
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)
-        return LMInput(text: .init(tokens: pa, mask: ones(like: pa).asType(.int8)), image: processedImage)
+        return LMInput(
+            text: .init(tokens: pa, mask: ones(like: pa).asType(.int8)),
+            image: processedImage,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 }

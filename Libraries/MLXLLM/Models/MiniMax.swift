@@ -335,6 +335,32 @@ public struct MiniMaxConfiguration: Codable, Sendable {
         case headDim = "head_dim"
         case useQkNorm = "use_qk_norm"
     }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "minimax"
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
+        kvHeads = try container.decode(Int.self, forKey: .kvHeads)
+        maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
+        numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerTok),
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
+        numLocalExperts = try container.decode(Int.self, forKey: .numLocalExperts)
+        sharedIntermediateSize = try container.decode(Int.self, forKey: .sharedIntermediateSize)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        rmsNormEps = try container.decode(Float.self, forKey: .rmsNormEps)
+        ropeTheta = try container.decode(Float.self, forKey: .ropeTheta)
+        rotaryDim = try container.decode(Int.self, forKey: .rotaryDim)
+        vocabularySize = try container.decode(Int.self, forKey: .vocabularySize)
+        tieWordEmbeddings =
+            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        scoringFunc = try container.decodeIfPresent(String.self, forKey: .scoringFunc) ?? "sigmoid"
+        headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
+        useQkNorm = try container.decodeIfPresent(Bool.self, forKey: .useQkNorm) ?? true
+    }
 }
 
 // MARK: - LoRA

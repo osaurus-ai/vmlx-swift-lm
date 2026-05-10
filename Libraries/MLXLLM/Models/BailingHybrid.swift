@@ -123,7 +123,10 @@ public struct BailingHybridConfiguration: Codable, Sendable {
         self.numSharedExperts =
             try c.decodeIfPresent(Int.self, forKey: .numSharedExperts) ?? 0
         self.numAttentionHeads = try c.decode(Int.self, forKey: .numAttentionHeads)
-        self.numExpertsPerTok = try c.decode(Int.self, forKey: .numExpertsPerTok)
+        self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try c.decode(Int.self, forKey: .numExpertsPerTok),
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
         self.numHiddenLayers = try c.decode(Int.self, forKey: .numHiddenLayers)
         self.numKeyValueHeads = try c.decode(Int.self, forKey: .numKeyValueHeads)
         self.rmsNormEps = try c.decode(Float.self, forKey: .rmsNormEps)

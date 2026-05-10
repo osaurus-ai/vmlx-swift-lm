@@ -441,16 +441,16 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray?,
         pixelValues: MLXArray?,
         imageSizes: [(Int, Int)]?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard var pixelValues, let imageSizes else {
             guard let inputIds else {
-                fatalError("Either inputIds or pixelValues must be provided")
+                throw VLMError.processing("Mistral3JANGTQ.getInputEmbeddings: either inputIds or pixelValues must be provided.")
             }
             return languageModel.embedTokens(inputIds)
         }
 
         guard let inputIds else {
-            fatalError("inputIds required when pixelValues provided")
+            throw VLMError.processing("Mistral3JANGTQ.getInputEmbeddings: inputIds required when pixelValues provided.")
         }
 
         let inputsEmbeds = languageModel.embedTokens(inputIds)
@@ -465,7 +465,7 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
         )
 
         guard let hiddenStates else {
-            fatalError("Vision model must return hidden states")
+            throw VLMError.processing("Mistral3JANGTQ vision tower returned nil hidden states; bundle may be missing vision_tower weights.")
         }
 
         let layerIndex =
@@ -476,7 +476,7 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
 
         let imageFeatures = multiModalProjector(selectedFeatures, imageSizes: imageSizes)
 
-        return mergeInputIdsWithImageFeatures(
+        return try mergeInputIdsWithImageFeatures(
             imageTokenIndex: config.imageTokenIndex,
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
@@ -489,17 +489,18 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
         imageFeatures: MLXArray,
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         let (_, numImagePatches, _) = (
             imageFeatures.dim(0), imageFeatures.dim(1), imageFeatures.dim(2))
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
         let imagePositions = inputIdArray.enumerated().compactMap {
             $1 == Int32(imageTokenIndex) ? $0 : nil
         }
+        // Mismatch is config/processor-stamp drift — surface as recoverable
+        // error instead of process abort. See Gemma deep-trace §7.3.
         guard imagePositions.count == numImagePatches else {
-            fatalError(
-                "Image token count (\(imagePositions.count)) does not match image patches"
-                + " (\(numImagePatches)).")
+            throw VLMError.processing(
+                "Mistral3JANGTQ image token count (\(imagePositions.count)) does not match image patches (\(numImagePatches)).")
         }
 
         var textSegments: [MLXArray] = []
@@ -535,7 +536,7 @@ public class Mistral3VLMJANGTQ: Module, VLMModel, KVCacheDimensionProvider {
             imageSizes = nil
         }
 
-        let embeddings = getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues,
             imageSizes: imageSizes

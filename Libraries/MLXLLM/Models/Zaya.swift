@@ -37,7 +37,7 @@ private func zayaPrintLayerStats(_ label: String, _ h: MLXArray) {
             label, "\(h.shape)", l2, mean, std, first).utf8))
 }
 
-private func zayaScaledL2Normalize(_ x: MLXArray, scale: Float) -> MLXArray {
+func zayaScaledL2Normalize(_ x: MLXArray, scale: Float) -> MLXArray {
     let xf = x.asType(.float32)
     let norm = sqrt((xf * xf).sum(axis: -1, keepDims: true) + 1e-6)
     return (xf * (scale / norm)).asType(x.dtype)
@@ -637,15 +637,22 @@ extension TurboQuantSwitchGLU: ZayaSwitchPrimitive {}
 final class ZayaExperts: Module {
     @ModuleInfo(key: "switch_mlp") var switchMLP: ZayaSwitchPrimitive
 
-    init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?) {
+    init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?, layerIdx: Int? = nil) {
         let H = cfg.hiddenSize
         let I = cfg.expertIntermediateSize
         let E = cfg.numExperts
         switch context {
         case .some(.jangtq(let gateUp, let down, let seed)):
-            self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
-                inputDims: H, hiddenDims: I, numExperts: E,
-                gateUpBits: gateUp, downBits: down, seed: seed)
+            if JANGTQStreamingExperts.isEnabled, let layerIdx {
+                self._switchMLP.wrappedValue = StreamingTurboQuantSwitchGLU(
+                    inputDims: H, hiddenDims: I, numExperts: E,
+                    gateUpBits: gateUp, downBits: down, seed: seed,
+                    layerIdx: layerIdx)
+            } else {
+                self._switchMLP.wrappedValue = TurboQuantSwitchGLU(
+                    inputDims: H, hiddenDims: I, numExperts: E,
+                    gateUpBits: gateUp, downBits: down, seed: seed)
+            }
         case .some(.affine), .some(.bf16), nil:
             self._switchMLP.wrappedValue = SwitchGLU(
                 inputDims: H, hiddenDims: I, numExperts: E)
@@ -660,10 +667,10 @@ final class ZayaMoEBlock: Module, ZayaSubLayer {
 
     let hiddenSize: Int
 
-    init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?) {
+    init(_ cfg: ZayaTextConfiguration, context: ZayaMoEContext?, layerIdx: Int? = nil) {
         self.hiddenSize = cfg.hiddenSize
         self._router.wrappedValue = ZayaRouter(cfg)
-        self._experts.wrappedValue = ZayaExperts(cfg, context: context)
+        self._experts.wrappedValue = ZayaExperts(cfg, context: context, layerIdx: layerIdx)
         super.init()
     }
 
@@ -734,7 +741,7 @@ final class ZayaDecoderLayer: Module {
         if isAttention {
             self._sub.wrappedValue = ZayaCCAAttention(cfg, layerIndex: layerIdx)
         } else {
-            self._sub.wrappedValue = ZayaMoEBlock(cfg, context: context)
+            self._sub.wrappedValue = ZayaMoEBlock(cfg, context: context, layerIdx: layerIdx)
         }
         super.init()
     }
@@ -793,8 +800,12 @@ public final class ZayaModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let embed = embedTokens(inputs)
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        inputEmbedding: MLXArray? = nil
+    ) -> MLXArray {
+        let embed = inputEmbedding ?? embedTokens(inputs)
         var h = embed
         zayaPrintLayerStats("HS 0 embed", h)
         var residual: MLXArray?
@@ -880,8 +891,12 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
         super.init()
     }
 
-    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let h = model(inputs, cache: cache)
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        inputEmbedding: MLXArray? = nil
+    ) -> MLXArray {
+        let h = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
         if let lmHead {
             return lmHead(h)
         }

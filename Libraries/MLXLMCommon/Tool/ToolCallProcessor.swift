@@ -218,10 +218,9 @@ public class ToolCallProcessor {
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separator: endTag, returnLeading: false)
 
-                // Parse the tool call using the parser
-                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    toolCalls.append(toolCall)
-                }
+                // Parse the completed wrapper. Some formats, including Hy3 /
+                // Hunyuan, can carry multiple calls inside one outer block.
+                toolCalls.append(contentsOf: parser.parseEOS(toolCallBuffer, tools: tools))
 
                 state = .normal
                 toolCallBuffer = ""

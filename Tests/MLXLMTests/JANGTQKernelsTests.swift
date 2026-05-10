@@ -264,4 +264,16 @@ final class JANGTQKernelsTests: XCTestCase {
         XCTAssertNil(cache.codebook(inFeatures: 999_999_999, bits: 17),
             "Unknown (inFeatures, bits) must return nil.")
     }
+
+    // MARK: - profile routed-bits inference
+
+    /// Hy3-preview has an experimental JANGTQ1 profile. The profile
+    /// fallback must recognize it when a bundle is still missing a sidecar
+    /// during conversion or when only profile metadata is available.
+    func testJANGTQProfileBitsRecognizesOneBitProfiles() {
+        XCTAssertEqual(jangtqBitsFromProfile("JANGTQ1"), 1)
+        XCTAssertEqual(jangtqBitsFromProfile("Hy3-preview-JANGTQ1"), 1)
+        XCTAssertEqual(jangtqBitsFromProfile("jangtq_1"), 1)
+        XCTAssertEqual(jangtqBitsFromProfile("jangtq-1"), 1)
+    }
 }

@@ -158,6 +158,18 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
         vocabSizePerLayerInput =
             try container.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
+        // PLE coherence: hidden_size_per_layer_input and vocab_size_per_layer_input are paired.
+        // Zero means PLE is off (E2B/E4B disabled). One non-zero without the other is structurally
+        // invalid: an Embedding(embeddingCount: 0, ...) or zero-dim hidden would silently produce
+        // garbage. See `docs/GEMMA4-DEEP-TRACE-2026-05-10.md` §7.6.
+        if (hiddenSizePerLayerInput == 0) != (vocabSizePerLayerInput == 0) {
+            throw DecodingError.dataCorruptedError(
+                forKey: .hiddenSizePerLayerInput, in: container,
+                debugDescription:
+                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(hiddenSizePerLayerInput) "
+                    + "and vocab_size_per_layer_input=\(vocabSizePerLayerInput); both must be zero (PLE off) "
+                    + "or both must be positive (PLE on).")
+        }
         numKvSharedLayers =
             try container.decodeIfPresent(Int.self, forKey: .numKvSharedLayers) ?? 0
         useDoubleWideMlp =
@@ -168,7 +180,10 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
-        topKExperts = try container.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0
+        topKExperts = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0,
+            modelType: modelType,
+            field: CodingKeys.topKExperts.rawValue)
         ropeTraditional =
             try container.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
         ropeParameters =

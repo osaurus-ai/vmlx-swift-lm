@@ -79,6 +79,9 @@ public struct ResolvedModelConfiguration: Sendable {
     /// ``ModelConfiguration/reasoningParserName`` for accepted values.
     public var reasoningParserName: String?
 
+    /// Optional defaults loaded from `generation_config.json`.
+    public var generationDefaults: GenerationConfigFile?
+
     public init(
         modelDirectory: URL,
         tokenizerDirectory: URL,
@@ -87,7 +90,8 @@ public struct ResolvedModelConfiguration: Sendable {
         extraEOSTokens: Set<String>,
         eosTokenIds: Set<Int>,
         toolCallFormat: ToolCallFormat?,
-        reasoningParserName: String? = nil
+        reasoningParserName: String? = nil,
+        generationDefaults: GenerationConfigFile? = nil
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -97,6 +101,7 @@ public struct ResolvedModelConfiguration: Sendable {
         self.eosTokenIds = eosTokenIds
         self.toolCallFormat = toolCallFormat
         self.reasoningParserName = reasoningParserName
+        self.generationDefaults = generationDefaults
     }
 }
 

@@ -104,6 +104,7 @@ public struct Gemma3Configuration: Codable, Sendable {
 
     private let _vocabularySize: Int?
     private let _padTokenId: Int?
+    private let _imageTokenId: Int?
 
     // Computed properties that use the text configuration or provide defaults
 
@@ -119,6 +120,16 @@ public struct Gemma3Configuration: Codable, Sendable {
         _padTokenId ?? 0
     }
 
+    /// Image-token ID inside the LM vocabulary (the post-expansion token
+    /// `prepareInputsForMultimodal` masks against). Defaults to `262144`,
+    /// the value baked into shipped Gemma3 bundles. Decoded from
+    /// `image_token_id` in `config.json` so a future Gemma3 variant with
+    /// a different vocab can override without touching source — the model
+    /// + processor read this rather than re-hardcoding 262144.
+    public var imageTokenId: Int {
+        _imageTokenId ?? 262144
+    }
+
     enum CodingKeys: String, CodingKey {
         case textConfiguration = "text_config"
         case visionConfiguration = "vision_config"
@@ -128,6 +139,7 @@ public struct Gemma3Configuration: Codable, Sendable {
 
         case _vocabularySize = "vocab_size"
         case _padTokenId = "pad_token_id"
+        case _imageTokenId = "image_token_id"
     }
 }
 
@@ -846,7 +858,7 @@ private func maskedScatter(
     finalEmbedding: MLXArray,
     imageMaskExpanded: MLXArray,
     scaledImageFeatures: MLXArray
-) -> MLXArray {
+) throws -> MLXArray {
     // Reshape the tensors to 1D
     let finalEmbeddingShape = finalEmbedding.shape
     let scaledImageFeaturesFlattened = scaledImageFeatures.flattened()
@@ -865,11 +877,17 @@ private func maskedScatter(
     // Scatter the scaled image features into the special image token positions
     let imagePositions = MLXArray(imagePositionIndices)
     guard scaledImageFeaturesFlattened.shape[0] == imagePositions.shape[0] else {
-        fatalError(
+        // Per `docs/GEMMA4-DEEP-TRACE-2026-05-10.md` §7.3, surface this
+        // as a recoverable VLMError instead of a process abort. The
+        // mismatch is a config/processor-stamp drift the caller can act
+        // on (e.g. swap to the right preprocessor_config.json or fix
+        // imageSeqLength) without crashing the host runtime.
+        throw VLMError.processing(
             """
-            Critical error in maskedScatter: Size mismatch between image features and positions.
-            Image features: \(scaledImageFeaturesFlattened.shape[0])
-            Image positions: \(imagePositions.shape[0])
+            Gemma3 maskedScatter: size mismatch between image features and positions. \
+            Image features: \(scaledImageFeaturesFlattened.shape[0]), \
+            image positions: \(imagePositions.shape[0]). \
+            Check that imageSeqLength in preprocessor_config matches the vision tower's expected token count.
             """)
     }
     finalEmbeddingFlattened[imagePositions] = scaledImageFeaturesFlattened
@@ -905,7 +923,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray? = nil,
         pixelValues: MLXArray? = nil,
         mask: MLXArray? = nil
-    ) -> (MLXArray, MLXArray?) {
+    ) throws -> (MLXArray, MLXArray?) {
         guard let pixelValues else {
             return (languageModel.model.embedTokens(inputIds!), nil)
         }
@@ -922,7 +940,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
 
         let imageFeatures = multiModalProjector(hiddenState)
 
-        let (finalEmbedding, finalAttentionMask4d) = prepareInputsForMultimodal(
+        let (finalEmbedding, finalAttentionMask4d) = try prepareInputsForMultimodal(
             imageFeatures: imageFeatures,
             inputsEmbeds: inputsEmbeds,
             inputIds: inputIds!,
@@ -937,7 +955,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray,
         attentionMask: MLXArray?
-    ) -> (MLXArray, MLXArray?) {
+    ) throws -> (MLXArray, MLXArray?) {
         let embedDim = inputsEmbeds.dim(2)
 
         // Scale image features to match text embedding magnitude
@@ -947,7 +965,11 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
         var finalEmbedding = inputsEmbeds
 
         let padTokenId = config.padTokenId
-        let imageTokenId = 262144  // Image token used after expansion
+        // Read through `config.imageTokenId` (defaults to 262144) so a
+        // future Gemma3 bundle with a different `image_token_id` stamp
+        // in `config.json` does not silently mismatch the processor's
+        // post-expansion image-token positions.
+        let imageTokenId = config.imageTokenId
 
         // Create masks for different token types
         let imageMask = MLX.equal(inputIds, MLXArray(imageTokenId))
@@ -964,7 +986,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             padMaskExpanded, MLXArray.zeros(like: finalEmbedding), finalEmbedding)
 
         // Insert image token embeddings using masked_scatter
-        finalEmbedding = maskedScatter(
+        finalEmbedding = try maskedScatter(
             finalEmbedding: finalEmbedding,
             imageMaskExpanded: imageMaskExpanded,
             scaledImageFeatures: scaledImageFeatures
@@ -992,7 +1014,7 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
             return .logits(result)
         }
 
-        let (inputEmbeddings, _) = getInputEmbeddings(
+        let (inputEmbeddings, _) = try getInputEmbeddings(
             inputIds: input.text.tokens,
             pixelValues: imagePixels,
             mask: input.text.mask
@@ -1092,9 +1114,15 @@ public struct Gemma3Processor: UserInputProcessor {
                 frames: imagePixelsAndFrames.map { $0.1 }
             )
 
-            // Expand single <start_of_image> token to multiple image tokens
+            // Expand single <start_of_image> token to multiple image tokens.
+            // The numeric image-token ID lives on `config.imageTokenId`
+            // (defaults to 262144) so it stays in sync with the model-side
+            // `Gemma3Configuration.imageTokenId` read by
+            // `prepareInputsForMultimodal`. Don't reintroduce a literal
+            // here — see `Gemma3Configuration.imageTokenId` (decoded from
+            // `image_token_id` in `config.json`).
             let startOfImageTokenId = 255999
-            let imageTokenId = 262144
+            let imageTokenId = config.imageTokenId
             let numImageTokens = config.imageSeqLength  // 256
 
             var expandedTokens: [Int] = []
@@ -1116,7 +1144,8 @@ public struct Gemma3Processor: UserInputProcessor {
         let mask = ones(like: promptArray).asType(.int8)
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
-            image: processedImage
+            image: processedImage,
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }
 }

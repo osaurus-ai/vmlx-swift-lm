@@ -27,6 +27,17 @@ private nonisolated(unsafe) var miniMaxJANGTQRouterCache:
     [MiniMaxJANGTQRouterKey: ([MLXArray]) -> [MLXArray]] = [:]
 private let miniMaxJANGTQRouterLock = NSLock()
 
+private func miniMaxJANGTQRouterCompileEnabled(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    let raw = environment["VMLX_MINIMAX_ROUTER_COMPILE"]
+        ?? environment["VMLINUX_MINIMAX_ROUTER_COMPILE"]
+    switch raw?.lowercased() {
+    case "1", "true", "on", "yes":
+        return true
+    default:
+        return false
+    }
+}
+
 private func miniMaxJANGTQRouter(numExperts: Int, k: Int) -> ([MLXArray]) -> [MLXArray] {
     let key = MiniMaxJANGTQRouterKey(numExperts: numExperts, k: k)
     miniMaxJANGTQRouterLock.lock()
@@ -47,10 +58,7 @@ private func miniMaxJANGTQRouter(numExperts: Int, k: Int) -> ([MLXArray]) -> [ML
         return [inds, scores]
     }
 
-    let raw = ProcessInfo.processInfo.environment["VMLINUX_MINIMAX_ROUTER_COMPILE"]?
-        .lowercased()
-    let enabled = raw == "1" || raw == "true" || raw == "on" || raw == "yes"
-    let router = (HardwareInfo.isCompiledDecodeSupported && enabled)
+    let router = (HardwareInfo.isCompiledDecodeSupported && miniMaxJANGTQRouterCompileEnabled())
         ? compile(shapeless: false, body)
         : body
     miniMaxJANGTQRouterCache[key] = router
@@ -464,7 +472,10 @@ public struct MiniMaxJANGTQConfiguration: Codable, Sendable {
         attentionHeads = try container.decode(Int.self, forKey: .attentionHeads)
         kvHeads = try container.decode(Int.self, forKey: .kvHeads)
         maxPositionEmbeddings = try container.decode(Int.self, forKey: .maxPositionEmbeddings)
-        numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerTok),
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
         numLocalExperts = try container.decode(Int.self, forKey: .numLocalExperts)
         sharedIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .sharedIntermediateSize) ?? 0

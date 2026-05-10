@@ -29,6 +29,33 @@ public struct BaseConfiguration: Codable, Sendable {
             case bits = "bits"
             case _mode = "mode"
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.groupSize = try container.decode(Int.self, forKey: .groupSize)
+            self.bits = try container.decode(Int.self, forKey: .bits)
+            if let rawMode = try container.decodeIfPresent(String.self, forKey: ._mode) {
+                let normalized = rawMode.lowercased()
+                if let mode = QuantizationMode(rawValue: normalized) {
+                    self._mode = mode
+                } else if normalized == "affine+mxtq" || normalized == "affine_mxtq" {
+                    // JANG VL bundles use this composite marker to say
+                    // non-routed affine weights plus MXTQ routed-expert
+                    // sidecars. BaseConfiguration only needs the ordinary
+                    // affine fallback; JangLoader consumes the MXTQ sidecar
+                    // metadata separately.
+                    self._mode = .affine
+                } else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: ._mode,
+                        in: container,
+                        debugDescription:
+                            "Cannot initialize QuantizationMode from invalid String value \(rawMode)")
+                }
+            } else {
+                self._mode = nil
+            }
+        }
     }
 
     /// handling instructions for ``PerLayerQuantization``

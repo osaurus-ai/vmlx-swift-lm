@@ -388,8 +388,16 @@ internal func groupExpertSelect(
 ) -> (MLXArray, MLXArray) {
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
 
-    // Original scores using sigmoid
-    let origScores = sigmoid(gates)
+    // Original scores using sigmoid. fp32 precision floor matches Python
+    // `mlx_lm/models/dots1.py:116` and `mlx_lm/models/nemotron_h.py:324`
+    // (both do `mx.sigmoid(gates.astype(mx.float32))`). NemotronH's caller
+    // passes bf16 gates without a pre-cast, so without this fp32 cast the
+    // sigmoid + downstream score-add ran in bf16 — the same class of
+    // precision drift that the Hy3 fp32 lm_head fix addresses, but at
+    // the MoE router instead of the logit head. Hy3's `Hy3MoEGate`
+    // pre-casts gates to fp32 already, so this cast is idempotent for
+    // Hy3 and load-bearing for NemotronH.
+    let origScores = sigmoid(gates.asType(.float32))
     var scores = origScores + eSCB
 
     // Group-based selection if n_group > 1
@@ -1135,7 +1143,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
             Int.self, forKey: .moeSharedExpertIntermediateSize)
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
-        numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decode(Int.self, forKey: .numExpertsPerTok),
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
         layerNormEpsilon =
             try container.decodeIfPresent(Float.self, forKey: .layerNormEpsilon) ?? 1e-5
         mlpBias = try container.decodeIfPresent(Bool.self, forKey: .mlpBias) ?? false

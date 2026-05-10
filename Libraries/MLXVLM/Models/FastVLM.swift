@@ -991,7 +991,10 @@ public struct FastVLMProcessor: UserInputProcessor {
                 additionalContext: input.additionalContext)
             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            return LMInput(
+                text: .init(tokens: tokensArray, mask: mask),
+                image: nil,
+                cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
         }
 
         guard input.images.count == 1 else {
@@ -1023,7 +1026,8 @@ public struct FastVLMProcessor: UserInputProcessor {
 
         return LMInput(
             text: .init(tokens: promptArray, mask: mask),
-            image: .init(pixels: pixels)
+            image: .init(pixels: pixels),
+            cacheScopeSalt: cacheScopeSalt(from: input.additionalContext)
         )
     }
 }

@@ -345,7 +345,11 @@ private func gatedDeltaUpdate(
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
     // Prefer fused Metal kernel (Python parity, ~210 fewer dispatches per token).
-    if VLMGatedDeltaKernelManager.shared.kernel != nil {
+    // The kernel tiles Dk in 32-wide SIMD chunks; unsupported head widths must
+    // use the ops fallback instead of compiling an invalid zero/remainder tile.
+    let manager = VLMGatedDeltaKernelManager.shared
+    let selectedKernel = mask == nil ? manager.kernel : manager.kernelMasked
+    if selectedKernel != nil && Dk >= 32 && Dk % 32 == 0 {
         return vlmGatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)

@@ -12,6 +12,9 @@ import Testing
 /// hash exists, so the disk tier (the only one that understands
 /// `LayerKind.deepseekV4`) gets a chance to handle the hit.
 @Test func coordinatorPagedIncompatibleSkipsPagedTier() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let blockSize = 4
     let config = CacheCoordinatorConfig(
         usePagedCache: true,
@@ -63,6 +66,9 @@ import Testing
 }
 
 @Test func coordinatorPagedIncompatibleStoresDeepseekV4InDiskTier() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let blockSize = 4
     let tmp = FileManager.default.temporaryDirectory
         .appendingPathComponent("dsv4-disk-tier-\(UUID().uuidString)")
@@ -133,6 +139,9 @@ import Testing
 }
 
 @Test func coordinatorPagedHit() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let blockSize = 4
     let config = CacheCoordinatorConfig(
         usePagedCache: true,
@@ -173,6 +182,9 @@ import Testing
 }
 
 @Test func coordinatorSSMCompanion() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let blockSize = 4
     let config = CacheCoordinatorConfig(
         usePagedCache: true,
@@ -215,6 +227,9 @@ import Testing
 }
 
 @Test func coordinatorClear() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
     let blockSize = 4
     let config = CacheCoordinatorConfig(
         usePagedCache: true,

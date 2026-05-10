@@ -327,7 +327,19 @@ func gatedDeltaUpdate(
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    // Mirror `MLXVLM/Models/Qwen35.swift` `gatedDeltaUpdate`:
+    // (1) select the masked vs unmasked kernel by `mask` presence so a
+    //     compile failure in only one direction can't crash the unrelated
+    //     direction, and (2) guard Dk against the 32-wide SIMD tile shape
+    //     the kernel source assumes — `n_per_t = Dk / 32` becomes 0 or a
+    //     fractional remainder for Dk < 32 / Dk not a multiple of 32, and
+    //     Metal rejects the resulting `float state[n_per_t]` zero-length
+    //     array. Real qwen3_next bundles use Dk=128 so the fast path is
+    //     always taken there; only narrow synthetic configs hit the ops
+    //     fallback.
+    let manager = GatedDeltaKernelManager.shared
+    let selectedKernel = mask == nil ? manager.kernel : manager.kernelMasked
+    if selectedKernel != nil && Dk >= 32 && Dk % 32 == 0 {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

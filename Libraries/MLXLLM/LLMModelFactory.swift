@@ -238,6 +238,9 @@ public enum LLMTypeRegistry {
             // Swift port plan + status:
             //   Libraries/MLXLLM/Models/DSV4-PORT-STATUS.md
             "deepseek_v4": dispatchDeepseekV4,
+            "hy_v3": create(Hy3Configuration.self, Hy3Model.init),
+            "hy3":   create(Hy3Configuration.self, Hy3Model.init),
+            "hy-v3": create(Hy3Configuration.self, Hy3Model.init),
         ]
     }
 
@@ -1006,7 +1009,9 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools, additionalContext: additionalContext)
 
-            return LMInput(tokens: MLXArray(promptTokens))
+            return LMInput(
+                tokens: MLXArray(promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: additionalContext))
         } catch TokenizerError.missingChatTemplate {
             print(
                 "No chat template was included or provided, so converting messages to simple text format. This is not optimal for model performance, so applications should provide a chat template if none is included with the model."
@@ -1016,7 +1021,9 @@ private struct LLMUserInputProcessor: UserInputProcessor {
                 .compactMap { $0["content"] as? String }
                 .joined(separator: "\n\n")
             let promptTokens = tokenizer.encode(text: prompt)
-            return LMInput(tokens: MLXArray(promptTokens))
+            return LMInput(
+                tokens: MLXArray(promptTokens),
+                cacheScopeSalt: cacheScopeSalt(from: additionalContext))
         }
     }
 
@@ -1040,19 +1047,23 @@ private struct LLMUserInputProcessor: UserInputProcessor {
         capabilities: JangCapabilities?
     ) -> [String: any Sendable]? {
         var context: [String: any Sendable] = [:]
-        let type = modelType?.lowercased() ?? ""
 
-        // Model metadata can declare that a template understands the
-        // thinking toggle while the converted/runtime bundle is not ready
-        // to expose thinking as a production mode. Seed the template with
-        // the safe default, but leave explicit per-request overrides intact
-        // for diagnostics.
+        // Trust the bundle's capability stamp. The runtime must NOT
+        // auto-rewrite or apply family-based default-template overrides
+        // by model_type prefix — that hides bundle-metadata bugs and
+        // contradicts a properly-stamped bundle's declaration. Fix bundle
+        // metadata at the source instead.
+        //
+        // The one universal rule that DOES belong here: a bundle that
+        // explicitly stamps `supports_thinking == false` (Ling/Bailing-style
+        // non-thinking models) gets `enable_thinking=false` seeded so a
+        // stale chat template can't produce noise. Per-request overrides
+        // are still respected.
         if capabilities?.supportsThinking == false {
-            context["enable_thinking"] = false
-        } else if type.hasPrefix("zaya") || type.hasPrefix("zyphra") {
             context["enable_thinking"] = false
         }
 
+        _ = modelType  // intentionally unused — see above
         return context.isEmpty ? nil : context
     }
 }
@@ -1213,6 +1224,7 @@ public final class LLMModelFactory: ModelFactory {
                 let priorFormat =
                     (configDict["weight_format"] as? String) ?? "(unset)"
                 let isMxtqStampAlready = (priorFormat.lowercased() == "mxtq")
+                    || (priorFormat.lowercased() == "jangtq1")
                     || (priorFormat.lowercased() == "jangtq2")
                     || (priorFormat.lowercased() == "jangtq4")
                 if !isMxtqStampAlready {
@@ -1324,11 +1336,13 @@ public final class LLMModelFactory: ModelFactory {
         // Load EOS token IDs from config.json, with optional override from generation_config.json
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
-        {
+        let generationConfig =
+            if let generationData = try? Data(contentsOf: generationConfigURL) {
+                try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: generationData)
+            } else {
+                nil as GenerationConfigFile?
+            }
+        if let genEosIds = generationConfig?.eosTokenIds?.values {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
         if baseConfig.modelType == "deepseek_v4" {
@@ -1466,7 +1480,8 @@ public final class LLMModelFactory: ModelFactory {
             extraEOSTokens: mutableConfiguration.extraEOSTokens,
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
-            reasoningParserName: mutableConfiguration.reasoningParserName)
+            reasoningParserName: mutableConfiguration.reasoningParserName,
+            generationDefaults: generationConfig)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

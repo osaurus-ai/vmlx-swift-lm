@@ -271,6 +271,36 @@ public struct GenerateParameters: Sendable {
         self.extraStopStrings = extraStopStrings
     }
 
+    public init(
+        generationConfig: GenerationConfigFile?,
+        fallback: GenerateParameters = GenerateParameters()
+    ) {
+        self = fallback
+        guard let generationConfig else { return }
+
+        if let maxNewTokens = generationConfig.maxNewTokens {
+            self.maxTokens = maxNewTokens
+        }
+        if let temperature = generationConfig.temperature {
+            self.temperature = temperature
+        }
+        if let topP = generationConfig.topP {
+            self.topP = topP
+        }
+        if let topK = generationConfig.topK {
+            self.topK = topK
+        }
+        if let minP = generationConfig.minP {
+            self.minP = minP
+        }
+        if let repetitionPenalty = generationConfig.repetitionPenalty {
+            self.repetitionPenalty = repetitionPenalty
+        }
+        if generationConfig.doSample == false {
+            self.temperature = 0
+        }
+    }
+
     public func sampler() -> LogitSampler {
         let usesTopP = topP > 0 && topP < 1
         let usesTopK = topK > 0
@@ -695,10 +725,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt token IDs captured at init for cache store after generation.
     let promptTokenIds: [Int]
 
-    /// Stable fingerprint of any VLM image/video/audio content in the input.
-    /// `nil` for text-only inputs. Mixed into cache-coordinator keys so
-    /// VLM multi-turn conversations can cache-hit on identical media,
-    /// and won't collide with text-only entries. See `computeMediaSalt`.
+    /// Stable fingerprint of any request-scope or media content in the input.
+    /// `nil` for ordinary text-only inputs. Mixed into cache-coordinator keys
+    /// so reasoning-mode and VLM multi-turn conversations can cache-hit without
+    /// colliding with other modes/media.
     let mediaSalt: String?
 
     // Internal metrics
@@ -803,11 +833,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.promptTokenIds = []
         }
 
-        // Compute a stable fingerprint of any image/video/audio content once at
-        // init, so both the pre-prepare fetch below and the post-generation
-        // store see the same salt. Text-only inputs get nil here, which
-        // preserves the exact pre-existing text-only cache hashing.
-        self.mediaSalt = computeMediaSalt(for: input)
+        // Compute a stable fingerprint of any request-scope or media content
+        // once at init, so both the pre-prepare fetch below and the
+        // post-generation store see the same salt. Ordinary text-only inputs
+        // get nil here, preserving the pre-existing text-only cache hashing.
+        self.mediaSalt = computeCacheSalt(for: input)
 
         // Multi-tier cache: attempt prefix fetch before prepare.
         // On cache hit, restore KV state and only prefill remaining tokens.
@@ -827,10 +857,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         // persistence + paged restore on cache hit.
         if let coordinator = cacheCoordinator, !promptTokenIds.isEmpty {
             if !coordinator.isHybrid {
-                let hasSSM = self.cache.contains { layer in
-                    layer is MambaCache || layer is ArraysCache
-                }
-                if hasSSM {
+                if cacheContainsPathDependentState(self.cache) {
                     coordinator.setHybrid(true)
                     Self.logger.info(
                         "TokenIterator: coordinator flipped to isHybrid=true"
@@ -844,9 +871,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // serializer because the paged tier stores only full-history KV
             // blocks and cannot round-trip rotating ring metadata.
             if !coordinator.isPagedIncompatible {
-                let hasHybridPool = self.cache.contains { $0 is HybridPoolCache }
-                let hasRotating = self.cache.contains { $0 is RotatingKVCache || $0 is RotatingKVCacheWrapper }
-                if hasHybridPool || hasRotating {
+                if cacheRequiresDiskBackedCoordinatorRestore(self.cache) {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
                         "TokenIterator: coordinator flipped to isPagedIncompatible=true"

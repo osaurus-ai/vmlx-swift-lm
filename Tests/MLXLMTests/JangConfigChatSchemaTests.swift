@@ -151,4 +151,28 @@ struct JangConfigChatSchemaTests {
         #expect(cfg.modelFamily == "deepseek_v4")
         #expect(cfg.capabilities?.family == "deepseek")
     }
+
+    @Test("ZAYA capability stamps are trusted instead of runtime-rewritten")
+    func zayaCapabilityStampsAreTrusted() throws {
+        let json: [String: Any] = [
+            "format": "jang",
+            "format_version": "2.0",
+            "capabilities": [
+                "family": "zaya",
+                "reasoning_parser": "qwen3",
+                "tool_parser": "zaya_xml",
+                "think_in_template": true,
+                "supports_tools": true,
+                "supports_thinking": false,
+                "cache_type": "hybrid",
+                "modality": "text",
+            ] as [String: Any],
+        ]
+
+        let cfg = try JangLoader.parseConfig(from: json)
+
+        #expect(cfg.capabilities?.family == "zaya")
+        #expect(cfg.capabilities?.supportsThinking == false)
+        #expect(cfg.capabilities?.thinkInTemplate == true)
+    }
 }

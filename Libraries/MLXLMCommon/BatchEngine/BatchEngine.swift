@@ -191,6 +191,13 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
+    /// Initial admission window for B>1 engines. The scheduler runs prefill on
+    /// the actor today, so once a long prefill starts a just-behind `submit`
+    /// cannot enqueue until that prefill returns. Give immediately-following
+    /// callers a short deterministic window to form the first batch without
+    /// adding latency to single-stream B=1 engines.
+    private let initialAdmissionCoalescingNanos: UInt64
+
     // MARK: - Initialization
 
     /// Create a new continuous batching engine.
@@ -214,6 +221,7 @@ public actor BatchEngine {
         self.maxBatchSize = maxBatchSize
         self.memoryPurgeInterval = memoryPurgeInterval
         self.cacheCoordinator = cacheCoordinator
+        self.initialAdmissionCoalescingNanos = maxBatchSize > 1 ? 25_000_000 : 0
 
         // Build stop token set from model config + tokenizer.
         // Matches the logic in Evaluate.swift's buildStopTokenIds plus unknownTokenId.
@@ -687,6 +695,15 @@ public actor BatchEngine {
     private func ensureLoopRunning() {
         guard loopTask == nil else { return }
         loopTask = Task {
+            // Give immediately-following submits a bounded coalescing window
+            // before the scheduler enters a potentially long prefill. A plain
+            // `Task.yield()` is not deterministic enough: the scheduler can
+            // still re-win the actor and monopolize it with the first request's
+            // prefill before the second submit appends to `waitQueue`. Keep
+            // this disabled for B=1 so single-stream TTFT is unchanged.
+            if self.initialAdmissionCoalescingNanos > 0 {
+                try? await Task.sleep(nanoseconds: self.initialAdmissionCoalescingNanos)
+            }
             await self.schedulingLoop()
         }
     }
@@ -814,15 +831,14 @@ public actor BatchEngine {
             // `.mamba` when a Mamba/SSM layer is present.
             if let coordinator = cacheCoordinator, !coordinator.isHybrid {
                 let family = CacheFamily.classify(cache)
-                if family == .heterogeneous || family == .mamba {
+                if family == .heterogeneous || family == .mamba || family == .zayaCCA {
                     // Second-line check: at least one layer actually is
-                    // a SSM-style cache before flipping the flag. Keeps
-                    // `.heterogeneous` models that mix attention +
-                    // rotating (Gemma-4) from being misflagged.
-                    let hasSSM = cache.contains { layer in
-                        layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
-                    }
-                    if hasSSM {
+                    // a path-dependent cache (Mamba/Arrays SSM or ZAYA
+                    // CCA-attention with conv_state+prev_hs) before
+                    // flipping the flag. Keeps `.heterogeneous` models
+                    // that mix attention + rotating (Gemma-4) from being
+                    // misflagged.
+                    if cacheContainsPathDependentState(cache) {
                         coordinator.setHybrid(true)
                         Self.logger.info(
                             "Coordinator flipped to isHybrid=true on first hybrid slot admission"
@@ -847,9 +863,7 @@ public actor BatchEngine {
             // mechanism for these models until paged blocks grow first-class
             // rotating-cache payloads.
             if let coordinator = cacheCoordinator, !coordinator.isPagedIncompatible {
-                let hasRotating = cache.contains { $0 is RotatingKVCache || $0 is RotatingKVCacheWrapper }
-                let hasZayaCCA = cache.contains { $0 is ZayaCCACache }
-                if hasHybridPool || hasRotating || hasZayaCCA {
+                if cacheRequiresDiskBackedCoordinatorRestore(cache) {
                     coordinator.setPagedIncompatible(true)
                     Self.logger.info(
                         "Coordinator flipped to isPagedIncompatible=true on first paged-incompatible slot admission"
@@ -1186,8 +1200,15 @@ public actor BatchEngine {
             // ``SSMStateCache``. This runs after the first token has been
             // yielded so TTFT does not pay the prompt-boundary bookkeeping.
             if let coordinator = cacheCoordinator, coordinator.isHybrid {
+                // ZayaCCACache's `conv_state` + `prev_hs` are path-dependent
+                // and round-trip through extractSSMStates / restoreSSMStates
+                // (see CacheHelpers.swift:293-300). Include it here so the
+                // post-prefill snapshot fires for ZAYA1 slots — without this
+                // gate the snapshot path was only firing for Mamba/Arrays
+                // hybrids and ZAYA's CCA state would never reach the
+                // SSMStateCache for cross-turn restore.
                 let hasSSM = slot.cache.contains {
-                    $0 is MambaCache || $0 is ArraysCache
+                    $0 is MambaCache || $0 is ArraysCache || $0 is ZayaCCACache
                 }
                 if hasSSM {
                     let promptTokens = slot.originalInput.text.tokens

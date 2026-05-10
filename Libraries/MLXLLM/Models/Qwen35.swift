@@ -129,8 +129,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
         // MoE fields
         self.numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 0
-        self.numExpertsPerTok =
-            try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 0
+        self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 0,
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
         self.decoderSparseStep =
             try container.decodeIfPresent(Int.self, forKey: .decoderSparseStep) ?? 1
         self.sharedExpertIntermediateSize =

@@ -293,11 +293,13 @@ public func reDeriveSSMStates(
 
     let freshCache: [KVCache] = model.newCache(parameters: nil)
 
-    // Pure-attention model check: if no cache layer looks Mamba-ish,
-    // there's no SSM state to re-derive and we bail immediately.
+    // Pure-attention model check: if no cache layer carries path-dependent
+    // state, there's nothing to re-derive and we bail immediately.
+    // ZayaCCACache fits the same contract — its conv_state + prev_hs are
+    // path-dependent alongside the KV pair (see CacheHelpers.swift:293-300).
     let hasSSMLayer = freshCache.contains { cache in
         let desc = String(describing: type(of: cache))
-        return desc.contains("Mamba") || desc.contains("Arrays")
+        return desc.contains("Mamba") || desc.contains("Arrays") || desc.contains("ZayaCCA")
     }
     guard hasSSMLayer else { return nil }
 
@@ -359,7 +361,7 @@ public func reDeriveSSMStatesAtBoundaries(
     let freshCache: [KVCache] = model.newCache(parameters: nil)
     let hasSSMLayer = freshCache.contains { cache in
         let desc = String(describing: type(of: cache))
-        return desc.contains("Mamba") || desc.contains("Arrays")
+        return desc.contains("Mamba") || desc.contains("Arrays") || desc.contains("ZayaCCA")
     }
     guard hasSSMLayer else { return [:] }
 
