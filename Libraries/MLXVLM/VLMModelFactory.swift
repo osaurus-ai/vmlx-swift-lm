@@ -124,15 +124,8 @@ public enum VLMTypeRegistry {
         "nemotron_h_omni": create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
         "NemotronH_Nano_Omni_Reasoning_V3":
             create(NemotronHOmniConfiguration.self, NemotronHOmni.init),
-        "zaya": dispatchZayaUnsupported,
         "zaya1_vl": dispatchZaya1VL,
     ]
-
-    private static func dispatchZayaUnsupported(data _: Data) throws -> any LanguageModel {
-        throw ModelFactoryError.unsupportedModelType(
-            "zaya (ZAYA1 CCA hybrid decoder is not implemented in vmlx-swift-lm yet; port requires CCA conv_state/prev_hs cache support, per-slot hybrid batching state, prefix-cache disabled until KV+CCA restore parity is proven, and JANGTQ pre-stacked switch_mlp expert wiring)"
-        )
-    }
 
     private static func dispatchZaya1VL(data: Data) throws -> any LanguageModel {
         let configuration = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)

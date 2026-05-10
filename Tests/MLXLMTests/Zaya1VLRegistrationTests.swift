@@ -171,6 +171,10 @@ struct Zaya1VLRegistrationTests {
     @Test("VLM registry recognizes zaya1_vl without silently routing to text-only zaya")
     func registryRecognizesZaya1VL() async throws {
         #expect(VLMTypeRegistry.supportedModelTypes.contains("zaya1_vl"))
+        #expect(
+            !VLMTypeRegistry.supportedModelTypes.contains("zaya"),
+            "Text ZAYA (`model_type=zaya`) is served by MLXLLM, not MLXVLM; advertising it here makes app-side VLM detection route text-only bundles through the wrong factory."
+        )
 
         let data = """
         {
