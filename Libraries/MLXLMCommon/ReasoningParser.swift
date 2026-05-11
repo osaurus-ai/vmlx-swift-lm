@@ -296,6 +296,7 @@ extension ReasoningParser {
             "deepseek_r1", "deepseek-r1", "deepseek", "glm", "glm4", "glm5",
             "nemotron", "nemotron_h", "minimax", "minimax_m2",
             "kimi", "kimi_k2", "kimik2",
+            "laguna", "laguna_xs", "laguna_s",
             "hy3", "hy_v3", "hy-v3", "hunyuan", "tencent":
             // Start inside the reasoning block — matches the Qwen 3.x
             // family's chat-template default (`enable_thinking=true`

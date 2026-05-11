@@ -43,6 +43,9 @@ struct Mistral3LagunaCoverageTests {
         #expect(reasoningStampFromModelType("laguna") == "think_xml")
         #expect(reasoningStampFromModelType("laguna_xs") == "think_xml")
         #expect(reasoningStampFromModelType("laguna_s") == "think_xml")
+        #expect(ReasoningParser.fromCapabilityName("laguna") != nil)
+        #expect(ReasoningParser.fromCapabilityName("laguna_xs") != nil)
+        #expect(ReasoningParser.fromCapabilityName("laguna_s") != nil)
     }
 
     @Test("Mistral 4 (sibling family) → 'none'")
@@ -73,6 +76,9 @@ struct Mistral3LagunaCoverageTests {
         #expect(ToolCallFormat.infer(from: "laguna") == .glm4)
         #expect(ToolCallFormat.infer(from: "laguna_xs") == .glm4)
         #expect(ToolCallFormat.infer(from: "laguna_s") == .glm4)
+        #expect(ToolCallFormat.fromCapabilityName("laguna") == .glm4)
+        #expect(ToolCallFormat.fromCapabilityName("laguna_xs") == .glm4)
+        #expect(ToolCallFormat.fromCapabilityName("laguna_s") == .glm4)
     }
 
     @Test("Mistral 4 → .mistral (sibling family, same parser)")

@@ -333,7 +333,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // `glm4` is also the canonical rawValue and already matches via
         // the direct lookup above, but is listed here for parity with
         // `glm4_moe` / `glm47` family aliases.
-        case "glm4", "glm47", "glm5", "glm4_moe", "deepseek":
+        case "glm4", "glm47", "glm5", "glm4_moe", "deepseek",
+            "laguna", "laguna_xs", "laguna_s":
             return .glm4
         // Nemotron-H / Cascade — same XML-style envelope as Qwen3 Coder.
         // Our `XMLFunctionParser` handles `<tool_call><function=name>…`
