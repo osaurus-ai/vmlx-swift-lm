@@ -75,7 +75,7 @@ let package = Package(
         // osaurus repo. Keeping both edges in the osaurus org avoids SwiftPM's
         // duplicate package-identity warning while retaining the 2.x Jinja API.
         .package(url: "https://github.com/osaurus-ai/Jinja.git", from: "2.0.0"),
-        .package(url: "https://github.com/osaurus-ai/swift-transformers", revision: "b4a094b34b997167549c7f45bde16c80f18ed5a8"),
+        .package(url: "https://github.com/osaurus-ai/swift-transformers", revision: "087a66b17e482220b94909c5cf98688383ae481a"),
         // SwiftNIO stack — used by MLXDistributedTransport for TLS-backed
         // pipeline-parallel inference (Phase 2). swift-nio is already
         // resolved transitively via swift-transformers; we pin the floor
@@ -300,6 +300,7 @@ let package = Package(
                 "MLXHuggingFace",
                 "CmlxGraphShim",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Jinja", package: "jinja"),
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "RunBench",
