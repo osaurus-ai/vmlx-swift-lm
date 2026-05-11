@@ -262,44 +262,53 @@ public final class CacheCoordinator: @unchecked Sendable {
             }
         }
 
-        // Tier 2: Disk cache (exact match, then one-shorter fallback)
+        // Tier 2: Disk cache.
+        //
+        // Disk entries are stored at prompt boundaries. Exact hits cover
+        // resumed identical prompts, but normal chat turns grow by many tokens
+        // at a time. After an app-side unload the in-memory paged tier is gone,
+        // so exact-or-one-shorter probing makes the L2 cache effectively miss
+        // every growing turn. Probe indexed prompt-boundary lengths from
+        // longest to shortest; each candidate is still content-address verified
+        // by `DiskCache.fetch(tokens:)`, so same-length entries from other
+        // models/media/prompts remain false-positive safe.
         if let diskCache {
-            if let arrays = diskCache.fetch(tokens: tokens, mediaSalt: mediaSalt) {
+            func diskHit(boundary: Int) -> CacheFetchResult? {
+                guard boundary > 0, boundary <= tokens.count else { return nil }
+                let prefix = boundary == tokens.count ? tokens : Array(tokens.prefix(boundary))
+                guard let arrays = diskCache.fetch(tokens: prefix, mediaSalt: mediaSalt) else {
+                    return nil
+                }
                 let ssmStates = resolveSSMStates(
-                    forTokens: tokens,
-                    boundary: tokens.count,
+                    forTokens: prefix,
+                    boundary: boundary,
                     diskArrays: arrays,
                     mediaSalt: mediaSalt)
                 if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
                     return .hit(
-                        matchedTokens: tokens.count,
-                        remainingTokens: [],
+                        matchedTokens: boundary,
+                        remainingTokens: Array(tokens.dropFirst(boundary)),
                         detail: .disk,
                         blocks: [],
                         ssmStates: ssmStates,
                         diskArrays: arrays
                     )
                 }
+                return nil
             }
 
-            if tokens.count > 1 {
-                let shorter = Array(tokens.dropLast())
-                if let arrays = diskCache.fetch(tokens: shorter, mediaSalt: mediaSalt) {
-                    let ssmStates = resolveSSMStates(
-                        forTokens: shorter,
-                        boundary: shorter.count,
-                        diskArrays: arrays,
-                        mediaSalt: mediaSalt)
-                    if hasRequiredHybridSSM(ssmStates, diskArrays: arrays) {
-                        return .hit(
-                            matchedTokens: shorter.count,
-                            remainingTokens: [tokens.last!],
-                            detail: .disk,
-                            blocks: [],
-                            ssmStates: ssmStates,
-                            diskArrays: arrays
-                        )
-                    }
+            var tried = Set<Int>()
+            for boundary in [tokens.count, tokens.count - 1] where boundary > 0 {
+                tried.insert(boundary)
+                if let hit = diskHit(boundary: boundary) {
+                    return hit
+                }
+            }
+
+            for boundary in diskCache.candidateTokenCounts(maxTokens: tokens.count) {
+                guard tried.insert(boundary).inserted else { continue }
+                if let hit = diskHit(boundary: boundary) {
+                    return hit
                 }
             }
         }

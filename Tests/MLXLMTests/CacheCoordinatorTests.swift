@@ -234,6 +234,48 @@ import Testing
     }
 }
 
+@Test func coordinatorDiskTierRestoresLongestStoredPrefixForGrowingPrompt() {
+    let mlxTestLock = lockSerializedMLXTest()
+    defer { mlxTestLock.unlock() }
+
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("disk-prefix-tier-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+
+    let config = CacheCoordinatorConfig(
+        usePagedCache: false,
+        enableDiskCache: true,
+        pagedBlockSize: 4,
+        maxCacheBlocks: 20,
+        diskCacheMaxGB: 1.0,
+        diskCacheDir: tmp,
+        modelKey: "disk-prefix-cache-contract-test"
+    )
+    let coordinator = CacheCoordinator(config: config)
+
+    let storedTokens = [1, 2, 3, 4, 5]
+    let keys = MLXArray.ones([1, 1, storedTokens.count, 4])
+    let values = MLXArray.ones([1, 1, storedTokens.count, 4]) * 2
+
+    coordinator.storeAfterGeneration(
+        promptTokens: storedTokens,
+        perLayerData: [(keys: keys, values: values)],
+        ssmStates: nil)
+
+    let query = [1, 2, 3, 4, 5, 6, 7, 8]
+    switch coordinator.fetch(tokens: query) {
+    case .hit(let matchedTokens, let remainingTokens, let detail, let blocks, _, let diskArrays):
+        #expect(matchedTokens == storedTokens.count)
+        #expect(remainingTokens == [6, 7, 8])
+        #expect(detail == .disk)
+        #expect(blocks.isEmpty)
+        #expect(diskArrays != nil)
+    case .miss:
+        Issue.record(
+            "Disk tier should restore the longest stored prompt prefix after app/model unload")
+    }
+}
+
 @Test func coordinatorSSMCompanion() {
     let mlxTestLock = lockSerializedMLXTest()
     defer { mlxTestLock.unlock() }

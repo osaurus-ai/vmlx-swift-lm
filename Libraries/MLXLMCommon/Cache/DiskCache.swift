@@ -186,6 +186,37 @@ public final class DiskCache: @unchecked Sendable {
         }
     }
 
+    /// Candidate prompt-boundary lengths currently present in the disk index.
+    ///
+    /// The disk tier is content-addressed by the full token prefix hash, so a
+    /// caller still has to probe `fetch(tokens: tokens.prefix(n))` to prove a
+    /// candidate is for the same model/media/token prefix. Returning lengths
+    /// from the SQLite index lets higher layers find cross-session growing-chat
+    /// prefix hits without walking every possible token count.
+    public func candidateTokenCounts(maxTokens: Int, limit: Int = 128) -> [Int] {
+        guard let db, maxTokens > 0, limit > 0 else { return [] }
+
+        var counts: [Int] = []
+        let sql = """
+            SELECT DISTINCT token_count
+            FROM cache_entries
+            WHERE token_count > 0 AND token_count <= ?
+            ORDER BY token_count DESC
+            LIMIT ?
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return []
+        }
+        sqlite3_bind_int64(stmt, 1, Int64(maxTokens))
+        sqlite3_bind_int(stmt, 2, Int32(limit))
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            counts.append(Int(sqlite3_column_int64(stmt, 0)))
+        }
+        sqlite3_finalize(stmt)
+        return counts
+    }
+
     /// Remove all cached entries and safetensors files.
     public func clear() {
         // Delete all SQLite entries

@@ -74,6 +74,27 @@ import Testing
     }
 }
 
+@Test func diskCacheCandidateTokenCountsAreDescendingAndBounded() async throws {
+    try await MLXMetalTestLock.withLock {
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vmlx_test_\(UUID())")
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let cache = DiskCache(cacheDir: tempDir, maxSizeGB: 0.1)
+        let arrays = ["data": MLXArray.ones([1, 1])]
+
+        cache.store(tokens: [1, 2, 3], arrays: arrays)
+        cache.store(tokens: [1, 2, 3, 4, 5], arrays: arrays)
+        cache.store(tokens: [9, 8, 7, 6, 5, 4, 3], arrays: arrays)
+
+        let counts = cache.candidateTokenCounts(maxTokens: 6)
+        #expect(counts == [5, 3])
+
+        let limited = cache.candidateTokenCounts(maxTokens: 10, limit: 2)
+        #expect(limited == [7, 5])
+    }
+}
+
 @Test func diskCacheHashDeterminism() {
     let tokens = [42, 43, 44, 45]
     let hash1 = DiskCache.hashTokens(tokens)
