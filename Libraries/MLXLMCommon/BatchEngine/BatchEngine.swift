@@ -445,6 +445,7 @@ public actor BatchEngine {
                 promptTail: promptTail)
         }
 
+        let promptTokenCount = input.text.tokens.size
         let (requestId, tokenStream) = submit(input: input, parameters: parameters)
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
@@ -602,9 +603,14 @@ public actor BatchEngine {
                 }
             }
 
+            var sawTerminalInfo = false
+            var generatedTokenCount = 0
+            let streamStartedAt = Date()
+
             for await event in tokenStream {
                 switch event {
                 case .token(let id):
+                    generatedTokenCount += 1
                     detokenizer.append(token: id)
                     if let text = detokenizer.next() {
                         pump(text)
@@ -619,6 +625,7 @@ public actor BatchEngine {
                         await engineRef.cancel(requestId)
                     }
                 case .info(let info):
+                    sawTerminalInfo = true
                     // Snapshot reasoning state BEFORE flush — `flush()`
                     // resets `insideReasoning` to false as part of
                     // draining the buffer. The pre-flush value is what
@@ -651,6 +658,25 @@ public actor BatchEngine {
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
                 }
+            }
+            if !sawTerminalInfo {
+                // Defensive contract repair: every public `generate` stream must
+                // terminate with completion info. Underlying token streams should
+                // normally emit `.info` themselves, but if a lower layer closes
+                // early we still need to flush held reasoning/tool-call text and
+                // surface whether the model ended inside `<think>`.
+                let unclosed = reasoningParser?.isInsideReasoning ?? false
+                flush()
+                detokenizer.startNewSegment()
+                let elapsed = Date().timeIntervalSince(streamStartedAt)
+                let finalInfo = GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: generatedTokenCount,
+                    promptTime: 0,
+                    generationTime: elapsed,
+                    stopReason: .cancelled,
+                    unclosedReasoning: unclosed)
+                continuation.yield(.info(finalInfo))
             }
             terminationState.markCompleted()
             continuation.finish()
