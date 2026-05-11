@@ -928,6 +928,11 @@ public struct TokenIterator: TokenIteratorProtocol {
                         {
                             restoreSSMStates(ssm, into: self.cache)
                         }
+                        // Mirror BatchEngine's disk-hit path: materialize
+                        // restored arrays before prefill builds the next
+                        // forward graph, instead of fusing restore + model
+                        // compute into one high-pressure command buffer.
+                        MLX.eval(self.cache)
                         restored = true
                         Self.logger.info(
                             "Cache \(detail.rawValue) hit: restored \(diskRestored) tokens from disk, prefilling \(remainingTokens.count) remaining"

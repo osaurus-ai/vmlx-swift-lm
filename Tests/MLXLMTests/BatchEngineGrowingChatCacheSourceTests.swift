@@ -39,4 +39,15 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache"))
         #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
     }
+
+    @Test("token iterator materializes disk cache restores before prefill")
+    func tokenIteratorMaterializesDiskRestoreBeforePrefill() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("let diskRestored = restoreFromDiskArrays(diskArrays, into: self.cache)"))
+        #expect(source.contains("MLX.eval(self.cache)"))
+        #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
+    }
 }
