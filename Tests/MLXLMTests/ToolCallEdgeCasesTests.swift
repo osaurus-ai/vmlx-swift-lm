@@ -227,6 +227,80 @@ struct ToolCallEdgeCasesTests {
         #expect(processor.toolCalls.first?.function.name == "search")
     }
 
+    @Test("MiniMax M2 incomplete tool-call-looking reasoning flushes as text at EOS")
+    func testMiniMaxM2IncompleteToolCallLookingReasoningFlushesAsText() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let stream = "The user mentioned <minimax:tool_call but this is not a complete tool call"
+
+        let visibleDuringStream = feedInChunks(stream, chunkSize: 6, into: processor)
+
+        #expect(
+            visibleDuringStream == stream,
+            "Unparseable MiniMax tool-call-looking text must be returned losslessly instead of disappearing at EOS"
+        )
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("MiniMax M2 incomplete tool-call-looking text preserves its channel on generation flush")
+    func testMiniMaxM2IncompleteToolCallFlushPreservesReasoningChannel() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let text = "The user is greeting <minimax:tool_call without an invoke"
+        var visible: [Generation] = []
+
+        for ch in text {
+            visible.append(contentsOf: routeGenerationText(String(ch), channel: .reasoning, through: processor))
+        }
+        let flushed = flushGenerationText(channel: .reasoning, through: processor)
+        visible.append(contentsOf: flushed)
+
+        let reasoningText = visible.compactMap {
+            if case .reasoning(let text) = $0 { text } else { nil }
+        }.joined()
+        #expect(reasoningText == text)
+        #expect(!visible.contains { if case .chunk = $0 { true } else { false } })
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("MiniMax M2 complete start tag followed by prose flushes during reasoning stream")
+    func testMiniMaxM2StartTagFollowedByProseFlushesDuringReasoningStream() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let text = "The user said <minimax:tool_call>The user simply wants a greeting."
+        var visible: [Generation] = []
+
+        for ch in text {
+            visible.append(contentsOf: routeGenerationText(String(ch), channel: .reasoning, through: processor))
+        }
+
+        let reasoningText = visible.compactMap {
+            if case .reasoning(let text) = $0 { text } else { nil }
+        }.joined()
+        #expect(
+            reasoningText == text,
+            "Invalid MiniMax tool-call body must not trap later reasoning tokens in the parser buffer"
+        )
+        #expect(!visible.contains { if case .chunk = $0 { true } else { false } })
+        #expect(flushGenerationText(channel: .reasoning, through: processor).isEmpty)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("MiniMax M2 valid invoke prefix still buffers until the wrapper closes")
+    func testMiniMaxM2ValidInvokePrefixStillBuffersUntilClose() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let prefix = "<minimax:tool_call><invoke name=\"search\""
+        let visiblePrefix = feedInChunks(prefix, chunkSize: 4, into: processor)
+
+        #expect(visiblePrefix.isEmpty)
+        #expect(processor.toolCalls.isEmpty)
+
+        let suffix = "><parameter name=\"query\">swift</parameter></invoke></minimax:tool_call>"
+        let visibleSuffix = feedInChunks(suffix, chunkSize: 4, into: processor)
+
+        #expect(visibleSuffix.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "search")
+        #expect(processor.toolCalls.first?.function.arguments["query"] == .string("swift"))
+    }
+
     // MARK: - Gemma-4 harmony-format channels
 
     /// Gemma-4 occasionally emits `<|channel|>thought\n...\n<channel|>` blocks

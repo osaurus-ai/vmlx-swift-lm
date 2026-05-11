@@ -10,6 +10,27 @@ public struct MiniMaxM2ToolCallParser: ToolCallParser, Sendable {
 
     public init() {}
 
+    public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
+        guard let startTag else { return true }
+
+        var text = toolCallBuffer
+        if text.hasPrefix(startTag) {
+            text.removeFirst(startTag.count)
+        }
+        if let endTag, let endRange = text.range(of: endTag) {
+            text = String(text[..<endRange.lowerBound])
+        }
+
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return true }
+
+        let requiredPrefix = "<invoke name="
+        if body.count <= requiredPrefix.count {
+            return requiredPrefix.hasPrefix(body)
+        }
+        return body.hasPrefix(requiredPrefix)
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Strip outer tags if present
         var text = content

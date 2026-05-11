@@ -86,17 +86,22 @@ public class ToolCallProcessor {
     ///
     /// For formats with end tags that appear in the text stream, the buffer
     /// will already be empty at generation end, making this a no-op.
-    public func processEOS() {
-        guard state == .collectingToolCall || state == .potentialToolCall else { return }
+    @discardableResult
+    public func processEOS() -> String? {
+        guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal
-            return
+            return nil
         }
 
-        toolCalls.append(contentsOf: parser.parseEOS(toolCallBuffer, tools: tools))
+        let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
+        toolCalls.append(contentsOf: parsed)
+        let unparsedText = parsed.isEmpty ? leadingTextBeforeToolCall + toolCallBuffer : nil
 
         toolCallBuffer = ""
+        leadingTextBeforeToolCall = ""
         state = .normal
+        return unparsedText?.isEmpty == false ? unparsedText : nil
     }
 
     // MARK: - Private Methods
@@ -217,6 +222,15 @@ public class ToolCallProcessor {
         case .collectingToolCall:
             guard let endTag = parser.endTag else {
                 return nil
+            }
+
+            guard parser.isValidPartialContent(toolCallBuffer) else {
+                state = .normal
+                let buffer = toolCallBuffer
+                toolCallBuffer = ""
+                let visible = leadingTextBeforeToolCall + buffer
+                leadingTextBeforeToolCall = ""
+                return visible.isEmpty ? nil : visible
             }
 
             if toolCallBuffer.contains(endTag) {

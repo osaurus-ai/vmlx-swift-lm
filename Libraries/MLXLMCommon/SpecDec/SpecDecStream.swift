@@ -380,8 +380,10 @@ public enum SpecDecStream {
             }
             reasoningParser = parser
         }
-        toolCallProcessor.processEOS()
-        for event in drainToolCallEvents(from: toolCallProcessor) {
+        for event in flushGenerationText(
+            channel: reasoningParser?.isInsideReasoning == true ? .reasoning : .content,
+            through: toolCallProcessor
+        ) {
             continuation.yield(event)
         }
     }

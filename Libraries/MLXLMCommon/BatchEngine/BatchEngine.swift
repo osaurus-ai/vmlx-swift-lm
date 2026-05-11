@@ -587,7 +587,12 @@ public actor BatchEngine {
                     }
                     reasoningParser = parser
                 }
-                toolCallProcessor.processEOS()
+                for event in flushGenerationText(
+                    channel: reasoningParser?.isInsideReasoning == true ? .reasoning : .content,
+                    through: toolCallProcessor
+                ) {
+                    continuation.yield(event)
+                }
 
                 // Drain the stop-string matcher's held tail — no more
                 // tokens are coming, whatever is held is safe to emit.
@@ -598,9 +603,6 @@ public actor BatchEngine {
                     if !tail.isEmpty { continuation.yield(.chunk(tail)) }
                 }
 
-                for event in drainToolCallEvents(from: toolCallProcessor) {
-                    continuation.yield(event)
-                }
             }
 
             var sawTerminalInfo = false

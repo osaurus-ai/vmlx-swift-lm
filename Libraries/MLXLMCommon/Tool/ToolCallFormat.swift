@@ -32,9 +32,19 @@ public protocol ToolCallParser: Sendable {
     /// The default implementation splits on `startTag` (if present) and parses
     /// each segment individually.
     func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+
+    /// Return whether the current tagged buffer can still become a valid tool
+    /// call for this format. Tagged parsers default to permissive collection;
+    /// stricter formats can reject impossible prefixes so literal tag-looking
+    /// prose is surfaced instead of being buffered forever.
+    func isValidPartialContent(_ toolCallBuffer: String) -> Bool
 }
 
 extension ToolCallParser {
+    public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
+        true
+    }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return

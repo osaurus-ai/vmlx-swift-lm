@@ -2900,7 +2900,14 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             reasoningParser = parser
         }
 
-        toolCallProcessor.processEOS()
+        for event in flushGenerationText(
+            channel: reasoningParser?.isInsideReasoning == true ? .reasoning : .content,
+            through: toolCallProcessor
+        ) {
+            if case .terminated = emit(event) {
+                return
+            }
+        }
 
         // Drain the stop-string matcher's tail (anything held back while
         // waiting for disambiguation is now safe — no more tokens).
@@ -2913,11 +2920,6 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             }
         }
 
-        for event in drainToolCallEvents(from: toolCallProcessor) {
-            if case .terminated = emit(event) {
-                break
-            }
-        }
     }
 
     private mutating func emitRouted(
