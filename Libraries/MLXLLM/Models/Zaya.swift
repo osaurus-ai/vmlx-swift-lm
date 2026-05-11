@@ -907,6 +907,10 @@ public final class ZayaModel: Module, LLMModel, KVCacheDimensionProvider {
         return model.embedTokens.asLinear(h)
     }
 
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        callAsFunction(inputs, cache: cache, inputEmbedding: nil)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let cfg = configuration.textConfig
         let convChannels = cfg.ccaNumQHeads * cfg.kvChannels + cfg.numQueryGroups * cfg.kvChannels
