@@ -1628,6 +1628,9 @@ private func buildStopTokenIds(
         "<|end|>",
         "<|end_of_turn|>",
         "<end_of_turn>",
+        "〈|EOS|〉",
+        "<｜end▁of▁sentence｜>",
+        "<|EOT|>",
     ]
     for token in commonEndTokens {
         if let id = tokenizer.convertTokenToId(token) {

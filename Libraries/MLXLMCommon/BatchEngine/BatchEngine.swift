@@ -270,6 +270,9 @@ public actor BatchEngine {
             "<|end|>",          // Phi 3, Phi 4
             "<|end_of_turn|>",  // Gemma family
             "<end_of_turn>",    // Gemma 2/3 alt spelling
+            "〈|EOS|〉",          // Laguna / Poolside
+            "<｜end▁of▁sentence｜>",  // DeepSeek V4 wide-pipe spelling
+            "<|EOT|>",          // Uppercase EOT variants in some shipped templates
         ]
         for token in commonEndTokens {
             if let id = context.tokenizer.convertTokenToId(token) {
