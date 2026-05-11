@@ -211,6 +211,22 @@ struct ToolCallEdgeCasesTests {
         #expect(processor.toolCalls[1].function.name == "g")
     }
 
+    @Test("MiniMax M2 preserves visible text around tagged tool calls")
+    func testMiniMaxM2PreservesVisibleTextAroundToolCall() {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let stream = """
+            before <minimax:tool_call><invoke name="search"><parameter name="query">swift</parameter></invoke></minimax:tool_call> after
+            """
+
+        let visible = processor.processChunk(stream) ?? ""
+
+        #expect(visible.contains("before "))
+        #expect(visible.contains(" after"))
+        #expect(!visible.contains("minimax:tool_call"))
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "search")
+    }
+
     // MARK: - Gemma-4 harmony-format channels
 
     /// Gemma-4 occasionally emits `<|channel|>thought\n...\n<channel|>` blocks

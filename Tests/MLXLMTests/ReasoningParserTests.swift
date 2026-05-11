@@ -28,7 +28,9 @@ private func driveGenerationPipeline(
                 case .content(let c):
                     kept.append(c)
                 case .reasoning(let r):
-                    events.append(.reasoning(r))
+                    events.append(
+                        contentsOf: routeGenerationText(
+                            r, channel: .reasoning, through: toolCallProcessor))
                 }
             }
             reasoningParser = parser
@@ -37,12 +39,9 @@ private func driveGenerationPipeline(
             pieces = [raw]
         }
         for piece in pieces {
-            if let textToYield = toolCallProcessor.processChunk(piece) {
-                events.append(.chunk(textToYield))
-            }
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                events.append(.toolCall(toolCall))
-            }
+            events.append(
+                contentsOf: routeGenerationText(
+                    piece, channel: .content, through: toolCallProcessor))
         }
     }
 
@@ -51,22 +50,19 @@ private func driveGenerationPipeline(
             for segment in parser.flush() {
                 switch segment {
                 case .content(let c):
-                    if let textToYield = toolCallProcessor.processChunk(c) {
-                        events.append(.chunk(textToYield))
-                    }
-                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                        events.append(.toolCall(toolCall))
-                    }
+                    events.append(
+                        contentsOf: routeGenerationText(
+                            c, channel: .content, through: toolCallProcessor))
                 case .reasoning(let r):
-                    events.append(.reasoning(r))
+                    events.append(
+                        contentsOf: routeGenerationText(
+                            r, channel: .reasoning, through: toolCallProcessor))
                 }
             }
             reasoningParser = parser
         }
         toolCallProcessor.processEOS()
-        for toolCall in toolCallProcessor.toolCalls {
-            events.append(.toolCall(toolCall))
-        }
+        events.append(contentsOf: drainToolCallEvents(from: toolCallProcessor))
     }
 
     for chunk in chunks { pump(chunk) }
@@ -144,6 +140,33 @@ struct GenerationReasoningEventTests {
         #expect(!content.contains("<think>"))
         #expect(!content.contains("</think>"))
         #expect(!reasoning.contains("actual answer"))
+    }
+
+    @Test("MiniMax tool calls inside reasoning extract as tool calls and do not leak")
+    func testMiniMaxToolCallInsideReasoningDoesNotLeak() throws {
+        let events = driveGenerationPipeline(
+            chunks: [
+                """
+                <think>Need a lookup.
+                <minimax:tool_call><invoke name="search"><parameter name="query">swift</parameter></invoke></minimax:tool_call>
+                Continue after tool.</think>Done.
+                """
+            ],
+            toolCallFormat: .minimaxM2)
+
+        let reasoning = events.compactMap { $0.reasoning }.joined()
+        let content = events.compactMap { $0.chunk }.joined()
+        let calls = events.compactMap { $0.toolCall }
+
+        #expect(reasoning.contains("Need a lookup."))
+        #expect(reasoning.contains("Continue after tool."))
+        #expect(content.contains("Done."))
+        #expect(!reasoning.contains("minimax:tool_call"))
+        #expect(!content.contains("minimax:tool_call"))
+        #expect(calls.count == 1)
+        let call = try #require(calls.first)
+        #expect(call.function.name == "search")
+        #expect(call.function.arguments["query"] == .string("swift"))
     }
 
     @Test("Generation enum has .reasoning case + reasoning computed property")

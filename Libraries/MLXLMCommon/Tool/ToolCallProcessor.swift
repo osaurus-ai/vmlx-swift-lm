@@ -30,6 +30,7 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     private var state = State.normal
     private var toolCallBuffer = ""
+    private var leadingTextBeforeToolCall = ""
 
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
@@ -191,6 +192,9 @@ public class ToolCallProcessor {
 
             leadingToken = separateToken(
                 from: &toolCallBuffer, separator: String(startChar), returnLeading: true)
+            if let leadingToken {
+                leadingTextBeforeToolCall += leadingToken
+            }
 
             fallthrough
         case .potentialToolCall:
@@ -206,7 +210,9 @@ public class ToolCallProcessor {
                 state = .normal
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
-                return (leadingToken ?? "") + buffer
+                let visible = leadingTextBeforeToolCall + buffer
+                leadingTextBeforeToolCall = ""
+                return visible
             }
         case .collectingToolCall:
             guard let endTag = parser.endTag else {
@@ -226,13 +232,18 @@ public class ToolCallProcessor {
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
+                let leading = leadingTextBeforeToolCall
+                leadingTextBeforeToolCall = ""
                 if let trailingToken, let startChar = startTagFirstChar,
                     trailingToken.contains(startChar)
                 {
-                    return processChunk(trailingToken)
+                    let trailing = processChunk(trailingToken) ?? ""
+                    let visible = leading + trailing
+                    return visible.isEmpty ? nil : visible
                 } else {
                     // Otherwise, return the collected token, or nil if it's empty
-                    return trailingToken?.isEmpty ?? true ? nil : trailingToken
+                    let visible = leading + (trailingToken ?? "")
+                    return visible.isEmpty ? nil : visible
                 }
             } else {
                 return nil

@@ -2804,9 +2804,15 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 case .content(let c):
                     pieces.append(c)
                 case .reasoning(let r):
-                    if case .terminated = emit(.reasoning(r)) {
-                        reasoningParser = parser
-                        return false
+                    for event in routeGenerationText(
+                        r,
+                        channel: .reasoning,
+                        through: toolCallProcessor
+                    ) {
+                        if !emitRouted(event, emit: emit) {
+                            reasoningParser = parser
+                            return false
+                        }
                     }
                 }
             }
@@ -2825,41 +2831,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         //    matching OpenAI semantics where stop sequences match the
         //    assistant answer, not the reasoning or tool envelope.
         for contentChunk in contentChunks {
-            guard let textToYield = toolCallProcessor.processChunk(contentChunk) else {
-                if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                    if case .terminated = emit(.toolCall(toolCall)) {
-                        return false
-                    }
-                }
-                continue
-            }
-
-            if stopStringMatcher.isEnabled {
-                switch stopStringMatcher.feed(textToYield) {
-                case .streaming(let emitText):
-                    if !emitText.isEmpty {
-                        if case .terminated = emit(.chunk(emitText)) {
-                            return false
-                        }
-                    }
-                case .stopped(let emitText):
-                    if !emitText.isEmpty {
-                        if case .terminated = emit(.chunk(emitText)) {
-                            stopSequenceHit = true
-                            return false
-                        }
-                    }
-                    stopSequenceHit = true
-                    return false
-                }
-            } else {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
-                }
-            }
-
-            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                if case .terminated = emit(.toolCall(toolCall)) {
+            for event in routeGenerationText(
+                contentChunk,
+                channel: .content,
+                through: toolCallProcessor
+            ) {
+                if !emitRouted(event, emit: emit) {
                     return false
                 }
             }
@@ -2897,24 +2874,26 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             for segment in parser.flush() {
                 switch segment {
                 case .content(let c):
-                    if let textToYield = toolCallProcessor.processChunk(c) {
-                        if case .terminated = emitChunkThroughStopMatcher(
-                            textToYield, emit: emit)
-                        {
-                            reasoningParser = parser
-                            return
-                        }
-                    }
-                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                        if case .terminated = emit(.toolCall(toolCall)) {
+                    for event in routeGenerationText(
+                        c,
+                        channel: .content,
+                        through: toolCallProcessor
+                    ) {
+                        if !emitRouted(event, emit: emit) {
                             reasoningParser = parser
                             return
                         }
                     }
                 case .reasoning(let r):
-                    if case .terminated = emit(.reasoning(r)) {
-                        reasoningParser = parser
-                        return
+                    for event in routeGenerationText(
+                        r,
+                        channel: .reasoning,
+                        through: toolCallProcessor
+                    ) {
+                        if !emitRouted(event, emit: emit) {
+                            reasoningParser = parser
+                            return
+                        }
                     }
                 }
             }
@@ -2934,10 +2913,28 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
             }
         }
 
-        for toolCall in toolCallProcessor.toolCalls {
-            if case .terminated = emit(.toolCall(toolCall)) {
+        for event in drainToolCallEvents(from: toolCallProcessor) {
+            if case .terminated = emit(event) {
                 break
             }
+        }
+    }
+
+    private mutating func emitRouted(
+        _ event: Generation,
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> Bool {
+        switch event {
+        case .chunk(let text):
+            if case .terminated = emitChunkThroughStopMatcher(text, emit: emit) {
+                return false
+            }
+            return !stopSequenceHit
+        case .reasoning, .toolCall, .info:
+            if case .terminated = emit(event) {
+                return false
+            }
+            return true
         }
     }
 

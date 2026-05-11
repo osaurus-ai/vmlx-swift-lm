@@ -512,6 +512,19 @@ public actor BatchEngine {
                 }
             }
 
+            func emitRouted(_ event: Generation) {
+                switch event {
+                case .chunk(let text):
+                    emitChunkThroughStop(text)
+                case .reasoning:
+                    continuation.yield(event)
+                case .toolCall:
+                    continuation.yield(event)
+                case .info:
+                    continuation.yield(event)
+                }
+            }
+
             func pump(_ raw: String) {
                 if stopMatched { return }
                 let pieces: [String]
@@ -522,7 +535,14 @@ public actor BatchEngine {
                         case .content(let c):
                             kept.append(c)
                         case .reasoning(let r):
-                            continuation.yield(.reasoning(r))
+                            for event in routeGenerationText(
+                                r,
+                                channel: .reasoning,
+                                through: toolCallProcessor
+                            ) {
+                                emitRouted(event)
+                                if stopMatched { return }
+                            }
                         }
                     }
                     reasoningParser = parser
@@ -531,12 +551,13 @@ public actor BatchEngine {
                     pieces = [raw]
                 }
                 for piece in pieces {
-                    if let textToYield = toolCallProcessor.processChunk(piece) {
-                        emitChunkThroughStop(textToYield)
+                    for event in routeGenerationText(
+                        piece,
+                        channel: .content,
+                        through: toolCallProcessor
+                    ) {
+                        emitRouted(event)
                         if stopMatched { return }
-                    }
-                    if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                        continuation.yield(.toolCall(toolCall))
                     }
                 }
             }
@@ -546,14 +567,21 @@ public actor BatchEngine {
                     for segment in parser.flush() {
                         switch segment {
                         case .content(let c):
-                            if let textToYield = toolCallProcessor.processChunk(c) {
-                                emitChunkThroughStop(textToYield)
-                            }
-                            if let toolCall = toolCallProcessor.toolCalls.popLast() {
-                                continuation.yield(.toolCall(toolCall))
+                            for event in routeGenerationText(
+                                c,
+                                channel: .content,
+                                through: toolCallProcessor
+                            ) {
+                                emitRouted(event)
                             }
                         case .reasoning(let r):
-                            continuation.yield(.reasoning(r))
+                            for event in routeGenerationText(
+                                r,
+                                channel: .reasoning,
+                                through: toolCallProcessor
+                            ) {
+                                emitRouted(event)
+                            }
                         }
                     }
                     reasoningParser = parser
@@ -569,8 +597,8 @@ public actor BatchEngine {
                     if !tail.isEmpty { continuation.yield(.chunk(tail)) }
                 }
 
-                for toolCall in toolCallProcessor.toolCalls {
-                    continuation.yield(.toolCall(toolCall))
+                for event in drainToolCallEvents(from: toolCallProcessor) {
+                    continuation.yield(event)
                 }
             }
 

@@ -8,6 +8,12 @@
 {%- set toolcall_end_token   = '</minimax:tool_call>' -%}
 {%- set _enable_thinking = enable_thinking | default(true) -%}
 
+{%- macro render_tool_namespace(namespace_name, tool_list) -%}
+{%- for tool in tool_list -%}
+<tool>{{ tool.function | tojson(ensure_ascii=False) }}</tool>
+{% endfor -%}
+{%- endmacro -%}
+
 {%- macro visible_text(content) -%}
     {%- if content is string -%}{{ content }}
     {%- elif content is iterable and content is not mapping -%}
@@ -51,10 +57,16 @@
 {%- if tools -%}
     {{- '\n\n' ~ '# Tools' ~ '\n' ~ 'You may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:' ~ '\n' }}
     {{- '\n' ~ '<tools>' ~ '\n' }}
-    {%- for tool in tools -%}
-        <tool>{{ tool.function | tojson(ensure_ascii=False) }}</tool>
-    {% endfor -%}
-    {{- '</tools>' ~ '\n' }}
+    {{- render_tool_namespace("functions", tools) }}
+    {{- '</tools>' ~ '\n\n' }}
+{{- 'When making tool calls, use XML format to invoke tools and pass parameters:' ~ '\n' }}
+{{- '\n' ~ toolcall_begin_token }}
+<invoke name="tool-name-1">
+<parameter name="param-key-1">param-value-1</parameter>
+<parameter name="param-key-2">param-value-2</parameter>
+...
+</invoke>
+{{- '\n' ~ toolcall_end_token }}
 {%- endif -%}
 {{- '[e~[\n' }}
 
@@ -76,7 +88,48 @@
             {{- '<think>' ~ '\n' ~ reasoning_content ~ '\n' ~ '</think>' ~ '\n\n' }}
         {%- endif -%}
         {%- if content -%}{{- content }}{%- endif -%}
+        {%- if message.tool_calls -%}
+            {{- '\n' ~ toolcall_begin_token ~ '\n' }}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if tool_call.function %}
+                    {%- set tool_call = tool_call.function %}
+                {%- endif %}
+                {{- '<invoke name="' + tool_call.name + '">' }}
+                {% set _args = tool_call.arguments %}
+                {%- for k, v in _args.items() %}
+                {{- '<parameter name="' + k + '">' }}
+                {{- v | tojson(ensure_ascii=False) if v is not string else v }}
+                {{- '</parameter>' }}
+                {% endfor %}
+                {{- '</invoke>' ~ '\n' }}
+            {%- endfor -%}
+            {{- toolcall_end_token}}
+            {%- set last_tool_call.name = message.tool_calls[-1].name -%}
+        {%- else -%}
+            {%- set last_tool_call.name = none -%}
+        {%- endif -%}
         {{- '[e~[' ~ '\n' }}
+    {%- elif message.role == 'tool' -%}
+    {%- if last_tool_call.name is none -%}
+        {{- raise_exception("Message has tool role, but there was no previous assistant message with a tool call!") }}
+    {%- endif -%}
+    {%- if loop.first or (conversation_messages[loop.index0 - 1].role != 'tool') -%}
+        {{- ']~b]tool' }}
+    {%- endif -%}
+    {%- if message.content is string -%}
+        {{- '\n<response>' }}
+        {{- message.content }}
+        {{- '</response>' }}
+    {%- else -%}
+        {%- for tr in message.content -%}
+            {{- '\n<response>' }}
+            {{- tr.output if tr.output is defined else (tr.text if tr.type == 'text' and tr.text is defined else tr) }}
+            {{- '\n</response>' }}
+        {%- endfor -%}
+    {%- endif -%}
+    {%- if loop.last or (conversation_messages[loop.index0 + 1].role != 'tool') -%}
+        {{- '[e~[\n' -}}
+    {%- endif -%}
     {%- elif message.role == 'user' -%}
         {{- ']~b]user' ~ '\n' }}
         {{- visible_text(message.content) }}

@@ -321,7 +321,13 @@ public enum SpecDecStream {
                     case .content(let c):
                         pieces.append(c)
                     case .reasoning(let r):
-                        continuation.yield(.reasoning(r))
+                        for event in routeGenerationText(
+                            r,
+                            channel: .reasoning,
+                            through: toolCallProcessor
+                        ) {
+                            continuation.yield(event)
+                        }
                     }
                 }
                 reasoningParser = parser
@@ -332,11 +338,12 @@ public enum SpecDecStream {
 
             // 2. Tool-call pass — same contract as non-speculative path.
             for piece in contentPieces {
-                if let visibleText = toolCallProcessor.processChunk(piece) {
-                    continuation.yield(.chunk(visibleText))
-                }
-                if let call = toolCallProcessor.toolCalls.popLast() {
-                    continuation.yield(.toolCall(call))
+                for event in routeGenerationText(
+                    piece,
+                    channel: .content,
+                    through: toolCallProcessor
+                ) {
+                    continuation.yield(event)
                 }
             }
         }
@@ -354,21 +361,28 @@ public enum SpecDecStream {
             for segment in parser.flush() {
                 switch segment {
                 case .content(let c):
-                    if let visibleText = toolCallProcessor.processChunk(c) {
-                        continuation.yield(.chunk(visibleText))
-                    }
-                    if let call = toolCallProcessor.toolCalls.popLast() {
-                        continuation.yield(.toolCall(call))
+                    for event in routeGenerationText(
+                        c,
+                        channel: .content,
+                        through: toolCallProcessor
+                    ) {
+                        continuation.yield(event)
                     }
                 case .reasoning(let r):
-                    continuation.yield(.reasoning(r))
+                    for event in routeGenerationText(
+                        r,
+                        channel: .reasoning,
+                        through: toolCallProcessor
+                    ) {
+                        continuation.yield(event)
+                    }
                 }
             }
             reasoningParser = parser
         }
         toolCallProcessor.processEOS()
-        for call in toolCallProcessor.toolCalls {
-            continuation.yield(.toolCall(call))
+        for event in drainToolCallEvents(from: toolCallProcessor) {
+            continuation.yield(event)
         }
     }
 }
