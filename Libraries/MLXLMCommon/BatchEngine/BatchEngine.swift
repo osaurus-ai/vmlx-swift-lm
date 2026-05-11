@@ -21,6 +21,21 @@ public enum BatchEngineConfigurationError: Error, LocalizedError, Sendable {
     }
 }
 
+private func _blankContentAfterReasoningLimit(
+    reasoningParserName: String?,
+    toolCallFormat: ToolCallFormat?
+) -> Int? {
+    if toolCallFormat == .minimaxM2 {
+        return 64
+    }
+    switch reasoningParserName?.lowercased() {
+    case "minimax", "minimax_m2":
+        return 64
+    default:
+        return nil
+    }
+}
+
 private func cancelledBatchStream(
     promptTokenCount: Int
 ) -> (id: BatchRequestID, stream: AsyncStream<BatchGeneration>) {
@@ -498,6 +513,12 @@ public actor BatchEngine {
                 promptTail: promptTail)
             var stopMatcher = StopStringMatcher(stopStrings: extraStopStrings)
             var stopMatched = false
+            let blankContentLimit = _blankContentAfterReasoningLimit(
+                reasoningParserName: reasoningParserName,
+                toolCallFormat: toolCallFormat)
+            var sawReasoningText = false
+            var sawContentText = false
+            var heldPostReasoningWhitespace = ""
 
             func emitChunkThroughStop(_ text: String) {
                 guard stopMatcher.isEnabled else {
@@ -536,6 +557,9 @@ public actor BatchEngine {
                         case .content(let c):
                             kept.append(c)
                         case .reasoning(let r):
+                            if !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                sawReasoningText = true
+                            }
                             for event in routeGenerationText(
                                 r,
                                 channel: .reasoning,
@@ -551,7 +575,24 @@ public actor BatchEngine {
                 } else {
                     pieces = [raw]
                 }
-                for piece in pieces {
+                for var piece in pieces {
+                    if let limit = blankContentLimit,
+                       sawReasoningText,
+                       !sawContentText {
+                        if piece.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            heldPostReasoningWhitespace += piece
+                            if heldPostReasoningWhitespace.count >= limit {
+                                stopMatched = true
+                                return
+                            }
+                            continue
+                        }
+                        sawContentText = true
+                        if !heldPostReasoningWhitespace.isEmpty {
+                            piece = heldPostReasoningWhitespace + piece
+                            heldPostReasoningWhitespace.removeAll(keepingCapacity: false)
+                        }
+                    }
                     for event in routeGenerationText(
                         piece,
                         channel: .content,
@@ -567,7 +608,23 @@ public actor BatchEngine {
                 if var parser = reasoningParser {
                     for segment in parser.flush() {
                         switch segment {
-                        case .content(let c):
+                        case .content(var c):
+                            if let limit = blankContentLimit,
+                               sawReasoningText,
+                               !sawContentText {
+                                if c.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    heldPostReasoningWhitespace += c
+                                    if heldPostReasoningWhitespace.count >= limit {
+                                        stopMatched = true
+                                    }
+                                    continue
+                                }
+                                sawContentText = true
+                                if !heldPostReasoningWhitespace.isEmpty {
+                                    c = heldPostReasoningWhitespace + c
+                                    heldPostReasoningWhitespace.removeAll(keepingCapacity: false)
+                                }
+                            }
                             for event in routeGenerationText(
                                 c,
                                 channel: .content,
@@ -576,6 +633,9 @@ public actor BatchEngine {
                                 emitRouted(event)
                             }
                         case .reasoning(let r):
+                            if !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                sawReasoningText = true
+                            }
                             for event in routeGenerationText(
                                 r,
                                 channel: .reasoning,

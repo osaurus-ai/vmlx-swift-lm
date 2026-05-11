@@ -2151,10 +2151,29 @@ public func generateTask(
             reasoningParser: ReasoningParser.forPrompt(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
-            stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings)
+            stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings),
+            blankContentAfterReasoningLimit:
+                blankContentAfterReasoningLimit(
+                    reasoningParserName: modelConfiguration.reasoningParserName,
+                    toolCallFormat: modelConfiguration.toolCallFormat)
         ),
         cacheStoreAction: cacheStoreAction
     )
+}
+
+private func blankContentAfterReasoningLimit(
+    reasoningParserName: String?,
+    toolCallFormat: ToolCallFormat?
+) -> Int? {
+    if toolCallFormat == .minimaxM2 {
+        return 64
+    }
+    switch reasoningParserName?.lowercased() {
+    case "minimax", "minimax_m2":
+        return 64
+    default:
+        return nil
+    }
 }
 
 /// Generates raw token IDs asynchronously using the provided language model input, parameters, and context.
@@ -2770,17 +2789,23 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     /// Flipped by `dispatch` when the stop matcher fires, so the loop
     /// task can signal `.stop` in its terminal `.info` event.
     private(set) var stopSequenceHit: Bool = false
+    private let blankContentAfterReasoningLimit: Int?
+    private var sawReasoningText = false
+    private var sawContentText = false
+    private var heldPostReasoningWhitespace = ""
 
     init(
         tokenizer: Tokenizer,
         format: ToolCallFormat,
         reasoningParser: ReasoningParser? = nil,
-        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: [])
+        stopStringMatcher: StopStringMatcher = StopStringMatcher(stopStrings: []),
+        blankContentAfterReasoningLimit: Int? = nil
     ) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
         toolCallProcessor = ToolCallProcessor(format: format)
         self.reasoningParser = reasoningParser
         self.stopStringMatcher = stopStringMatcher
+        self.blankContentAfterReasoningLimit = blankContentAfterReasoningLimit
     }
 
     /// Feed a raw decoded chunk through the reasoning parser (if any) and
@@ -2804,6 +2829,9 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                 case .content(let c):
                     pieces.append(c)
                 case .reasoning(let r):
+                    if !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        sawReasoningText = true
+                    }
                     for event in routeGenerationText(
                         r,
                         channel: .reasoning,
@@ -2830,7 +2858,24 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         //    user-visible `.chunk` text is a candidate for a stop match,
         //    matching OpenAI semantics where stop sequences match the
         //    assistant answer, not the reasoning or tool envelope.
-        for contentChunk in contentChunks {
+        for var contentChunk in contentChunks {
+            if let limit = blankContentAfterReasoningLimit,
+               sawReasoningText,
+               !sawContentText {
+                if contentChunk.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    heldPostReasoningWhitespace += contentChunk
+                    if heldPostReasoningWhitespace.count >= limit {
+                        stopSequenceHit = true
+                        return false
+                    }
+                    continue
+                }
+                sawContentText = true
+                if !heldPostReasoningWhitespace.isEmpty {
+                    contentChunk = heldPostReasoningWhitespace + contentChunk
+                    heldPostReasoningWhitespace.removeAll(keepingCapacity: false)
+                }
+            }
             for event in routeGenerationText(
                 contentChunk,
                 channel: .content,
@@ -2873,7 +2918,23 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         if var parser = reasoningParser {
             for segment in parser.flush() {
                 switch segment {
-                case .content(let c):
+                case .content(var c):
+                    if let limit = blankContentAfterReasoningLimit,
+                       sawReasoningText,
+                       !sawContentText {
+                        if c.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            heldPostReasoningWhitespace += c
+                            if heldPostReasoningWhitespace.count >= limit {
+                                stopSequenceHit = true
+                            }
+                            continue
+                        }
+                        sawContentText = true
+                        if !heldPostReasoningWhitespace.isEmpty {
+                            c = heldPostReasoningWhitespace + c
+                            heldPostReasoningWhitespace.removeAll(keepingCapacity: false)
+                        }
+                    }
                     for event in routeGenerationText(
                         c,
                         channel: .content,
@@ -2885,6 +2946,9 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
                         }
                     }
                 case .reasoning(let r):
+                    if !r.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        sawReasoningText = true
+                    }
                     for event in routeGenerationText(
                         r,
                         channel: .reasoning,

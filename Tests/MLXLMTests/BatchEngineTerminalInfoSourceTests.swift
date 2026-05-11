@@ -17,4 +17,22 @@ struct BatchEngineTerminalInfoSourceTests {
         #expect(source.contains("unclosedReasoning: unclosed"))
         #expect(source.contains("continuation.yield(.info(finalInfo))"))
     }
+
+    @Test("MiniMax blank content after reasoning is stopped on both public generate paths")
+    func miniMaxBlankContentAfterReasoningStopsBothGeneratePaths() throws {
+        let batchSource = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+        let evalSource = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        for source in [batchSource, evalSource] {
+            #expect(source.contains("blankContentAfterReasoningLimit"))
+            #expect(source.contains("toolCallFormat == .minimaxM2"))
+            #expect(source.contains("heldPostReasoningWhitespace.count >= limit"))
+            #expect(source.contains("sawReasoningText"))
+            #expect(source.contains("!sawContentText"))
+        }
+    }
 }
