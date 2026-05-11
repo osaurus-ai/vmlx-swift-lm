@@ -103,4 +103,24 @@ struct Hy3ToolCallParserRoutingTests {
         #expect(!visible.contains("<tool_calls>"))
         #expect(!visible.contains("<tool_call>"))
     }
+
+    @Test("ToolCallProcessor flushes invalid Hunyuan tool-call prose during stream")
+    func processorFlushesInvalidWrapperProseDuringStream() throws {
+        let processor = ToolCallProcessor(format: .hunyuan)
+        let text = "Answer text <tool_calls>I'm not calling a tool; this is prose."
+        var visible = ""
+
+        for ch in text {
+            if let chunk = processor.processChunk(String(ch)) {
+                visible += chunk
+            }
+        }
+
+        #expect(
+            visible == text,
+            "Invalid Hy3/Hunyuan tool-call-looking prose must not stay buffered until EOS"
+        )
+        #expect(processor.toolCalls.isEmpty)
+        #expect(processor.processEOS() == nil)
+    }
 }

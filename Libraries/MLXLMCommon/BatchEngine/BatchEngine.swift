@@ -200,6 +200,20 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
+    /// Hy3/Hunyuan currently decodes coherently on the uncompiled path but
+    /// diverges on the single-slot compiled trace. Keep compile opt-in from
+    /// silently taking that unsafe route until the model path has a dedicated
+    /// compiled-vs-uncompiled parity test.
+    private var compiledDecodeDeniedForModel: Bool {
+        if context.configuration.toolCallFormat == .hunyuan {
+            return true
+        }
+        let modelName = context.configuration.name.lowercased()
+        let modelTypeName = String(describing: type(of: context.model)).lowercased()
+        return modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
+            || modelTypeName.contains("hy3") || modelTypeName.contains("hunyuan")
+    }
+
     /// Initial admission window for B>1 engines. The scheduler runs prefill on
     /// the actor today, so once a long prefill starts a just-behind `submit`
     /// cannot enqueue until that prefill returns. Give immediately-following
@@ -706,7 +720,7 @@ public actor BatchEngine {
         let promptTokenCount = input.text.tokens.size
         let fastPathID = UUID()
         var soloParameters = parameters
-        if soloParameters.enableCompiledBatchDecode && !soloParameters.enableCompiledDecode {
+        if soloParameters.enableCompiledBatchDecode && !compiledDecodeDeniedForModel && !soloParameters.enableCompiledDecode {
             soloParameters.enableCompiledDecode = true
         }
         if let coordinator = cacheCoordinator {
@@ -1549,6 +1563,7 @@ public actor BatchEngine {
     /// then routes this slot's decode tokens through the closure.
     private func maybePromoteToCompiledDecode(slot: inout BatchSlot) {
         guard slot.parameters.enableCompiledBatchDecode else { return }
+        guard !compiledDecodeDeniedForModel else { return }
         // Stage 1B.3 scope: single-slot path. Multi-slot promotion is
         // routed through `maybePromoteToBucket(slot:)` once Stage 1B.4
         // wires up `BucketHandle`. Today that helper is a no-op so

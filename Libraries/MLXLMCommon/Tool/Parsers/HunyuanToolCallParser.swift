@@ -31,6 +31,26 @@ public struct HunyuanToolCallParser: ToolCallParser, Sendable {
 
     public init() {}
 
+    public func isValidPartialContent(_ toolCallBuffer: String) -> Bool {
+        guard let startTag else { return true }
+
+        var text = toolCallBuffer
+        if text.hasPrefix(startTag) {
+            text.removeFirst(startTag.count)
+        }
+        if let endTag, let endRange = text.range(of: endTag) {
+            text = String(text[..<endRange.lowerBound])
+        }
+
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return true }
+
+        if body.count <= toolCallStart.count {
+            return toolCallStart.hasPrefix(body)
+        }
+        return body.hasPrefix(toolCallStart)
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         parseCalls(content, tools: tools).first
     }

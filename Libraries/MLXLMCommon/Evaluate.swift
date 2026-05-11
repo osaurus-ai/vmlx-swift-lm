@@ -700,6 +700,11 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private static let logger = Logger(subsystem: "vmlx", category: "TokenIterator")
 
+    private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
+        let typeName = String(describing: type(of: model)).lowercased()
+        return typeName.contains("hy3") || typeName.contains("hunyuan")
+    }
+
     let model: any LanguageModel
     var state: LMOutput.State?
 
@@ -1044,7 +1049,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     input: inputForPrepare))
         }
 
-        if parameters.enableCompiledDecode {
+        if parameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             try setupCompiledDecode(
                 maxCacheLength: parameters.compiledMaxCacheLength ?? 4096)
         }
