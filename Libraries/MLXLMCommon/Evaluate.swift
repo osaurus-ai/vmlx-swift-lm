@@ -5,6 +5,8 @@ import MLX
 import MLXNN
 import os
 
+private let reasoningCloseBiasLog = Logger(subsystem: "vmlx", category: "Generation")
+
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
 ///
@@ -3139,7 +3141,9 @@ internal func _parametersWithAutomaticReasoningCloseBias(
         return parameters
     }
 
-    guard let closeTokenID = tokenizer.convertTokenToId("</think>") else {
+    guard let closeTokenID = _specialTokenID("</think>", tokenizer: tokenizer) else {
+        reasoningCloseBiasLog.info(
+            "reasoningCloseBias skipped model=\(modelConfiguration.name, privacy: .public) reason=no_close_token")
         return parameters
     }
 
@@ -3152,5 +3156,21 @@ internal func _parametersWithAutomaticReasoningCloseBias(
         activateAfterTokens: activateAfter,
         bias: 8.0,
         forceAfterTokens: forceAfter)
+    reasoningCloseBiasLog.info(
+        "reasoningCloseBias active model=\(modelConfiguration.name, privacy: .public) tokenID=\(closeTokenID, privacy: .public) activateAfter=\(activateAfter, privacy: .public) forceAfter=\(forceAfter ?? -1, privacy: .public)")
     return adjusted
+}
+
+private func _specialTokenID(_ token: String, tokenizer: any Tokenizer) -> Int? {
+    if let id = tokenizer.convertTokenToId(token) {
+        return id
+    }
+
+    let encoded = tokenizer.encode(text: token, addSpecialTokens: false)
+    guard encoded.count == 1, let id = encoded.first else {
+        return nil
+    }
+
+    let roundTrip = tokenizer.decode(tokenIds: [id], skipSpecialTokens: false)
+    return roundTrip == token ? id : nil
 }

@@ -68,6 +68,8 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(evaluate.contains("name.contains(\"minimax\") || modelTypeName.contains(\"minimax\")"))
         #expect(evaluate.contains("promptTail.range(of: \"<think>\", options: .backwards)"))
         #expect(evaluate.contains("promptTail.range(of: \"</think>\", options: .backwards)"))
-        #expect(evaluate.contains("tokenizer.convertTokenToId(\"</think>\")"))
+        #expect(evaluate.contains("_specialTokenID(\"</think>\", tokenizer: tokenizer)"))
+        #expect(evaluate.contains("tokenizer.encode(text: token, addSpecialTokens: false)"))
+        #expect(evaluate.contains("reasoningCloseBias active"))
     }
 }

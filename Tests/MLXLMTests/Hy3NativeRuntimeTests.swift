@@ -143,7 +143,7 @@ final class Hy3NativeRuntimeTests: XCTestCase {
                 ).asType(.float16),
                 bias: nil)
 
-            let actual = hy3LMHeadFP32(hidden, head)
+            let actual = hy3LMHead(hidden, head)
             let expected = matmul(
                 hidden.asType(.float32),
                 head.weight.asType(.float32).transposed())
@@ -153,7 +153,7 @@ final class Hy3NativeRuntimeTests: XCTestCase {
         }
     }
 
-    func testLMHeadProjectionDequantizesQuantizedWeightsBeforeFP32Matmul() throws {
+    func testLMHeadProjectionUsesQuantizedKernelForQuantizedWeights() throws {
         try MLXMetalTestLock.withLock {
             let hidden = MLXArray(
                 (0..<32).map { Float($0 % 7) * 0.25 - 0.75 },
@@ -169,20 +169,9 @@ final class Hy3NativeRuntimeTests: XCTestCase {
                 groupSize: 32,
                 bits: 4)
 
-            let actual = hy3LMHeadFP32(hidden, head)
-            let expected = matmul(
-                hidden.asType(.float32),
-                dequantized(
-                    head.weight,
-                    scales: head.scales,
-                    biases: head.biases,
-                    groupSize: head.groupSize,
-                    bits: head.bits,
-                    mode: head.mode,
-                    dtype: .float32)
-                    .transposed())
+            let actual = hy3LMHead(hidden, head)
+            let expected = head(hidden)
 
-            XCTAssertEqual(actual.dtype, .float32)
             assertClose(actual, expected, tolerance: 1e-5)
         }
     }

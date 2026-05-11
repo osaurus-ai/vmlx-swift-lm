@@ -369,23 +369,13 @@ class Hy3MoE: Module, UnaryLayer {
 
 // MARK: - Logit head
 
-func hy3LMHeadFP32(_ hidden: MLXArray, _ lmHead: Linear) -> MLXArray {
-    let hiddenFP32 = hidden.asType(.float32)
-    let weightFP32: MLXArray
-
-    if let quantized = lmHead as? QuantizedLinear {
-        weightFP32 = dequantized(
-            quantized.weight,
-            scales: quantized.scales,
-            biases: quantized.biases,
-            groupSize: quantized.groupSize,
-            bits: quantized.bits,
-            mode: quantized.mode,
-            dtype: .float32)
-    } else {
-        weightFP32 = lmHead.weight.asType(.float32)
+func hy3LMHead(_ hidden: MLXArray, _ lmHead: Linear) -> MLXArray {
+    if lmHead is QuantizedLinear {
+        return lmHead(hidden)
     }
 
+    let hiddenFP32 = hidden.asType(.float32)
+    let weightFP32 = lmHead.weight.asType(.float32)
     var logits = matmul(hiddenFP32, weightFP32.transposed())
     if let bias = lmHead.bias {
         logits = logits + bias.asType(.float32)
@@ -485,7 +475,7 @@ public class Hy3Model: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
         if let lmHead {
-            return hy3LMHeadFP32(out, lmHead)
+            return hy3LMHead(out, lmHead)
         }
         return model.embedTokens.asLinear(out)
     }
