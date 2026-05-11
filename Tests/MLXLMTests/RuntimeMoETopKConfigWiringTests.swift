@@ -14,6 +14,7 @@ final class RuntimeMoETopKConfigWiringTests: XCTestCase {
             ("Libraries/MLXLLM/Models/Qwen3MoE.swift", "self.numExpertsPerToken = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Qwen35.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Qwen35JANGTQ.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
+            ("Libraries/MLXLLM/Models/Laguna.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Gemma4Text.swift", "topKExperts = RuntimeMoETopKOverride.effectiveTopK"),
         ]
 
@@ -55,6 +56,16 @@ final class RuntimeMoETopKConfigWiringTests: XCTestCase {
         XCTAssertTrue(
             source.contains("miniMaxJANGTQRouterCompileEnabled(environment:"),
             "Router compile env parsing must stay in a testable helper")
+    }
+
+    func testLagunaRouterUsesCompiledHelperAndStreamingReductionParity() throws {
+        let source = try readRepositoryFile("Libraries/MLXLLM/Models/Laguna.swift")
+        XCTAssertTrue(source.contains("private func lagunaRouter("))
+        XCTAssertTrue(source.contains("VMLX_LAGUNA_ROUTER_COMPILE"))
+        XCTAssertTrue(source.contains("VMLINUX_LAGUNA_ROUTER_COMPILE"))
+        XCTAssertTrue(source.contains("let routed = lagunaRouter(numExperts: cfg.numExperts, k: topK)"))
+        XCTAssertTrue(source.contains("if let streaming = switchLayer as? StreamingTurboQuantSwitchGLU"))
+        XCTAssertTrue(source.contains("streaming.reduced(x, indices: topkIdx, scores: topkW)"))
     }
 
     private func readRepositoryFile(_ relativePath: String) throws -> String {

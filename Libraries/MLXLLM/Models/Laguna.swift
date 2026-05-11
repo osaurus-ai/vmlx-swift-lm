@@ -34,6 +34,56 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Compiled router fast path
+
+private struct LagunaRouterKey: Hashable {
+    let numExperts: Int
+    let k: Int
+}
+
+private nonisolated(unsafe) var lagunaRouterCache:
+    [LagunaRouterKey: ([MLXArray]) -> [MLXArray]] = [:]
+private let lagunaRouterLock = NSLock()
+
+private func lagunaRouterCompileEnabled(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+) -> Bool {
+    let raw = environment["VMLX_LAGUNA_ROUTER_COMPILE"]
+        ?? environment["VMLINUX_LAGUNA_ROUTER_COMPILE"]
+    switch raw?.lowercased() {
+    case "0", "false", "off", "no":
+        return false
+    default:
+        return true
+    }
+}
+
+private func lagunaRouter(numExperts: Int, k: Int) -> ([MLXArray]) -> [MLXArray] {
+    let key = LagunaRouterKey(numExperts: numExperts, k: k)
+    lagunaRouterLock.lock()
+    defer { lagunaRouterLock.unlock() }
+    if let cached = lagunaRouterCache[key] { return cached }
+
+    let body: ([MLXArray]) -> [MLXArray] = { args in
+        let logits = args[0]
+        let bias = args[1]
+        let scores = sigmoid(logits)
+        let scoresForSelection = scores + bias
+        let indices = argPartition(
+            -scoresForSelection, kth: k - 1, axis: -1
+        )[.ellipsis, ..<k]
+        var weights = MLX.takeAlong(scores, indices, axis: -1)
+        weights = weights / (weights.sum(axis: -1, keepDims: true) + MLXArray(1e-20, dtype: weights.dtype))
+        return [indices, weights]
+    }
+
+    let router = (HardwareInfo.isCompiledDecodeSupported && lagunaRouterCompileEnabled())
+        ? compile(shapeless: false, body)
+        : body
+    lagunaRouterCache[key] = router
+    return router
+}
+
 // MARK: - Permissive value enum for mixed-shape rope_parameters decode
 
 internal enum StringOrNumberOrDict: Codable {
@@ -153,7 +203,10 @@ public struct LagunaConfiguration: Codable, Sendable {
         self.tieWordEmbeddings =
             try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         self.numExperts = try c.decodeIfPresent(Int.self, forKey: .numExperts) ?? 256
-        self.numExpertsPerTok = try c.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 8
+        self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: try c.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 8,
+            modelType: modelType,
+            field: CodingKeys.numExpertsPerTok.rawValue)
         self.moeIntermediateSize =
             try c.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 512
         self.sharedExpertIntermediateSize =
@@ -510,24 +563,18 @@ internal final class LagunaMoE: Module, UnaryLayer {
         // (Python comment quotes std growth 0.29 → 11 across 30 layers,
         // max=616 → garbage saturation). The previous Swift impl folded
         // the bias into the sigmoid input, reproducing exactly that bug.
-        let logits = gate(x).asType(.float32)
-        let scores = sigmoid(logits)                                  // un-biased
-        let scoresForSelection = scores + eScoreCorrectionBias.asType(.float32)
-
         let topK = cfg.numExpertsPerTok
-        // 2026-05-01: argPartition (O(n)) instead of argSort
-        // (O(n log n)). For Laguna's 256 experts top-8 this is the
-        // canonical Python ref pattern (see comment block at line 454,
-        // and matches MiniMaxJANGTQ:127 / DeepseekV3:290 / Qwen35JANGTQ:72).
-        // The order of returned indices is unspecified — irrelevant
-        // here because TurboQuantSwitchGLU sums over the K dim regardless.
-        let topkIdx = argPartition(
-            -scoresForSelection, kth: topK - 1, axis: -1
-        )[.ellipsis, ..<topK]                                          // (B, T, K)
+        // 2026-05-10: keep the same unbiased-score routing semantics, but
+        // fuse sigmoid → bias → argPartition → gather → normalize through
+        // the Laguna router helper. This mirrors the Qwen35 JANGTQ compiled
+        // router and removes repeated per-layer dispatch overhead.
+        let routed = lagunaRouter(numExperts: cfg.numExperts, k: topK)([
+            gate(x).asType(.float32),
+            eScoreCorrectionBias.asType(.float32),
+        ])
+        let topkIdx = routed[0]                                       // (B, T, K)
         JangPressCanonicalExpertAdvisor.shared.observe(layer: layerIndex, indices: topkIdx)
-        var topkW = MLX.takeAlong(scores, topkIdx, axis: -1)          // (B, T, K) — un-biased!
-        let normSum = topkW.sum(axis: -1, keepDims: true) + 1e-20
-        topkW = topkW / normSum
+        let topkW = routed[1]                                         // (B, T, K) — un-biased!
 
         // SwitchGLU dispatch: returns (B, T, K, H). `experts` is
         // type-erased — TurboQuantSwitchGLU (mxtq) and SwitchGLU
@@ -539,6 +586,10 @@ internal final class LagunaMoE: Module, UnaryLayer {
                 + "(got \(type(of: experts))). Bundle weight_format may be "
                 + "unsupported — only mxtq (codebook) and mxfp4 (affine) "
                 + "are wired today.")
+        }
+        if let streaming = switchLayer as? StreamingTurboQuantSwitchGLU {
+            let y = streaming.reduced(x, indices: topkIdx, scores: topkW)
+            return (y * cfg.moeRoutedScalingFactor + sharedExpert(x)).asType(x.dtype)
         }
         let yK = switchLayer(x, topkIdx)
         // Weight by router scores and sum over the K dim → (B, T, H).
