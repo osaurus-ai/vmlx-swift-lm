@@ -79,6 +79,15 @@ struct BatchSlot {
     /// Number of tokens generated so far (decode phase only).
     var generatedTokenCount: Int = 0
 
+    /// Token IDs emitted to the caller for this request.
+    ///
+    /// CacheCoordinator stores a prompt-boundary entry after prefill, but a
+    /// multi-turn chat's next prompt starts with the previous prompt plus the
+    /// assistant answer. Recording visible generated tokens lets finishSlot
+    /// persist that post-answer boundary too, so growing-chat turns can reuse
+    /// the previous conversation prefix instead of missing every turn.
+    var generatedTokenIds: [Int] = []
+
     /// Number of prompt tokens (for completion info).
     let promptTokenCount: Int
 
@@ -158,6 +167,8 @@ extension BatchSlot {
         self.originalInput = request.input
         self.pendingTokens = request.input.text.tokens
         self.nextToken = nil
+        self.generatedTokenCount = 0
+        self.generatedTokenIds = []
         self.promptTokenCount = request.input.text.tokens.size
         self.prefillStartTime = Date()
         self.prefillStepSize = request.parameters.prefillStepSize

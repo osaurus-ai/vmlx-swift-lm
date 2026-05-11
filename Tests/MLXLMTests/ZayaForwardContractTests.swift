@@ -27,7 +27,7 @@ final class ZayaForwardContractTests: XCTestCase {
 
         let concrete = ZayaModel(configuration, moe: nil)
         let erased: any LanguageModel = concrete
-        let input = MLXArray([[Int32(1), Int32(2)]])
+        let input = MLXArray([Int32(1), Int32(2)]).reshaped(1, 2)
 
         let logits = erased(input, cache: [])
         eval(logits)

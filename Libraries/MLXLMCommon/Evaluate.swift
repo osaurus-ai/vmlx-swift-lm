@@ -671,6 +671,16 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
+    mutating func storeCacheAfterGeneration(
+        generatedTokenIds: [Int],
+        includeGeneratedBoundary: Bool)
+}
+
+extension TokenIteratorProtocol {
+    mutating func storeCacheAfterGeneration(
+        generatedTokenIds: [Int],
+        includeGeneratedBoundary: Bool
+    ) {}
 }
 
 /// Generator of tokens.
@@ -730,6 +740,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Prompt token IDs captured at init for cache store after generation.
     let promptTokenIds: [Int]
 
+    /// Clean cache state captured immediately after prefill and before any
+    /// generated token is fed back into the model.
+    var promptCacheSnapshot: [KVCache]?
+
     /// Stable fingerprint of any request-scope or media content in the input.
     /// `nil` for ordinary text-only inputs. Mixed into cache-coordinator keys
     /// so reasoning-mode and VLM multi-turn conversations can cache-hit without
@@ -784,6 +798,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
@@ -794,6 +809,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     requested: parameters.prefillStepSize,
                     input: promptInput))
         }
+        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -837,6 +853,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         } else {
             self.promptTokenIds = []
         }
+        self.promptCacheSnapshot = nil
 
         // Compute a stable fingerprint of any request-scope or media content
         // once at init, so both the pre-prepare fetch below and the
@@ -920,20 +937,19 @@ public struct TokenIterator: TokenIteratorProtocol {
 
                 if restored {
                     let hasMediaContent = input.hasMediaContent
-                    let hasSSMLayer = self.cache.contains { layer in
-                        layer is MambaCache || layer is ArraysCache
+                    let hasPathDependentLayer = self.cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
-                    let unsafePartial = !remainingTokens.isEmpty &&
-                        (hasMediaContent || hasSSMLayer)
-                    let unsafeFullHit = remainingTokens.isEmpty && hasSSMLayer
+                    let unsafePartial = !remainingTokens.isEmpty && hasMediaContent
+                    let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer
                     if unsafePartial || unsafeFullHit {
                         let why: String
                         if hasMediaContent {
                             why = "media token region can't be split"
                         } else if unsafeFullHit {
-                            why = "hybrid SSM full cache hit would double-count SSM state"
+                            why = "path-dependent full cache hit: re-feeding last token would double-count recurrent state"
                         } else {
-                            why = "hybrid SSM recurrence path-dependent on full prefix"
+                            why = "cache hit can't be extended safely"
                         }
                         Self.logger.info(
                             "TokenIterator: cache hit rolling back to full prefill (\(why))"
@@ -1048,6 +1064,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     requested: parameters.prefillStepSize,
                     input: inputForPrepare))
         }
+        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
 
         if parameters.enableCompiledDecode && !Self.compiledDecodeDenied(for: model) {
             try setupCompiledDecode(
@@ -1086,6 +1103,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         self.cacheCoordinator = nil
         self.promptTokenIds = []
+        self.promptCacheSnapshot = nil
         self.mediaSalt = nil
 
         self.promptPrefillTime = try measure {
@@ -1095,6 +1113,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     requested: prefillStepSize,
                     input: input))
         }
+        self.promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: self.cache)
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
@@ -1249,6 +1268,56 @@ public struct TokenIterator: TokenIteratorProtocol {
         }
 
         return previousY.tokens.item(Int.self)
+    }
+
+    mutating func storeCacheAfterGeneration(
+        generatedTokenIds: [Int],
+        includeGeneratedBoundary: Bool
+    ) {
+        guard let coordinator = cacheCoordinator, !promptTokenIds.isEmpty else {
+            return
+        }
+
+        func store(tokens: [Int], cache cacheToStore: [KVCache]) {
+            guard !tokens.isEmpty else { return }
+            let snapshot = cacheToStore.map { $0.copy() }
+            MLX.eval(snapshot)
+            let perLayerData = extractLayerData(from: snapshot)
+            let requiresDiskBackedRestore =
+                cacheRequiresDiskBackedCoordinatorRestore(snapshot)
+            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
+                coordinator.config.enableSSMReDerive &&
+                !requiresDiskBackedRestore
+                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
+                    coordinator: coordinator,
+                    model: model,
+                    promptTokenIds: tokens,
+                    mediaSalt: mediaSalt)
+                : (coordinator.isHybrid ? extractSSMStates(from: snapshot) : nil)
+            let diskStoreCache = makeDiskStoreCache(
+                fromPromptBoundary: snapshot,
+                kvBits: kvBits,
+                kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart,
+                kvMode: kvMode)
+            coordinator.storeAfterGeneration(
+                promptTokens: tokens,
+                perLayerData: perLayerData,
+                ssmStates: ssmCapture,
+                cache: diskStoreCache,
+                mediaSalt: mediaSalt
+            )
+        }
+
+        if let promptCacheSnapshot {
+            store(tokens: promptTokenIds, cache: promptCacheSnapshot)
+        }
+
+        guard includeGeneratedBoundary, !generatedTokenIds.isEmpty else { return }
+        let generatedBoundaryTokens = promptTokenIds + generatedTokenIds
+        guard (cache.map(\.offset).max() ?? 0) >= generatedBoundaryTokens.count
+        else { return }
+        store(tokens: generatedBoundaryTokens, cache: cache)
     }
 }
 
@@ -2097,56 +2166,6 @@ public func generateTask(
         ?? _decodePromptTail(
             tokenIds: iterator.promptTokenIds, tokenizer: tokenizer, tokens: 64)
 
-    // Capture cache coordinator state and extract KV data before consuming the iterator.
-    //
-    // SLIDING-1 (2026-04-15): the legacy `!hasRotatingCache` early-out
-    // is gone now that `TQDiskSerializer` v2 handles ring-buffer state
-    // round-trip via the `.rotating` `LayerKind`. Sliding-window models
-    // get full L2 disk persistence on the same code path as standard KV.
-    let cacheStoreAction: (@Sendable () -> Void)? = {
-        guard let coordinator = iterator.cacheCoordinator,
-              !iterator.promptTokenIds.isEmpty else { return nil }
-        let promptTokenIds = iterator.promptTokenIds
-        let capturedMediaSalt = iterator.mediaSalt
-        let promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: iterator.cache)
-        let model = iterator.model
-        let perLayerData = extractLayerData(from: promptCacheSnapshot)
-        let kvBits = iterator.kvBits
-        let kvGroupSize = iterator.kvGroupSize
-        let quantizedKVStart = iterator.quantizedKVStart
-        let kvMode = iterator.kvMode
-        // MLXArray is not Sendable but is safe after eval; suppress the diagnostic.
-        nonisolated(unsafe) let layerCapture = perLayerData
-        nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
-        nonisolated(unsafe) let modelCapture = model
-        return {
-            let requiresDiskBackedRestore =
-                cacheRequiresDiskBackedCoordinatorRestore(promptCacheCapture)
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
-                coordinator.config.enableSSMReDerive &&
-                !requiresDiskBackedRestore
-                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
-                    coordinator: coordinator,
-                    model: modelCapture,
-                    promptTokenIds: promptTokenIds,
-                    mediaSalt: capturedMediaSalt)
-                : nil
-            let diskStoreCache = makeDiskStoreCache(
-                fromPromptBoundary: promptCacheCapture,
-                kvBits: kvBits,
-                kvGroupSize: kvGroupSize,
-                quantizedKVStart: quantizedKVStart,
-                kvMode: kvMode)
-            coordinator.storeAfterGeneration(
-                promptTokens: promptTokenIds,
-                perLayerData: layerCapture,
-                ssmStates: ssmCapture,
-                cache: diskStoreCache,
-                mediaSalt: capturedMediaSalt
-            )
-        }
-    }()
-
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
@@ -2160,8 +2179,7 @@ public func generateTask(
                 stampName: modelConfiguration.reasoningParserName,
                 promptTail: effectivePromptTail),
             stopStringMatcher: StopStringMatcher(stopStrings: extraStopStrings)
-        ),
-        cacheStoreAction: cacheStoreAction
+        )
     )
 }
 
@@ -2324,51 +2342,6 @@ public func generateTokenTask(
     includeStopToken: Bool = false,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<TokenGeneration>, Task<Void, Never>) {
-    // Capture cache coordinator state and extract KV data before consuming the iterator.
-    // SLIDING-1: rotating cache now persists to disk via the v2 schema.
-    let cacheStoreAction: (@Sendable () -> Void)? = {
-        guard let coordinator = iterator.cacheCoordinator,
-              !iterator.promptTokenIds.isEmpty else { return nil }
-        let promptTokenIds = iterator.promptTokenIds
-        let capturedMediaSalt = iterator.mediaSalt
-        let promptCacheSnapshot = makePromptBoundaryCacheSnapshot(from: iterator.cache)
-        let model = iterator.model
-        let perLayerData = extractLayerData(from: promptCacheSnapshot)
-        let kvBits = iterator.kvBits
-        let kvGroupSize = iterator.kvGroupSize
-        let quantizedKVStart = iterator.quantizedKVStart
-        let kvMode = iterator.kvMode
-        nonisolated(unsafe) let layerCapture = perLayerData
-        nonisolated(unsafe) let promptCacheCapture = promptCacheSnapshot
-        nonisolated(unsafe) let modelCapture = model
-        return {
-            let requiresDiskBackedRestore =
-                cacheRequiresDiskBackedCoordinatorRestore(promptCacheCapture)
-            let ssmCapture: [MLXArray]? = coordinator.isHybrid &&
-                coordinator.config.enableSSMReDerive &&
-                !requiresDiskBackedRestore
-                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
-                    coordinator: coordinator,
-                    model: modelCapture,
-                    promptTokenIds: promptTokenIds,
-                    mediaSalt: capturedMediaSalt)
-                : nil
-            let diskStoreCache = makeDiskStoreCache(
-                fromPromptBoundary: promptCacheCapture,
-                kvBits: kvBits,
-                kvGroupSize: kvGroupSize,
-                quantizedKVStart: quantizedKVStart,
-                kvMode: kvMode)
-            coordinator.storeAfterGeneration(
-                promptTokens: promptTokenIds,
-                perLayerData: layerCapture,
-                ssmStates: ssmCapture,
-                cache: diskStoreCache,
-                mediaSalt: capturedMediaSalt
-            )
-        }
-    }()
-
     return generateLoopTask(
         promptTokenCount: promptTokenCount,
         modelConfiguration: modelConfiguration,
@@ -2376,8 +2349,7 @@ public func generateTokenTask(
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket,
         includeStopToken: includeStopToken,
-        handler: RawTokenLoopHandler(),
-        cacheStoreAction: cacheStoreAction
+        handler: RawTokenLoopHandler()
     )
 }
 
@@ -2388,8 +2360,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     includeStopToken: Bool = false,
-    handler: consuming Handler,
-    cacheStoreAction: (@Sendable () -> Void)? = nil
+    handler: consuming Handler
 ) -> (AsyncStream<Handler.Output>, Task<Void, Never>) {
 
     let (stream, continuation) = AsyncStream<Handler.Output>.makeStream()
@@ -2400,12 +2371,13 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
             var promptTime: TimeInterval = 0
             var tokenCount = 0
+            var generatedTokenIds: [Int] = []
             var stopReason: GenerateStopReason?
 
             let stopTokenIds = buildStopTokenIds(
@@ -2448,6 +2420,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                     stopReason = handler.stopSequenceHit ? .stop : .cancelled
                     break
                 }
+                generatedTokenIds.append(token)
             }
 
             if stopReason == nil {
@@ -2474,14 +2447,14 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             )
             _ = continuation.yield(handler.infoEvent(info))
 
-            // Multi-tier cache: store prompt state after completion info is
+            // Multi-tier cache: store cache state after completion info is
             // visible to stream consumers, but keep the store serialized on
             // this generation task. Detached SSM re-derive previously raced
             // Metal command encoders; yielding `.info` first removes the UI
             // end-of-stream wait without reintroducing concurrent model use.
-            if let cacheStoreAction = cacheStoreAction {
-                cacheStoreAction()
-            }
+            iterator.storeCacheAfterGeneration(
+                generatedTokenIds: generatedTokenIds,
+                includeGeneratedBoundary: stopReason == .stop && !handler.stopSequenceHit)
 
             // Synchronize with the stream to ensure tasks are completed
             Stream().synchronize()

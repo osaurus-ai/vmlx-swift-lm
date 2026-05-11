@@ -1,11 +1,11 @@
 // Copyright © 2026 Osaurus AI. All rights reserved.
 
-enum GenerationTextChannel {
+public enum GenerationTextChannel {
     case content
     case reasoning
 }
 
-func routeGenerationText(
+public func routeGenerationText(
     _ text: String,
     channel: GenerationTextChannel,
     through toolCallProcessor: ToolCallProcessor
@@ -23,14 +23,14 @@ func routeGenerationText(
     return events
 }
 
-func drainToolCallEvents(from toolCallProcessor: ToolCallProcessor) -> [Generation] {
+public func drainToolCallEvents(from toolCallProcessor: ToolCallProcessor) -> [Generation] {
     guard !toolCallProcessor.toolCalls.isEmpty else { return [] }
     let calls = toolCallProcessor.toolCalls
     toolCallProcessor.toolCalls.removeAll(keepingCapacity: true)
     return calls.map { .toolCall($0) }
 }
 
-func flushGenerationText(
+public func flushGenerationText(
     channel: GenerationTextChannel,
     through toolCallProcessor: ToolCallProcessor
 ) -> [Generation] {

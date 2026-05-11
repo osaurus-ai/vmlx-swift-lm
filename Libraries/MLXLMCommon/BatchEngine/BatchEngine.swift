@@ -1193,17 +1193,17 @@ public actor BatchEngine {
                     //    cache boundary can make the splice path crash or
                     //    attach the wrong media state.
                     //
-                    // 2. Hybrid SSM: the Mamba/SSM branch's recurrence is
-                    //    path-dependent. Restoring SSM state that was
-                    //    computed over the FULL prefix and then only feeding
-                    //    "remaining" tokens double-counts some positions
-                    //    and the resulting state diverges from what a clean
-                    //    prefill would produce — model output degrades.
-                    //    Detect by checking cache for MambaCache/ArraysCache
-                    //    layers.
+                    // 2. Exact full hits on hybrid SSM: the restored SSM
+                    //    state already includes the last token's recurrence
+                    //    contribution. The remaining.isEmpty path has to
+                    //    re-feed the last token to seed logits, which would
+                    //    double-count that recurrence. Partial disk hits are
+                    //    different: a complete state at boundary N plus
+                    //    prefill over [N...M] is the intended Markov resume
+                    //    path for MambaCache, ArraysCache, and ZayaCCACache.
                     let hasMediaContent = slot.originalInput.hasMediaContent
-                    let hasSSMLayer = slot.cache.contains { layer in
-                        layer is MambaCache || layer is ArraysCache
+                    let hasPathDependentLayer = slot.cache.contains { layer in
+                        layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
                     // Full disk hit on hybrid-SSM is ALSO unsafe: the
                     // restored SSM state already includes the last
@@ -1215,14 +1215,13 @@ public actor BatchEngine {
                     // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
                     // Same SSM-state path-dependence rationale as the
                     // remaining.nonEmpty case below.
-                    let unsafePartial = !remaining.isEmpty &&
-                        (hasMediaContent || hasSSMLayer)
-                    let unsafeFullHit = remaining.isEmpty && hasSSMLayer
+                    let unsafePartial = !remaining.isEmpty && hasMediaContent
+                    let unsafeFullHit = remaining.isEmpty && hasPathDependentLayer
                     if unsafePartial || unsafeFullHit {
                         let why: String
                         if hasMediaContent { why = "media token region can't be split" }
-                        else if unsafeFullHit { why = "hybrid SSM full disk hit — re-feeding last token would double-count SSM state" }
-                        else                { why = "hybrid SSM recurrence path-dependent on full prefix" }
+                        else if unsafeFullHit { why = "path-dependent full disk hit: re-feeding last token would double-count recurrent state" }
+                        else                { why = "path-dependent cache hit can't be extended safely" }
                         let slotIDStr = slot.id.description
                         Self.logger.info(
                             "Slot \(slotIDStr, privacy: .public): cache hit — rolling back to full prefill (\(why))"
@@ -1365,6 +1364,7 @@ public actor BatchEngine {
         } else {
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
+            slot.generatedTokenIds.append(tokenID)
             slot.nextToken = firstToken
 
             if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
@@ -1491,6 +1491,7 @@ public actor BatchEngine {
         } else {
             slot.continuation.yield(.token(tokenID))
             slot.generatedTokenCount += 1
+            slot.generatedTokenIds.append(tokenID)
             slot.nextToken = token
 
             if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
@@ -1864,6 +1865,7 @@ public actor BatchEngine {
             } else {
                 slot.continuation.yield(.token(tokenID))
                 slot.generatedTokenCount += 1
+                slot.generatedTokenIds.append(tokenID)
                 slot.nextToken = token
 
                 if let maxTokens = slot.maxTokens, slot.generatedTokenCount >= maxTokens {
@@ -1881,7 +1883,8 @@ public actor BatchEngine {
     /// Finish a slot by yielding completion info and closing its stream.
     ///
     /// When a cache coordinator is present and the slot completed normally
-    /// (not cancelled), stores the prompt tokens for future cache reuse.
+    /// (not cancelled), stores prompt and safe post-answer boundaries for
+    /// future cache reuse.
     private func finishSlot(_ slot: BatchSlot, reason: GenerateStopReason) {
         let now = Date()
         let prefillTime = (slot.decodeStartTime ?? now).timeIntervalSince(slot.prefillStartTime)
@@ -1901,7 +1904,7 @@ public actor BatchEngine {
         // paths raced Metal command encoders on shared model state.
         slot.continuation.yield(.info(completionInfo))
 
-        // Store prompt cache state for completed (non-cancelled) generations.
+        // Store cache state for completed (non-cancelled) generations.
         //
         // SLIDING-1 (2026-04-15): the legacy `!hasRotatingCache` guard
         // was removed once the v2 `TQDiskSerializer` learned to round-trip
@@ -1920,32 +1923,70 @@ public actor BatchEngine {
                 slot.continuation.finish()
                 return
             }
-            let perLayerData = extractLayerData(from: promptCacheSnapshot)
-            let requiresDiskBackedRestore =
-                cacheRequiresDiskBackedCoordinatorRestore(promptCacheSnapshot)
-            let ssmStates: [MLXArray]? = coordinator.isHybrid &&
-                coordinator.config.enableSSMReDerive &&
-                !requiresDiskBackedRestore
-                ? reDeriveAndStoreSSMStatesForPromptBoundaries(
-                    coordinator: coordinator,
-                    model: context.model,
-                    promptTokenIds: promptTokens,
-                    mediaSalt: slot.mediaSalt,
-                    prefillStepSize: slot.parameters.prefillStepSize)
-                : nil
-            let diskStoreCache = makeDiskStoreCache(
-                fromPromptBoundary: promptCacheSnapshot,
-                parameters: slot.parameters)
-            coordinator.storeAfterGeneration(
-                promptTokens: promptTokens,
-                perLayerData: perLayerData,
-                ssmStates: ssmStates,
-                cache: diskStoreCache,
-                mediaSalt: slot.mediaSalt
-            )
-            Self.logger.debug(
-                "Stored cache entry for slot \(slot.id): \(promptTokens.count) prompt tokens"
-            )
+
+            func cacheCovers(_ tokenCount: Int, cache: [KVCache]) -> Bool {
+                cache.map(\.offset).max() ?? 0 >= tokenCount
+            }
+
+            func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
+                guard !tokens.isEmpty else { return }
+                let perLayerData = extractLayerData(from: snapshot)
+                let requiresDiskBackedRestore =
+                    cacheRequiresDiskBackedCoordinatorRestore(snapshot)
+                let ssmStates: [MLXArray]? = {
+                    guard coordinator.isHybrid else { return nil }
+                    if coordinator.config.enableSSMReDerive &&
+                        !requiresDiskBackedRestore
+                    {
+                        return reDeriveAndStoreSSMStatesForPromptBoundaries(
+                            coordinator: coordinator,
+                            model: context.model,
+                            promptTokenIds: tokens,
+                            mediaSalt: slot.mediaSalt,
+                            prefillStepSize: slot.parameters.prefillStepSize)
+                    }
+                    return extractSSMStates(from: snapshot)
+                }()
+                let diskStoreCache = makeDiskStoreCache(
+                    fromPromptBoundary: snapshot,
+                    parameters: slot.parameters)
+                coordinator.storeAfterGeneration(
+                    promptTokens: tokens,
+                    perLayerData: perLayerData,
+                    ssmStates: ssmStates,
+                    cache: diskStoreCache,
+                    mediaSalt: slot.mediaSalt
+                )
+                Self.logger.debug(
+                    "Stored \(label, privacy: .public) cache entry for slot \(slot.id.description, privacy: .public): \(tokens.count) tokens"
+                )
+            }
+
+            storeCacheEntry(
+                tokens: promptTokens,
+                snapshot: promptCacheSnapshot,
+                label: "prompt-boundary")
+
+            // A normal EOS stop means the last visible assistant token has
+            // already been fed back into the cache before EOS was sampled.
+            // Length/cancel stops can end immediately after sampling a token,
+            // so the live cache may be one token behind the visible text.
+            // Store the growing-chat boundary only when the cache offset proves
+            // it covers prompt + generated tokens exactly enough to resume.
+            let generatedBoundaryTokens = promptTokens + slot.generatedTokenIds
+            if reason == .stop,
+               !slot.generatedTokenIds.isEmpty,
+               cacheCovers(generatedBoundaryTokens.count, cache: slot.cache)
+            {
+                storeCacheEntry(
+                    tokens: generatedBoundaryTokens,
+                    snapshot: slot.cache,
+                    label: "post-answer")
+            } else if !slot.generatedTokenIds.isEmpty {
+                Self.logger.debug(
+                    "Skipped post-answer cache entry for slot \(slot.id.description, privacy: .public): reason=\(String(describing: reason), privacy: .public) generated=\(slot.generatedTokenIds.count) cacheOffset=\((slot.cache.map(\.offset).max() ?? 0), privacy: .public)"
+                )
+            }
         }
 
         slot.continuation.finish()
