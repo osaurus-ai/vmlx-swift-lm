@@ -50,4 +50,24 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("MLX.eval(self.cache)"))
         #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
     }
+
+    @Test("MiniMax open-thinking prompts get decode-time close-token correction")
+    func minimaxOpenThinkingGetsReasoningCloseBias() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(evaluate.contains("public struct ReasoningCloseBiasConfig"))
+        #expect(evaluate.contains("public struct ReasoningCloseBiasProcessor"))
+        #expect(evaluate.contains("forceAfterTokens"))
+        #expect(evaluate.contains("token.item(Int.self) == config.tokenID"))
+        #expect(engine.contains("parametersWithAutomaticReasoningCloseBias"))
+        #expect(evaluate.contains("name.contains(\"minimax\") || modelTypeName.contains(\"minimax\")"))
+        #expect(evaluate.contains("promptTail.range(of: \"<think>\", options: .backwards)"))
+        #expect(evaluate.contains("promptTail.range(of: \"</think>\", options: .backwards)"))
+        #expect(evaluate.contains("tokenizer.convertTokenToId(\"</think>\")"))
+    }
 }

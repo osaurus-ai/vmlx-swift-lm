@@ -359,9 +359,17 @@ public actor BatchEngine {
         }
 
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
+        let promptTail = _decodePromptTail(
+            input: input, tokenizer: context.tokenizer, tokens: 64)
+        let effectiveParameters = _parametersWithAutomaticReasoningCloseBias(
+            parameters,
+            promptTail: promptTail,
+            modelConfiguration: context.configuration,
+            model: context.model,
+            tokenizer: context.tokenizer)
         let request = BatchPendingRequest(
             input: input,
-            parameters: parameters,
+            parameters: effectiveParameters,
             continuation: continuation
         )
         waitQueue.append(request)
@@ -454,16 +462,22 @@ public actor BatchEngine {
         // we have the tokenizer on hand.
         let promptTail = _decodePromptTail(
             input: input, tokenizer: tokenizer, tokens: 64)
+        let effectiveParameters = _parametersWithAutomaticReasoningCloseBias(
+            parameters,
+            promptTail: promptTail,
+            modelConfiguration: context.configuration,
+            model: context.model,
+            tokenizer: context.tokenizer)
 
         if canStartSoloFastPath {
             return startSoloFastPath(
                 input: input,
-                parameters: parameters,
+                parameters: effectiveParameters,
                 promptTail: promptTail)
         }
 
         let promptTokenCount = input.text.tokens.size
-        let (requestId, tokenStream) = submit(input: input, parameters: parameters)
+        let (requestId, tokenStream) = submit(input: input, parameters: effectiveParameters)
 
         // Mirror the canonical `Evaluate.generateLoopTask` pattern: pair
         // `AsyncStream.makeStream()` with an unstructured `Task {}` that
