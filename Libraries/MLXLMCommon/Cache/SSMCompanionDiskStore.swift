@@ -92,9 +92,10 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         defer { lock.unlock() }
 
         // Pre-realize on calling thread — same rationale as
-        // DiskCache.swift:114-116. GPU work must complete before the
+        // DiskCache.swift:148-157. GPU work must complete before the
         // safetensors writer can read the storage. MLX's tensor
         // realization (NOT script eval — this is `mlx.core.eval`).
+        Stream.gpu.synchronize()
         MLX.eval(ssmStates)
         Stream.gpu.synchronize()
 

@@ -148,11 +148,13 @@ public final class DiskCache: @unchecked Sendable {
         // Pre-realize arrays under the lock so Metal work completes
         // before the writer hits the C++ save path AND no other thread
         // can interleave MLX ops on the same device during this window.
-        // The explicit stream sync is required for post-generation cache
-        // stores: the decode loop uses asyncEval, and MLX's safetensors
-        // writer calls back into gpu::eval. Entering that path while the
-        // default GPU stream still has a committed command buffer can trip
-        // Metal's `_status < MTLCommandBufferStatusCommitted` assertion.
+        // The explicit stream syncs are required for post-generation cache
+        // stores: the decode loop uses asyncEval, and MLX's eval/safetensors
+        // paths add command-buffer completion handlers. Entering those paths
+        // while the default GPU stream still has a committed command buffer
+        // can trip Metal's `_status < MTLCommandBufferStatusCommitted`
+        // assertion. Sync before materializing, then again before/after save.
+        Stream.gpu.synchronize()
         MLX.eval(Array(arrays.values))
         Stream.gpu.synchronize()
         do {
