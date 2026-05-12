@@ -24,9 +24,11 @@
 //   key = SHA-256( modelKey + ":" + tokens[..<boundary].joined(",") )
 //
 // Concurrency: store/fetch/clear are serialized with an
-// `OSAllocatedUnfairLock`. MLX tensor realization and safetensors IO should
-// not overlap on this store, and the metadata sidecar must stay paired with
-// the tensor file.
+// `OSAllocatedUnfairLock`, and MLX safetensors IO also takes
+// `MLXDiskCacheIOLock.shared` so companion-state reads/writes cannot overlap
+// KV-cache safetensors reads/writes from another resident model. MLX tensor
+// realization and safetensors IO should not overlap, and the metadata sidecar
+// must stay paired with the tensor file.
 //
 // Wired by `CacheCoordinator` when `CacheCoordinatorConfig.enableDiskCache`
 // is true. `SSMStateCache.store` write-throughs here and `fetchEntry`
@@ -84,6 +86,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
             tokens: tokens, boundary: boundary,
             mediaSalt: mediaSalt, modelKey: modelKey)
 
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
 
@@ -141,6 +145,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         let safetensorsURL = self.safetensorsURL(for: key)
         let sidecarURL = self.sidecarURL(for: key)
 
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
 
@@ -181,6 +187,8 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
     /// unload so subsequent loads don't see stale state. No-op if the
     /// directory is empty.
     public func clear() {
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
 

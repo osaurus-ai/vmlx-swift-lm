@@ -6,6 +6,21 @@ import MLX
 import SQLite3
 import os
 
+/// Process-wide guard for MLX safetensors disk-cache IO.
+///
+/// Each model owns its own ``DiskCache`` instance, so an instance-local lock
+/// cannot prevent this crash class:
+///
+/// - model A finishes generation and calls `save_safetensors`
+/// - model B starts a following request and calls `loadArraysAndMetadata`
+///
+/// Both paths can submit/evaluate Metal work while touching safetensors-backed
+/// arrays. Keep them globally serialized until MLX's safetensors IO is proven
+/// safe for cross-thread, cross-model overlap.
+enum MLXDiskCacheIOLock {
+    static let shared = OSAllocatedUnfairLock()
+}
+
 /// L2 SSD cache with SQLite index and safetensors file storage.
 ///
 /// `DiskCache` provides persistent KV cache storage on disk using safetensors
@@ -105,6 +120,12 @@ public final class DiskCache: @unchecked Sendable {
         // even when each individual `save()` is held by a lock. So the
         // lock has to cover the realize step too.
         //
+        // Iter 174: make that serialization process-wide. Osaurus can keep
+        // multiple models resident, therefore multiple CacheCoordinator /
+        // DiskCache instances can overlap. A MiniMax post-answer save raced a
+        // ZAYA restore in the next request and crashed in MLX safetensors IO.
+        // Instance locks are not enough for that topology.
+        //
         // BatchEngine's actor serializes per-engine, but the coordinator
         // is reachable from non-actor callers (TokenIterator path,
         // external cache warmers), so thread-safety has to live here,
@@ -119,6 +140,8 @@ public final class DiskCache: @unchecked Sendable {
         // `@Sendable` closures under Swift 6 strict concurrency. The
         // unfair-lock primitive doesn't require Sendable — we just need
         // `defer { unlock() }` to cover every exit path.
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
         lock.lock()
         defer { lock.unlock() }
         stores += 1
@@ -159,17 +182,22 @@ public final class DiskCache: @unchecked Sendable {
         let hash = DiskCache.hashTokens(tokens, modelKey: modelKey, mediaSalt: mediaSalt)
         let url = safetensorsURL(for: hash)
 
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
+
         guard FileManager.default.fileExists(atPath: url.path) else {
-            lock.withLock { misses += 1 }
+            misses += 1
             return nil
         }
 
         do {
             let (arrays, _) = try loadArraysAndMetadata(url: url)
-            lock.withLock { hits += 1 }
+            hits += 1
             return arrays
         } catch {
-            lock.withLock { misses += 1 }
+            misses += 1
             // A failed deserialize is almost always a corrupt safetensors
             // file — a 0-byte leftover from the pre-synchronous-store
             // bug, a partial write from an earlier crash, disk full
@@ -195,6 +223,8 @@ public final class DiskCache: @unchecked Sendable {
     /// prefix hits without walking every possible token count.
     public func candidateTokenCounts(maxTokens: Int, limit: Int = 128) -> [Int] {
         guard let db, maxTokens > 0, limit > 0 else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
 
         var counts: [Int] = []
         let sql = """
@@ -219,7 +249,13 @@ public final class DiskCache: @unchecked Sendable {
 
     /// Remove all cached entries and safetensors files.
     public func clear() {
+        MLXDiskCacheIOLock.shared.lock()
+        defer { MLXDiskCacheIOLock.shared.unlock() }
+
         // Delete all SQLite entries
+        lock.lock()
+        defer { lock.unlock() }
+
         executeSQL("DELETE FROM cache_entries")
 
         // Remove all .safetensors files in the cache directory
@@ -236,11 +272,9 @@ public final class DiskCache: @unchecked Sendable {
         }
 
         // Reset stats
-        lock.withLock {
-            hits = 0
-            misses = 0
-            stores = 0
-        }
+        hits = 0
+        misses = 0
+        stores = 0
     }
 
     // MARK: - Hashing
