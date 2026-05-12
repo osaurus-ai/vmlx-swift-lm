@@ -493,6 +493,11 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     private let config: NemotronHOmniProcessorConfiguration
     private let tokenizer: any Tokenizer
 
+    private struct PreparedAudioClip {
+        let waveform: [Float]
+        let preEncodedEmbedding: MLXArray?
+    }
+
     public init(_ config: NemotronHOmniProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
@@ -512,29 +517,44 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     /// Decode + resample audio resources into 16 kHz mono Float32 PCM
     /// (Parakeet's required input rate per `config_omni.json`).
     public func preprocess(audios: [UserInput.Audio]) throws -> [[Float]] {
-        var out: [[Float]] = []
+        try preprocessAudioClips(audios: audios).map(\.waveform)
+    }
+
+    /// Decode + resample audio resources while preserving caller-supplied
+    /// Parakeet/sound-projection embeddings for low-latency live voice turns.
+    private func preprocessAudioClips(audios: [UserInput.Audio]) throws -> [PreparedAudioClip] {
+        var clips: [PreparedAudioClip] = []
         for a in audios {
             switch a {
             case .url(let url):
-                out.append(
-                    try nemotronOmniLoadAudioFile(
-                        url, targetSampleRate: 16_000))
+                clips.append(PreparedAudioClip(
+                    waveform: try nemotronOmniLoadAudioFile(
+                        url, targetSampleRate: 16_000),
+                    preEncodedEmbedding: nil))
             case .samples(let pcm, let sr):
                 if sr == 16_000 {
-                    out.append(pcm)
+                    clips.append(PreparedAudioClip(waveform: pcm, preEncodedEmbedding: nil))
                 } else {
-                    out.append(
-                        linearResamplePCM(pcm, fromRate: sr, toRate: 16_000))
+                    clips.append(PreparedAudioClip(
+                        waveform: linearResamplePCM(pcm, fromRate: sr, toRate: 16_000),
+                        preEncodedEmbedding: nil))
                 }
             case .array(let arr, let sr):
                 let pcm = arr.reshaped([-1]).asType(.float32).asArray(Float.self)
-                out.append(
-                    sr == 16_000
+                clips.append(PreparedAudioClip(
+                    waveform: sr == 16_000
                         ? pcm
-                        : linearResamplePCM(pcm, fromRate: sr, toRate: 16_000))
+                        : linearResamplePCM(pcm, fromRate: sr, toRate: 16_000),
+                    preEncodedEmbedding: nil))
+            case .preEncoded(let pcm, let sr, let embedding):
+                clips.append(PreparedAudioClip(
+                    waveform: sr == 16_000
+                        ? pcm
+                        : linearResamplePCM(pcm, fromRate: sr, toRate: 16_000),
+                    preEncodedEmbedding: embedding))
             }
         }
-        return out
+        return clips
     }
 
     /// Decode video resources to the (groups, T*3, 512, 512) channel-stack
@@ -619,35 +639,37 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             // Mirrors Python jang_tools.nemotron_omni: audio embeds
             // are flat (frames, hidden) per turn; the model doesn't
             // care about per-clip boundaries beyond positional order.
-            let waveforms = try preprocess(audios: input.audios)
-            let combined = waveforms.flatMap { $0 }
-            // Pre-encode here so repeated turns over the same audio
-            // don't re-run mel STFT + Parakeet. The result rides on
-            // ProcessedAudio.preEncodedEmbedding — `prepare(_:)` on
-            // the model side picks it up directly.
-            // We need the model instance for this; the processor
-            // doesn't have one. Instead, we ship the raw waveform
-            // and let `NemotronHOmni.prepare` invoke the encoder.
-            // (Pre-encoding here would require coupling processor to
-            // model, which UserInputProcessor's contract avoids.)
+            let clips = try preprocessAudioClips(audios: input.audios)
+            let combined = clips.flatMap(\.waveform)
+            let encodedEmbeddings = clips.compactMap(\.preEncodedEmbedding)
+            let combinedPreEncodedEmbedding: MLXArray? =
+                encodedEmbeddings.count == clips.count && !encodedEmbeddings.isEmpty
+                ? (encodedEmbeddings.count == 1
+                    ? encodedEmbeddings[0]
+                    : MLX.concatenated(encodedEmbeddings, axis: 0))
+                : nil
             let waveArray = MLXArray(combined).reshaped([1, combined.count])
             processedAudio = LMInput.ProcessedAudio(
                 waveform: waveArray,
                 sampleRate: 16_000,
-                preEncodedEmbedding: nil)
-            // Audio token count = expected Parakeet output frames.
-            // Mel STFT: nFrames ≈ 1 + (samples + 2*pad - nFFT)/hop
-            // with pad=nFFT/2=256, nFFT=512, hop=160. Parakeet
-            // subsamples by 8 → audio_tokens ≈ nFrames / 8.
-            let nFFT = 512, hop = 160, pad = nFFT / 2
-            let melFrames = max(0, 1 + (combined.count + 2 * pad - nFFT) / hop)
-            // Subsampling factor 8 with stride-2 conv stack (3 levels).
-            // Each level: ceil(T_in / 2). For melFrames=101 → 51 → 26
-            // → 13. Compute exactly the same way to avoid placeholder
-            // count drift between processor and encoder.
-            var t = melFrames
-            for _ in 0 ..< 3 { t = (t + 1) / 2 }
-            totalAudioTokens = t
+                preEncodedEmbedding: combinedPreEncodedEmbedding)
+            if let combinedPreEncodedEmbedding {
+                totalAudioTokens = max(1, combinedPreEncodedEmbedding.dim(0))
+            } else {
+                // Audio token count = expected Parakeet output frames.
+                // Mel STFT: nFrames ≈ 1 + (samples + 2*pad - nFFT)/hop
+                // with pad=nFFT/2=256, nFFT=512, hop=160. Parakeet
+                // subsamples by 8 → audio_tokens ≈ nFrames / 8.
+                let nFFT = 512, hop = 160, pad = nFFT / 2
+                let melFrames = max(0, 1 + (combined.count + 2 * pad - nFFT) / hop)
+                // Subsampling factor 8 with stride-2 conv stack (3 levels).
+                // Each level: ceil(T_in / 2). For melFrames=101 → 51 → 26
+                // → 13. Compute exactly the same way to avoid placeholder
+                // count drift between processor and encoder.
+                var t = melFrames
+                for _ in 0 ..< 3 { t = (t + 1) / 2 }
+                totalAudioTokens = t
+            }
         }
 
         // Insert media placeholders into the user message before tokenization.

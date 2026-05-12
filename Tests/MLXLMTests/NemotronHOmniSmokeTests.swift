@@ -110,6 +110,25 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertFalse(arr.allSatisfy { $0 == 0 || $0.isNaN })
     }
 
+    func testProcessorPreservesPreEncodedAudioEmbedding() async throws {
+        let processor = NemotronHOmniProcessor(
+            NemotronHOmniProcessorConfiguration(),
+            tokenizer: TestTokenizer(vocabularySize: 262_272))
+        let samples = [Float](repeating: 0.05, count: 1_600)
+        let embedding = MLXArray.zeros([5, 2_688])
+
+        let input = UserInput(
+            prompt: "What did the caller say?",
+            audios: [
+                .preEncoded(samples: samples, sampleRate: 16_000, embedding: embedding)
+            ])
+        let lmInput = try await processor.prepare(input: input)
+
+        XCTAssertEqual(lmInput.audio?.waveform.shape, [1, samples.count])
+        XCTAssertEqual(lmInput.audio?.sampleRate, 16_000)
+        XCTAssertEqual(lmInput.audio?.preEncodedEmbedding?.shape, [5, 2_688])
+    }
+
     func testRemapMlp1Weights() throws {
         let raw: [String: MLXArray] = [
             "mlp1.0.weight": MLXArray.zeros([5120]),

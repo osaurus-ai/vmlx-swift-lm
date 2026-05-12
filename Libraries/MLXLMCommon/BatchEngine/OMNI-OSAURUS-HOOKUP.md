@@ -15,8 +15,8 @@ file covers everything those docs don't:
 
 1. Bundle detection + factory dispatch
 2. The four-tower wrapper layout (LLM + RADIO + Parakeet + projectors)
-3. Multimodal embed splice through `inputsEmbeds` (image + video work via
-   `LMInput`; **audio currently does NOT** — it's the open seam)
+3. Multimodal embed splice through `inputsEmbeds` (image + video + audio via
+   `LMInput`; audio also supports caller-supplied pre-encoded embeddings)
 4. Hybrid Mamba/Attention/MoE cache topology (52 layers: 23M + 23E + 6\*)
    — what works under coordinator, disk cache, BatchEngine; what doesn't
 5. TurboQuant KV interaction with the hybrid pattern
@@ -43,16 +43,15 @@ let context = try await VLMModelFactory.shared.loadContainer(
 // 2. Tag the cache coordinator hybrid (auto-flips on first admission, but
 //    do it eagerly to avoid the first-turn no-op admission edge case).
 coordinator.setHybrid(true)
-coordinator.setMediaSalt(computeMediaSalt(for: input))   // image/video
+coordinator.setMediaSalt(computeMediaSalt(for: input))   // image/video/audio
 
 // 3. Build LMInput as usual — image goes through input.image.pixels, video
 //    through input.video.pixels. NemotronHOmniProcessor handles tile
 //    selection + chat-template splice + 256-tokens-per-tile expansion.
 
-// 4. Audio: TODO — see §3. Today osaurus has TWO options:
-//      a. Pre-encode via `omni.extractAudioEmbeds(waveform:)` and splice
-//         manually before calling `prepare`. Audio is NOT in LMInput yet.
-//      b. Punt audio to a future turn behind a feature flag.
+// 4. Audio: build `UserInput(audios:)` from file URLs, PCM samples, MLXArray,
+//    or pre-encoded embeddings. `NemotronHOmniProcessor` prepares placeholders;
+//    `NemotronHOmni.prepare(_:)` splices Parakeet/sound-projection embeddings.
 
 // 5. Run BatchEngine OR Evaluate. Both work, with caveats:
 //      - BatchEngine: heterogeneous cache (M/*/E) → uncompiled decode,
@@ -176,8 +175,8 @@ public func extractAudioEmbeds(waveform: [Float]) -> MLXArray
 
 ## 3. Audio pipeline — first-class through `LMInput.ProcessedAudio`
 
-**Audio is now a first-class modality alongside image + video** as of
-commit `ae49c7c`. No manual splice or workarounds. `Chat.Message.audios`
+**Audio is now a first-class modality alongside image + video** as of the
+2026-05-12 live-voice update. No manual splice or workarounds. `Chat.Message.audios`
 + `UserInput.audios` + `LMInput.ProcessedAudio` flow through the standard
 `UserInputProcessor.prepare(input:)` → `NemotronHOmni.prepare(_:)` path.
 
@@ -188,12 +187,16 @@ public enum Audio {
     case url(URL)                                  // any AVFoundation-decodable file
     case samples([Float], sampleRate: Int)         // pre-loaded mono PCM
     case array(MLXArray, sampleRate: Int)          // mono Float32 MLXArray
+    case preEncoded(samples: [Float], sampleRate: Int, embedding: MLXArray)
 }
 ```
 
 The processor decodes + resamples to 16 kHz mono Float32 (Parakeet's
 required rate) automatically. `AVAudioConverter` handles file inputs;
-`linearResamplePCM` covers in-memory PCM at non-16 kHz rates.
+`linearResamplePCM` covers in-memory PCM at non-16 kHz rates. The
+`preEncoded` case carries an already-computed Parakeet/sound-projection
+embedding and lets the model skip its mel + audio-encoder pass for low-latency
+handoffs.
 
 ### 3.2 End-to-end usage from osaurus
 
@@ -850,6 +853,34 @@ BENCH_OMNI=1 \
 # Expected: "7 passed, 0 failed | load 1.11s"
 ```
 
+### Current live-voice reproduce prompt (2026-05-12)
+
+`RunBench/` is a local-only bench harness in this checkout, but the command
+below is the handoff shape to give another agent on a machine that has the
+same harness and a local Nemotron Omni bundle:
+
+```text
+Find a local Nemotron Omni bundle with config_omni.json. Prefer the smallest
+JANGTQ/MXFP4 bundle available. Run:
+
+BENCH_OMNI=1 \
+BENCH_MAX_TOKENS=8 \
+BENCH_MODEL=<absolute path to the Nemotron Omni bundle> \
+/usr/bin/time -l swift run RunBench
+
+Record the full OmniBench summary, especially audio encoder smoke,
+audio LMInput end-to-end, mixed image+audio, media-salt isolation,
+max resident set size, swaps, and before/after free memory. Do not report
+TTFAB from this run; it measures input-side audio encode/splice/generation,
+not output TTS first audio byte.
+```
+
+Latest local result on `Nemotron-Omni-Nano-JANGTQ-CRACK`:
+`13 passed, 0 failed`; audio encoder smoke `0.29s`; audio LMInput
+end-to-end `1.56s` at `52.3 tok/s`; mixed image+audio `2.88s`;
+media-salt isolation audio A vs B `2.18s`; max RSS `7,740,358,656`
+bytes; swaps `0`.
+
 ---
 
 ## 13. Known gaps + tracking
@@ -858,8 +889,8 @@ BENCH_OMNI=1 \
 |---|---|---|---|
 | ~~MXFP4 omni first-forward crash (rms_norm 2688)~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED in `ae526a3`** |
 | ~~`NemotronHJANGTQ.swift` missing~~ | ~~HIGH~~ | ~~vmlx-side~~ | **CLOSED — JANGTQ4 + JANGTQ2 both 7/7 PASS** |
-| `LMInput` has no audio field | medium | vmlx-side | this doc §3.2; unblock once osaurus signals demand |
-| `MediaSalt` skips audio | medium | vmlx-side | this doc §3.3; trivial fix once §3.2 lands |
+| ~~`LMInput` has no audio field~~ | ~~medium~~ | ~~vmlx-side~~ | **CLOSED** — `LMInput.ProcessedAudio` and `UserInput.Audio` flow through processor + model |
+| ~~`MediaSalt` skips audio~~ | ~~medium~~ | ~~vmlx-side~~ | **CLOSED** — audio waveform + sample rate are part of media salt |
 | BatchEngine prefill uses tokens, not inputsEmbeds | medium | vmlx-side | this doc §10.1; affects ALL VLMs not just omni |
 | Compiled decode for hybrid (Stage 4) | low | vmlx-side | called out in `BatchCompile.swift:85`; perf optimization, not correctness |
 | EVS keep-first-frame edge case | low | vmlx-side | `vlmApplyEVS` first-group always-kept logic; matches Python ref but Python defaults `dissimilarity[0] = 255` directly. Re-verify if you see token-count drift between Python + Swift. |

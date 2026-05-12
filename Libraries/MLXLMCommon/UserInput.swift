@@ -149,6 +149,10 @@ public struct UserInput {
         case samples([Float], sampleRate: Int)
         /// Pre-loaded waveform as MLXArray (mono, Float32).
         case array(MLXArray, sampleRate: Int)
+        /// Pre-loaded Float32 PCM samples plus an already-computed audio
+        /// embedding. Speech-aware models can splice the embedding directly
+        /// and skip their mel/encoder pass for live voice handoff.
+        case preEncoded(samples: [Float], sampleRate: Int, embedding: MLXArray)
     }
 
     /// Representation of processing to apply to media.
