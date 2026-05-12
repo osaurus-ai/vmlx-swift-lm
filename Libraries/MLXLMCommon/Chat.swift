@@ -8,6 +8,13 @@ public enum Chat {
         /// The content of the message.
         public var content: String
 
+        /// Optional assistant reasoning text carried on OpenAI-compatible
+        /// multi-turn messages as `reasoning_content`. Several reasoning
+        /// chat templates (ZAYA, Nemotron-H/Omni, MiniMax) read this field
+        /// directly and reconstruct the prior `<think>...</think>` envelope
+        /// before rendering the visible assistant answer.
+        public var reasoningContent: String?
+
         /// Array of image data associated with the message.
         public var images: [UserInput.Image]
 
@@ -57,11 +64,13 @@ public enum Chat {
             role: Role, content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
             audios: [UserInput.Audio] = [],
+            reasoningContent: String? = nil,
             toolCalls: [ToolCall]? = nil,
             toolCallId: String? = nil
         ) {
             self.role = role
             self.content = content
+            self.reasoningContent = reasoningContent
             self.images = images
             self.videos = videos
             self.audios = audios
@@ -269,6 +278,10 @@ public func defaultMessageDict(for message: Chat.Message) -> Message {
         "role": message.role.rawValue,
         "content": message.content,
     ]
+
+    if let reasoningContent = message.reasoningContent {
+        dict["reasoning_content"] = reasoningContent
+    }
 
     if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
         dict["tool_calls"] = toolCalls.enumerated().map { (idx, call) in

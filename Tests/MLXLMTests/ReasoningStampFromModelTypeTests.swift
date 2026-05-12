@@ -106,6 +106,12 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
         }
     }
 
+    func testZayaGetsThinkXml() {
+        for modelType in ["zaya", "zaya1", "zaya2"] {
+            XCTAssertEqual(reasoningStampFromModelType(modelType), "think_xml")
+        }
+    }
+
     func testNemotronHGetsThinkXml() {
         XCTAssertEqual(reasoningStampFromModelType("nemotron_h"), "think_xml")
     }
@@ -149,6 +155,7 @@ final class ReasoningStampFromModelTypeTests: XCTestCase {
             reasoningStampFromModelType("gemma4"),
             reasoningStampFromModelType("mistral"),
             reasoningStampFromModelType("holo3"),
+            reasoningStampFromModelType("zaya"),
         ])
         for stamp in stamps {
             // `"none"` intentionally returns nil from the parser

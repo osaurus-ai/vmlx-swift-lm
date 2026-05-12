@@ -53,8 +53,22 @@ struct ChatMessageToolCallTests {
         let dict = defaultMessageDict(for: msg)
         #expect(dict["role"] as? String == "user")
         #expect(dict["content"] as? String == "hi")
+        #expect(dict["reasoning_content"] == nil)
         #expect(dict["tool_calls"] == nil)
         #expect(dict["tool_call_id"] == nil)
+    }
+
+    @Test("assistant reasoning_content is emitted for thinking templates")
+    func assistantReasoningContentDict() {
+        let msg = Chat.Message(
+            role: .assistant,
+            content: "Final answer.",
+            reasoningContent: "Prior reasoning."
+        )
+        let dict = defaultMessageDict(for: msg)
+        #expect(dict["role"] as? String == "assistant")
+        #expect(dict["content"] as? String == "Final answer.")
+        #expect(dict["reasoning_content"] as? String == "Prior reasoning.")
     }
 
     @Test("assistant with tool call emits both flat and nested views")

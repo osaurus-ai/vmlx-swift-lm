@@ -14,7 +14,7 @@
 //     ↓ true  → return "harmony"
 //     ↓ false
 //   D3: thinkXmlPrefixes.contains(where: t.hasPrefix)
-//        — disjunction of 9 prefix checks (one per family)
+//        — disjunction of 10 prefix checks (one per family)
 //     ↓ true  → return "think_xml"
 //     ↓ false → return "none"
 //
@@ -23,9 +23,9 @@
 //  - D1 (∧): need (T,T)→T, (F,T), (T,F) — 3 cases.
 //  - D2a/D2b (single-prefix harmony branches): 2 true cases plus false
 //    fall-through coverage.
-//  - D3 (∨ over 9 prefixes): each prefix must independently flip the
-//    decision. Need 1 all-false case + 9 cases each with exactly one
-//    matching prefix and all 8 others non-matching = 10 cases.
+//  - D3 (∨ over 10 prefixes): each prefix must independently flip the
+//    decision. Need 1 all-false case + 10 cases each with exactly one
+//    matching prefix and all 9 others non-matching = 11 cases.
 //
 // Plus a master "all-default" case where t doesn't match any branch.
 
@@ -153,7 +153,15 @@ struct ReasoningStampMCDCTests {
             "case-insensitive match")
     }
 
-    /// All 9 prefixes FALSE simultaneously → D3 disjunction is FALSE → "none".
+    @Test("D3.zaya prefix flips decision")
+    func d3_zaya() {
+        #expect(reasoningStampFromModelType("zaya") == "think_xml")
+        #expect(reasoningStampFromModelType("zaya1") == "think_xml")
+        #expect(reasoningStampFromModelType("ZAYA") == "think_xml",
+            "case-insensitive match")
+    }
+
+    /// All 10 prefixes FALSE simultaneously → D3 disjunction is FALSE → "none".
     /// Pair-completes the MC/DC table: shows that with no prefix matching,
     /// the decision flips to FALSE regardless of which prefix is "tested".
     @Test("D3 all-false → 'none' (LFM2, LLaMA, Phi, etc.)")

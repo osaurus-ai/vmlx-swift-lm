@@ -970,6 +970,27 @@ struct StartInReasoningTests {
         #expect(content == "answer is 4")
     }
 
+    @Test("ZAYA model_type fallback routes open-thinking prompt to reasoning")
+    func testZayaModelTypeFallbackRoutesOpenThinkingPrompt() {
+        let stamp = reasoningStampFromModelType("zaya")
+        #expect(stamp == "think_xml")
+        let promptTail = "<|im_start|>assistant\n<think>\n"
+        guard let parser = ReasoningParser.forPrompt(
+            stampName: stamp,
+            promptTail: promptTail)
+        else {
+            Issue.record("ZAYA fallback stamp should create a think_xml parser")
+            return
+        }
+        var p = parser
+        var segs = p.feed("zaya internal note</think>visible answer")
+        segs.append(contentsOf: p.flush())
+        let reasoning = segs.compactMap { if case .reasoning(let r) = $0 { return r } else { return nil } }.joined()
+        let content = segs.compactMap { if case .content(let c) = $0 { return c } else { return nil } }.joined()
+        #expect(reasoning == "zaya internal note")
+        #expect(content == "visible answer")
+    }
+
     @Test("B1: prompt tail with NEITHER <think> nor </think> → start in content (mis-stamp safety net)")
     func testB1NoTagsInTailStartsInContent() {
         // Defense-in-depth against mis-stamped bundles. If a JANG

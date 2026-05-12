@@ -455,9 +455,8 @@ public func loadModelContainer(
 ///   - directory: directory of configuration and weights
 ///   - tokenizerLoader: the ``TokenizerLoader`` to use
 ///   - loadConfiguration: typed JangPress + resident-cap policy.
-///     Defaults to ``LoadConfiguration/default`` (auto JangPress with
-///     env fallback, 70%-of-physical-RAM resident cap, 70%-clamped
-///     memory limit).
+///     Defaults to ``LoadConfiguration/default`` (JangPress disabled,
+///     70%-of-physical-RAM cache/memory caps, mmap safetensors on).
 /// - Returns: a `ModelContainer` whose `jangPressRuntime` reflects
 ///   the activation result.
 public func loadModelContainer(
@@ -503,8 +502,8 @@ public func loadModelContainer(
 ///   - directory: directory of configuration and weights
 ///   - tokenizerLoader: the ``TokenizerLoader`` to use for loading the tokenizer
 ///   - loadConfiguration: typed JangPress + resident-cap policy.
-///     Defaults to ``LoadConfiguration/default`` (auto JangPress with
-///     env fallback, 70%-of-physical-RAM resident cap).
+///     Defaults to ``LoadConfiguration/default`` (JangPress disabled,
+///     70%-of-physical-RAM cache/memory caps, mmap safetensors on).
 /// - Returns: tuple of (`ModelContext`, `JangPressRuntime`)
 public func loadModel(
     from directory: URL,

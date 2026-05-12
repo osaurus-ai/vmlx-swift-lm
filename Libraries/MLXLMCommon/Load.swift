@@ -119,14 +119,30 @@ public func loadWeights(
         // Older pins ignore the env and fall back to the stock
         // pread/allocator path. `MmapSafetensorsLoader.swift` remains
         // a header/parser test utility, not the production tensor path.
+        let prestackedRoutedKeys = (try? JangPressPrestacker
+            .prestackedRoutedReplacementKeys(in: modelDirectory)) ?? []
+        var skippedPrestackedSourceTensors = 0
         for url in allShardURLs {
             let (w, m) = try loadArraysAndMetadata(url: url)
+            let isPrestackedShard = url.lastPathComponent == "jangpress-prestacked.safetensors"
             for (key, value) in w {
+                if !isPrestackedShard,
+                   let replacementKey = JangPressPrestacker.prestackedReplacementKey(
+                    forPerExpertKey: key),
+                   prestackedRoutedKeys.contains(replacementKey)
+                {
+                    skippedPrestackedSourceTensors += 1
+                    continue
+                }
                 weights[key] = value
             }
             if metadata.isEmpty {
                 metadata = m
             }
+        }
+        if skippedPrestackedSourceTensors > 0 {
+            FileHandle.standardError.write(Data(
+                "[loadWeights] using JangPress prestacked routed overlay; skipped \(skippedPrestackedSourceTensors) original per-expert tensor(s)\n".utf8))
         }
     }
 

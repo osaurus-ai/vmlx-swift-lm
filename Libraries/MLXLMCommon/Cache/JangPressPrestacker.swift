@@ -24,6 +24,18 @@ public enum JangPressPrestacker {
     private static let outputName = "jangpress-prestacked.safetensors"
     private static let alignmentManifestName = "jangpress-align-manifest.json"
 
+    static func prestackedRoutedReplacementKeys(in directory: URL) throws -> Set<String> {
+        let outputURL = directory.resolvingSymlinksInPath().appendingPathComponent(outputName)
+        guard FileManager.default.fileExists(atPath: outputURL.path) else {
+            return []
+        }
+        return Set(try readSafetensorsHeader(outputURL).tensors.keys)
+    }
+
+    static func prestackedReplacementKey(forPerExpertKey key: String) -> String? {
+        matchPerExpertKey(key)?.outputKey
+    }
+
     public static func prepareBundleIfNeeded(
         originalURL: URL,
         enabled: Bool

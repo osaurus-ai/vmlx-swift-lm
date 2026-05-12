@@ -50,7 +50,7 @@ If you're migrating off the old API:
 | Iter 23 (removed) | Iter 26 (current) |
 |---|---|
 | `JangPressController.shared.preload(...)` | host doesn't call anything; `JangPressPrestacker.prepareBundleIfNeeded(...)` runs once per bundle URL |
-| `JangPressController.shared.evictionThreshold = ...` | `LoadConfiguration.jangPressOptions.coldFraction` (clamped to `[0, 0.95]`) |
+| `JangPressController.shared.evictionThreshold = ...` | `LoadConfiguration.jangPress = .enabled(coldFraction:)` or `.auto(envFallback:)` (clamped to `[0, 0.95]`) |
 | `JangPressMachCache` | `JangPressMmapTier` (deferred to first inference) |
 | Manual `JangPressController.shared.activate(layerIdx)` | implicit — the canonical-expert-advisor observes routing and the mmap tier follows |
 | `JangPressController.shared.flush()` | not exposed — eviction is automatic based on `coldFraction` |
@@ -65,14 +65,11 @@ indices: indices)`. The host never calls `observe(...)` directly.
 import MLXLMCommon
 
 let loadConfig = LoadConfiguration(
-    // JangPress policy. .auto = enable when the bundle has routed
-    // experts; .disabled = always off; .enabled(...) = always on with
-    // explicit options.
-    jangPressPolicy: .auto,
-    jangPressOptions: JangPressLoadOptions(
-        coldFraction: 0.7,    // fraction of routed weights to keep cold
-        residentCap: .fraction(0.7),
-    ),
+    // JangPress policy. Production default is .disabled; .auto is an
+    // opt-in routed-MoE cold tier after per-family validation.
+    jangPress: .disabled,
+    maxResidentBytes: .fraction(0.7),
+    memoryLimit: .fraction(0.7),
     useMmapSafetensors: true)
 
 let context = try await ModelFactory.shared.loadContainer(
@@ -83,12 +80,12 @@ let context = try await ModelFactory.shared.loadContainer(
 
 Defaults (`LoadConfiguration.default`):
 
-- `jangPressPolicy = .auto` → enabled when `inspect(...)` detects a
-  routed-MoE bundle.
-- `coldFraction = 0.70` → keep 70% of routed-expert tiles cold (mmap
-  pages, evictable).
-- `residentCap = .fraction(0.70)` → cap on resident bytes is 70% of
-  physical RAM.
+- `jangPress = .disabled` → the routed-expert cold tier is off unless
+  the host opts in with `.enabled(...)` or `.experimentalJangPressAuto`.
+- `maxResidentBytes = .fraction(0.70)` → cap on MLX allocator cache
+  reuse is 70% of physical RAM.
+- `memoryLimit = .fraction(0.70)` → cap on total MLX allocation
+  budget is 70% of physical RAM, clamped to the recommended working set.
 - `useMmapSafetensors = true` → use the direct-mmap loader path.
 
 ## Env-var overrides
@@ -104,8 +101,8 @@ The host can override defaults at runtime:
 | `JANGPRESS_ALIGN_JANGTQ` | `1` enables alignment overlay for JANGTQ bundles (off by default — would double cache footprint) | rare |
 | `JANGPRESS_ALIGN_CACHE_DIR` | overrides the default cache directory location | `JANGPRESS_ALIGN_CACHE_DIR=/custom/path` |
 | `MLX_SAFETENSORS_MMAP` | `0` disables the direct-mmap loader; `1` enables (passed by `LoadConfiguration.useMmapSafetensors`) | wired automatically |
-| `MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS` | `1` makes individual tensors mmap'd via Metal (cold-start mode) | wired automatically when JangPress is enabled |
-| `MLX_SAFETENSORS_MMAP_START_COLD` | `1` starts every tensor cold (paged out) | wired automatically when JangPress is enabled |
+| `MLX_SAFETENSORS_MMAP_TENSOR_BUFFERS` | `1` makes individual tensors mmap'd via Metal (cold-start mode) | wired automatically when mmap tensor-buffer mode is available |
+| `MLX_SAFETENSORS_MMAP_START_COLD` | `1` starts every tensor cold (paged out) | wired automatically when the resolved cold-tier asks for it |
 | `MLX_SAFETENSORS_MMAP_COLD_PCT` | integer `0..100` controlling the cold fraction the mmap loader applies; defaults to `coldFraction × 100` | wired automatically |
 
 The env vars are designed for diagnostics. In production, set
@@ -190,9 +187,11 @@ swift test --filter "JangPress|LoadConfiguration|MmapSafetensors"
 
 ## P0 contracts (must not regress)
 
-1. JangPress is opt-out from the host's perspective —
-   `LoadConfiguration.default` enables it. Hosts that explicitly
-   opt out must call `LoadConfiguration.off`.
+1. JangPress is opt-in from the host's perspective —
+   `LoadConfiguration.default` disables the routed-expert cold tier but
+   keeps memory caps and mmap loading enabled. Hosts that explicitly
+   want routed-MoE cold-tier behavior must pass `.enabled(...)` or
+   `LoadConfiguration.experimentalJangPressAuto`.
 2. The prestack overlay is a per-bundle cache; deleting the cache
    directory MUST NOT corrupt the original bundle.
 3. JangPress failures are non-fatal by default and fall back to the

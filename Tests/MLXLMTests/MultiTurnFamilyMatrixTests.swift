@@ -59,6 +59,8 @@ struct ReasoningStampFamilyMatrixTests {
         "bailing_moe", "bailing_hybrid", "bailing_moe_v2_5",
         // Laguna (Poolside)
         "laguna", "laguna_xs", "laguna_s", "laguna_m",
+        // ZAYA
+        "zaya", "zaya1", "zaya2",
     ])
     func thinkXmlFamilies(_ modelType: String) {
         #expect(reasoningStampFromModelType(modelType) == "think_xml",
@@ -465,6 +467,7 @@ struct PerFamilyMultiTurnReasoningTests {
         "nemotron_h", "nemotron_h_omni",
         "holo3",
         "laguna", "laguna_xs",
+        "zaya", "zaya1",
     ])
     func threeTurnReasoningToggle(_ modelType: String) {
         let stamp = reasoningStampFromModelType(modelType)
