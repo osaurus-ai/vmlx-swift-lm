@@ -235,7 +235,14 @@ For live audio capture and voice output, see
   `UserInput.Audio.samples(pcm, sampleRate: 16_000)`. Caller manages
   permission (`NSMicrophoneUsageDescription` Info.plist + the
   `AVAudioApplication.requestRecordPermission(_:)` grant) per Apple
-  policy.
+  policy. The recorder also exposes `snapshot()` for the retained full
+  turn and `consumeAvailableSamples()` for VAD/call-mode loops that need
+  live PCM chunks before endpoint.
+- **`NemotronHOmniLiveAudioBuffer`** — thread-safe retained PCM buffer
+  with a streaming cursor. Use it when the host app already owns the
+  audio engine (for example Osaurus's FluidAudio/Parakeet transcription
+  path) but still needs a stable full-turn waveform plus incremental
+  chunks for endpointing.
 - **`NemotronHOmniSpeaker`** — AVSpeechSynthesizer wrapper for voice
   OUT. The bundle has NO neural vocoder — text comes out of the LLM,
   the speaker turns it into audio via system TTS. This is the

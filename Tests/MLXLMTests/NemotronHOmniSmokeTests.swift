@@ -66,6 +66,31 @@ final class NemotronHOmniSmokeTests: XCTestCase {
         XCTAssertEqual(out.dim(2), 128)
     }
 
+    func testLiveAudioBufferSnapshotAndStreamingCursor() throws {
+        let buffer = NemotronHOmniLiveAudioBuffer(sampleRate: 4)
+
+        XCTAssertEqual(buffer.snapshot().samples, [])
+        XCTAssertEqual(buffer.durationSeconds, 0)
+
+        buffer.append([1, 2, 3])
+        let firstChunk = buffer.consumeAvailableSamples()
+        XCTAssertEqual(firstChunk.samples, [1, 2, 3])
+        XCTAssertEqual(firstChunk.sampleRate, 4)
+        XCTAssertEqual(firstChunk.durationSeconds, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(buffer.consumeAvailableSamples().samples, [])
+
+        buffer.append([4, 5])
+        XCTAssertEqual(buffer.consumeAvailableSamples().samples, [4, 5])
+        XCTAssertEqual(buffer.snapshot().samples, [1, 2, 3, 4, 5])
+
+        buffer.resetConsumeCursor()
+        XCTAssertEqual(buffer.consumeAvailableSamples().samples, [1, 2, 3, 4, 5])
+
+        buffer.clear()
+        XCTAssertEqual(buffer.snapshot().samples, [])
+        XCTAssertEqual(buffer.retainedSampleCount, 0)
+    }
+
     func testRelShiftSkewing() throws {
         // 2 batches × 2 heads × 3 query tokens × (2*3-1)=5 score columns.
         let scores = MLXArray(

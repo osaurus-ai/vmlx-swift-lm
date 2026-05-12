@@ -13,8 +13,113 @@
 //     need higher-quality voice output.
 
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
 import MLX
+
+// MARK: - Live PCM buffer
+
+/// Thread-safe 16 kHz mono PCM buffer for live voice handoff.
+///
+/// `snapshot()` returns the whole retained turn for the final Omni request.
+/// `consumeAvailableSamples()` returns only samples appended since the
+/// previous consume call, which lets a VAD/call-mode loop poll the same
+/// recorder without losing the final full-turn waveform.
+public final class NemotronHOmniLiveAudioBuffer: @unchecked Sendable {
+    public struct Snapshot: Sendable {
+        public let samples: [Float]
+        public let sampleRate: Int
+
+        public var durationSeconds: Double {
+            guard sampleRate > 0 else { return 0 }
+            return Double(samples.count) / Double(sampleRate)
+        }
+    }
+
+    private let lock = NSLock()
+    private let sampleRate: Int
+    private var samples: [Float] = []
+    private var consumeCursor = 0
+
+    public init(sampleRate: Int = 16_000, reserveCapacity: Int = 0) {
+        self.sampleRate = max(1, sampleRate)
+        if reserveCapacity > 0 {
+            samples.reserveCapacity(reserveCapacity)
+        }
+    }
+
+    public var retainedSampleCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return samples.count
+    }
+
+    public var durationSeconds: Double {
+        Double(retainedSampleCount) / Double(sampleRate)
+    }
+
+    public func append(_ newSamples: [Float]) {
+        guard !newSamples.isEmpty else { return }
+        lock.lock()
+        samples.append(contentsOf: newSamples)
+        lock.unlock()
+    }
+
+    public func snapshot() -> Snapshot {
+        lock.lock()
+        let copy = samples
+        lock.unlock()
+        return Snapshot(samples: copy, sampleRate: sampleRate)
+    }
+
+    /// Return samples appended since the last consume call.
+    public func consumeAvailableSamples() -> Snapshot {
+        lock.lock()
+        let start = min(consumeCursor, samples.count)
+        let chunk = start < samples.count ? Array(samples[start ..< samples.count]) : []
+        consumeCursor = samples.count
+        lock.unlock()
+        return Snapshot(samples: chunk, sampleRate: sampleRate)
+    }
+
+    public func resetConsumeCursor() {
+        lock.lock()
+        consumeCursor = 0
+        lock.unlock()
+    }
+
+    public func clear(keepingCapacity: Bool = true) {
+        lock.lock()
+        samples.removeAll(keepingCapacity: keepingCapacity)
+        consumeCursor = 0
+        lock.unlock()
+    }
+}
+
+private final class NemotronHOmniAudioConverterInput: @unchecked Sendable {
+    private let lock = NSLock()
+    private let buffer: AVAudioPCMBuffer
+    private var consumed = false
+
+    init(_ buffer: AVAudioPCMBuffer) {
+        self.buffer = buffer
+    }
+
+    func next(
+        _ outStatus: UnsafeMutablePointer<AVAudioConverterInputStatus>
+    ) -> AVAudioPCMBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !consumed else {
+            outStatus.pointee = .endOfStream
+            return nil
+        }
+
+        consumed = true
+        outStatus.pointee = .haveData
+        return buffer
+    }
+}
 
 // MARK: - Live mic capture
 
@@ -37,20 +142,35 @@ import MLX
 @available(macOS 14.0, iOS 17.0, *)
 public final class NemotronHOmniMicRecorder: @unchecked Sendable {
     private let engine = AVAudioEngine()
-    private var buffer: [Float] = []
+    private let liveBuffer = NemotronHOmniLiveAudioBuffer(sampleRate: 16_000)
     private let queue = DispatchQueue(label: "nemotron.omni.mic.recorder")
     private let targetSampleRate: Double = 16_000
+    private var recording = false
 
-    /// Set true while the engine is capturing. Updated on the
-    /// recorder's internal queue.
-    public private(set) var isRecording: Bool = false
+    /// True while the engine is capturing.
+    public var isRecording: Bool {
+        queue.sync { recording }
+    }
+
+    /// Retained samples for the active turn. This is the waveform to send
+    /// with the final `UserInput.Audio.samples` / `.preEncoded` request.
+    public func snapshot() -> NemotronHOmniLiveAudioBuffer.Snapshot {
+        liveBuffer.snapshot()
+    }
+
+    /// Samples appended since the previous consume call. Poll this from a
+    /// call-mode VAD loop to make endpoint decisions while continuing to
+    /// retain the complete turn for the final Omni request.
+    public func consumeAvailableSamples() -> NemotronHOmniLiveAudioBuffer.Snapshot {
+        liveBuffer.consumeAvailableSamples()
+    }
 
     public init() {}
 
     public func start() throws {
         try queue.sync {
-            guard !isRecording else { return }
-            buffer.removeAll(keepingCapacity: true)
+            guard !recording else { return }
+            liveBuffer.clear(keepingCapacity: true)
             let inputNode = engine.inputNode
             let inputFormat = inputNode.inputFormat(forBus: 0)
             // Tap at the input format; convert per-buffer below.
@@ -63,24 +183,25 @@ public final class NemotronHOmniMicRecorder: @unchecked Sendable {
                 self.handleBuffer(inBuffer, inputFormat: inputFormat)
             }
             try engine.start()
-            isRecording = true
+            recording = true
         }
     }
 
     /// Stop the engine and return the accumulated 16 kHz mono Float32 PCM.
     public func stop() throws -> [Float] {
         return queue.sync {
-            guard isRecording else { return [] }
+            guard recording else { return [] }
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
-            isRecording = false
-            return buffer
+            recording = false
+            return liveBuffer.snapshot().samples
         }
     }
 
     /// Convert a captured buffer to 16 kHz mono Float32 and append.
-    /// Done synchronously in the audio thread's tap closure (queue
-    /// sync), matching what AVAudioConverter expects.
+    /// Done synchronously in the audio thread's tap closure, then appended
+    /// through the live buffer's lock so stop/snapshot/consume can run from
+    /// the UI or VAD loop without racing the audio callback.
     private func handleBuffer(
         _ inBuffer: AVAudioPCMBuffer, inputFormat: AVAudioFormat
     ) {
@@ -100,24 +221,18 @@ public final class NemotronHOmniMicRecorder: @unchecked Sendable {
             let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outFrames)
         else { return }
 
-        var consumed = false
+        let input = NemotronHOmniAudioConverterInput(inBuffer)
         var error: NSError?
         let status = converter.convert(to: outBuffer, error: &error) {
             _, outStatus in
-            if consumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            consumed = true
-            outStatus.pointee = .haveData
-            return inBuffer
+            input.next(outStatus)
         }
         guard status != .error,
             let chData = outBuffer.floatChannelData
         else { return }
         let n = Int(outBuffer.frameLength)
         let bp = UnsafeBufferPointer(start: chData[0], count: n)
-        buffer.append(contentsOf: bp)
+        liveBuffer.append(Array(bp))
     }
 }
 

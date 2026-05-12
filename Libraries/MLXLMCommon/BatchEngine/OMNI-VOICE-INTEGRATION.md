@@ -25,6 +25,7 @@ import MLXVLM   // for NemotronHOmniMicRecorder + NemotronHOmniSpeaker
 // === Voice IN (mic → omni) ===
 let mic = NemotronHOmniMicRecorder()
 try mic.start()                             // user holds button
+let liveChunk = mic.consumeAvailableSamples() // optional VAD/call-mode poll
 // ... user speaks ...
 let pcm = try mic.stop()                    // [Float] @ 16 kHz mono
 let userInput = UserInput(
@@ -71,14 +72,18 @@ voice-mode UI needs to know about:
 
 | Symbol | Purpose | Used by |
 |---|---|---|
+| `NemotronHOmniLiveAudioBuffer` | thread-safe retained PCM + streaming cursor | VAD loops, tests, custom mic wrappers |
 | `NemotronHOmniMicRecorder` | live mic → 16 kHz mono PCM | push-to-talk, voice mode |
 | `NemotronHOmniSpeaker` | text → speech via AVSpeechSynthesizer | voice mode (TTS replies) |
 | `nemotronOmniLoadAudioFile(_:targetSampleRate:)` | file URL → 16 kHz PCM | drag-drop audio file |
 | `linearResamplePCM(_:fromRate:toRate:)` | in-memory rate conversion | 3rd-party audio formats |
 
-All four are thread-safe in the obvious way: `MicRecorder` synchronizes
-on its own queue, `Speaker` wraps `AVSpeechSynthesizer` (which is
-already main-actor-safe), and the two functions are pure transforms.
+The live input classes are safe to poll from a UI/VAD loop while the
+audio tap is running. `NemotronHOmniLiveAudioBuffer.snapshot()` returns
+the full retained turn for the final Omni request, while
+`consumeAvailableSamples()` returns only samples appended since the
+previous consume call. Endpointing code can inspect live PCM without
+losing the complete waveform needed for the model turn.
 
 ---
 
@@ -163,9 +168,12 @@ extension Array where Element == Float {
     }
 }
 
-// Inside your AVAudioEngine tap (after NemotronHOmniMicRecorder
-// extracts 16 kHz PCM in chunks), watch RMS — sustained low RMS
-// over ~600 ms = end-of-utterance, flush accumulated PCM to omni.
+// Poll the recorder while it captures. `consumeAvailableSamples()` advances
+// a streaming cursor but keeps the full retained turn available to `stop()`.
+let chunk = mic.consumeAvailableSamples()
+if chunk.samples.rms < threshold { /* count silence */ }
+// Sustained low RMS over ~600 ms = end-of-utterance; call stop() and flush
+// the complete retained PCM to omni.
 ```
 
 For production-quality VAD, layer Silero or Web Audio VAD on top.
