@@ -59,6 +59,13 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     /// Clamp for DSV4 SwiGLU: `silu(min(gate, lim)) * clip(up, ±lim)`.
     /// Set to 10.0 in DSV4-Flash; essential to prevent activation blow-up.
     public var swigluLimit: Float = 10.0
+    /// Default MXTQ bit width for routed experts. DSV4 JANGTQ-K bundles
+    /// can override individual layers through ``routedExpertLayerBits``.
+    public var routedExpertDefaultBits: Int = 2
+    /// Per-layer routed expert bit overrides from `routed_expert_bit_plan`.
+    /// Example: DSV4-Flash-JANGTQ-K keeps most routed layers at 2-bit but
+    /// preserves layers 23/25/28/34/36 at 4-bit.
+    public var routedExpertLayerBits: [Int: Int] = [:]
 
     // MARK: - mHC (Manifold Hyper-Connections)
 
@@ -122,6 +129,10 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case normTopkProb = "norm_topk_prob"
         case routedScalingFactor = "routed_scaling_factor"
         case swigluLimit = "swiglu_limit"
+        case routedExpertBits = "routed_expert_bits"
+        case mxtqBits = "mxtq_bits"
+        case routedExpertBitPlan = "routed_expert_bit_plan"
+        case quantization
         case hcMult = "hc_mult"
         case hcSinkhornIters = "hc_sinkhorn_iters"
         case hcEps = "hc_eps"
@@ -157,13 +168,19 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         self.oLoraRank = req(.oLoraRank, 1024)
         self.nRoutedExperts = req(.nRoutedExperts, 256)
         self.nSharedExperts = req(.nSharedExperts, 1)
-        self.numExpertsPerTok = req(.numExpertsPerTok, 6)
+        let configuredNumExpertsPerTok: Int = req(.numExpertsPerTok, 6)
+        self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK(
+            currentTopK: configuredNumExpertsPerTok,
+            modelType: "deepseek_v4",
+            field: "num_experts_per_tok")
         self.moeIntermediateSize = req(.moeIntermediateSize, 2048)
         self.numHashLayers = req(.numHashLayers, 3)
         self.scoringFunc = req(.scoringFunc, "sqrtsoftplus")
         self.normTopkProb = req(.normTopkProb, true)
         self.routedScalingFactor = req(.routedScalingFactor, 1.5)
         self.swigluLimit = req(.swigluLimit, 10.0)
+        self.routedExpertDefaultBits = Self.decodeRoutedExpertDefaultBits(from: c)
+        self.routedExpertLayerBits = Self.decodeRoutedExpertLayerBits(from: c)
         self.hcMult = req(.hcMult, 4)
         self.hcSinkhornIters = req(.hcSinkhornIters, 20)
         self.hcEps = req(.hcEps, 1e-6)
@@ -179,6 +196,173 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     }
 
     public init() {}
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(vocabSize, forKey: .vocabSize)
+        try c.encode(hiddenSize, forKey: .hiddenSize)
+        try c.encode(numHiddenLayers, forKey: .numHiddenLayers)
+        try c.encode(numAttentionHeads, forKey: .numAttentionHeads)
+        try c.encode(numKeyValueHeads, forKey: .numKeyValueHeads)
+        try c.encode(headDim, forKey: .headDim)
+        try c.encode(qkRopeHeadDim, forKey: .qkRopeHeadDim)
+        try c.encode(qLoraRank, forKey: .qLoraRank)
+        try c.encode(rmsNormEps, forKey: .rmsNormEps)
+        try c.encode(maxPositionEmbeddings, forKey: .maxPositionEmbeddings)
+        try c.encode(oGroups, forKey: .oGroups)
+        try c.encode(oLoraRank, forKey: .oLoraRank)
+        try c.encode(nRoutedExperts, forKey: .nRoutedExperts)
+        try c.encode(nSharedExperts, forKey: .nSharedExperts)
+        try c.encode(numExpertsPerTok, forKey: .numExpertsPerTok)
+        try c.encode(moeIntermediateSize, forKey: .moeIntermediateSize)
+        try c.encode(numHashLayers, forKey: .numHashLayers)
+        try c.encode(scoringFunc, forKey: .scoringFunc)
+        try c.encode(normTopkProb, forKey: .normTopkProb)
+        try c.encode(routedScalingFactor, forKey: .routedScalingFactor)
+        try c.encode(swigluLimit, forKey: .swigluLimit)
+        try c.encode(routedExpertDefaultBits, forKey: .routedExpertBits)
+        if !routedExpertLayerBits.isEmpty {
+            let layerBits = Dictionary(uniqueKeysWithValues: routedExpertLayerBits.map {
+                (String($0.key), $0.value)
+            })
+            try c.encode(
+                RoutedExpertBitPlan(
+                    defaultBits: routedExpertDefaultBits,
+                    routedLayerBits: layerBits),
+                forKey: .routedExpertBitPlan)
+        }
+        try c.encode(hcMult, forKey: .hcMult)
+        try c.encode(hcSinkhornIters, forKey: .hcSinkhornIters)
+        try c.encode(hcEps, forKey: .hcEps)
+        try c.encode(ropeTheta, forKey: .ropeTheta)
+        try c.encode(compressRopeTheta, forKey: .compressRopeTheta)
+        try c.encodeIfPresent(ropeScaling, forKey: .ropeScaling)
+        try c.encode(slidingWindow, forKey: .slidingWindow)
+        try c.encode(compressRatios, forKey: .compressRatios)
+        try c.encode(indexNHeads, forKey: .indexNHeads)
+        try c.encode(indexHeadDim, forKey: .indexHeadDim)
+        try c.encode(indexTopk, forKey: .indexTopk)
+        try c.encode(useAttnSink, forKey: .useAttnSink)
+    }
+
+    private struct MxtqBitsSpec: Decodable {
+        let routedExpert: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case routedExpert = "routed_expert"
+        }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer().decode(Int.self) {
+                self.routedExpert = single
+                return
+            }
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.routedExpert = try c.decodeIfPresent(Int.self, forKey: .routedExpert)
+        }
+    }
+
+    private struct RoutedExpertBitPlan: Codable {
+        let defaultBits: Int?
+        let routedLayerBits: [String: Int]?
+
+        init(defaultBits: Int?, routedLayerBits: [String: Int]?) {
+            self.defaultBits = defaultBits
+            self.routedLayerBits = routedLayerBits
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case defaultBits = "default_bits"
+            case routedLayerBits = "routed_layer_bits"
+        }
+    }
+
+    private struct QuantizationSpec: Decodable {
+        let routedExpertBits: Int?
+        let mxtqBits: MxtqBitsSpec?
+        let routedExpertBitPlan: RoutedExpertBitPlan?
+        let routedExperts: RoutedExperts?
+
+        enum CodingKeys: String, CodingKey {
+            case routedExpertBits = "routed_expert_bits"
+            case mxtqBits = "mxtq_bits"
+            case routedExpertBitPlan = "routed_expert_bit_plan"
+            case routedExperts = "routed_experts"
+        }
+
+        struct RoutedExperts: Decodable {
+            let bits: Int?
+            let bitPlan: RoutedExpertBitPlan?
+
+            enum CodingKeys: String, CodingKey {
+                case bits
+                case bitPlan = "bit_plan"
+            }
+        }
+    }
+
+    private static func decodeRoutedExpertDefaultBits(
+        from c: KeyedDecodingContainer<CodingKeys>
+    ) -> Int {
+        if let topPlan = try? c.decode(RoutedExpertBitPlan.self, forKey: .routedExpertBitPlan),
+           let bits = topPlan.defaultBits {
+            return bits
+        }
+        if let bits = try? c.decode(Int.self, forKey: .routedExpertBits) {
+            return bits
+        }
+        if let mxtq = try? c.decode(MxtqBitsSpec.self, forKey: .mxtqBits),
+           let bits = mxtq.routedExpert {
+            return bits
+        }
+        if let q = try? c.decode(QuantizationSpec.self, forKey: .quantization) {
+            if let bits = q.routedExpertBitPlan?.defaultBits {
+                return bits
+            }
+            if let bits = q.routedExperts?.bitPlan?.defaultBits {
+                return bits
+            }
+            if let bits = q.routedExpertBits {
+                return bits
+            }
+            if let bits = q.routedExperts?.bits {
+                return bits
+            }
+            if let bits = q.mxtqBits?.routedExpert {
+                return bits
+            }
+        }
+        return 2
+    }
+
+    private static func decodeRoutedExpertLayerBits(
+        from c: KeyedDecodingContainer<CodingKeys>
+    ) -> [Int: Int] {
+        func parse(_ raw: [String: Int]?) -> [Int: Int] {
+            guard let raw else { return [:] }
+            var result: [Int: Int] = [:]
+            for (key, value) in raw {
+                if let layer = Int(key) {
+                    result[layer] = value
+                }
+            }
+            return result
+        }
+
+        if let plan = try? c.decode(RoutedExpertBitPlan.self, forKey: .routedExpertBitPlan),
+           !(plan.routedLayerBits?.isEmpty ?? true) {
+            return parse(plan.routedLayerBits)
+        }
+        if let q = try? c.decode(QuantizationSpec.self, forKey: .quantization) {
+            if !(q.routedExpertBitPlan?.routedLayerBits?.isEmpty ?? true) {
+                return parse(q.routedExpertBitPlan?.routedLayerBits)
+            }
+            if !(q.routedExperts?.bitPlan?.routedLayerBits?.isEmpty ?? true) {
+                return parse(q.routedExperts?.bitPlan?.routedLayerBits)
+            }
+        }
+        return [:]
+    }
 }
 
 extension DeepseekV4Configuration {
@@ -200,5 +384,10 @@ extension DeepseekV4Configuration {
     /// layers (with YaRN scaling), lower theta on plain attention.
     public func ropeTheta(forLayer layer: Int) -> Float {
         hasCompressor(layer: layer) ? compressRopeTheta : ropeTheta
+    }
+
+    /// Routed expert MXTQ bit width for a decoder layer.
+    public func routedExpertBits(forLayer layer: Int) -> Int {
+        routedExpertLayerBits[layer] ?? routedExpertDefaultBits
     }
 }

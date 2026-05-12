@@ -1,5 +1,18 @@
 # CHANGELOG — vmlx-swift-lm (osaurus-ai/vmlx-swift-lm)
 
+## [2026-05-12] — DSV4 Flash JANGTQ-K routing bits and MoE top-k parity
+
+- DeepSeek-V4 JANGTQ-K now preserves `routed_expert_bit_plan` from bundle metadata instead of flattening all routed expert layers to one bit width.
+- `DeepseekV4JANGTQModel` exposes the effective routed expert bit width per layer for regression tests and diagnostics.
+- DSV4 routed MoE `num_experts_per_tok` now participates in the existing lower-only runtime top-k override helper, while DSV4 compressor `index_topk` remains untouched as NSA/compression selection.
+- Factory dispatch now preserves mixed routed layer bit plans when loading `weight_format=mxtq` DSV4 bundles.
+
+**Verification:**
+- `swift build --target MLXLLM`
+- `swift build --target MLXLMCommon`
+- `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcrun swift test --filter 'DeepseekV4|RuntimeMoETopKConfigWiringTests' --no-parallel`
+- Focused tests cover DSV4 config decode/encode, factory dispatch, chat/reasoning/tool parser flows, cache topology, disk round-trip, TurboQuant bypass, and MoE top-k wiring.
+
 ## [2026-05-10] — B=1 lifecycle, streaming experts, and VLM cache offsets
 
 - `BatchEngine.generate` now clears the B=1 solo fast-path lifecycle before the returned stream finishes. This removes the race where callers could receive completion while the engine still reported active solo work.

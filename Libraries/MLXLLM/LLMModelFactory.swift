@@ -487,8 +487,11 @@ public enum LLMTypeRegistry {
                 else { return nil }
                 return r
             }()
-            let mxtqBits = envBits ?? stampBits ?? routedBits ?? configBits ?? 2
-            return DeepseekV4JANGTQModel(config, mxtqBits: mxtqBits, mxtqSeed: 42)
+            let hasLayerBitPlan = !config.routedExpertLayerBits.isEmpty
+            let uniformBits =
+                envBits
+                ?? (hasLayerBitPlan ? nil : (stampBits ?? routedBits ?? configBits))
+            return DeepseekV4JANGTQModel(config, mxtqBits: uniformBits, mxtqSeed: 42)
         }
         return DeepseekV4Model(config)
     }

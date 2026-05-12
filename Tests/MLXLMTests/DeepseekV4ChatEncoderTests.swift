@@ -315,4 +315,51 @@ struct DeepseekV4ChatEncoderTests {
         #expect(cfg.swigluLimit == 10.0)
         #expect(cfg.hcMult == 4)
     }
+
+    @Test("DeepseekV4Configuration preserves routed expert bit plan")
+    func configurationRoutedExpertBitPlan() throws {
+        let json = """
+            {
+              "model_type": "deepseek_v4",
+              "num_hidden_layers": 43,
+              "mxtq_bits": {
+                "routed_expert": 2,
+                "attention": 8,
+                "shared_expert": 8
+              },
+              "routed_expert_bit_plan": {
+                "default_bits": 2,
+                "codec": "mxtq",
+                "routed_layer_bits": {
+                  "23": 4,
+                  "25": 4,
+                  "28": 4,
+                  "34": 4,
+                  "36": 4
+                }
+              }
+            }
+            """.data(using: .utf8)!
+
+        let cfg = try JSONDecoder().decode(DeepseekV4Configuration.self, from: json)
+
+        #expect(cfg.routedExpertBits(forLayer: 0) == 2)
+        #expect(cfg.routedExpertBits(forLayer: 22) == 2)
+        #expect(cfg.routedExpertBits(forLayer: 23) == 4)
+        #expect(cfg.routedExpertBits(forLayer: 25) == 4)
+        #expect(cfg.routedExpertBits(forLayer: 28) == 4)
+        #expect(cfg.routedExpertBits(forLayer: 34) == 4)
+        #expect(cfg.routedExpertBits(forLayer: 36) == 4)
+        #expect(cfg.routedExpertBits(forLayer: 42) == 2)
+
+        let model = DeepseekV4JANGTQModel(cfg)
+        #expect(model.routedExpertBitsByLayer[23] == 4)
+        #expect(model.routedExpertBitsByLayer[42] == 2)
+
+        let roundTripped = try JSONDecoder().decode(
+            DeepseekV4Configuration.self,
+            from: JSONEncoder().encode(cfg))
+        #expect(roundTripped.routedExpertBits(forLayer: 23) == 4)
+        #expect(roundTripped.routedExpertBits(forLayer: 42) == 2)
+    }
 }

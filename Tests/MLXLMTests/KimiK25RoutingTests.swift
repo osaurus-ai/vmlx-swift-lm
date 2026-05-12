@@ -256,6 +256,42 @@ final class KimiK25RoutingTests: XCTestCase {
             "mxtq deepseek_v4 must dispatch to DeepseekV4JANGTQModel")
     }
 
+    func testDeepseekV4MxtqDispatchPreservesRoutedExpertBitPlan() async throws {
+        let typeRegistry = LLMModelFactory.shared.typeRegistry
+        let cfg = """
+            {
+              "model_type": "deepseek_v4",
+              "weight_format": "mxtq",
+              "hidden_size": 16,
+              "num_hidden_layers": 4,
+              "moe_intermediate_size": 16,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "head_dim": 8,
+              "qk_rope_head_dim": 4,
+              "q_lora_rank": 8,
+              "o_groups": 2,
+              "o_lora_rank": 4,
+              "vocab_size": 256,
+              "n_routed_experts": 4,
+              "num_experts_per_tok": 2,
+              "n_shared_experts": 1,
+              "hc_mult": 2,
+              "compress_ratios": [0, 0, 0, 0],
+              "routed_expert_bit_plan": {
+                "default_bits": 2,
+                "routed_layer_bits": { "1": 4, "3": 4 }
+              }
+            }
+            """
+        let model = try await typeRegistry.createModel(
+            configuration: cfg.data(using: .utf8)!,
+            modelType: "deepseek_v4")
+        let dsv4 = try XCTUnwrap(model as? DeepseekV4JANGTQModel)
+        XCTAssertEqual(dsv4.routedExpertBitsByLayer, [2, 4, 2, 4],
+            "factory dispatch must not flatten JANGTQ-K routed expert bits")
+    }
+
     /// Non-mxtq configs with the same model_type MUST fall through to
     /// the standard DeepseekV3Model. Regression guard: if someone adds
     /// a new format check above the deepseek branch, affine bundles

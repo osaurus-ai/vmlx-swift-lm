@@ -15,6 +15,7 @@ final class RuntimeMoETopKConfigWiringTests: XCTestCase {
             ("Libraries/MLXLLM/Models/Qwen35.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Qwen35JANGTQ.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Laguna.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
+            ("Libraries/MLXLLM/Models/DeepseekV4Configuration.swift", "self.numExpertsPerTok = RuntimeMoETopKOverride.effectiveTopK"),
             ("Libraries/MLXLLM/Models/Gemma4Text.swift", "topKExperts = RuntimeMoETopKOverride.effectiveTopK"),
         ]
 

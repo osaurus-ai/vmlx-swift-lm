@@ -137,16 +137,24 @@ public final class DeepseekV4ModelInnerJANGTQ: Module {
     let config: DeepseekV4Configuration
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     var layers: [DeepseekV4DecoderLayerJANGTQ]
+    public let routedExpertBitsByLayer: [Int]
     @ModuleInfo(key: "hc_head") var hcHead: DeepseekV4HyperHead
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
-    init(config: DeepseekV4Configuration, mxtqBits: Int, mxtqSeed: Int) {
+    init(config: DeepseekV4Configuration, mxtqBits: Int?, mxtqSeed: Int) {
         self.config = config
+        let layerBits = (0..<config.numHiddenLayers).map {
+            mxtqBits ?? config.routedExpertBits(forLayer: $0)
+        }
+        self.routedExpertBitsByLayer = layerBits
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         self.layers = (0..<config.numHiddenLayers).map {
             DeepseekV4DecoderLayerJANGTQ(
-                config: config, layerIdx: $0, mxtqBits: mxtqBits, mxtqSeed: mxtqSeed)
+                config: config,
+                layerIdx: $0,
+                mxtqBits: layerBits[$0],
+                mxtqSeed: mxtqSeed)
         }
         self._hcHead.wrappedValue = DeepseekV4HyperHead(config: config)
         self._norm.wrappedValue = RMSNorm(
@@ -172,9 +180,10 @@ public final class DeepseekV4JANGTQModel:
     public var kvHeads: [Int]
     let config: DeepseekV4Configuration
     public var model: DeepseekV4ModelInnerJANGTQ
+    public var routedExpertBitsByLayer: [Int] { model.routedExpertBitsByLayer }
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    public init(_ config: DeepseekV4Configuration, mxtqBits: Int = 2, mxtqSeed: Int = 42) {
+    public init(_ config: DeepseekV4Configuration, mxtqBits: Int? = nil, mxtqSeed: Int = 42) {
         self.config = config
         self.kvHeads = Array(repeating: 1, count: config.numHiddenLayers)
         self.model = DeepseekV4ModelInnerJANGTQ(
