@@ -688,6 +688,11 @@ public actor BatchEngine {
                         generationTime: info.generateTime,
                         stopReason: finalStop,
                         unclosedReasoning: unclosed)
+                    if unclosed && info.generationTokenCount > 0 {
+                        Self.logger.warning(
+                            "Generation ended inside an unclosed reasoning block (\(info.generationTokenCount, privacy: .public) tokens generated, all routed to .reasoning). The consumer sees `completion_tokens: 0` and empty `message.content` even though the model produced output. Raise `max_tokens` or disable thinking mode (e.g. `chat_template_kwargs.enable_thinking=false` for Qwen)."
+                        )
+                    }
                     terminationState.markCompleted()
                     continuation.yield(.info(finalInfo))
                 }
