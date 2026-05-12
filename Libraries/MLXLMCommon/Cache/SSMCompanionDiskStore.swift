@@ -96,6 +96,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // safetensors writer can read the storage. MLX's tensor
         // realization (NOT script eval — this is `mlx.core.eval`).
         MLX.eval(ssmStates)
+        Stream.gpu.synchronize()
 
         // Materialize key→array dict expected by `save(arrays:metadata:url:)`.
         // Ordering preserved by `state_<idx>` keys; `extractSSMStates`
@@ -112,6 +113,7 @@ public final class SSMCompanionDiskStore: @unchecked Sendable {
         // Async dispatch races with SIGTERM on short-lived sessions,
         // leaving zero-byte files. Costs ~ms on already-realized arrays.
         try save(arrays: arrays, metadata: ["format": "mlx"], url: safetensorsURL)
+        Stream.gpu.synchronize()
 
         // JSON sidecar for is_complete flag + num_states.
         let sidecar: [String: Any] = [

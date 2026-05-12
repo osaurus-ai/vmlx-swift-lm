@@ -62,9 +62,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
 
         #expect(disk.contains("enum MLXDiskCacheIOLock"))
         #expect(disk.contains("MLXDiskCacheIOLock.shared.lock()"))
+        #expect(disk.contains("Stream.gpu.synchronize()"))
         #expect(disk.contains("try loadArraysAndMetadata(url: url)"))
         #expect(disk.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: url)"))
         #expect(ssm.contains("MLXDiskCacheIOLock.shared.lock()"))
+        #expect(ssm.contains("Stream.gpu.synchronize()"))
         #expect(ssm.contains("loadArraysAndMetadata(url: safetensorsURL)"))
         #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
     }
