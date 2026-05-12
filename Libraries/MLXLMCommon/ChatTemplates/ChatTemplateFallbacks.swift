@@ -260,6 +260,12 @@ public enum ChatTemplateFallbacks {
 {%- set think_open = '<think>' -%}
 {%- set think_close = '</think>' -%}
 {%- set dsml = '｜DSML｜' -%}
+{%- set ns = namespace(last_user_index=-1) -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' or message['role'] == 'developer' -%}
+{%- set ns.last_user_index = loop.index0 -%}
+{%- endif -%}
+{%- endfor -%}
 {{- bos -}}
 {%- if enable_thinking and reasoning_effort == 'max' -%}
 {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
@@ -269,23 +275,23 @@ public enum ChatTemplateFallbacks {
 {{- message['content'] -}}
 {%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
 {{- user_token -}}{{- message['content'] -}}
-{%- elif message['role'] == 'assistant' -%}
+{%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
+{%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if message.get('reasoning_content') -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
+{{- think_open -}}
+{%- else -%}
+{{- think_close -}}
+{%- endif -%}
+{%- endif -%}
+{%- elif message['role'] == 'assistant' -%}
+{%- if enable_thinking and message.get('reasoning_content') and loop.index0 > ns.last_user_index -%}
 {{- message['reasoning_content'] -}}{{- think_close -}}
 {%- endif -%}
 {{- message['content'] or '' -}}
 {{- eos -}}
 {%- endif -%}
 {%- endfor -%}
-{%- if add_generation_prompt -%}
-{{- asst_token -}}
-{%- if enable_thinking -%}
-{{- think_open -}}
-{%- else -%}
-{{- think_close -}}
-{%- endif -%}
-{%- endif -%}
 """#
 
     /// Laguna / Poolside minimal chat template.
