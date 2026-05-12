@@ -123,6 +123,8 @@ run_test.py
 # Metal library copied from Xcode DerivedData for terminal swift-run bench
 # runs (see ../vmlx-swift/VMLX_README.md for the workaround). Do not commit.
 default.metallib
+default.profraw
+*.profraw
 run_test.swift
 test_*.swift
 test_*.py
