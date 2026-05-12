@@ -152,7 +152,8 @@ public struct BaseConfiguration: Codable, Sendable {
                 // list the per-layer-override decode below tries to
                 // parse `2` as a `Quantization` sub-dict and throws
                 // `configurationDecodingError`, blocking model load.
-                case "mxtq_bits", "routed_expert_bits", "mxtq_seed": continue
+                case "mxtq_bits", "routed_expert_bits", "routed_expert_bit_plan", "mxtq_seed":
+                    continue
 
                 // 2026-05-06 (ZAYA prep):
                 // New hybrid bundles may stamp role-level quantization

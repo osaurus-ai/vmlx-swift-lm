@@ -67,4 +67,47 @@ public class BaseConfigurationTests: XCTestCase {
             .init(groupSize: 64, bits: 4))
     }
 
+    func testDSV4RoutedExpertBitPlanIsQuantizationMetadata() throws {
+        let json =
+            """
+            {
+                "model_type": "deepseek_v4",
+                "weight_format": "mxtq",
+                "quantization": {
+                    "bits": 8,
+                    "group_size": 32,
+                    "mode": "affine",
+                    "routed_expert_bits": 2,
+                    "routed_expert_bit_plan": {
+                        "default_bits": 2,
+                        "codec": "mxtq",
+                        "routed_layer_bits": {
+                            "23": 4,
+                            "25": 4,
+                            "28": 4,
+                            "34": 4,
+                            "36": 4
+                        }
+                    },
+                    "mxtq_bits": {
+                        "routed_expert": 2,
+                        "attention": 8,
+                        "shared_expert": 8
+                    }
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: json.data(using: .utf8)!)
+
+        let fallback = config.perLayerQuantization?.quantization(layer: "model.layers.23.mlp.experts")
+        XCTAssertEqual(fallback?.groupSize, 32)
+        XCTAssertEqual(fallback?.bits, 8)
+        XCTAssertEqual(fallback?.mode, .affine)
+        XCTAssertTrue(
+            config.perLayerQuantization?.perLayerQuantization.isEmpty ?? false,
+            "DSV4 routed_expert_bit_plan is consumed by DeepseekV4Configuration/JANGTQ, not by BaseConfiguration per-layer affine overrides")
+    }
+
 }
