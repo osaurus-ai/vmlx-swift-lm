@@ -5,15 +5,15 @@
 //
 // Gemma4 E2B / E4B variants opt into Per-Layer Embedding by setting BOTH
 // `hidden_size_per_layer_input` AND `vocab_size_per_layer_input` to non-zero.
-// Setting only one of them is structurally invalid:
+// Setting a positive hidden size without vocab is structurally invalid:
 //   * vocab=0, hidden>0 → `Embedding(embeddingCount: 0, ...)` → garbage rows
-//   * vocab>0, hidden=0 → zero-dim hidden state → silent dim collapse
-// Both fields default to 0 in the decoder (PLE off — base E27 / 31B models).
+// Shipped full Gemma4 rows may set vocab>0 while hidden=0; the decoder treats
+// hidden=0 as the authoritative PLE-off signal and normalizes vocab to 0.
+// Both fields default to 0 in the decoder (PLE off — base 26B / 31B models).
 //
-// Before today, the decoder accepted the incoherent state silently and the
-// model would either crash deeper in init or silently produce wrong output.
-// Now `init(from:)` throws `DecodingError.dataCorrupted` so a malformed
-// config.json fails fast at load time with a precise error.
+// Before today, the decoder rejected shipped 26B/31B-style configs that carried
+// `vocab_size_per_layer_input` even though PLE was disabled by hidden=0.
+// It now accepts and normalizes that shape, while still rejecting hidden>0/vocab=0.
 //
 // Source-coverage style — no MLX runtime needed.
 
@@ -87,9 +87,10 @@ struct Gemma4PLECoherenceTests {
         }
     }
 
-    /// Vocab positive but hidden zero — must throw (mirror case).
-    @Test("Gemma4 LLM config rejects vocab>0 with hidden=0")
-    func plVocabWithoutHiddenThrows() throws {
+    /// Vocab positive but hidden zero — shipped full Gemma4 configs use this
+    /// shape; hidden=0 means PLE is off, so vocab is ignored/normalized.
+    @Test("Gemma4 LLM config treats vocab>0 with hidden=0 as PLE off")
+    func plVocabWithoutHiddenNormalizesToOff() throws {
         let json = """
             {
               "model_type": "gemma4_text",
@@ -97,9 +98,9 @@ struct Gemma4PLECoherenceTests {
               "vocab_size_per_layer_input": 262144
             }
             """
-        #expect(throws: DecodingError.self) {
-            _ = try Self.decode(json)
-        }
+        let config = try Self.decode(json)
+        #expect(config.hiddenSizePerLayerInput == 0)
+        #expect(config.vocabSizePerLayerInput == 0)
     }
 
     /// Source-coverage guard for the VLM-side config (Gemma4.swift's
@@ -115,13 +116,13 @@ struct Gemma4PLECoherenceTests {
         let url = repo.appendingPathComponent("Libraries/MLXVLM/Models/Gemma4.swift")
         let source = try String(contentsOf: url, encoding: .utf8)
 
-        // The guard is present.
+        // The normalization is present.
         #expect(
-            source.contains("Gemma4 PLE config incoherent"),
-            "Gemma4.swift (VLM) must include the same PLE coherence DecodingError as the LLM side.")
-        // The xor pattern is present (matches LLM side phrasing).
+            source.contains("decodedHiddenSizePerLayerInput == 0"),
+            "Gemma4.swift (VLM) must normalize hidden=0/vocab>0 to PLE off.")
+        // The positive-hidden invalid guard is present.
         #expect(
-            source.contains("(hiddenSizePerLayerInput == 0) != (vocabSizePerLayerInput == 0)"),
-            "Gemma4.swift (VLM) must use the same xor-on-zero pattern.")
+            source.contains("decodedVocabSizePerLayerInput == 0"),
+            "Gemma4.swift (VLM) must still reject hidden>0/vocab=0.")
     }
 }

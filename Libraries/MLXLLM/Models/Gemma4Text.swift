@@ -154,22 +154,27 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         attentionBias = try container.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
         attentionKEqV = try container.decodeIfPresent(Bool.self, forKey: .attentionKEqV) ?? false
 
-        hiddenSizePerLayerInput =
+        let decodedHiddenSizePerLayerInput =
             try container.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
-        vocabSizePerLayerInput =
+        var decodedVocabSizePerLayerInput =
             try container.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
         // PLE coherence: hidden_size_per_layer_input and vocab_size_per_layer_input are paired.
-        // Zero means PLE is off (E2B/E4B disabled). One non-zero without the other is structurally
-        // invalid: an Embedding(embeddingCount: 0, ...) or zero-dim hidden would silently produce
-        // garbage. See `docs/GEMMA4-DEEP-TRACE-2026-05-10.md` §7.6.
-        if (hiddenSizePerLayerInput == 0) != (vocabSizePerLayerInput == 0) {
+        // `hidden_size_per_layer_input == 0` is the authoritative PLE-off signal
+        // for full Gemma4 rows (26B/31B). Some shipped configs still carry the
+        // ordinary vocab size in `vocab_size_per_layer_input`; tolerate that by
+        // normalizing the pair to PLE off. The opposite shape (hidden>0, vocab=0)
+        // is still invalid because it would build a zero-row PLE embedding.
+        if decodedHiddenSizePerLayerInput == 0 {
+            decodedVocabSizePerLayerInput = 0
+        } else if decodedVocabSizePerLayerInput == 0 {
             throw DecodingError.dataCorruptedError(
                 forKey: .hiddenSizePerLayerInput, in: container,
                 debugDescription:
-                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(hiddenSizePerLayerInput) "
-                    + "and vocab_size_per_layer_input=\(vocabSizePerLayerInput); both must be zero (PLE off) "
-                    + "or both must be positive (PLE on).")
+                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(decodedHiddenSizePerLayerInput) "
+                    + "and vocab_size_per_layer_input=\(decodedVocabSizePerLayerInput); vocab must be positive when PLE hidden size is positive.")
         }
+        hiddenSizePerLayerInput = decodedHiddenSizePerLayerInput
+        vocabSizePerLayerInput = decodedVocabSizePerLayerInput
         numKvSharedLayers =
             try container.decodeIfPresent(Int.self, forKey: .numKvSharedLayers) ?? 0
         useDoubleWideMlp =

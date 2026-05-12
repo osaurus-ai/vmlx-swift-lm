@@ -208,17 +208,25 @@ struct G4TextConfig: Codable, Sendable {
         tieWordEmbeddings = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
         attentionBias = try c.decodeIfPresent(Bool.self, forKey: .attentionBias) ?? false
         attentionKEqV = try c.decodeIfPresent(Bool.self, forKey: .attentionKEqV) ?? false
-        hiddenSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
-        vocabSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
+        let decodedHiddenSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .hiddenSizePerLayerInput) ?? 0
+        var decodedVocabSizePerLayerInput = try c.decodeIfPresent(Int.self, forKey: .vocabSizePerLayerInput) ?? 0
         // PLE coherence: paired E2B/E4B fields. See Gemma4Text.swift / deep-trace §7.6.
-        if (hiddenSizePerLayerInput == 0) != (vocabSizePerLayerInput == 0) {
+        // `hidden_size_per_layer_input == 0` is the authoritative PLE-off signal
+        // for full Gemma4 rows. Some shipped configs still carry the ordinary
+        // vocab size in `vocab_size_per_layer_input`; normalize that to PLE off.
+        // The opposite shape remains invalid because a positive PLE hidden size
+        // requires a positive PLE vocab.
+        if decodedHiddenSizePerLayerInput == 0 {
+            decodedVocabSizePerLayerInput = 0
+        } else if decodedVocabSizePerLayerInput == 0 {
             throw DecodingError.dataCorruptedError(
                 forKey: .hiddenSizePerLayerInput, in: c,
                 debugDescription:
-                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(hiddenSizePerLayerInput) "
-                    + "and vocab_size_per_layer_input=\(vocabSizePerLayerInput); both must be zero (PLE off) "
-                    + "or both must be positive (PLE on).")
+                    "Gemma4 PLE config incoherent: hidden_size_per_layer_input=\(decodedHiddenSizePerLayerInput) "
+                    + "and vocab_size_per_layer_input=\(decodedVocabSizePerLayerInput); vocab must be positive when PLE hidden size is positive.")
         }
+        hiddenSizePerLayerInput = decodedHiddenSizePerLayerInput
+        vocabSizePerLayerInput = decodedVocabSizePerLayerInput
         numKvSharedLayers = try c.decodeIfPresent(Int.self, forKey: .numKvSharedLayers) ?? 0
         useDoubleWideMlp = try c.decodeIfPresent(Bool.self, forKey: .useDoubleWideMlp) ?? false
         enableMoeBlock = try c.decodeIfPresent(Bool.self, forKey: .enableMoeBlock) ?? false
