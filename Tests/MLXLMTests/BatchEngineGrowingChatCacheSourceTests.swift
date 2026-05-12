@@ -51,8 +51,38 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("Cache \\(detail.rawValue) hit: restored \\(diskRestored) tokens from disk"))
     }
 
-    @Test("MiniMax open-thinking prompts get decode-time close-token correction")
-    func minimaxOpenThinkingGetsReasoningCloseBias() throws {
+    @Test("disk cache serializes MLX safetensors IO across model cache instances")
+    func diskCacheSerializesMLXSafetensorsIOAcrossInstances() throws {
+        let disk = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/DiskCache.swift",
+            encoding: .utf8)
+        let ssm = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Cache/SSMCompanionDiskStore.swift",
+            encoding: .utf8)
+
+        #expect(disk.contains("enum MLXDiskCacheIOLock"))
+        #expect(disk.contains("MLXDiskCacheIOLock.shared.lock()"))
+        #expect(disk.contains("try loadArraysAndMetadata(url: url)"))
+        #expect(disk.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: url)"))
+        #expect(ssm.contains("MLXDiskCacheIOLock.shared.lock()"))
+        #expect(ssm.contains("loadArraysAndMetadata(url: safetensorsURL)"))
+        #expect(ssm.contains("try save(arrays: arrays, metadata: [\"format\": \"mlx\"], url: safetensorsURL)"))
+    }
+
+    @Test("token iterator trims full cache hits before one-token seed prefill")
+    func tokenIteratorTrimsFullCacheHitBeforeSeedPrefill() throws {
+        let source = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+
+        #expect(source.contains("let trimNeeded = cacheOffset - (promptLen - 1)"))
+        #expect(source.contains("for layer in self.cache where layer.isTrimmable"))
+        #expect(source.contains("_ = layer.trim(trimNeeded)"))
+        #expect(source.contains("let lastToken = MLXArray([Int32(last)])"))
+    }
+
+    @Test("MiniMax open-thinking prompts get close-token bias without forced close")
+    func minimaxOpenThinkingGetsReasoningCloseBiasWithoutForcedClose() throws {
         let evaluate = try String(
             contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
             encoding: .utf8)
@@ -70,6 +100,35 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(evaluate.contains("promptTail.range(of: \"</think>\", options: .backwards)"))
         #expect(evaluate.contains("_specialTokenID(\"</think>\", tokenizer: tokenizer)"))
         #expect(evaluate.contains("tokenizer.encode(text: token, addSpecialTokens: false)"))
+        #expect(evaluate.contains("forceAfterTokens: nil"))
+        #expect(!evaluate.contains("forceAfterTokens: forceAfter"))
+        #expect(!evaluate.contains("let forceAfter: Int?"))
         #expect(evaluate.contains("reasoningCloseBias active"))
+    }
+
+    @Test("batch engine has env-gated reasoning prompt-tail diagnostics")
+    func batchEngineHasReasoningPromptTailDiagnostics() throws {
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(engine.contains("VMLINUX_REASONING_PROMPT_TAIL_LOG"))
+        #expect(engine.contains("debugLogReasoningPromptTail"))
+        #expect(engine.contains("path: \"BatchEngine.generate\""))
+        #expect(engine.contains("path: \"BatchEngine.submit\""))
+    }
+
+    @Test("MiniMax stays off compiled decode until parity is proven")
+    func minimaxCompiledDecodeIsDenied() throws {
+        let evaluate = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/Evaluate.swift",
+            encoding: .utf8)
+        let engine = try String(
+            contentsOfFile: "Libraries/MLXLMCommon/BatchEngine/BatchEngine.swift",
+            encoding: .utf8)
+
+        #expect(evaluate.contains("typeName.contains(\"minimax\")"))
+        #expect(engine.contains("modelName.contains(\"minimax\")"))
+        #expect(engine.contains("modelTypeName.contains(\"minimax\")"))
     }
 }

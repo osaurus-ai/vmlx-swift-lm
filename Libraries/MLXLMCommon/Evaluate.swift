@@ -224,11 +224,11 @@ public struct GenerateParameters: Sendable {
 
     /// Optional decode-time control for models whose chat template opens a
     /// reasoning block with a real special token but whose quantized logits can
-    /// under-rank the matching close token. The processor first applies an
-    /// additive bias after `activateAfterTokens`; if the model still has not
-    /// sampled the close token by `forceAfterTokens`, it forces that exact token
-    /// once so the model state and downstream reasoning parser observe the same
-    /// boundary.
+    /// under-rank the matching close token. The processor applies an additive
+    /// bias after `activateAfterTokens`. `forceAfterTokens` is available only
+    /// for explicit experiments; the automatic MiniMax path must not use it,
+    /// because a forced close token can move downstream parsing out of the
+    /// reasoning rail before the model has naturally transitioned.
     public var reasoningCloseBias: ReasoningCloseBiasConfig? = nil
 
     public init(
@@ -666,6 +666,10 @@ public struct FrequencyPenaltyContext: LogitProcessor {
 }
 
 /// Biases, then optionally forces, a reasoning close token once.
+///
+/// Forcing is intentionally not enabled by automatic MiniMax handling. It is
+/// only here for explicit diagnostic experiments where the caller accepts that
+/// the model state may not match a naturally sampled reasoning boundary.
 public struct ReasoningCloseBiasProcessor: LogitProcessor {
     let config: ReasoningCloseBiasConfig
     private var generatedCount = 0
@@ -792,7 +796,9 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     private static func compiledDecodeDenied(for model: any LanguageModel) -> Bool {
         let typeName = String(describing: type(of: model)).lowercased()
-        return typeName.contains("hy3") || typeName.contains("hunyuan")
+        return typeName.contains("hy3")
+            || typeName.contains("hunyuan")
+            || typeName.contains("minimax")
     }
 
     let model: any LanguageModel
@@ -1052,10 +1058,21 @@ public struct TokenIterator: TokenIteratorProtocol {
                         // 2D already or tolerate the extra leading axis.
                         if remainingTokens.isEmpty, let last = promptTokenIds.last {
                             // Full cache hit — feed just the last token to seed decode.
-                            // prepare() needs at least 1 token to produce initial logits.
-                            // `let last` defensively guards the "shouldn't happen" case
-                            // where the coordinator hands back .hit with empty tokens;
-                            // falling through to the remaining branch preserves safety.
+                            // Match BatchEngine.stepPrefill: the restored cache already
+                            // contains the full prompt, so trim it back to promptLen - 1
+                            // before re-feeding the final prompt token. Without this,
+                            // RoPE-positioned KV models re-feed the last token one
+                            // position too far to the right after a full disk/paged hit,
+                            // which can produce blank/newline-only first-token behavior
+                            // on the B=1 solo path used by osaurus.
+                            let promptLen = promptTokenIds.count
+                            let cacheOffset = self.cache.first?.offset ?? promptLen
+                            let trimNeeded = cacheOffset - (promptLen - 1)
+                            if trimNeeded > 0 {
+                                for layer in self.cache where layer.isTrimmable {
+                                    _ = layer.trim(trimNeeded)
+                                }
+                            }
                             let lastToken = MLXArray([Int32(last)])
                                 .expandedDimensions(axis: 0)
                             inputForPrepare = LMInput(
@@ -3150,14 +3167,13 @@ internal func _parametersWithAutomaticReasoningCloseBias(
     var adjusted = parameters
     let maxTokens = parameters.maxTokens ?? 1024
     let activateAfter = min(64, max(24, maxTokens / 4))
-    let forceAfter: Int? = maxTokens > 96 ? min(maxTokens - 32, 128) : nil
     adjusted.reasoningCloseBias = ReasoningCloseBiasConfig(
         tokenID: closeTokenID,
         activateAfterTokens: activateAfter,
         bias: 8.0,
-        forceAfterTokens: forceAfter)
+        forceAfterTokens: nil)
     reasoningCloseBiasLog.info(
-        "reasoningCloseBias active model=\(modelConfiguration.name, privacy: .public) tokenID=\(closeTokenID, privacy: .public) activateAfter=\(activateAfter, privacy: .public) forceAfter=\(forceAfter ?? -1, privacy: .public)")
+        "reasoningCloseBias active model=\(modelConfiguration.name, privacy: .public) tokenID=\(closeTokenID, privacy: .public) activateAfter=\(activateAfter, privacy: .public) forceAfter=-1")
     return adjusted
 }
 

@@ -52,6 +52,81 @@ private func cancelledGenerationStream(
     return stream
 }
 
+private func debugLogReasoningPromptTail(
+    modelName: String,
+    promptTail: String?,
+    path: String
+) {
+    guard ProcessInfo.processInfo.environment["VMLINUX_REASONING_PROMPT_TAIL_LOG"] == "1"
+    else { return }
+    let escaped = (promptTail ?? "<nil>")
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+    let line = "[vmlx] reasoning promptTail path=\(path) model=\(modelName) tail=\(escaped)\n"
+    if let data = line.data(using: .utf8) {
+        FileHandle.standardError.write(data)
+    }
+}
+
+private func debugDumpReasoningPrompt(
+    input: LMInput,
+    tokenizer: any Tokenizer,
+    modelName: String,
+    path: String
+) {
+    let env = ProcessInfo.processInfo.environment
+    guard let dir = env["VMLINUX_REASONING_PROMPT_DUMP_DIR"],
+          !dir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return }
+
+    let promptTokens = input.text.tokens
+    guard promptTokens.ndim >= 1 else { return }
+    let total = promptTokens.ndim == 1
+        ? promptTokens.dim(0)
+        : promptTokens.dim(promptTokens.ndim - 1)
+    guard total > 0 else { return }
+
+    let tokenArray: MLXArray
+    if promptTokens.ndim == 1 {
+        tokenArray = promptTokens[0 ..< total]
+    } else {
+        tokenArray = promptTokens[.ellipsis, 0 ..< total]
+    }
+    let tokenIds = tokenArray.asArray(Int32.self).map { Int($0) }
+    let rendered = tokenizer.decode(tokenIds: tokenIds, skipSpecialTokens: false)
+
+    let safeModel = modelName
+        .map { ch in ch.isLetter || ch.isNumber || ch == "-" || ch == "_" ? ch : "_" }
+        .reduce(into: "") { $0.append($1) }
+    let timestamp = Int(Date().timeIntervalSince1970 * 1000)
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let url = URL(fileURLWithPath: dir, isDirectory: true)
+        .appendingPathComponent("prompt-\(timestamp)-\(pid)-\(path)-\(safeModel).txt")
+    let body = """
+    path=\(path)
+    model=\(modelName)
+    promptTokens=\(tokenIds.count)
+
+    \(rendered)
+    """
+    do {
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: dir, isDirectory: true),
+            withIntermediateDirectories: true)
+        try body.write(to: url, atomically: true, encoding: .utf8)
+        let line = "[vmlx] reasoning promptDump path=\(path) model=\(modelName) file=\(url.path)\n"
+        if let data = line.data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
+    } catch {
+        let line = "[vmlx] reasoning promptDump failed path=\(path) model=\(modelName) error=\(error.localizedDescription)\n"
+        if let data = line.data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
+    }
+}
+
 private final class BatchStreamTerminationState: @unchecked Sendable {
     private let lock = NSLock()
     private var completed = false
@@ -200,10 +275,10 @@ public actor BatchEngine {
     /// Maximum B=1 decode steps before yielding back to the actor executor.
     private let controlPlaneYieldInterval: Int = 8
 
-    /// Hy3/Hunyuan currently decodes coherently on the uncompiled path but
-    /// diverges on the single-slot compiled trace. Keep compile opt-in from
-    /// silently taking that unsafe route until the model path has a dedicated
-    /// compiled-vs-uncompiled parity test.
+    /// Hy3/Hunyuan and MiniMax currently decode coherently on the uncompiled
+    /// path but diverge on the single-slot compiled trace. Keep compile opt-in
+    /// from silently taking those unsafe routes until each model path has a
+    /// dedicated compiled-vs-uncompiled parity test.
     private var compiledDecodeDeniedForModel: Bool {
         if context.configuration.toolCallFormat == .hunyuan {
             return true
@@ -212,6 +287,7 @@ public actor BatchEngine {
         let modelTypeName = String(describing: type(of: context.model)).lowercased()
         return modelName.contains("hy3") || modelName.contains("hy_v3") || modelName.contains("hy-v3")
             || modelTypeName.contains("hy3") || modelTypeName.contains("hunyuan")
+            || modelName.contains("minimax") || modelTypeName.contains("minimax")
     }
 
     /// Initial admission window for B>1 engines. The scheduler runs prefill on
@@ -361,6 +437,15 @@ public actor BatchEngine {
         let (stream, continuation) = AsyncStream<BatchGeneration>.makeStream()
         let promptTail = _decodePromptTail(
             input: input, tokenizer: context.tokenizer, tokens: 64)
+        debugLogReasoningPromptTail(
+            modelName: context.configuration.name,
+            promptTail: promptTail,
+            path: "BatchEngine.submit")
+        debugDumpReasoningPrompt(
+            input: input,
+            tokenizer: context.tokenizer,
+            modelName: context.configuration.name,
+            path: "BatchEngine.submit")
         let effectiveParameters = _parametersWithAutomaticReasoningCloseBias(
             parameters,
             promptTail: promptTail,
@@ -462,6 +547,15 @@ public actor BatchEngine {
         // we have the tokenizer on hand.
         let promptTail = _decodePromptTail(
             input: input, tokenizer: tokenizer, tokens: 64)
+        debugLogReasoningPromptTail(
+            modelName: context.configuration.name,
+            promptTail: promptTail,
+            path: "BatchEngine.generate")
+        debugDumpReasoningPrompt(
+            input: input,
+            tokenizer: tokenizer,
+            modelName: context.configuration.name,
+            path: "BatchEngine.generate")
         let effectiveParameters = _parametersWithAutomaticReasoningCloseBias(
             parameters,
             promptTail: promptTail,
