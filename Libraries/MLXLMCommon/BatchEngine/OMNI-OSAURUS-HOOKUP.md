@@ -1,6 +1,6 @@
 # Nemotron-Omni × Osaurus Hookup Guide
 
-**Audience**: osaurus integrators consuming `vmlx-swift-lm` ≥ commit `b4eec09`.
+**Audience**: osaurus integrators consuming `vmlx-swift-lm` ≥ commit `fb8fb39`.
 
 **Scope**: everything the osaurus runtime layer needs to know to safely
 serve **Nemotron-3-Nano-Omni-30B-A3B-{MXFP4, JANGTQ4, JANGTQ2}** bundles

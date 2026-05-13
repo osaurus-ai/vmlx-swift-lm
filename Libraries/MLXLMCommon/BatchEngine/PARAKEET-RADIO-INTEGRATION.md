@@ -1,7 +1,8 @@
 # Parakeet (audio) + RADIO (vision) host-integration spec
 
-Status: spec draft for the host team UI hookup of Nemotron-3-Nano-Omni's
-two non-text modalities. Pinned to vmlx revision `13abe40`.
+Status: live host-integration spec for the Osaurus Nemotron-3-Nano-Omni
+audio/vision path. Current Osaurus live-voice work consumes
+`vmlx-swift-lm` revision `fb8fb39` or newer.
 
 The Nemotron-3 omni bundle ships THREE encoders (text + Parakeet audio +
 RADIO vision) that share one MoE+SSM hybrid backbone. The host already
@@ -35,9 +36,10 @@ for await event in await batchEngine.generate(input: userInput, ...) {
 }
 ```
 
-`UserInput.Audio` and `UserInput.Video` are unions that accept either a
-file URL or a pre-decoded float array. Both paths converge on the same
-preprocessor.
+`UserInput.Audio` and `UserInput.Video` are unions that accept file URLs,
+pre-decoded samples/arrays, and for audio an already-computed
+Parakeet/sound-projection embedding. All paths converge on the same
+processor/`LMInput` surface.
 
 | Surface | Type | Where |
 |---|---|---|
@@ -47,8 +49,9 @@ preprocessor.
 | Video frame extractor | `nemotronOmniExtractVideoFrames` | `Libraries/MLXVLM/Models/NemotronHOmni/Preprocessors.swift:577` |
 | Audio mel preproc | `NemotronHOmniProcessor.preprocess(audios:)` | `Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift:467` |
 | Video preproc | `NemotronHOmniProcessor.preprocess(videos:)` | `Libraries/MLXVLM/Models/NemotronHOmni/NemotronHOmni.swift:495` |
-| Parakeet encoder | `NemotronHParakeetEncoder` | `Libraries/MLXVLM/Models/NemotronHOmni/Parakeet.swift:328` |
-| RADIO vision encoder | `NemotronHRADIOVisionTransformer` | `Libraries/MLXVLM/Models/NemotronHOmni/RADIOVision.swift` |
+| Parakeet encoder | `NemotronHParakeetEncoder` | `Libraries/MLXVLM/Models/NemotronHOmni/Parakeet.swift` |
+| RADIO vision encoder | `NemotronHRADIOVisionModel` | `Libraries/MLXVLM/Models/NemotronHOmni/RADIOVision.swift` |
+| Pre-encoded audio | `UserInput.Audio.preEncoded` | `Libraries/MLXLMCommon/UserInput.swift` |
 
 ---
 
@@ -59,7 +62,13 @@ preprocessor.
 - **File URL**: any container AVAudioConverter can decode — wav, mp3,
   m4a, flac, ogg/opus, aac. Sample rate doesn't matter (resampled to
   16 kHz mono Float32 internally).
-- **Raw `[Float]`**: must already be 16 kHz mono. No resampling done.
+- **Raw `[Float]` / `MLXArray`**: pass the source sample rate; the
+  Nemotron processor linearly resamples in-memory PCM to 16 kHz mono when
+  needed.
+- **Pre-encoded audio**: `UserInput.Audio.preEncoded(samples:sampleRate:embedding:)`
+  carries a Parakeet + sound-projection embedding that was computed
+  earlier against the resident model. This is the fast live-call path when
+  the host has already pre-encoded retained PCM during capture.
 
 ### What the host UI must enforce
 
@@ -87,16 +96,27 @@ canonical extensions:
 
 ### Streaming vs one-shot
 
-Parakeet runs as a **non-streaming encoder** — the full audio is encoded
-into a token sequence before decode begins. Parakeet itself does not
-emit incremental events. The host UI should:
+Parakeet currently runs as a **non-streaming encoder** — a waveform is
+encoded into a token sequence before LLM decode begins. Parakeet itself
+does not emit incremental events. The low-latency live-call path is to
+pre-encode the retained PCM against the resident Nemotron model while the
+caller is still speaking, then submit `UserInput.Audio.preEncoded` at the
+endpoint. Osaurus rejects stale pre-encodes by sample count/rate and falls
+back to raw PCM if a fresh embedding is not available.
+
+The host UI should:
 
 - Show a "transcribing audio…" spinner while `BatchEngine.generate` is
-  blocked on audio preprocessing (typically <500 ms for clips ≤ 30 s on
-  M5 Max).
+  blocked on audio preprocessing. With fresh pre-encoded audio this step is
+  skipped in the model turn; with raw PCM it includes mel + Parakeet +
+  sound-projection work.
 - Display TTFT (time-to-first-token) including the audio-encode latency
   rather than from-prefill — `runtime_start` → `first_token` already
   measures this end-to-end via `TTFTTrace`.
+- Treat true causal/chunk-concatenated Parakeet embedding accumulation as
+  unproven until prefix-stability tests prove a safe overlap/rollback
+  window. The current correct path is resident full-snapshot pre-encode,
+  not concatenating arbitrary chunk outputs.
 
 ### Length limits
 
