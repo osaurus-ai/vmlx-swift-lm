@@ -304,6 +304,18 @@ let package = Package(
             path: "Tools/OmniAudioLatencyBench"
         ),
         .executableTarget(
+            name: "OmniAudioChunkStabilityBench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Tools/OmniAudioChunkStabilityBench"
+        ),
+        .executableTarget(
             name: "RunBench",
             dependencies: [
                 "MLXLMCommon",
