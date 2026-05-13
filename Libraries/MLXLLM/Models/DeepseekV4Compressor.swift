@@ -474,6 +474,7 @@ public final class DeepseekV4Indexer: Module {
     let nHeads: Int
     let headDim: Int
     let topK: Int
+    let compressRatio: Int
     let scale: Float
 
     @ModuleInfo(key: "wq_b") var wqB: Linear
@@ -484,6 +485,7 @@ public final class DeepseekV4Indexer: Module {
         self.nHeads = config.indexNHeads
         self.headDim = config.indexHeadDim
         self.topK = config.indexTopk
+        self.compressRatio = compressRatio
         self.scale = 1.0 / sqrt(Float(headDim))
         self._wqB.wrappedValue = Linear(
             config.qLoraRank, nHeads * headDim, bias: false)
@@ -556,6 +558,8 @@ public final class DeepseekV4Indexer: Module {
         // Reshape scores sum axis: (B, 1, L, nHeads) multiply → sum.
         let wExpanded = wRaw.swappedAxes(-1, -2).expandedDimensions(axis: -1)
         scores = (scores * wExpanded).sum(axis: 1)  // (B, L, pooledLen)
+        scores = DeepseekV4Math.causalMaskedIndexerScores(
+            scores, offset: startPos, ratio: compressRatio)
 
         let k = min(topK, pooled.dim(1))
         let topIdx = argPartition(-scores, kth: k - 1, axis: -1)[

@@ -154,6 +154,10 @@ Per-class behavior:
 - For DSV4 prefix-cache hits, `restoreDeepseekV4Layer` reseats the
   rotating + pool + buffer state in one shot — no incremental re-prefill
   needed.
+- DSV4 HSA top-k is causal before selection: prefill masks indexer scores
+  with `compressedVisibility` before `argPartition`, then applies the SDPA
+  visibility mask again. This prevents long prompts from spending the entire
+  top-k budget on future pool rows that would be filtered out later.
 
 ## Common pitfalls
 
@@ -171,3 +175,6 @@ Per-class behavior:
    it leaves contaminated pool entries that hurt next-token quality.
 5. **Force-enabling paged cache for DSV4.** It will silently produce
    wrong attention output. The model is paged-incompatible by design.
+6. **Selecting HSA top-k before causal masking.** This looks fine while
+   `pooledLen <= index_topk`, then degrades once the compressed pool grows.
+   Always mask future compressed chunks before `argPartition`.

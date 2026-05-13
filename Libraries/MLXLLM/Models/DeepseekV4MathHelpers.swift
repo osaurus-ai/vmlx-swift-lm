@@ -431,6 +431,29 @@ public enum DeepseekV4Math {
         return MLX.broadcast(v4, to: [B, 1, S, compressedLen])
     }
 
+    /// Apply DSV4's block-causal compressed-pool visibility before
+    /// HSA indexer top-k selection. The later SDPA mask is still the
+    /// final authority, but masking here prevents argpartition from
+    /// spending the whole top-k budget on future chunks that are later
+    /// filtered out.
+    ///
+    /// `scores` shape: `(B, S, compressedLen)`.
+    public static func causalMaskedIndexerScores(
+        _ scores: MLXArray, offset: Int, ratio: Int
+    ) -> MLXArray {
+        let B = scores.dim(0)
+        let S = scores.dim(1)
+        let compressedLen = scores.dim(2)
+        guard S > 1, compressedLen > 0 else { return scores }
+
+        let visible = compressedVisibility(
+            batch: B, queryLen: S, offset: offset,
+            compressedLen: compressedLen, ratio: ratio
+        ).squeezed(axis: 1)
+        let negLarge = MLXArray(Float(-1.0e30), dtype: scores.dtype)
+        return MLX.where(visible, scores, negLarge)
+    }
+
     /// AND the per-query indexer top-k selection onto a compressed
     /// visibility mask. `topk` is the indexer's `(B, S, K)` int array
     /// of selected chunk indices; returns `(B, 1, S, compressedLen)`
