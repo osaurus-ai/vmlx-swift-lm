@@ -351,33 +351,48 @@ public final class DeepseekV4Compressor: Module {
         var kv = wkv(x)
         var gate = wgate(x)
 
-        // Accumulate windows. When cache present, prepend unused-tail
-        // buffers from prior calls.
         var poolBase = startPos
-        if let cache = v4Cache {
-            let (bufKV, bufGate) = cache.getBuffers(branch)
-            if let bKV = bufKV, bKV.dim(1) > 0, let bG = bufGate {
-                kv = concatenated([bKV, kv], axis: 1)
-                gate = concatenated([bG, gate], axis: 1)
-                poolBase -= bKV.dim(1)
-            }
-            let total = kv.dim(1)
-            let usable = (total / compressRatio) * compressRatio
-            // Stash the tail for the next call.
-            let tailKV = usable < total ? kv[0..., usable..., 0...] : nil
-            let tailGate = usable < total ? gate[0..., usable..., 0...] : nil
-            cache.setBuffers(branch, kv: tailKV, gate: tailGate)
-            kv = kv[0..., 0..<usable, 0...]
-            gate = gate[0..., 0..<usable, 0...]
+        let alreadyWindowed: Bool
+        if let cache = v4Cache, overlap {
+            let positions = MLXArray(
+                Int32(startPos)..<Int32(startPos + gate.dim(1)))
+            let apeRows = ape.asType(gate.dtype)[positions % Int32(compressRatio)]
+            gate = gate + apeRows.expandedDimensions(axis: 0)
+            let accumulated = accumulateOverlapWindows(
+                kv: kv, gate: gate, cache: cache, branch: branch,
+                ratio: compressRatio, startPos: startPos)
+            kv = accumulated.kvRows
+            gate = accumulated.gateRows
+            poolBase = accumulated.poolBase
+            alreadyWindowed = true
         } else {
-            let total = kv.dim(1)
-            let usable = (total / compressRatio) * compressRatio
-            kv = kv[0..., 0..<usable, 0...]
-            gate = gate[0..., 0..<usable, 0...]
+            // Accumulate windows. When cache present, prepend unused-tail
+            // buffers from prior calls.
+            if let cache = v4Cache {
+                let (bufKV, bufGate) = cache.getBuffers(branch)
+                if let bKV = bufKV, bKV.dim(1) > 0, let bG = bufGate {
+                    kv = concatenated([bKV, kv], axis: 1)
+                    gate = concatenated([bG, gate], axis: 1)
+                    poolBase -= bKV.dim(1)
+                }
+                let total = kv.dim(1)
+                let usable = (total / compressRatio) * compressRatio
+                // Stash the tail for the next call.
+                let tailKV = usable < total ? kv[0..., usable..., 0...] : nil
+                let tailGate = usable < total ? gate[0..., usable..., 0...] : nil
+                cache.setBuffers(branch, kv: tailKV, gate: tailGate)
+                kv = kv[0..., 0..<usable, 0...]
+                gate = gate[0..., 0..<usable, 0...]
+            } else {
+                let total = kv.dim(1)
+                let usable = (total / compressRatio) * compressRatio
+                kv = kv[0..., 0..<usable, 0...]
+                gate = gate[0..., 0..<usable, 0...]
+            }
+            alreadyWindowed = false
         }
 
-        let Lready = kv.dim(1)
-        if Lready == 0 {
+        if kv.dim(1) == 0 {
             let empty = MLXArray.zeros([B, 0, headDim], dtype: x.dtype)
             if let cache = v4Cache {
                 return cache.getPooled(branch) ?? empty
@@ -385,17 +400,26 @@ public final class DeepseekV4Compressor: Module {
             return empty
         }
 
-        let W = Lready / compressRatio
-        var kvWin = kv.reshaped(B, W, compressRatio, outDim)
-        var gateWin =
-            gate.reshaped(B, W, compressRatio, outDim) + ape.asType(gate.dtype)
+        let W: Int
+        var kvWin: MLXArray
+        var gateWin: MLXArray
+        if alreadyWindowed {
+            W = kv.dim(1)
+            kvWin = kv
+            gateWin = gate
+        } else {
+            W = kv.dim(1) / compressRatio
+            kvWin = kv.reshaped(B, W, compressRatio, outDim)
+            gateWin =
+                gate.reshaped(B, W, compressRatio, outDim) + ape.asType(gate.dtype)
 
-        if overlap {
-            kvWin = overlapTransform(kvWin, fillValue: 0.0)
-            // For gate, the pre-allocated fill is -inf so softmax assigns
-            // zero mass to the padding half.
-            gateWin = overlapTransform(
-                gateWin, fillValue: -Float.infinity)
+            if overlap {
+                kvWin = overlapTransform(kvWin, fillValue: 0.0)
+                // For gate, the pre-allocated fill is -inf so softmax assigns
+                // zero mass to the padding half.
+                gateWin = overlapTransform(
+                    gateWin, fillValue: -Float.infinity)
+            }
         }
 
         let weights =
@@ -430,6 +454,143 @@ public final class DeepseekV4Compressor: Module {
             }
         }
         return pooled
+    }
+
+    /// Ratio-4 overlap accumulation for the stateful decode path.
+    ///
+    /// DSV4's overlap compressor needs the previous complete window for the
+    /// left half of the next pooled row. A plain remainder buffer works during
+    /// large prefill chunks but corrupts single-token decode: every completed
+    /// decode row would otherwise get a zero left half at the call boundary.
+    func accumulateOverlapWindows(
+        kv: MLXArray,
+        gate: MLXArray,
+        cache: DeepseekV4Cache,
+        branch: DeepseekV4Cache.BranchKey,
+        ratio: Int,
+        startPos: Int
+    ) -> (kvRows: MLXArray, gateRows: MLXArray, poolBase: Int) {
+        let B = kv.dim(0)
+
+        func emptyRows(_ poolBase: Int) -> (kvRows: MLXArray, gateRows: MLXArray, poolBase: Int) {
+            (
+                MLXArray.zeros([B, 0, 2 * ratio, headDim], dtype: kv.dtype),
+                MLXArray.zeros([B, 0, 2 * ratio, headDim], dtype: gate.dtype),
+                poolBase
+            )
+        }
+
+        func makeRow(
+            prevKV: MLXArray?,
+            prevGate: MLXArray?,
+            curKV: MLXArray,
+            curGate: MLXArray
+        ) -> (MLXArray, MLXArray) {
+            let leftKV: MLXArray
+            let leftGate: MLXArray
+            if let prevKV, let prevGate {
+                leftKV = prevKV[0..., 0..., 0..<headDim]
+                leftGate = prevGate[0..., 0..., 0..<headDim]
+            } else {
+                leftKV = MLXArray.zeros([B, ratio, headDim], dtype: kv.dtype)
+                leftGate = MLXArray.full(
+                    [B, ratio, headDim],
+                    values: MLXArray(-Float.infinity).asType(gate.dtype))
+            }
+            let rightKV = curKV[0..., 0..., headDim...]
+            let rightGate = curGate[0..., 0..., headDim...]
+            return (
+                concatenated([leftKV, rightKV], axis: 1).expandedDimensions(axis: 1),
+                concatenated([leftGate, rightGate], axis: 1).expandedDimensions(axis: 1)
+            )
+        }
+
+        if startPos == 0 {
+            let usable = (kv.dim(1) / ratio) * ratio
+            let remainderKV = usable < kv.dim(1) ? kv[0..., usable..., 0...] : nil
+            let remainderGate = usable < gate.dim(1) ? gate[0..., usable..., 0...] : nil
+            if usable >= ratio {
+                let lastKV = kv[0..., (usable - ratio)..<usable, 0...]
+                let lastGate = gate[0..., (usable - ratio)..<usable, 0...]
+                cache.setBuffers(
+                    branch,
+                    kv: remainderKV != nil
+                        ? concatenated([lastKV, remainderKV!], axis: 1)
+                        : lastKV,
+                    gate: remainderGate != nil
+                        ? concatenated([lastGate, remainderGate!], axis: 1)
+                        : lastGate)
+            } else {
+                cache.setBuffers(branch, kv: remainderKV, gate: remainderGate)
+            }
+            guard usable > 0 else { return emptyRows(startPos) }
+            let W = usable / ratio
+            let fullKV = kv[0..., 0..<usable, 0...].reshaped(B, W, ratio, outDim)
+            let fullGate = gate[0..., 0..<usable, 0...].reshaped(B, W, ratio, outDim)
+            return (
+                overlapTransform(fullKV, fillValue: 0.0),
+                overlapTransform(fullGate, fillValue: -Float.infinity),
+                startPos
+            )
+        }
+
+        let (bufKV, bufGate) = cache.getBuffers(branch)
+        var prevKV: MLXArray? = nil
+        var prevGate: MLXArray? = nil
+        var partialKV = bufKV
+        var partialGate = bufGate
+        if let bKV = bufKV, bKV.dim(1) >= ratio, let bGate = bufGate {
+            prevKV = bKV[0..., 0..<ratio, 0...]
+            prevGate = bGate[0..., 0..<ratio, 0...]
+            partialKV = bKV.dim(1) > ratio ? bKV[0..., ratio..., 0...] : nil
+            partialGate = bGate.dim(1) > ratio ? bGate[0..., ratio..., 0...] : nil
+        }
+
+        let priorPartialLen = partialKV?.dim(1) ?? 0
+        var currentKV =
+            if let partialKV, partialKV.dim(1) > 0 {
+                concatenated([partialKV, kv], axis: 1)
+            } else {
+                kv
+            }
+        var currentGate =
+            if let partialGate, partialGate.dim(1) > 0 {
+                concatenated([partialGate, gate], axis: 1)
+            } else {
+                gate
+            }
+
+        var kvRows: [MLXArray] = []
+        var gateRows: [MLXArray] = []
+        while currentKV.dim(1) >= ratio {
+            let curKV = currentKV[0..., 0..<ratio, 0...]
+            let curGate = currentGate[0..., 0..<ratio, 0...]
+            let row = makeRow(prevKV: prevKV, prevGate: prevGate, curKV: curKV, curGate: curGate)
+            kvRows.append(row.0)
+            gateRows.append(row.1)
+            prevKV = curKV
+            prevGate = curGate
+            currentKV = currentKV.dim(1) > ratio ? currentKV[0..., ratio..., 0...] :
+                MLXArray.zeros([B, 0, outDim], dtype: kv.dtype)
+            currentGate = currentGate.dim(1) > ratio ? currentGate[0..., ratio..., 0...] :
+                MLXArray.zeros([B, 0, outDim], dtype: gate.dtype)
+        }
+
+        if let prevKV, let prevGate {
+            cache.setBuffers(
+                branch,
+                kv: currentKV.dim(1) > 0 ? concatenated([prevKV, currentKV], axis: 1) : prevKV,
+                gate: currentGate.dim(1) > 0 ? concatenated([prevGate, currentGate], axis: 1) : prevGate)
+        } else {
+            cache.setBuffers(
+                branch,
+                kv: currentKV.dim(1) > 0 ? currentKV : nil,
+                gate: currentGate.dim(1) > 0 ? currentGate : nil)
+        }
+
+        let poolBase = max(0, startPos - priorPartialLen)
+        guard !kvRows.isEmpty else { return emptyRows(poolBase) }
+        return (concatenated(kvRows, axis: 1), concatenated(gateRows, axis: 1), poolBase)
     }
 
     /// Overlap transform for compress_ratio=4. Expands (B, W, R, D) to
