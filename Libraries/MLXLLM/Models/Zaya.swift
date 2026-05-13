@@ -125,6 +125,12 @@ public struct ZayaTextConfiguration: Codable, Sendable {
 
     public init() {}
 
+    private struct RoutedExpertBitMetadata {
+        let routedBits: Int?
+        let gateUpBits: Int?
+        let downBits: Int?
+    }
+
     /// ZAYA stores `ffn_hidden_size` as the fused `linear_fc1` output
     /// width (gate + up). SwitchGLU wants the per-branch intermediate
     /// width, so the real 8B config's 4096 maps to 2048.
@@ -163,17 +169,64 @@ public struct ZayaTextConfiguration: Codable, Sendable {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .residualInFP32) { self.residualInFP32 = v }
 
         self.weightFormat = try c.decodeIfPresent(String.self, forKey: .weightFormat)
-        // mxtqBits cascade — accept flat int or per-role dict (factory pre-merges
-        // the nested layout into mxtq_gate_up_bits / mxtq_down_bits / mxtq_bits).
-        if let flat = try? c.decodeIfPresent(Int.self, forKey: .mxtqBits) {
-            self.mxtqBits = flat
-        } else if let dict = try? c.decodeIfPresent([String: Int].self, forKey: .mxtqBits) {
-            self.mxtqBits = dict["routed_expert"] ?? dict.values.first
-        }
-        self.mxtqGateUpBits = try c.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits)
-        self.mxtqDownBits = try c.decodeIfPresent(Int.self, forKey: .mxtqDownBits)
+        let routed = try Self.decodeRoutedExpertBits(from: c)
+        self.mxtqBits = routed.routedBits
+        self.mxtqGateUpBits =
+            try c.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits)
+            ?? routed.gateUpBits
+        self.mxtqDownBits =
+            try c.decodeIfPresent(Int.self, forKey: .mxtqDownBits)
+            ?? routed.downBits
         self.mxtqSeed = try c.decodeIfPresent(Int.self, forKey: .mxtqSeed)
         self.zayaExpertLayout = try c.decodeIfPresent(String.self, forKey: .zayaExpertLayout)
+    }
+
+    private static func decodeRoutedExpertBits(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> RoutedExpertBitMetadata {
+        if let flat = try? container.decodeIfPresent(Int.self, forKey: .mxtqBits) {
+            return RoutedExpertBitMetadata(routedBits: flat, gateUpBits: flat, downBits: flat)
+        }
+        guard container.contains(.mxtqBits) else {
+            return RoutedExpertBitMetadata(routedBits: nil, gateUpBits: nil, downBits: nil)
+        }
+        if let dict = try? container.decode([String: Int].self, forKey: .mxtqBits) {
+            let routed = dict["routed_expert"] ?? dict.values.first
+            return RoutedExpertBitMetadata(
+                routedBits: routed,
+                gateUpBits: routed,
+                downBits: routed)
+        }
+        struct ProjectionBits: Decodable {
+            let gateProj: Int?
+            let upProj: Int?
+            let downProj: Int?
+            enum CodingKeys: String, CodingKey {
+                case gateProj = "gate_proj"
+                case upProj = "up_proj"
+                case downProj = "down_proj"
+            }
+        }
+        struct NestedBits: Decodable {
+            let routedExpert: ProjectionBits?
+            enum CodingKeys: String, CodingKey { case routedExpert = "routed_expert" }
+        }
+        let nested = try container.decode(NestedBits.self, forKey: .mxtqBits)
+        let gate = nested.routedExpert?.gateProj
+        let up = nested.routedExpert?.upProj
+        if let gate, let up, gate != up {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath + [CodingKeys.mxtqBits],
+                debugDescription:
+                    "mxtq_bits.routed_expert gate_proj and up_proj must match for fused gate/up kernels"
+            ))
+        }
+        let gateUp = gate ?? up
+        let down = nested.routedExpert?.downProj
+        return RoutedExpertBitMetadata(
+            routedBits: gateUp ?? down,
+            gateUpBits: gateUp,
+            downBits: down)
     }
 }
 

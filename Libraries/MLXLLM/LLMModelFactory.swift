@@ -271,6 +271,7 @@ public enum LLMTypeRegistry {
         enum ProbeBits: Codable {
             case flat(Int)
             case roles([String: Int])
+            case projections(gateUp: Int?, down: Int?)
             init(from decoder: Decoder) throws {
                 let c = try decoder.singleValueContainer()
                 if let v = try? c.decode(Int.self) {
@@ -279,25 +280,62 @@ public enum LLMTypeRegistry {
                 if let v = try? c.decode([String: Int].self) {
                     self = .roles(v); return
                 }
+                struct ProjectionBits: Decodable {
+                    let gateProj: Int?
+                    let upProj: Int?
+                    let downProj: Int?
+                    enum CodingKeys: String, CodingKey {
+                        case gateProj = "gate_proj"
+                        case upProj = "up_proj"
+                        case downProj = "down_proj"
+                    }
+                }
+                struct NestedBits: Decodable {
+                    let routedExpert: ProjectionBits?
+                    enum CodingKeys: String, CodingKey { case routedExpert = "routed_expert" }
+                }
+                if let v = try? c.decode(NestedBits.self) {
+                    let gate = v.routedExpert?.gateProj
+                    let up = v.routedExpert?.upProj
+                    if let gate, let up, gate != up {
+                        throw DecodingError.dataCorruptedError(
+                            in: c,
+                            debugDescription:
+                                "mxtq_bits.routed_expert gate_proj and up_proj must match for fused gate/up kernels")
+                    }
+                    self = .projections(
+                        gateUp: gate ?? up,
+                        down: v.routedExpert?.downProj)
+                    return
+                }
                 throw DecodingError.typeMismatch(
                     ProbeBits.self,
                     .init(codingPath: decoder.codingPath,
                           debugDescription: "mxtq_bits must be Int or [String: Int]"))
             }
         }
-        let config = try JSONDecoder().decode(ZayaConfiguration.self, from: data)
-        let probe = try? JSONDecoder().decode(Probe.self, from: data)
+        let config = try JSONDecoder.json5().decode(ZayaConfiguration.self, from: data)
+        let probe = try? JSONDecoder.json5().decode(Probe.self, from: data)
 
         // Resolve routed-expert bit width from the probe, accepting both shapes.
         let routedBits: Int? = {
             switch probe?.mxtqBits {
             case .flat(let v): return v
             case .roles(let dict): return dict["routed_expert"] ?? dict.values.first
+            case .projections(let gateUp, let down): return gateUp ?? down
             case nil: return nil
             }
         }()
+        let projectedBits: (gateUp: Int?, down: Int?) = {
+            switch probe?.mxtqBits {
+            case .projections(let gateUp, let down): return (gateUp, down)
+            default: return (nil, nil)
+            }
+        }()
 
-        let weightFormat = probe?.weightFormat?.lowercased()
+        let weightFormat = (probe?.weightFormat ?? config.textConfig.weightFormat)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
         let isJANGTQ =
             weightFormat == "mxtq"
             || weightFormat == "jangtq2"
@@ -305,8 +343,8 @@ public enum LLMTypeRegistry {
             || routedBits != nil
 
         let context: ZayaMoEContext? = isJANGTQ ? .jangtq(
-            gateUpBits: probe?.mxtqGateUpBits ?? routedBits ?? 2,
-            downBits:   probe?.mxtqDownBits   ?? routedBits ?? 2,
+            gateUpBits: probe?.mxtqGateUpBits ?? projectedBits.gateUp ?? routedBits ?? 2,
+            downBits:   probe?.mxtqDownBits   ?? projectedBits.down   ?? routedBits ?? 2,
             seed:       probe?.mxtqSeed ?? 42
         ) : nil
         return ZayaModel(config, moe: context)
@@ -1154,15 +1192,24 @@ public final class LLMModelFactory: ModelFactory {
                 configDict["mxtq_bits"] as? [String: Any],
                 jangDict["mxtq_bits"] as? [String: Any],
             ].compactMap { $0 }
+            func intValue(_ value: Any?) -> Int? {
+                if let value = value as? Int {
+                    return value
+                }
+                if let value = value as? NSNumber {
+                    return value.intValue
+                }
+                return nil
+            }
             for bitsMap in bitsMaps {
                 let routedAny = bitsMap["routed_expert"]
-                if let routedInt = routedAny as? Int {
+                if let routedInt = intValue(routedAny) {
                     configDict["mxtq_bits"] = routedInt
                     break
-                } else if let routedDict = routedAny as? [String: Int] {
-                    let gate = routedDict["gate_proj"]
-                    let up = routedDict["up_proj"]
-                    let down = routedDict["down_proj"]
+                } else if let routedDict = routedAny as? [String: Any] {
+                    let gate = intValue(routedDict["gate_proj"])
+                    let up = intValue(routedDict["up_proj"])
+                    let down = intValue(routedDict["down_proj"])
                     // gate and up MUST share a width — the fused gate+up
                     // Metal kernel takes a single `bits` parameter.
                     if let g = gate, let u = up, g == u {
@@ -1172,13 +1219,30 @@ public final class LLMModelFactory: ModelFactory {
                             configDict["mxtq_down_bits"] = d
                         }
                         break
+                    } else if let g = gate, let u = up {
+                        throw ModelFactoryError.configurationFileError(
+                            jangConfigURL.lastPathComponent,
+                            configuration.name,
+                            NSError(
+                                domain: "LLMModelFactory",
+                                code: 4,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey:
+                                        "mxtq_bits.routed_expert gate_proj (\(g)) and up_proj (\(u)) differ; fused gate/up JANGTQ kernels require matching widths"
+                                ]))
                     } else if let g = gate {
-                        // Mismatched gate/up — fall back to gate width
-                        // and warn. The model class will reject the
-                        // bundle on a same-bits assertion.
                         configDict["mxtq_bits"] = g
-                        FileHandle.standardError.write(Data(
-                            "[Load] WARNING: mxtq_bits.routed_expert has gate_proj != up_proj; the fused gate+up Metal kernel cannot dispatch mismatched bit widths\n".utf8))
+                        configDict["mxtq_gate_up_bits"] = g
+                        if let d = down {
+                            configDict["mxtq_down_bits"] = d
+                        }
+                        break
+                    } else if let u = up {
+                        configDict["mxtq_bits"] = u
+                        configDict["mxtq_gate_up_bits"] = u
+                        if let d = down {
+                            configDict["mxtq_down_bits"] = d
+                        }
                         break
                     }
                 }
@@ -1276,6 +1340,7 @@ public final class LLMModelFactory: ModelFactory {
             if var textConfig = configDict["text_config"] as? [String: Any] {
                 for key in [
                     "weight_format", "mxtq_seed", "mxtq_bits",
+                    "mxtq_gate_up_bits", "mxtq_down_bits",
                     "routed_expert_bits",
                 ] {
                     if textConfig[key] == nil, let v = configDict[key] {

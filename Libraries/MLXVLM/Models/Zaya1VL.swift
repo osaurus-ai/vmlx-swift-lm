@@ -141,6 +141,9 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
     public let visionStartTokenId: Int
     public let visionEndTokenId: Int
     public let weightFormat: String?
+    public let mxtqGateUpBits: Int?
+    public let mxtqDownBits: Int?
+    public let mxtqSeed: Int?
     public let visionConfiguration: VisionConfiguration
 
     private let mxtqBits: Int?
@@ -181,7 +184,16 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
         case visionEndTokenId = "vision_end_token_id"
         case weightFormat = "weight_format"
         case mxtqBits = "mxtq_bits"
+        case mxtqGateUpBits = "mxtq_gate_up_bits"
+        case mxtqDownBits = "mxtq_down_bits"
+        case mxtqSeed = "mxtq_seed"
         case visionConfiguration = "vision_config"
+    }
+
+    private struct RoutedExpertBitMetadata {
+        let routedBits: Int?
+        let gateUpBits: Int?
+        let downBits: Int?
     }
 
     public init(from decoder: Decoder) throws {
@@ -231,7 +243,15 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
         self.visionStartTokenId = try container.decode(Int.self, forKey: .visionStartTokenId)
         self.visionEndTokenId = try container.decode(Int.self, forKey: .visionEndTokenId)
         self.weightFormat = try container.decodeIfPresent(String.self, forKey: .weightFormat)
-        self.mxtqBits = try Self.decodeRoutedExpertBits(from: container)
+        let routed = try Self.decodeRoutedExpertBits(from: container)
+        self.mxtqBits = routed.routedBits
+        self.mxtqGateUpBits =
+            try container.decodeIfPresent(Int.self, forKey: .mxtqGateUpBits)
+            ?? routed.gateUpBits
+        self.mxtqDownBits =
+            try container.decodeIfPresent(Int.self, forKey: .mxtqDownBits)
+            ?? routed.downBits
+        self.mxtqSeed = try container.decodeIfPresent(Int.self, forKey: .mxtqSeed)
         self.visionConfiguration = try container.decode(
             VisionConfiguration.self, forKey: .visionConfiguration)
     }
@@ -272,20 +292,58 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
         try container.encode(visionEndTokenId, forKey: .visionEndTokenId)
         try container.encodeIfPresent(weightFormat, forKey: .weightFormat)
         try container.encodeIfPresent(mxtqBits, forKey: .mxtqBits)
+        try container.encodeIfPresent(mxtqGateUpBits, forKey: .mxtqGateUpBits)
+        try container.encodeIfPresent(mxtqDownBits, forKey: .mxtqDownBits)
+        try container.encodeIfPresent(mxtqSeed, forKey: .mxtqSeed)
         try container.encode(visionConfiguration, forKey: .visionConfiguration)
     }
 
     private static func decodeRoutedExpertBits(
         from container: KeyedDecodingContainer<CodingKeys>
-    ) throws -> Int? {
+    ) throws -> RoutedExpertBitMetadata {
         if let value = try? container.decodeIfPresent(Int.self, forKey: .mxtqBits) {
-            return value
+            return RoutedExpertBitMetadata(routedBits: value, gateUpBits: value, downBits: value)
         }
         guard container.contains(.mxtqBits) else {
-            return nil
+            return RoutedExpertBitMetadata(routedBits: nil, gateUpBits: nil, downBits: nil)
         }
-        let dict = try container.decode([String: Int].self, forKey: .mxtqBits)
-        return dict["routed_expert"] ?? dict["experts"] ?? dict.values.min()
+        if let dict = try? container.decode([String: Int].self, forKey: .mxtqBits) {
+            let routed = dict["routed_expert"] ?? dict["experts"] ?? dict.values.min()
+            return RoutedExpertBitMetadata(
+                routedBits: routed,
+                gateUpBits: routed,
+                downBits: routed)
+        }
+        struct ProjectionBits: Decodable {
+            let gateProj: Int?
+            let upProj: Int?
+            let downProj: Int?
+            enum CodingKeys: String, CodingKey {
+                case gateProj = "gate_proj"
+                case upProj = "up_proj"
+                case downProj = "down_proj"
+            }
+        }
+        struct NestedBits: Decodable {
+            let routedExpert: ProjectionBits?
+            enum CodingKeys: String, CodingKey { case routedExpert = "routed_expert" }
+        }
+        let nested = try container.decode(NestedBits.self, forKey: .mxtqBits)
+        let gate = nested.routedExpert?.gateProj
+        let up = nested.routedExpert?.upProj
+        if let gate, let up, gate != up {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: container.codingPath + [CodingKeys.mxtqBits],
+                debugDescription:
+                    "mxtq_bits.routed_expert gate_proj and up_proj must match for fused gate/up kernels"
+            ))
+        }
+        let gateUp = gate ?? up
+        let down = nested.routedExpert?.downProj
+        return RoutedExpertBitMetadata(
+            routedBits: gateUp ?? down,
+            gateUpBits: gateUp,
+            downBits: down)
     }
 
     public func makeQwen25VisionConfiguration() throws -> Qwen25VLConfiguration.VisionConfiguration {
@@ -326,6 +384,9 @@ public struct Zaya1VLConfiguration: Codable, Sendable {
         text.residualInFP32 = residualInFP32
         text.weightFormat = weightFormat
         text.mxtqBits = routedExpertBits
+        text.mxtqGateUpBits = mxtqGateUpBits
+        text.mxtqDownBits = mxtqDownBits
+        text.mxtqSeed = mxtqSeed
         text.zayaExpertLayout = zayaExpertLayout
         return text
     }
@@ -1497,7 +1558,10 @@ public final class Zaya1VL: Module, VLMModel {
             }
             return nil
         }
-        return .jangtq(gateUpBits: routedBits ?? 2, downBits: routedBits ?? 2, seed: 42)
+        return .jangtq(
+            gateUpBits: config.mxtqGateUpBits ?? routedBits ?? 2,
+            downBits: config.mxtqDownBits ?? routedBits ?? 2,
+            seed: config.mxtqSeed ?? 42)
     }
 
     public func newCache(parameters _: GenerateParameters?) -> [KVCache] {

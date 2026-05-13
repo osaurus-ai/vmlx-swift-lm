@@ -768,6 +768,92 @@ struct Zaya1VLRegistrationTests {
         }
     }
 
+    @Test("ZAYA1-VL JANGTQ_K nested routed-expert bits decode without config parse failure")
+    func jangtqKNestedRoutedExpertBitsDecode() throws {
+        let data = """
+        {
+          "model_type": "zaya1_vl",
+          "architectures": ["Zaya1VLForConditionalGeneration"],
+          "hidden_size": 2048,
+          "num_hidden_layers": 40,
+          "num_attention_heads": 8,
+          "num_key_value_heads": 2,
+          "head_dim": 128,
+          "num_query_groups": 2,
+          "ffn_hidden_size": 4096,
+          "vocab_size": 262272,
+          "image_token_id": 262147,
+          "vision_start_token_id": 255999,
+          "vision_end_token_id": 256000,
+          "weight_format": "mxtq",
+          "mxtq_bits": {
+            "routed_expert": {
+              "gate_proj": 2,
+              "up_proj": 2,
+              "down_proj": 4
+            },
+            "attention": 8,
+            "router": 16,
+            "embed_tokens": 8,
+            "lm_head": 8,
+            "cca_conv": 16,
+            "norms_residual": 16
+          },
+          "vision_config": {
+            "model_type": "qwen2_5_vl",
+            "hidden_size": 1280,
+            "out_hidden_size": 2048
+          }
+        }
+        """.data(using: .utf8)!
+
+        let config = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
+        let text = config.makeZayaTextConfiguration()
+
+        #expect(config.routedExpertBits == 2)
+        #expect(text.mxtqBits == 2)
+        #expect(text.mxtqGateUpBits == 2)
+        #expect(text.mxtqDownBits == 4)
+    }
+
+    @Test("ZAYA1-VL JANGTQ_K rejects mismatched fused gate/up bits")
+    func jangtqKRejectsMismatchedGateUpBits() throws {
+        let data = """
+        {
+          "model_type": "zaya1_vl",
+          "architectures": ["Zaya1VLForConditionalGeneration"],
+          "hidden_size": 2048,
+          "num_hidden_layers": 40,
+          "num_attention_heads": 8,
+          "num_key_value_heads": 2,
+          "head_dim": 128,
+          "num_query_groups": 2,
+          "ffn_hidden_size": 4096,
+          "vocab_size": 262272,
+          "image_token_id": 262147,
+          "vision_start_token_id": 255999,
+          "vision_end_token_id": 256000,
+          "weight_format": "mxtq",
+          "mxtq_bits": {
+            "routed_expert": {
+              "gate_proj": 2,
+              "up_proj": 3,
+              "down_proj": 4
+            }
+          },
+          "vision_config": {
+            "model_type": "qwen2_5_vl",
+            "hidden_size": 1280,
+            "out_hidden_size": 2048
+          }
+        }
+        """.data(using: .utf8)!
+
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(Zaya1VLConfiguration.self, from: data)
+        }
+    }
+
     @Test("ZAYA1-VL config maps to Zaya text primitive dimensions without 80-layer coercion",
           .enabled(if: FileManager.default.fileExists(
               atPath: bundlePath("ZAYA1-VL-8B-JANGTQ2") + "/config.json")))

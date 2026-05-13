@@ -90,6 +90,49 @@ struct ZayaConfigDecodeTests {
         #expect(cfg.textConfig.mxtqDownBits == 4)
     }
 
+    @Test("Nested JANGTQ_K routed-expert mxtq_bits decode without pre-merge")
+    func nestedJANGTQKBitsDecode() throws {
+        let json = """
+        {
+          "model_type": "zaya",
+          "weight_format": "mxtq",
+          "mxtq_bits": {
+            "routed_expert": {
+              "gate_proj": 2,
+              "up_proj": 2,
+              "down_proj": 4
+            },
+            "attention": 8,
+            "router": 16
+          }
+        }
+        """.data(using: .utf8)!
+        let cfg = try JSONDecoder().decode(ZayaConfiguration.self, from: json)
+        #expect(cfg.textConfig.mxtqBits == 2)
+        #expect(cfg.textConfig.mxtqGateUpBits == 2)
+        #expect(cfg.textConfig.mxtqDownBits == 4)
+    }
+
+    @Test("Nested JANGTQ_K rejects mismatched fused gate/up bits")
+    func nestedJANGTQKRejectsMismatchedGateUpBits() throws {
+        let json = """
+        {
+          "model_type": "zaya",
+          "weight_format": "mxtq",
+          "mxtq_bits": {
+            "routed_expert": {
+              "gate_proj": 2,
+              "up_proj": 3,
+              "down_proj": 4
+            }
+          }
+        }
+        """.data(using: .utf8)!
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder().decode(ZayaConfiguration.self, from: json)
+        }
+    }
+
     @Test("Defaults apply when fields are missing")
     func defaultsApply() throws {
         let json = """

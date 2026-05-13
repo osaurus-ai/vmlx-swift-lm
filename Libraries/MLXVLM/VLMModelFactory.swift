@@ -417,6 +417,56 @@ public final class VLMModelFactory: ModelFactory {
             if let wf = jangJSON["weight_format"] as? String {
                 configDict["weight_format"] = wf
             }
+            let bitsMaps: [[String: Any]] = [
+                configDict["mxtq_bits"] as? [String: Any],
+                jangJSON["mxtq_bits"] as? [String: Any],
+            ].compactMap { $0 }
+            func intValue(_ value: Any?) -> Int? {
+                if let value = value as? Int {
+                    return value
+                }
+                if let value = value as? NSNumber {
+                    return value.intValue
+                }
+                return nil
+            }
+            for bitsMap in bitsMaps {
+                let routedAny = bitsMap["routed_expert"]
+                if let routedInt = intValue(routedAny) {
+                    configDict["mxtq_bits"] = routedInt
+                    break
+                } else if let routedDict = routedAny as? [String: Any] {
+                    let gate = intValue(routedDict["gate_proj"])
+                    let up = intValue(routedDict["up_proj"])
+                    let down = intValue(routedDict["down_proj"])
+                    if let g = gate, let u = up, g == u {
+                        configDict["mxtq_bits"] = g
+                        configDict["mxtq_gate_up_bits"] = g
+                        if let d = down {
+                            configDict["mxtq_down_bits"] = d
+                        }
+                        break
+                    } else if let g = gate, let u = up {
+                        throw ModelFactoryError.configurationFileError(
+                            jangConfigURL.lastPathComponent,
+                            configuration.name,
+                            NSError(
+                                domain: "VLMModelFactory",
+                                code: 4,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey:
+                                        "mxtq_bits.routed_expert gate_proj (\(g)) and up_proj (\(u)) differ; fused gate/up JANGTQ kernels require matching widths"
+                                ]))
+                    } else if let g = gate ?? up {
+                        configDict["mxtq_bits"] = g
+                        configDict["mxtq_gate_up_bits"] = g
+                        if let d = down {
+                            configDict["mxtq_down_bits"] = d
+                        }
+                        break
+                    }
+                }
+            }
             // mxtq_bits comes from the converter's bit_widths_used list
             // (lowest bit width) or an explicit `mxtq_bits` key if present.
             if let qDict = jangJSON["quantization"] as? [String: Any] {
@@ -438,6 +488,11 @@ public final class VLMModelFactory: ModelFactory {
                 {
                     configDict["mxtq_seed"] = seed
                 }
+            }
+            if configDict["mxtq_seed"] == nil,
+                let seed = jangJSON["mxtq_seed"] as? Int
+            {
+                configDict["mxtq_seed"] = seed
             }
             if let merged = try? JSONSerialization.data(withJSONObject: configDict) {
                 mergedConfigData = merged
