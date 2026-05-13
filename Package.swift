@@ -292,6 +292,18 @@ let package = Package(
             path: "Tools/ANEProbe"
         ),
         .executableTarget(
+            name: "OmniAudioLatencyBench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Tools/OmniAudioLatencyBench"
+        ),
+        .executableTarget(
             name: "RunBench",
             dependencies: [
                 "MLXLMCommon",

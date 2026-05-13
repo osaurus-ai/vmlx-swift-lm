@@ -882,11 +882,63 @@ TTFAB from this run; it measures input-side audio encode/splice/generation,
 not output TTS first audio byte.
 ```
 
+For call-mode latency numbers, run the tracked JSONL harness instead:
+
+```text
+BENCH_OMNI_AUDIO_PATH=both \
+BENCH_OMNI_AUDIO_PREENCODE=1 \
+BENCH_OMNI_AUDIO_DISK_CACHE=1 \
+BENCH_AUDIO_REPEATS=3 \
+BENCH_AUDIO_FILE=Tests/MLXLMTests/Resources/audio_only.mov \
+BENCH_MAX_TOKENS=8 \
+BENCH_MODEL=<absolute path to the Nemotron Omni bundle> \
+/usr/bin/time -l swift run OmniAudioLatencyBench
+
+Parse the `OMNI_AUDIO_LATENCY { ... }` lines. The important fields are
+`path` (`batch` matches Osaurus's engine path, `iterator` is direct
+TokenIterator), `mode` (`raw_samples` vs `preencoded` Parakeet embedding),
+`processor_prepare_ms`, `first_delta_ms`, `total_ms`, `e2e_tokens_per_s`,
+`rss_mib`, and `peak_rss_mib`. `turn > 1` uses the same in-process
+`CacheCoordinator` and disk cache for that path/mode, so it is the quick
+prefix-cache reuse probe for identical audio+prompt. `first_delta_ms` is
+first semantic text delta, not output TTS first audio byte.
+```
+
+Agent prompt to hand another machine:
+
+```text
+In this repo, build and run the tracked Nemotron Omni audio latency bench.
+First find a local model folder containing config_omni.json. Prefer the
+smallest Nemotron Omni JANGTQ/MXFP4 bundle available. Then run:
+
+BENCH_OMNI_AUDIO_PATH=both \
+BENCH_OMNI_AUDIO_PREENCODE=1 \
+BENCH_OMNI_AUDIO_DISK_CACHE=1 \
+BENCH_AUDIO_REPEATS=3 \
+BENCH_AUDIO_FILE=Tests/MLXLMTests/Resources/audio_only.mov \
+BENCH_MAX_TOKENS=8 \
+BENCH_MODEL=<absolute path to that bundle> \
+/usr/bin/time -l swift run OmniAudioLatencyBench
+
+Send back every OMNI_AUDIO_LATENCY JSON line plus the /usr/bin/time -l
+memory/swaps lines. Compare raw_samples vs preencoded first_delta_ms,
+and compare turn 1 vs turn 2 for cache reuse. Do not call this TTFAB; it
+is TTFT/first semantic delta before any separate TTS model.
+```
+
 Latest local result on `Nemotron-Omni-Nano-JANGTQ-CRACK`:
 `13 passed, 0 failed`; audio encoder smoke `0.29s`; audio LMInput
 end-to-end `1.56s` at `52.3 tok/s`; mixed image+audio `2.88s`;
 media-salt isolation audio A vs B `2.18s`; max RSS `7,740,358,656`
 bytes; swaps `0`.
+
+Focused call-mode result from `docs/benchmarks/omni-audio-latency-2026-05-12.md`:
+BatchEngine raw PCM first semantic delta was `2180.7 ms` on turn 1 and
+`1473.8 ms` on turn 2. BatchEngine pre-encoded Parakeet first semantic
+delta was `200.0 ms` on turn 1 and `211.9 ms` on turn 2. This measures
+first text delta before any TTS model; the actionable live-call path is
+stream/accumulate Parakeet embeddings during caller speech and submit
+`.preEncoded` audio at endpoint.
 
 ---
 

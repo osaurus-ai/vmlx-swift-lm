@@ -582,6 +582,14 @@ With Parakeet + LLM prefill ≈ 500 ms + first-sentence-then-TTS ≈
 - Pre-warming the speaker with `NemotronHOmniSpeaker(voiceLanguage:
   "en-US")` at app launch (first call has ~100 ms init cost).
 
+Use `swift run OmniAudioLatencyBench` for stopwatch-grade local checks.
+It prints `OMNI_AUDIO_LATENCY` JSON lines for raw PCM vs pre-encoded
+Parakeet embeddings, BatchEngine vs TokenIterator, first semantic delta,
+total wall time, token rate, and RSS. Prefer
+`BENCH_OMNI_AUDIO_PATH=batch` when validating the Osaurus call path. This
+is TTFT/first semantic delta; add a separate TTS stopwatch for true
+output TTFAB.
+
 ---
 
 ## 10. Common pitfalls + fixes
@@ -640,5 +648,5 @@ existing chat-engine plumbing.
 - **Multi-speaker conversations** — Parakeet doesn't speaker-diarize.
   If you want "who said what" you need a separate diarization model.
 
-Last updated: 2026-04-29. References commit `a5c02a0` and later on
+Last updated: 2026-05-12. References commit `a5c02a0` and later on
 `osaurus-ai/vmlx-swift-lm` main.
