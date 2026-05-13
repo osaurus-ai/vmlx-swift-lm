@@ -1027,16 +1027,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
 
                 if restored {
-                    let hasMediaContent = input.hasMediaContent
                     let hasPathDependentLayer = self.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
-                    let unsafePartial = !remainingTokens.isEmpty && hasMediaContent
+                    let unsafePartial =
+                        input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)
                     let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer
                     if unsafePartial || unsafeFullHit {
                         let why: String
-                        if hasMediaContent {
-                            why = "media token region can't be split"
+                        if unsafePartial {
+                            why = "media placeholder tokens remain in cache-hit suffix"
                         } else if unsafeFullHit {
                             why = "path-dependent full cache hit: re-feeding last token would double-count recurrent state"
                         } else {

@@ -148,7 +148,7 @@ enum OmniAudioLatencyRunner {
                     default:
                         continue
                     }
-                    printJSON([
+                    var fields: [String: Any] = [
                         "event": "turn",
                         "model": modelDir.lastPathComponent,
                         "path": path,
@@ -171,7 +171,9 @@ enum OmniAudioLatencyRunner {
                         "rss_mib": rounded(result.rssMiB),
                         "peak_rss_mib": rounded(result.peakRssMiB),
                         "text": result.text,
-                    ])
+                    ]
+                    fields.merge(result.promptDiagnostics.jsonFields) { _, new in new }
+                    printJSON(fields)
                 }
                 if let engine {
                     await engine.shutdown()
@@ -191,7 +193,35 @@ enum OmniAudioLatencyRunner {
         let e2eTokensPerSecond: Double
         let rssMiB: Double
         let peakRssMiB: Double
+        let promptDiagnostics: PromptDiagnostics
         let text: String
+    }
+
+    private struct PromptDiagnostics {
+        let promptTokens: Int
+        let mediaTokenIdsKnown: Bool
+        let mediaTokenIds: [Int]
+        let mediaPlaceholderTokens: Int
+        let firstMediaTokenIndex: Int
+        let lastMediaTokenIndex: Int
+        let blockSize: Int
+        let blockSuffixMediaTokens: Int
+        let promptMinusOneAfterMedia: Bool
+
+        var jsonFields: [String: Any] {
+            [
+                "prompt_tokens": promptTokens,
+                "media_token_ids_known": mediaTokenIdsKnown,
+                "media_token_ids": mediaTokenIds,
+                "media_placeholder_tokens": mediaPlaceholderTokens,
+                "first_media_token_index": firstMediaTokenIndex,
+                "last_media_token_index": lastMediaTokenIndex,
+                "cache_block_size": blockSize,
+                "block_suffix_media_tokens": blockSuffixMediaTokens,
+                "block_suffix_contains_media": blockSuffixMediaTokens > 0,
+                "prompt_minus_one_after_media": promptMinusOneAfterMedia,
+            ]
+        }
     }
 
     private static func runIteratorTurn(
@@ -206,6 +236,7 @@ enum OmniAudioLatencyRunner {
         let prepareStart = CFAbsoluteTimeGetCurrent()
         let lmInput = try await context.processor.prepare(input: input)
         let prepareMs = elapsedMs(since: prepareStart)
+        let promptDiagnostics = promptDiagnostics(for: lmInput)
         let params = generationParameters(maxNewTokens: maxNewTokens)
 
         let iteratorStart = CFAbsoluteTimeGetCurrent()
@@ -247,6 +278,7 @@ enum OmniAudioLatencyRunner {
             e2eTokensPerSecond: tokensPerSecond(count: tokenIds.count, totalMs: totalMs),
             rssMiB: currentRSSMiB(),
             peakRssMiB: peakRSS,
+            promptDiagnostics: promptDiagnostics,
             text: text.replacingOccurrences(of: "\n", with: " "))
     }
 
@@ -262,6 +294,7 @@ enum OmniAudioLatencyRunner {
         let prepareStart = CFAbsoluteTimeGetCurrent()
         let lmInput = try await context.processor.prepare(input: input)
         let prepareMs = elapsedMs(since: prepareStart)
+        let promptDiagnostics = promptDiagnostics(for: lmInput)
         let params = generationParameters(maxNewTokens: maxNewTokens)
 
         let streamStart = CFAbsoluteTimeGetCurrent()
@@ -311,7 +344,39 @@ enum OmniAudioLatencyRunner {
             e2eTokensPerSecond: tokensPerSecond(count: count, totalMs: totalMs),
             rssMiB: currentRSSMiB(),
             peakRssMiB: peakRSS,
+            promptDiagnostics: promptDiagnostics,
             text: text.replacingOccurrences(of: "\n", with: " "))
+    }
+
+    private static func promptDiagnostics(for input: LMInput) -> PromptDiagnostics {
+        let tokens = input.text.tokens.reshaped(-1).asArray(Int.self)
+        let knownIDs = input.mediaTokenIds != nil
+        let mediaTokenIds = input.mediaTokenIds ?? []
+        let mediaTokenSet = Set(mediaTokenIds)
+        let mediaPositions = tokens.enumerated().compactMap { index, token in
+            mediaTokenSet.contains(token) ? index : nil
+        }
+        let blockSize = 64
+        let suffixMediaTokens: Int
+        if input.hasMediaContent && !knownIDs {
+            suffixMediaTokens = -1
+        } else {
+            suffixMediaTokens = tokens.dropFirst(blockSize).filter {
+                mediaTokenSet.contains($0)
+            }.count
+        }
+        let lastMedia = mediaPositions.last ?? -1
+        let promptMinusOneAfterMedia = lastMedia >= 0 && (tokens.count - 1) > lastMedia
+        return PromptDiagnostics(
+            promptTokens: tokens.count,
+            mediaTokenIdsKnown: knownIDs,
+            mediaTokenIds: mediaTokenIds,
+            mediaPlaceholderTokens: mediaPositions.count,
+            firstMediaTokenIndex: mediaPositions.first ?? -1,
+            lastMediaTokenIndex: lastMedia,
+            blockSize: blockSize,
+            blockSuffixMediaTokens: suffixMediaTokens,
+            promptMinusOneAfterMedia: promptMinusOneAfterMedia)
     }
 
     private static func makeCoordinator(

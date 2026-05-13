@@ -493,6 +493,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
     private let config: NemotronHOmniProcessorConfiguration
     private let tokenizer: any Tokenizer
 
+    private static let imageContextTokenId = 18
+    private static let soundContextTokenId = 27
+
     private struct PreparedAudioClip {
         let waveform: [Float]
         let preEncodedEmbedding: MLXArray?
@@ -719,6 +722,9 @@ public struct NemotronHOmniProcessor: UserInputProcessor {
             image: processedImage,
             video: processedVideo,
             audio: processedAudio,
+            mediaTokenIds: media.isEmpty
+                ? nil
+                : [Self.imageContextTokenId, Self.soundContextTokenId],
             cacheScopeSalt: cacheScopeSalt(from: input.additionalContext))
     }
 

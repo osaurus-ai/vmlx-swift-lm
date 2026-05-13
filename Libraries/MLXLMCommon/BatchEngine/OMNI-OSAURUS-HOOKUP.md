@@ -403,10 +403,10 @@ elided by the iter pattern).
 | Surface | Behaviour for Nemotron-Omni |
 |---|---|
 | **`CacheCoordinator.isHybrid`** | **MUST be true** for omni. Auto-flips on first BatchEngine admission via `BatchEngine.swift:622-635` when any layer is `MambaCache` or `ArraysCache`. Eager-set is harmless and avoids a one-frame stale-flag window if osaurus admits requests via Evaluate first. |
-| **`CacheCoordinator.diskCache`** (L2) | Works. `Cache/CacheCoordinator.swift:storeAfterGeneration` iterates per-layer caches and stores `KVCacheSimple` and `MambaCache` round-trip-capable arrays via `TQDiskSerializer` (`LayerKind.simple=0`, `LayerKind.mamba=2` — and `LayerKind.rotating=6` was added 2026-04-15). MoE layers have no cache so they're skipped. |
+| **`CacheCoordinator.diskCache`** (L2) | Works for safe partial boundaries. `Cache/CacheCoordinator.swift:storeAfterGeneration` iterates per-layer caches and stores `KVCacheSimple` and `MambaCache` round-trip-capable arrays via `TQDiskSerializer` (`LayerKind.simple=0`, `LayerKind.mamba=2` — and `LayerKind.rotating=6` was added 2026-04-15). Exact full-prefix hybrid hits are intentionally skipped because seeding logits by re-feeding the last token would double-count recurrent state. |
 | **`CacheCoordinator.ssmStateCache`** | Used. When `isHybrid=true`, the coordinator additionally fetches/stores SSM companion state (Mamba conv/hidden) keyed by token sequence. This is the same SSMReDeriver path that ships for Qwen 3.5 / 3.6 hybrid models. |
-| **`PagedCacheManager` (paged KV)** | Works for the 6 attention layers. The 23 Mamba layers go through the SSM state cache instead — they're recurrent, not block-paged. |
-| **`MediaSalt`** (image+video) | Works. **Audio is missing** — see §3.3. |
+| **`PagedCacheManager` (paged KV)** | Works for ordinary attention-only block boundaries. Disk-backed hybrid/cache-specific entries do not register token-only paged false hits; media partial hits are reused only when the remaining suffix does not contain image/audio placeholder tokens. |
+| **`MediaSalt`** (image+video+audio) | Works. Audio waveform bytes and sample rate are salted alongside image/video pixels — see §3.3. |
 | **`CacheCoordinatorConfig.defaultKVMode`** | Applies only to the 6 attention layers. Mamba layers ignore the kv-mode field; they're always full-precision. Recommended: `.turboQuant(keyBits: 3, valueBits: 3)` for memory-bounded omni serving. |
 | **`defaultMaxKVSize`** | Applies only to the attention layers. Reasonable default: 8192 (matches `KV-SIZING-CONTRACT.md` recommendation). The `longPromptMultiplier=2.0` lets it stretch to 16K for long video / audio prompts. |
 
@@ -424,24 +424,29 @@ let coordinator = CacheCoordinator(
 coordinator.setHybrid(true)   // do this before the first turn
 ```
 
-### 5.3 Multi-turn cache reuse — verified across all modalities
+### 5.3 Multi-turn cache reuse — verified boundaries
 
-The standard multi-turn flow works for **every modality** as of
-commit `3b78db4`. All paths share the same `CacheCoordinator` —
-the only thing that varies is which media bytes get fingerprinted
-into `MediaSalt`.
+The standard multi-turn flow is media-salt safe as of the 2026-05-12 live
+voice update. All paths share the same `CacheCoordinator`; the media bytes
+fingerprinted into `MediaSalt` determine whether a prefix can be shared.
 
 **Flow (any modality):**
 - Turn 1: prompt + media → `MediaSalt = sha256(image+video+audio+sr)`
   identifies this media. Encoder runs once, KV + Mamba SSM state
   cached at this turn's token positions.
-- Turn 2 same media: salt matches → attention KV restored from paged
-  cache (or disk on cold-start), Mamba SSM state restored from
-  `ssmStateCache`. **Encoder NOT re-run** for vision; audio has the
-  same property when its waveform bytes are identical.
+- Turn 2 same media: salt matches. A cache hit is reused only if the matched
+  boundary does not split model-side placeholder tokens. For a short raw
+  audio prompt, the 64-token block boundary can land inside the 63-token
+  `<so_embedding>` run, so the correct behavior is full re-prefill.
 - Turn 2 different media: salt diverges → cache miss for the media
   positions → fresh encode + prefill. Existing context tokens
   unaffected.
+
+For low-latency call mode, do not rely on raw identical-audio repeat caching:
+the current local bench shows raw PCM remains about 1.5 s to first semantic
+delta. Stream/accumulate Parakeet embeddings while the caller speaks and
+submit `UserInput.Audio.preEncoded` at endpoint; that path is about 200 ms
+to first semantic text delta on the local M5 Max.
 
 **Verified by `BENCH_OMNI=1`:**
 
@@ -737,12 +742,15 @@ Use this as a PR checklist when wiring omni support into the osaurus runtime:
       changes needed.
 - [ ] Video turn — call `nemotronOmniPreprocessVideo` ahead of
       `LMInput`, wrap as `ProcessedVideo`.
-- [ ] Audio turn — Option A (manual pre-encode + splice + custom salt)
-      OR wait for `LMInput.audio` (Option B) to land.
-- [ ] Multi-turn cache reuse — verify image disk cache hits across turns
-      with same image + extended prompt. (`mediaSalt` should auto-resolve.)
-- [ ] BatchEngine — text-only OK, multimodal turns must route through
-      `Evaluate.generate()` until the BatchEngine inputsEmbeds path lands.
+- [ ] Audio turn — use standard `UserInput(prompt:audios:)`. For live calls,
+      prefer `.preEncoded(samples:sampleRate:embedding:)` so Parakeet work is
+      done while the caller is speaking.
+- [ ] Multi-turn cache reuse — verify same-media/different-media salt
+      isolation and inspect `block_suffix_media_tokens`; do not reuse a
+      partial prefix that still contains media placeholders.
+- [ ] BatchEngine — text, image, video, and audio all route through the
+      standard `LMInput` path; `OmniAudioLatencyBench` is the quick Osaurus
+      engine-path latency check.
 - [ ] Reasoning toggle — `enable_thinking=false` produces no `<think>`
       block; `=true` (default) emits `Generation.reasoning(String)`
       events, captured by your stream consumer.
@@ -898,6 +906,7 @@ Parse the `OMNI_AUDIO_LATENCY { ... }` lines. The important fields are
 `path` (`batch` matches Osaurus's engine path, `iterator` is direct
 TokenIterator), `mode` (`raw_samples` vs `preencoded` Parakeet embedding),
 `processor_prepare_ms`, `first_delta_ms`, `total_ms`, `e2e_tokens_per_s`,
+`prompt_tokens`, `media_placeholder_tokens`, `block_suffix_media_tokens`,
 `rss_mib`, and `peak_rss_mib`. `turn > 1` uses the same in-process
 `CacheCoordinator` and disk cache for that path/mode, so it is the quick
 prefix-cache reuse probe for identical audio+prompt. `first_delta_ms` is
@@ -922,8 +931,10 @@ BENCH_MODEL=<absolute path to that bundle> \
 
 Send back every OMNI_AUDIO_LATENCY JSON line plus the /usr/bin/time -l
 memory/swaps lines. Compare raw_samples vs preencoded first_delta_ms,
-and compare turn 1 vs turn 2 for cache reuse. Do not call this TTFAB; it
-is TTFT/first semantic delta before any separate TTS model.
+compare turn 1 vs turn 2 for cache reuse, and include
+block_suffix_media_tokens so we know whether the cache boundary splits the
+audio placeholder run. Do not call this TTFAB; it is TTFT/first semantic
+delta before any separate TTS model.
 ```
 
 Latest local result on `Nemotron-Omni-Nano-JANGTQ-CRACK`:
@@ -933,12 +944,14 @@ media-salt isolation audio A vs B `2.18s`; max RSS `7,740,358,656`
 bytes; swaps `0`.
 
 Focused call-mode result from `docs/benchmarks/omni-audio-latency-2026-05-12.md`:
-BatchEngine raw PCM first semantic delta was `2180.7 ms` on turn 1 and
-`1473.8 ms` on turn 2. BatchEngine pre-encoded Parakeet first semantic
-delta was `200.0 ms` on turn 1 and `211.9 ms` on turn 2. This measures
-first text delta before any TTS model; the actionable live-call path is
-stream/accumulate Parakeet embeddings during caller speech and submit
-`.preEncoded` audio at endpoint.
+BatchEngine raw PCM first semantic delta was `1514.1 ms` on turn 1 and
+`1498.6 ms` on turn 2. BatchEngine pre-encoded Parakeet first semantic
+delta was `208.9 ms` on turn 1 and `201.8 ms` on turn 2. The prompt had
+94 tokens with 63 audio placeholder tokens at positions 12...74, and the
+64-token cache boundary left 11 audio placeholders in the suffix. This
+measures first text delta before any TTS model; the actionable live-call
+path is stream/accumulate Parakeet embeddings during caller speech and
+submit `.preEncoded` audio at endpoint.
 
 ---
 

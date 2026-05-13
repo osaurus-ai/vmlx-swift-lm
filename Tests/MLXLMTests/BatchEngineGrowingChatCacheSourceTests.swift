@@ -18,10 +18,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("slot.generatedTokenIds.append(tokenID)"))
         #expect(source.contains(#"label: "post-answer""#))
         #expect(source.contains("promptTokens + slot.generatedTokenIds"))
-        #expect(source.contains("let unsafePartial = !remaining.isEmpty && hasMediaContent"))
+        #expect(source.contains("slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)"))
         #expect(source.contains("let unsafeFullHit = remaining.isEmpty && hasPathDependentLayer"))
         #expect(source.contains("layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache"))
-        #expect(!source.contains("let unsafePartial = !remaining.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
+        #expect(source.contains("media placeholder tokens remain in cache-hit suffix"))
+        #expect(!source.contains("let unsafePartial = !remaining.isEmpty && hasMediaContent"))
     }
 
     @Test("token iterator mirrors post-answer cache boundary policy")
@@ -34,10 +35,11 @@ struct BatchEngineGrowingChatCacheSourceTests {
         #expect(source.contains("generatedTokenIds.append(token)"))
         #expect(source.contains("let generatedBoundaryTokens = promptTokenIds + generatedTokenIds"))
         #expect(source.contains("includeGeneratedBoundary: stopReason == .stop && !handler.stopSequenceHit"))
-        #expect(source.contains("let unsafePartial = !remainingTokens.isEmpty && hasMediaContent"))
+        #expect(source.contains("input.cacheHitSuffixContainsMediaPlaceholder(remainingTokens)"))
         #expect(source.contains("let unsafeFullHit = remainingTokens.isEmpty && hasPathDependentLayer"))
         #expect(source.contains("layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache"))
-        #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty &&\n                        (hasMediaContent || hasSSMLayer)"))
+        #expect(source.contains("media placeholder tokens remain in cache-hit suffix"))
+        #expect(!source.contains("let unsafePartial = !remainingTokens.isEmpty && hasMediaContent"))
     }
 
     @Test("token iterator materializes disk cache restores before prefill")

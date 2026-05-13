@@ -37,6 +37,7 @@ public struct LMInput {
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
     public let audio: ProcessedAudio?
+    public let mediaTokenIds: [Int]?
 
     /// Optional request-scope cache-key salt independent of media bytes.
     ///
@@ -157,12 +158,14 @@ public struct LMInput {
         text: LMInput.Text, image: LMInput.ProcessedImage? = nil,
         video: LMInput.ProcessedVideo? = nil,
         audio: LMInput.ProcessedAudio? = nil,
+        mediaTokenIds: [Int]? = nil,
         cacheScopeSalt: String? = nil
     ) {
         self.text = text
         self.image = image
         self.video = video
         self.audio = audio
+        self.mediaTokenIds = mediaTokenIds
         self.cacheScopeSalt = cacheScopeSalt
     }
 }
@@ -176,6 +179,22 @@ public extension LMInput {
     /// back to full prefill.
     var hasMediaContent: Bool {
         image != nil || video != nil || audio != nil
+    }
+
+    /// True when a cache hit boundary would leave model-side media
+    /// placeholder tokens in the suffix still being prefetched.
+    ///
+    /// `nil` ``mediaTokenIds`` means the processor did not declare its
+    /// placeholder IDs, so media prompts stay on the conservative rollback
+    /// path. Models that do declare IDs can safely resume after the
+    /// placeholder span, while still rolling back if the remaining suffix
+    /// includes any media token.
+    func cacheHitSuffixContainsMediaPlaceholder(_ remainingTokenIds: [Int]) -> Bool {
+        guard hasMediaContent, !remainingTokenIds.isEmpty else { return false }
+        guard let mediaTokenIds else { return true }
+        guard !mediaTokenIds.isEmpty else { return false }
+        let mediaTokenSet = Set(mediaTokenIds)
+        return remainingTokenIds.contains { mediaTokenSet.contains($0) }
     }
 }
 

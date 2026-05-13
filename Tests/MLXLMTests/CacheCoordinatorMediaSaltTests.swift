@@ -263,4 +263,24 @@ final class CacheCoordinatorMediaSaltTests: XCTestCase {
             text: .init(tokens: MLXArray([Int32(1)])),
             audio: .init(waveform: waveform)).hasMediaContent)
     }
+
+    func testMediaPlaceholderGuardAllowsKnownTextOnlySuffix() {
+        let waveform = MLXArray([Float](repeating: 0.0, count: 8)).reshaped([1, 8])
+        realize(waveform)
+        let unknown = LMInput(
+            text: .init(tokens: MLXArray([Int32(1), 27, 2])),
+            audio: .init(waveform: waveform))
+        XCTAssertFalse(unknown.cacheHitSuffixContainsMediaPlaceholder([]))
+        XCTAssertTrue(unknown.cacheHitSuffixContainsMediaPlaceholder([1, 2]))
+
+        let known = LMInput(
+            text: .init(tokens: MLXArray([Int32(1), 27, 2])),
+            audio: .init(waveform: waveform),
+            mediaTokenIds: [27])
+        XCTAssertTrue(known.cacheHitSuffixContainsMediaPlaceholder([27, 2]))
+        XCTAssertFalse(known.cacheHitSuffixContainsMediaPlaceholder([2, 3]))
+        XCTAssertFalse(LMInput(
+            text: .init(tokens: MLXArray([Int32(1)])),
+            mediaTokenIds: [27]).cacheHitSuffixContainsMediaPlaceholder([27]))
+    }
 }

@@ -24,19 +24,26 @@ BENCH_MODEL=<absolute path to Nemotron-Omni-Nano-JANGTQ-CRACK> \
 Audio fixture: `Tests/MLXLMTests/Resources/audio_only.mov`, 80,620 samples,
 5,038.8 ms at 16 kHz.
 
-Load: 2,295.6 ms, RSS 5,265.9 MiB.
+Load: 2,289.1 ms, RSS 5,267.2 MiB.
 
-Pre-encode: 1,777.8 ms for 63 audio tokens at hidden size 2,688.
+Pre-encode: 1,335.8 ms for 63 audio tokens at hidden size 2,688.
+
+Prompt topology: 94 prompt tokens, 63 media placeholder tokens, media positions
+12...74, `cache_block_size=64`, and 11 media placeholder tokens in the suffix
+after the 64-token cache boundary. `prompt_minus_one_after_media=true`, but
+the default live-call path does not run an extra prompt-minus-one media
+re-prefill because that pushed first-turn latency up in testing and disk
+restore was slower than a short pre-encoded forward.
 
 | Path | Mode | Turn | First semantic delta | Total | Tokens | Effective tok/s | RSS MiB | Peak RSS MiB |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| BatchEngine | raw PCM | 1 | 2,180.7 ms | 2,302.9 ms | 8 | 3.5 | 5,328.8 | 5,292.7 |
-| BatchEngine | raw PCM | 2 | 1,473.8 ms | 1,590.6 ms | 8 | 5.0 | 5,355.4 | 5,354.1 |
-| BatchEngine | pre-encoded Parakeet | 1 | 200.0 ms | 301.1 ms | 8 | 26.6 | 5,357.8 | 5,355.5 |
-| BatchEngine | pre-encoded Parakeet | 2 | 211.9 ms | 327.2 ms | 8 | 24.4 | 5,360.9 | 5,360.8 |
+| BatchEngine | raw PCM | 1 | 1,514.1 ms | 1,633.6 ms | 8 | 4.9 | 5,330.3 | 5,294.2 |
+| BatchEngine | raw PCM | 2 | 1,498.6 ms | 1,619.8 ms | 8 | 4.9 | 5,348.2 | 5,330.7 |
+| BatchEngine | pre-encoded Parakeet | 1 | 208.9 ms | 317.6 ms | 8 | 25.2 | 5,358.9 | 5,348.4 |
+| BatchEngine | pre-encoded Parakeet | 2 | 201.8 ms | 320.3 ms | 8 | 25.0 | 5,359.0 | 5,358.9 |
 
-`/usr/bin/time -l`: 9.40 s real, max RSS 7,747,796,992 bytes, swaps 0,
-peak memory footprint 15,140,101,296 bytes.
+`/usr/bin/time -l`: 8.29 s real, max RSS 7,749,156,864 bytes, swaps 0,
+peak memory footprint 15,140,248,656 bytes.
 
 ## Read
 
@@ -46,7 +53,9 @@ because Parakeet audio encoding and multimodal prefill happen after endpoint.
 Passing pre-encoded Parakeet embeddings into `UserInput.Audio.preEncoded`
 brings first semantic delta to about 200 ms on the Osaurus BatchEngine path.
 
-Turn 2 raw PCM is faster than turn 1, but it is still roughly 1.5 s. Do not
-count raw identical-audio repeat as a solved conversational prefix-cache path
-yet; the live-call path should stream/accumulate Parakeet embeddings while
-the caller is speaking and submit pre-encoded audio at endpoint.
+Turn 2 raw PCM is still roughly 1.5 s. Do not count raw identical-audio repeat
+as a solved conversational prefix-cache path; the 64-token cache block splits
+the 63-token audio placeholder run, and exact full hybrid hits are intentionally
+skipped because re-feeding the last token would double-count recurrent state.
+The live-call path should stream/accumulate Parakeet embeddings while the
+caller is speaking and submit pre-encoded audio at endpoint.

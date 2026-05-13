@@ -572,11 +572,15 @@ expectations:
 | Decode (post-prefill) | 51–128 tok/s | 36–101 tok/s | 38–107 tok/s |
 
 Voice-mode UX target: under 1 s from end-of-utterance to first audio.
-With Parakeet + LLM prefill ≈ 500 ms + first-sentence-then-TTS ≈
-200 ms, you land at ~700 ms on JANGTQ2. MXFP4 is ~1 s. Tune by:
+On the local M5 Max call-mode bench, raw 5 s PCM takes about 1.5 s to first
+semantic text delta because Parakeet encoding runs after endpoint. Passing
+pre-encoded Parakeet embeddings takes about 200 ms to first semantic text
+delta. Tune by:
 
 - Reducing chat history (faster prefill).
 - Using JANGTQ2 (smallest, fastest decode).
+- Streaming/accumulating Parakeet embeddings during caller speech, then
+  submitting `UserInput.Audio.preEncoded` at endpoint.
 - Streaming text → TTS at sentence boundaries (don't wait for full
   reply).
 - Pre-warming the speaker with `NemotronHOmniSpeaker(voiceLanguage:
@@ -588,7 +592,9 @@ Parakeet embeddings, BatchEngine vs TokenIterator, first semantic delta,
 total wall time, token rate, and RSS. Prefer
 `BENCH_OMNI_AUDIO_PATH=batch` when validating the Osaurus call path. This
 is TTFT/first semantic delta; add a separate TTS stopwatch for true
-output TTFAB.
+output TTFAB. The JSON also reports `block_suffix_media_tokens`; if that
+is nonzero, the prefix-cache boundary splits the media placeholder run and
+the runtime must not reuse that partial media prefix.
 
 ---
 

@@ -1309,7 +1309,6 @@ public actor BatchEngine {
                     //    different: a complete state at boundary N plus
                     //    prefill over [N...M] is the intended Markov resume
                     //    path for MambaCache, ArraysCache, and ZayaCCACache.
-                    let hasMediaContent = slot.originalInput.hasMediaContent
                     let hasPathDependentLayer = slot.cache.contains { layer in
                         layer is MambaCache || layer is ArraysCache || layer is ZayaCCACache
                     }
@@ -1323,11 +1322,12 @@ public actor BatchEngine {
                     // S2 reproducer on Qwen3.6-35B-A3B-JANGTQ4 2026-05-01).
                     // Same SSM-state path-dependence rationale as the
                     // remaining.nonEmpty case below.
-                    let unsafePartial = !remaining.isEmpty && hasMediaContent
+                    let unsafePartial =
+                        slot.originalInput.cacheHitSuffixContainsMediaPlaceholder(remaining)
                     let unsafeFullHit = remaining.isEmpty && hasPathDependentLayer
                     if unsafePartial || unsafeFullHit {
                         let why: String
-                        if hasMediaContent { why = "media token region can't be split" }
+                        if unsafePartial { why = "media placeholder tokens remain in cache-hit suffix" }
                         else if unsafeFullHit { why = "path-dependent full disk hit: re-feeding last token would double-count recurrent state" }
                         else                { why = "path-dependent cache hit can't be extended safely" }
                         let slotIDStr = slot.id.description
@@ -2038,9 +2038,11 @@ public actor BatchEngine {
 
             func storeCacheEntry(tokens: [Int], snapshot: [KVCache], label: String) {
                 guard !tokens.isEmpty else { return }
-                let perLayerData = extractLayerData(from: snapshot)
                 let requiresDiskBackedRestore =
                     cacheRequiresDiskBackedCoordinatorRestore(snapshot)
+                let perLayerData = requiresDiskBackedRestore
+                    ? []
+                    : extractLayerData(from: snapshot)
                 let ssmStates: [MLXArray]? = {
                     guard coordinator.isHybrid else { return nil }
                     if coordinator.config.enableSSMReDerive &&
