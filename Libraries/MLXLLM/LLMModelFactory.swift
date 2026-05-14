@@ -342,11 +342,11 @@ public enum LLMTypeRegistry {
             || weightFormat == "jangtq4"
             || routedBits != nil
 
-        let context: ZayaMoEContext? = isJANGTQ ? .jangtq(
-            gateUpBits: probe?.mxtqGateUpBits ?? projectedBits.gateUp ?? routedBits ?? 2,
-            downBits:   probe?.mxtqDownBits   ?? projectedBits.down   ?? routedBits ?? 2,
-            seed:       probe?.mxtqSeed ?? 42
-        ) : nil
+        let gateUpBits: Int = probe?.mxtqGateUpBits ?? projectedBits.gateUp ?? routedBits ?? 2
+        let downBits: Int = probe?.mxtqDownBits ?? projectedBits.down ?? routedBits ?? 2
+        let seed: Int = probe?.mxtqSeed ?? 42
+        let context: ZayaMoEContext? =
+            isJANGTQ ? .jangtq(gateUpBits: gateUpBits, downBits: downBits, seed: seed) : nil
         return ZayaModel(config, moe: context)
     }
 
