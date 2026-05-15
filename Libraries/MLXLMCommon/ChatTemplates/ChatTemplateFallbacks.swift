@@ -260,7 +260,36 @@ public enum ChatTemplateFallbacks {
 {%- set think_open = '<think>' -%}
 {%- set think_close = '</think>' -%}
 {%- set dsml = '｜DSML｜' -%}
-{%- set ns = namespace(last_user_index=-1) -%}
+{%- macro render_dsml_tools(tools) -%}
+## Tools
+
+You have access to the following tools. To invoke a tool, you must use the following DSML format:
+
+<{{ dsml }}tool_calls>
+<{{ dsml }}invoke name="$TOOL_NAME">
+<{{ dsml }}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{{ dsml }}parameter>
+</{{ dsml }}invoke>
+</{{ dsml }}tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by {{ think_open }}), you MUST output your complete reasoning inside {{ think_open }}...{{ think_close }} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {{ think_close }} with tool calls or final response.
+
+### Available Tool Schemas
+
+{%- for tool in tools %}
+{%- if tool['function'] -%}
+{{- tool['function'] | tojson -}}{{- "\n" -}}
+{%- else -%}
+{{- tool | tojson -}}{{- "\n" -}}
+{%- endif -%}
+{%- endfor -%}
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1, rendered_tools=false) -%}
+{%- set first_role = messages[0]['role'] if messages|length > 0 else none -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'user' or message['role'] == 'developer' -%}
 {%- set ns.last_user_index = loop.index0 -%}
@@ -270,11 +299,23 @@ public enum ChatTemplateFallbacks {
 {%- if enable_thinking and reasoning_effort == 'max' -%}
 {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
 {%- endif -%}
+{%- if tools and first_role != 'system' and first_role != 'developer' -%}
+{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
+{%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}
 {{- message['content'] -}}
+{%- if tools and not ns.rendered_tools -%}
+{{- '\n\n' -}}{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
+{%- endif -%}
 {%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
 {{- user_token -}}{{- message['content'] -}}
+{%- if message['role'] == 'developer' and tools and not ns.rendered_tools -%}
+{{- '\n\n' -}}{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
+{%- endif -%}
 {%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
 {%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}

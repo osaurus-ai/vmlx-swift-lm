@@ -82,4 +82,42 @@ final class DeepseekV4ChatTemplateFallbackTests: XCTestCase {
             rendered.hasSuffix("<\u{FF5C}User\u{FF5C}>Turn 2.<\u{FF5C}Assistant\u{FF5C}><think>"),
             rendered.debugDescription)
     }
+
+    func testMinimalFallbackRendersDSMLToolsFromTokenizerContext() throws {
+        let template = try Template(ChatTemplateFallbacks.dsv4Minimal)
+        let rendered = try template.renderDSV4([
+            "messages": [
+                ["role": "system", "content": "Helpful assistant."],
+                ["role": "user", "content": "Weather in Paris?"],
+            ],
+            "tools": [
+                [
+                    "type": "function",
+                    "function": [
+                        "name": "get_weather",
+                        "description": "Get the weather for a city.",
+                        "parameters": [
+                            "type": "object",
+                            "properties": [
+                                "location": ["type": "string"]
+                            ],
+                            "required": ["location"],
+                        ],
+                    ],
+                ]
+            ],
+            "add_generation_prompt": true,
+            "enable_thinking": false,
+        ])
+
+        XCTAssertTrue(rendered.contains("## Tools"), rendered.debugDescription)
+        XCTAssertTrue(
+            rendered.contains("<\u{FF5C}DSML\u{FF5C}tool_calls>"),
+            rendered.debugDescription)
+        XCTAssertTrue(
+            rendered.contains("<\u{FF5C}DSML\u{FF5C}invoke name=\"$TOOL_NAME\">"),
+            rendered.debugDescription)
+        XCTAssertTrue(rendered.contains("\"name\":\"get_weather\""), rendered.debugDescription)
+        XCTAssertFalse(rendered.contains("<available_tools>"), rendered.debugDescription)
+    }
 }

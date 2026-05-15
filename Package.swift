@@ -315,21 +315,6 @@ let package = Package(
             ],
             path: "Tools/OmniAudioChunkStabilityBench"
         ),
-        .executableTarget(
-            name: "RunBench",
-            dependencies: [
-                "MLXLMCommon",
-                "MLXLLM",
-                "MLXVLM",
-                "MLXHuggingFace",
-                "CmlxGraphShim",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "Jinja", package: "jinja"),
-                .product(name: "Transformers", package: "swift-transformers"),
-            ],
-            path: "RunBench",
-            exclude: ["coherency-matrix.sh", "test_slice.swift.bak"]
-        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [

@@ -36,55 +36,76 @@
 {%- set think_open = '<think>' -%}
 {%- set think_close = '</think>' -%}
 {%- set dsml = '｜DSML｜' -%}
+{%- macro render_dsml_tools(tools) -%}
+## Tools
+
+You have access to the following tools. To invoke a tool, you must use the following DSML format:
+
+<{{ dsml }}tool_calls>
+<{{ dsml }}invoke name="$TOOL_NAME">
+<{{ dsml }}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{{ dsml }}parameter>
+</{{ dsml }}invoke>
+</{{ dsml }}tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by {{ think_open }}), you MUST output your complete reasoning inside {{ think_open }}...{{ think_close }} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {{ think_close }} with tool calls or final response.
+
+### Available Tool Schemas
+
+{%- for tool in tools %}
+{%- if tool['function'] -%}
+{{- tool['function'] | tojson -}}{{- "\n" -}}
+{%- else -%}
+{{- tool | tojson -}}{{- "\n" -}}
+{%- endif -%}
+{%- endfor -%}
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1, rendered_tools=false) -%}
+{%- set first_role = messages[0]['role'] if messages|length > 0 else none -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'user' or message['role'] == 'developer' -%}
+{%- set ns.last_user_index = loop.index0 -%}
+{%- endif -%}
+{%- endfor -%}
 {{- bos -}}
 {%- if enable_thinking and reasoning_effort == 'max' -%}
 {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
 {%- endif -%}
+{%- if tools and first_role != 'system' and first_role != 'developer' -%}
+{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
+{%- endif -%}
 {%- for message in messages -%}
 {%- if message['role'] == 'system' -%}
 {{- message['content'] -}}
-{%- if tools -%}
-{{- '\n\n## Tools\n\nYou have access to a set of tools to help answer the user\'s question. Invoke a tool by writing a "<' ~ dsml ~ 'tool_calls>" block:\n\n<' ~ dsml ~ 'tool_calls>\n<' ~ dsml ~ 'invoke name="$TOOL_NAME">\n<' ~ dsml ~ 'parameter name="$NAME" string="true|false">$VALUE</' ~ dsml ~ 'parameter>\n</' ~ dsml ~ 'invoke>\n</' ~ dsml ~ 'tool_calls>\n\nString parameters use string="true". Numbers/bools/arrays/objects use string="false" with a JSON-encoded value.\n\n### Available Tool Schemas\n\n' -}}
-{%- for tool in tools -%}
-{{- tool.function | tojson -}}{{ '\n' }}
-{%- endfor -%}
-{{- '\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.' -}}
+{%- if tools and not ns.rendered_tools -%}
+{{- '\n\n' -}}{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
 {%- endif -%}
 {%- elif message['role'] == 'user' or message['role'] == 'developer' -%}
 {{- user_token -}}{{- message['content'] -}}
-{%- elif message['role'] == 'assistant' -%}
+{%- if message['role'] == 'developer' and tools and not ns.rendered_tools -%}
+{{- '\n\n' -}}{{- render_dsml_tools(tools) -}}
+{%- set ns.rendered_tools = true -%}
+{%- endif -%}
+{%- set next_role = messages[loop.index0 + 1]['role'] if loop.index0 + 1 < messages|length else none -%}
+{%- if next_role == 'assistant' or loop.last and add_generation_prompt -%}
 {{- asst_token -}}
-{%- if message.get('reasoning_content') and (message.get('drop_thinking', false) == false or loop.last) -%}
-{{- message['reasoning_content'] -}}{{- think_close -}}
-{%- endif -%}
-{{- message['content'] or '' -}}
-{%- if message.get('tool_calls') -%}
-{{- '\n\n<' ~ dsml ~ 'tool_calls>\n' -}}
-{%- for tc in message['tool_calls'] -%}
-{{- '<' ~ dsml ~ 'invoke name="' ~ tc.function.name ~ '">\n' -}}
-{%- set args = tc.function.arguments -%}
-{%- if args is string -%}
-{%- set args = args | fromjson -%}
-{%- endif -%}
-{%- for k, v in args.items() -%}
-{%- if v is string -%}
-{{- '<' ~ dsml ~ 'parameter name="' ~ k ~ '" string="true">' ~ v ~ '</' ~ dsml ~ 'parameter>\n' -}}
-{%- else -%}
-{{- '<' ~ dsml ~ 'parameter name="' ~ k ~ '" string="false">' ~ (v | tojson) ~ '</' ~ dsml ~ 'parameter>\n' -}}
-{%- endif -%}
-{%- endfor -%}
-{{- '</' ~ dsml ~ 'invoke>\n' -}}
-{%- endfor -%}
-{{- '</' ~ dsml ~ 'tool_calls>' -}}
-{%- endif -%}
-{{- eos -}}
-{%- endif -%}
-{%- endfor -%}
-{%- if add_generation_prompt -%}
-{{- asst_token -}}
-{%- if enable_thinking -%}
+{%- if enable_thinking and loop.index0 >= ns.last_user_index -%}
 {{- think_open -}}
 {%- else -%}
 {{- think_close -}}
 {%- endif -%}
 {%- endif -%}
+{%- elif message['role'] == 'assistant' -%}
+{%- if enable_thinking and message.get('reasoning_content') and loop.index0 > ns.last_user_index -%}
+{{- message['reasoning_content'] -}}{{- think_close -}}
+{%- endif -%}
+{{- message['content'] or '' -}}
+{{- eos -}}
+{%- endif -%}
+{%- endfor -%}
