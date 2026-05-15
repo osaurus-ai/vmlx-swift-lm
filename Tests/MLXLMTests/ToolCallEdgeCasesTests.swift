@@ -36,13 +36,20 @@ struct ToolCallEdgeCasesTests {
                 output += chunk
             }
         }
-        processor.processEOS()
+        if let flushed = processor.processEOS() {
+            output += flushed
+        }
         return output
     }
 
     /// Feed text into a processor in arbitrary chunk sizes. Simulates
     /// real streaming where chunks straddle token boundaries.
-    private func feedInChunks(_ text: String, chunkSize: Int, into processor: ToolCallProcessor) -> String {
+    private func feedInChunks(
+        _ text: String,
+        chunkSize: Int,
+        into processor: ToolCallProcessor,
+        finish: Bool = true
+    ) -> String {
         var output = ""
         var idx = text.startIndex
         while idx < text.endIndex {
@@ -53,7 +60,9 @@ struct ToolCallEdgeCasesTests {
             }
             idx = end
         }
-        processor.processEOS()
+        if finish, let flushed = processor.processEOS() {
+            output += flushed
+        }
         return output
     }
 
@@ -287,7 +296,7 @@ struct ToolCallEdgeCasesTests {
     func testMiniMaxM2ValidInvokePrefixStillBuffersUntilClose() {
         let processor = ToolCallProcessor(format: .minimaxM2)
         let prefix = "<minimax:tool_call><invoke name=\"search\""
-        let visiblePrefix = feedInChunks(prefix, chunkSize: 4, into: processor)
+        let visiblePrefix = feedInChunks(prefix, chunkSize: 4, into: processor, finish: false)
 
         #expect(visiblePrefix.isEmpty)
         #expect(processor.toolCalls.isEmpty)
