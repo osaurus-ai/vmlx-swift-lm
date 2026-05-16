@@ -51,6 +51,22 @@ final class ChatTemplateOverrideIntegrationTests: XCTestCase {
         return nil
     }
 
+    private func deepseekV4TokenizerDirectory() -> URL? {
+        let env = ProcessInfo.processInfo.environment
+        if let override = env["VMLX_TEST_DSV4_TOKENIZER_DIR"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent("models/JANGQ/DeepSeek-V4-Flash-JANGTQ-K"),
+            home.appendingPathComponent("models/JANGQ/DeepSeek-V4-Flash-JANGTQ2"),
+        ]
+        return candidates.first { dir in
+            FileManager.default.fileExists(
+                atPath: dir.appendingPathComponent("tokenizer.json").path)
+        }
+    }
+
     /// Write a minimal template to a temp file that produces a
     /// recognisable, unambiguous output. Returns the file URL.
     private func writeMarkerTemplate() throws -> URL {
@@ -221,5 +237,56 @@ final class ChatTemplateOverrideIntegrationTests: XCTestCase {
             "Gemma4Minimal must emit user-turn delimiters. Decoded: \(decoded)")
         XCTAssertTrue(decoded.contains("<|turn>model\nhello<turn|>"),
             "Gemma4Minimal maps assistant→model. Decoded: \(decoded)")
+    }
+
+    // MARK: - DSV4 native encoder bridge
+
+    func testDeepseekV4BridgeUsesNativeEncoderForMaxReasoningAndTools() async throws {
+        guard let dir = deepseekV4TokenizerDirectory() else {
+            throw XCTSkip("DeepSeek-V4 tokenizer snapshot not available.")
+        }
+        unsetenv("VMLX_CHAT_TEMPLATE_OVERRIDE")
+
+        let loader = #huggingFaceTokenizerLoader()
+        let tokenizer = try await loader.load(from: dir)
+
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "search",
+                "description": "Search current information.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "required": ["query"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ] as [String: any Sendable]]
+        let messages: [[String: any Sendable]] = [
+            ["role": "user", "content": "What is the weather in Paris right now?"],
+        ]
+
+        let tokenIds = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: tools,
+            additionalContext: [
+                "enable_thinking": true,
+                "reasoning_effort": "max",
+            ])
+        let decoded = tokenizer.decode(tokenIds: tokenIds, skipSpecialTokens: false)
+        let dsml = DeepseekV4Tokens.dsml
+
+        XCTAssertTrue(decoded.contains("Reasoning Effort: Absolute maximum"),
+            "DSV4 max effort must use the native preface. Decoded: \(decoded)")
+        XCTAssertTrue(decoded.contains("## Tools"),
+            "DSV4 native bridge must include tool instructions. Decoded: \(decoded)")
+        XCTAssertTrue(decoded.contains("<\(dsml)tool_calls>"),
+            "DSV4 native bridge must include DSML tool-call guidance. Decoded: \(decoded)")
+        XCTAssertTrue(decoded.contains("\"name\":\"search\"") || decoded.contains("\"name\": \"search\""),
+            "DSV4 native bridge must include the provided tool schema. Decoded: \(decoded)")
+        XCTAssertTrue(decoded.hasSuffix(DeepseekV4Tokens.assistant + DeepseekV4Tokens.thinkStart),
+            "max reasoning must end with an open thinking tail. Decoded: \(decoded)")
     }
 }

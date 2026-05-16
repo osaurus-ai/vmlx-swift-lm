@@ -173,11 +173,10 @@ wrong scheme).
 
 **Routed MoE:** `TurboQuantSwitchGLU` keyed at `switch_mlp` (different from Laguna's `experts` key — bundle layout convention).
 
-**Chat template:** DSV4 ships NO `chat_template` field. Bridge sniff (`bos_token == "<\|begin▁of▁sentence\|>"` with curly-quote U+FF5C) auto-engages `DSV4Minimal.jinja` fallback. `VMLX_CHAT_TEMPLATE_FALLBACK_DISABLE=1` opts out.
+**Chat template:** DSV4 ships NO `chat_template` field. Bridge sniff (`bos_token == "<\|begin▁of▁sentence\|>"` with curly-quote U+FF5C) routes through `DeepseekV4ChatEncoder.swift`, the Swift port of `encoding_dsv4.py`. `DSV4Minimal.jinja` remains only as a legacy/reference fallback; the runtime bridge uses the native encoder so `enable_thinking`, `reasoning_effort=max`, tool schemas, and DSML assistant tool calls share the DSV4 Python encoder contract.
 
 **Note (open issues):**
-1. `DeepseekV4ChatEncoder.swift` is a full Swift port of `encoding_dsv4.py` but is currently NOT wired into the bridge — runtime uses the `DSV4Minimal.jinja` approximation instead. Tool-calling chats render with simplified envelopes vs the native DSML format. Tracked for future wiring; not blocking current basic chat.
-2. **DSV4 model forward has a separate reshape bug at HEAD** — verified 2026-05-01 against `DeepSeek-V4-Flash-JANGTQ` bundle on disk. `BENCH_SIMPLE` with a 10-token synthetic prompt fails with `[reshape] Cannot reshape array of size 163840 into shape (1,5,16384)` — the model produces 2× the expected positions on axis-1. Factor-of-2 suggests an mHC residual-stream split or a multi-token-prediction artifact not being reduced before reshape. Reproducible with `BENCH_SIMPLE` AND `BENCH_COHERENT`. Pre-existing; not introduced by this pin's commits. Out of scope for the current osaurus integration push — flag for the DSV4 author to investigate. **DO NOT ship DSV4 in osaurus until this is fixed.**
+1. **Historical 2026-05-01 forward bug:** `BENCH_SIMPLE` with a 10-token synthetic prompt failed with `[reshape] Cannot reshape array of size 163840 into shape (1,5,16384)`. Later DSV4 runtime work added the mHC reduction/cache path; keep full-weight live smokes as the release gate rather than relying on this historical note.
 
 **Mistral 3 / 3.5 VLM — root cause traced, mxfp4 path FIXED (commit `af89da7`):**
 

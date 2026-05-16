@@ -251,7 +251,10 @@ public enum ChatTemplateFallbacks {
     /// closed `</think>` chat-mode tail / open `<think>` thinking-
     /// mode tail / DSML tool calls / `enable_thinking=true` +
     /// `reasoning_effort=max` preface).
-    /// Selected via the DSV4 BOS sniff in the tokenizer bridge.
+    /// Kept as a legacy/reference fallback; the tokenizer bridge now
+    /// routes DSV4 BOS tokenizers through `DeepseekV4ChatEncoder`
+    /// directly so tool schemas and reasoning-effort prompts follow
+    /// the Python encoder contract.
     public static let dsv4Minimal: String = #"""
 {%- set bos = '<｜begin▁of▁sentence｜>' -%}
 {%- set eos = '<｜end▁of▁sentence｜>' -%}
