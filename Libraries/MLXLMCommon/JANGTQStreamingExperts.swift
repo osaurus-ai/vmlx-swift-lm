@@ -2,6 +2,26 @@ import Foundation
 import MLX
 import MLXNN
 
+private func float16BitsToFloat32(_ bits: UInt16) -> UInt32 {
+    let sign = UInt32(bits >> 15) << 31
+    let exp = (bits >> 10) & 0x1f
+    let mant = UInt32(bits & 0x3ff) << 13
+    if exp == 0 {
+        if mant == 0 { return sign }
+        let adj = UInt32((bits & 0x3ff).leadingZeroBitCount - 6)
+        let e = 1 - Int16(adj)
+        let m = UInt32(bits & 0x3ff) << (13 + adj)
+        return sign | (UInt32(bitPattern: Int32(e) + 127) << 23) | (m & 0x7fffff)
+    } else if exp == 31 {
+        return sign | 0x7f800000 | mant
+    }
+    return sign | ((UInt32(exp) + 112) << 23) | mant
+}
+
+private func bfloat16BitsToFloat32(_ bits: UInt16) -> UInt32 {
+    UInt32(bits) << 16
+}
+
 public enum JANGTQStreamingExperts {
     public static var isEnabled: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -530,13 +550,17 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 MLXArray(Array($0.bindMemory(to: Int32.self)), shape)
             }
         case "F16":
-            return data.withUnsafeBytes {
-                MLXArray(Array($0.bindMemory(to: Float16.self)), shape)
+            let floats: [Float] = data.withUnsafeBytes { buf in
+                let f16 = Array(buf.bindMemory(to: UInt16.self))
+                return f16.map { Float(bitPattern: float16BitsToFloat32($0)) }
             }
+            return MLXArray(floats, shape)
         case "BF16":
-            return data.withUnsafeBytes {
-                MLXArray(Array($0.bindMemory(to: Float16.self)), shape).asType(.bfloat16)
+            let floats: [Float] = data.withUnsafeBytes { buf in
+                let f16 = Array(buf.bindMemory(to: UInt16.self))
+                return f16.map { Float(bitPattern: bfloat16BitsToFloat32($0)) }
             }
+            return MLXArray(floats, shape).asType(.bfloat16)
         case "F32":
             return data.withUnsafeBytes {
                 MLXArray(Array($0.bindMemory(to: Float.self)), shape)
