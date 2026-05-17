@@ -581,7 +581,7 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 let u16s = Array(buf.bindMemory(to: UInt16.self))
                 return u16s.map(float16BitsToFloat32)
             }
-            return MLXArray(floats, shape)
+            return MLXArray(floats, shape).asType(.float16)
 #endif
         case "BF16":
 #if !arch(x86_64)
