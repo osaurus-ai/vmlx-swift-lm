@@ -2,25 +2,47 @@ import Foundation
 import MLX
 import MLXNN
 
-private func float16BitsToFloat32(_ bits: UInt16) -> UInt32 {
+// MARK: - Float16/bfloat16 fallbacks for x86_64
+
+#if arch(x86_64)
+/// Convert IEEE 754 float16 bits (as UInt16) to float32.
+/// The `Float16` type is unavailable on x86_64 macOS, so we
+/// use manual bit manipulation instead.  Handles all cases:
+/// zero, subnormal, normal, infinity, and quiet/signalling NaN.
+private func float16BitsToFloat32(_ bits: UInt16) -> Float {
     let sign = UInt32(bits >> 15) << 31
-    let exp = (bits >> 10) & 0x1f
-    let mant = UInt32(bits & 0x3ff) << 13
-    if exp == 0 {
-        if mant == 0 { return sign }
-        let adj = UInt32((bits & 0x3ff).leadingZeroBitCount - 6)
-        let e = 1 - Int16(adj)
-        let m = UInt32(bits & 0x3ff) << (13 + adj)
-        return sign | (UInt32(bitPattern: Int32(e) + 127) << 23) | (m & 0x7fffff)
-    } else if exp == 31 {
-        return sign | 0x7f800000 | mant
+    var exp = Int((bits >> 10) & 0x1f)
+    var mant = UInt32(bits & 0x03ff)
+
+    switch exp {
+    case 0:
+        guard mant != 0 else { return Float(bitPattern: sign) }
+        // Subnormal: renormalise by shifting left until the
+        // leading 1 reaches bit 10 of the 10-bit mantissa.
+        while mant & 0x0400 == 0 {
+            mant <<= 1
+            exp -= 1
+        }
+        mant &= 0x03ff
+        exp += 1
+        fallthrough
+    case 1...30:
+        let exp8 = exp + 127 - 15  // adjust bias: float16(15) → float32(127)
+        return Float(bitPattern: sign | (UInt32(exp8) << 23) | (mant << 13))
+    default: // exp == 31
+        if mant == 0 {
+            return Float(bitPattern: sign | 0x7f800000)  // infinity
+        }
+        return Float(bitPattern: sign | 0x7f800000 | (mant << 13))  // NaN
     }
-    return sign | ((UInt32(exp) + 112) << 23) | mant
 }
 
-private func bfloat16BitsToFloat32(_ bits: UInt16) -> UInt32 {
-    UInt32(bits) << 16
+/// Convert bfloat16 bits to float32.
+/// bfloat16 occupies the upper 16 bits of the float32 layout.
+private func bfloat16BitsToFloat32(_ bits: UInt16) -> Float {
+    Float(bitPattern: UInt32(bits) << 16)
 }
+#endif
 
 public enum JANGTQStreamingExperts {
     public static var isEnabled: Bool {
@@ -550,17 +572,29 @@ private final class JANGTQStreamingExpertStore: @unchecked Sendable {
                 MLXArray(Array($0.bindMemory(to: Int32.self)), shape)
             }
         case "F16":
+#if !arch(x86_64)
+            return data.withUnsafeBytes {
+                MLXArray(Array($0.bindMemory(to: Float16.self)), shape)
+            }
+#else
             let floats: [Float] = data.withUnsafeBytes { buf in
-                let f16 = Array(buf.bindMemory(to: UInt16.self))
-                return f16.map { Float(bitPattern: float16BitsToFloat32($0)) }
+                let u16s = Array(buf.bindMemory(to: UInt16.self))
+                return u16s.map(float16BitsToFloat32)
             }
             return MLXArray(floats, shape)
+#endif
         case "BF16":
+#if !arch(x86_64)
+            return data.withUnsafeBytes {
+                MLXArray(Array($0.bindMemory(to: Float16.self)), shape).asType(.bfloat16)
+            }
+#else
             let floats: [Float] = data.withUnsafeBytes { buf in
-                let f16 = Array(buf.bindMemory(to: UInt16.self))
-                return f16.map { Float(bitPattern: bfloat16BitsToFloat32($0)) }
+                let u16s = Array(buf.bindMemory(to: UInt16.self))
+                return u16s.map(bfloat16BitsToFloat32)
             }
             return MLXArray(floats, shape).asType(.bfloat16)
+#endif
         case "F32":
             return data.withUnsafeBytes {
                 MLXArray(Array($0.bindMemory(to: Float.self)), shape)
