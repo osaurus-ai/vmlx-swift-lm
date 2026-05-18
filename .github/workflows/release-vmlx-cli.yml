@@ -1,0 +1,110 @@
+name: Release vmlx-cli
+
+on:
+  push:
+    tags:
+      - "vmlx-cli-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. vmlx-cli-v0.1.0). Required when run manually."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    if: github.repository == 'osaurus-ai/vmlx-swift-lm'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Resolve tag + version
+        id: meta
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#vmlx-cli-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (version $VERSION)"
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build vmlx-cli (release, arm64)
+        shell: bash
+        run: |
+          swift build \
+            -c release \
+            --product vmlx-cli \
+            --arch arm64
+
+      - name: Stage binary
+        id: stage
+        shell: bash
+        run: |
+          BIN_PATH=$(swift build -c release --arch arm64 --show-bin-path)/vmlx-cli
+          test -x "$BIN_PATH" || { echo "binary not found at $BIN_PATH"; exit 1; }
+
+          STAGE="$RUNNER_TEMP/vmlx-cli-${{ steps.meta.outputs.version }}-arm64-macos"
+          mkdir -p "$STAGE"
+          cp "$BIN_PATH" "$STAGE/vmlx-cli"
+          strip -x "$STAGE/vmlx-cli" || true
+
+          # Strip extended attributes; ad-hoc sign so users can run it without
+          # a Gatekeeper quarantine prompt on the same machine that built it.
+          xattr -cr "$STAGE/vmlx-cli"
+          codesign --force --sign - "$STAGE/vmlx-cli"
+
+          # Smoke-test the binary actually runs before we publish it.
+          "$STAGE/vmlx-cli" version
+
+          TARBALL="$RUNNER_TEMP/vmlx-cli-${{ steps.meta.outputs.version }}-arm64-macos.tar.gz"
+          tar -czf "$TARBALL" -C "$STAGE" vmlx-cli
+          SHA256=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
+
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "Built $(basename "$TARBALL") ($SHA256)"
+
+      - name: Write SHA-256 sidecar
+        shell: bash
+        run: |
+          echo "${{ steps.stage.outputs.sha256 }}  $(basename "${{ steps.stage.outputs.tarball }}")" \
+            > "${{ steps.stage.outputs.tarball }}.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: vmlx-cli ${{ steps.meta.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.tarball }}.sha256
+          body: |
+            **vmlx-cli ${{ steps.meta.outputs.version }}** — headless MLX inference server, OpenAI-compatible HTTP.
+
+            ## Install (arm64 macOS)
+
+            ```sh
+            curl -L https://github.com/osaurus-ai/vmlx-swift-lm/releases/download/${{ steps.meta.outputs.tag }}/vmlx-cli-${{ steps.meta.outputs.version }}-arm64-macos.tar.gz | tar -xz
+            ./vmlx-cli serve --model-dir ~/.vmlx/models
+            ```
+
+            **SHA-256:** `${{ steps.stage.outputs.sha256 }}`
+
+            Requires Apple Silicon. x86_64 macOS is not supported (MLX is arm64-only).

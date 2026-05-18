@@ -283,6 +283,81 @@ if await container.isVLM {
 
 ---
 
+## `VMLXServer` + `vmlx-cli` — headless inference server
+
+In addition to the inference libraries, this package ships an
+OpenAI-compatible HTTP server (`VMLXServer` library) and a headless CLI
+wrapper (`vmlx-cli` executable). They are **optional products** — the
+inference libraries (`MLXLLM`, `MLXVLM`, `MLXLMCommon`, `MLXEmbedders`)
+don't pull them in. Only consumers of `.product(name: "VMLXServer", …)`
+or `.product(name: "vmlx-cli", …)` see the SwiftNIO / IkigaJSON /
+swift-argument-parser dependencies.
+
+`VMLXServer` is the engine that powers the [Osaurus](https://github.com/osaurus-ai/osaurus)
+Mac app. It exposes:
+
+- `OsaurusServer` — SwiftNIO HTTP server; `.start(_:)` / `.stop()` are async.
+- OpenAI-compatible endpoints: `/v1/chat/completions` (streaming + non-streaming),
+  `/v1/models`, `/v1/embeddings`, `/v1/audio/transcriptions`, plus
+  Anthropic Messages and an "Open Responses" wire format.
+- `InferenceServices` registry — 17 host-supplied seam protocols
+  (`ModelDirectoryProvider`, `ChatEngineProvider`, `EmbeddingProvider`,
+  `SpeechProvider`, `BackgroundTaskService`, `APIKeyValidating`, …)
+  with No-Op defaults the CLI uses out of the box.
+- Wire-format Codable types (`ChatCompletionRequest` / `ChatMessage` /
+  `Tool` / `AnthropicMessagesRequest`, …) — useful even when not
+  hosting the server (e.g. building a client).
+
+### Quick start — `vmlx-cli`
+
+```sh
+swift run vmlx-cli serve --host 127.0.0.1 --port 8080 \
+                         --model-dir ~/.vmlx/models
+swift run vmlx-cli list       # installed models in --model-dir
+swift run vmlx-cli version    # vmlx-cli 0.1.0
+```
+
+The CLI scans a `<root>/<org>/<repo>` two-level layout (matching the
+Hugging Face cache shape). Point `--model-dir` at the directory that
+contains downloaded MLX-format model bundles.
+
+### Embedding `VMLXServer` in another Swift app
+
+```swift
+// Package.swift
+.package(url: "https://github.com/osaurus-ai/vmlx-swift-lm", from: "..."),
+// ...
+.product(name: "VMLXServer", package: "vmlx-swift-lm"),
+```
+
+```swift
+import VMLXServer
+
+InferenceServices.register(modelLocator: MyModelLocator())
+InferenceServices.register(modelDirectory: MyModelDirectoryProvider())
+// register the rest of the seams you need; everything else stays no-op.
+
+let server = OsaurusServer()
+let config = OsaurusServer.Config(
+    host: "127.0.0.1",
+    port: 8080,
+    serverConfiguration: .default,
+    validatorFactory: { NoOpAPIKeyValidator() },
+    preHandlerFactory: nil,
+    trustLoopback: true
+)
+try await server.start(config)
+```
+
+### Releases
+
+Binary releases of `vmlx-cli` are attached to tags of the form
+`vmlx-cli-vX.Y.Z` (Apple Silicon only — MLX is arm64-only). The
+release artifact is a tarball containing a stripped, ad-hoc-signed
+`vmlx-cli` binary plus a SHA-256 sidecar.
+
+---
+
 ## Why this fork is faster on MoE / MLA / hybrid models
 
 The "Swift native runtime as the pure-speed lane for MLX inference" thesis is **[t@osaurus.ai](mailto:t@osaurus.ai)** (tpae)'s — pursuing the Swift library specifically for runtime speed is what justified investing in this fork in the first place. Root-cause investigation + per-architecture fixes by **[eric@osaurus.ai](mailto:eric@osaurus.ai)** and the **Osaurus team**.
