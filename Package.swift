@@ -49,6 +49,12 @@ let package = Package(
         .executable(
             name: "ANEProbe",
             targets: ["ANEProbe"]),
+        .library(
+            name: "VMLXServer",
+            targets: ["VMLXServer"]),
+        .executable(
+            name: "vmlx-cli",
+            targets: ["vmlx-cli"]),
     ],
     dependencies: [
         // 2026-05-04 reverted to 0a56f90 (was a21d2af). The advance to
@@ -95,6 +101,11 @@ let package = Package(
         // 0.32.0) need the 3.x branch to resolve cleanly.
         .package(url: "https://github.com/apple/swift-certificates.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", "3.0.0"..<"5.0.0"),
+        // VMLXServer + vmlx-cli: OpenAI-compatible HTTP server on top
+        // of the inference libraries. Optional — only consumers of the
+        // `VMLXServer` library / `vmlx-cli` executable pull these in.
+        .package(url: "https://github.com/orlandos-nl/IkigaJSON", from: "2.3.2"),
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.5.0"),
     ],
     targets: [
         .target(
@@ -351,6 +362,36 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        // VMLXServer: OpenAI-compatible HTTP server layered on top of
+        // MLXLLM/MLXVLM/MLXLMCommon. Pulls in SwiftNIO and IkigaJSON
+        // only when consumed; library-only users see no new transitive
+        // deps.
+        .target(
+            name: "VMLXServer",
+            dependencies: [
+                "MLXLLM",
+                "MLXVLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Jinja", package: "Jinja"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "IkigaJSON", package: "IkigaJSON"),
+            ],
+            path: "Libraries/VMLXServer",
+            resources: [.process("Engine/Resources")]
+        ),
+        .executableTarget(
+            name: "vmlx-cli",
+            dependencies: [
+                "VMLXServer",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Tools/vmlx-cli"
         ),
     ],
     // C++20 needed by the vendored mlx-c distributed C ABI shim files in
