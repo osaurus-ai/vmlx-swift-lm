@@ -64,7 +64,9 @@ import Foundation
 /// observations. Thread-safety: `RollingTokenRate` is a value type holding
 /// a fixed-capacity ring buffer. Each chat turn owns its own instance so
 /// concurrent reads are not a concern; the type itself is `Sendable`.
-struct RollingTokenRate: Sendable {
+public struct RollingTokenRate: Sendable {
+
+    public init() {}
 
     // MARK: - Tunables (static so tests can override + comment block above
     // documents the rationale for each default).
@@ -73,17 +75,17 @@ struct RollingTokenRate: Sendable {
     /// Tokens emitted within this window are still counted in the running
     /// total but don't contribute to the rate display until the warm-up
     /// elapses. See file-level comment for empirical rationale.
-    static let warmupSeconds: TimeInterval = 0.4
+    public static let warmupSeconds: TimeInterval = 0.4
 
     /// Minimum number of token observations before the rate display is
     /// allowed to fire — prevents a single delta from producing a wildly
     /// extrapolated tok/s on very fast streams where 0.4s would otherwise
     /// skip the entire answer.
-    static let warmupTokens: Int = 4
+    public static let warmupTokens: Int = 4
 
     /// Sliding window length. The rate is `tokens-in-window / window-seconds`.
     /// Tokens older than this are dropped from the running sum.
-    static let windowSeconds: TimeInterval = 1.5
+    public static let windowSeconds: TimeInterval = 1.5
 
     // MARK: - State
 
@@ -108,12 +110,12 @@ struct RollingTokenRate: Sendable {
     /// Running total of all tokens observed across the lifetime of this
     /// estimator. Cheaper to maintain than re-summing the window — also
     /// surfaced via `totalTokens` for the final-stamp `tokenCount` field.
-    private(set) var totalTokens: Int = 0
+    public private(set) var totalTokens: Int = 0
 
     /// `true` once the warm-up gates (time AND token-count) have both
     /// elapsed. Read-only convenience for the caller — `currentRate(now:)`
     /// returns `nil` until this flips.
-    var isWarmedUp: Bool {
+    public var isWarmedUp: Bool {
         guard let firstAt else { return false }
         let elapsed = Date().timeIntervalSince(firstAt)
         return elapsed >= Self.warmupSeconds && totalTokens >= Self.warmupTokens
@@ -130,7 +132,7 @@ struct RollingTokenRate: Sendable {
     /// Pass `0` for non-token deltas (sentinel envelopes, empty chunks)
     /// — they update `lastAt` so the window denominator stays current
     /// without contaminating the numerator.
-    mutating func observe(tokens: Int, at now: Date = Date()) {
+    public mutating func observe(tokens: Int, at now: Date = Date()) {
         if firstAt == nil { firstAt = now }
         lastAt = now
         if tokens > 0 {
@@ -143,7 +145,7 @@ struct RollingTokenRate: Sendable {
     /// Return the current rolling rate, or `nil` while still in warm-up.
     /// The denominator is floored at `min(windowSeconds, now - firstAt)` so
     /// a paused stream doesn't get penalised for the gap.
-    func currentRate(at now: Date = Date()) -> Double? {
+    public func currentRate(at now: Date = Date()) -> Double? {
         guard let firstAt, let _ = lastAt else { return nil }
         let elapsedFromFirst = now.timeIntervalSince(firstAt)
         guard elapsedFromFirst >= Self.warmupSeconds, totalTokens >= Self.warmupTokens
@@ -161,7 +163,7 @@ struct RollingTokenRate: Sendable {
     /// at the moment of `lastAt`. Caller stamps this on `ChatTurn` once
     /// the stream finishes. Falls back to `totalTokens / wallTime` ONLY
     /// if the warm-up never elapsed (response was too short to converge).
-    func finalRate() -> Double? {
+    public func finalRate() -> Double? {
         guard let firstAt, let lastAt else { return nil }
         if let rolling = currentRate(at: lastAt) { return rolling }
         // Fallback: full-generation average. Better than no number at all

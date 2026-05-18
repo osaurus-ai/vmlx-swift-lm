@@ -32,9 +32,9 @@ public actor ModelRuntime {
     // MARK: - Types
 
     public struct ModelCacheSummary: Sendable {
-        let name: String
-        let bytes: Int64
-        let isCurrent: Bool
+        public let name: String
+        public let bytes: Int64
+        public let isCurrent: Bool
     }
 
     public struct LiveVoiceAudioPreencodeResult: Sendable, Equatable {
@@ -47,11 +47,11 @@ public actor ModelRuntime {
             case failed
         }
 
-        let status: Status
-        let sampleCount: Int
-        let sampleRate: Int
-        let encodeMs: Int
-        let message: String?
+        public let status: Status
+        public let sampleCount: Int
+        public let sampleRate: Int
+        public let encodeMs: Int
+        public let message: String?
     }
 
     private final class SessionHolder: NSObject, @unchecked Sendable {

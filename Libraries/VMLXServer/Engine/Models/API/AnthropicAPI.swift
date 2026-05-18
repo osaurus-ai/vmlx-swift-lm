@@ -23,6 +23,34 @@ public struct AnthropicMessagesRequest: Codable, Sendable {
     public let tools: [AnthropicTool]?
     public let tool_choice: AnthropicToolChoice?
     public let metadata: AnthropicMetadata?
+
+    public init(
+        model: String,
+        max_tokens: Int,
+        system: AnthropicSystemContent? = nil,
+        messages: [AnthropicMessage],
+        stream: Bool? = nil,
+        temperature: Double? = nil,
+        top_p: Double? = nil,
+        top_k: Int? = nil,
+        stop_sequences: [String]? = nil,
+        tools: [AnthropicTool]? = nil,
+        tool_choice: AnthropicToolChoice? = nil,
+        metadata: AnthropicMetadata? = nil
+    ) {
+        self.model = model
+        self.max_tokens = max_tokens
+        self.system = system
+        self.messages = messages
+        self.stream = stream
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.stop_sequences = stop_sequences
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.metadata = metadata
+    }
 }
 
 /// System content can be a string or array of content blocks
@@ -77,6 +105,11 @@ public enum AnthropicSystemContent: Codable, Sendable {
 public struct AnthropicMessage: Codable, Sendable {
     public let role: String  // "user" or "assistant"
     public let content: AnthropicMessageContent
+
+    public init(role: String, content: AnthropicMessageContent) {
+        self.role = role
+        self.content = content
+    }
 }
 
 /// Message content can be a string or array of content blocks
@@ -237,6 +270,18 @@ public struct AnthropicToolResultBlock: Codable, Sendable {
     public let tool_use_id: String
     public let content: AnthropicToolResultContent?
     public let is_error: Bool?
+
+    public init(
+        type: String,
+        tool_use_id: String,
+        content: AnthropicToolResultContent? = nil,
+        is_error: Bool? = nil
+    ) {
+        self.type = type
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+    }
 }
 
 /// Tool result content can be a string or array of content blocks
@@ -291,6 +336,12 @@ public struct AnthropicTool: Codable, Sendable {
     public let name: String
     public let description: String?
     public let input_schema: JSONValue?
+
+    public init(name: String, description: String?, input_schema: JSONValue?) {
+        self.name = name
+        self.description = description
+        self.input_schema = input_schema
+    }
 }
 
 /// Tool choice specification

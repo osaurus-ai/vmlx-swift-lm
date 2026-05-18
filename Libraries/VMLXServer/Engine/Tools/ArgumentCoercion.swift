@@ -3,7 +3,7 @@ import Foundation
 /// Shared coercion helpers for tool arguments. Local/quantized models frequently
 /// serialize values with wrong JSON types (arrays as strings, numbers as strings, etc.).
 /// These helpers normalize common mistakes so tool execution succeeds.
-enum ArgumentCoercion {
+public enum ArgumentCoercion {
     /// Coerce to `[String]`: actual array, JSON-encoded string (`"[\"a\"]"`),
     /// or bare string wrapped into a single-element array.
     public static func stringArray(_ value: Any?) -> [String]? {

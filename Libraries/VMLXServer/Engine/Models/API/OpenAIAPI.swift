@@ -194,17 +194,17 @@ public enum MessageContentPart: Codable, Sendable {
     }
 
     private struct ImageUrlContent: Codable {
-        let url: String
-        let detail: String?
+        public let url: String
+        public let detail: String?
     }
 
     private struct InputAudioContent: Codable {
-        let data: String
-        let format: String
+        public let data: String
+        public let format: String
     }
 
     private struct VideoUrlContent: Codable {
-        let url: String
+        public let url: String
     }
 
     public init(from decoder: Decoder) throws {
@@ -762,10 +762,10 @@ public struct OpenAIError: Codable, Error, Sendable {
     public let error: ErrorDetail
 
     public struct ErrorDetail: Codable, Sendable {
-        let message: String
-        let type: String
-        let param: String?
-        let code: String?
+        public let message: String
+        public let type: String
+        public let param: String?
+        public let code: String?
     }
 }
 

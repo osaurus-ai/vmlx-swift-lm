@@ -13,6 +13,10 @@ import Foundation
 /// Reasoning configuration for reasoning models.
 public struct OpenResponsesReasoningConfig: Codable, Sendable {
     public let effort: String
+
+    public init(effort: String) {
+        self.effort = effort
+    }
 }
 
 /// Open Responses API create request
@@ -41,6 +45,34 @@ public struct OpenResponsesRequest: Codable, Sendable {
     public let metadata: [String: String]?
     /// Reasoning configuration for reasoning models
     public let reasoning: OpenResponsesReasoningConfig?
+
+    public init(
+        model: String,
+        input: OpenResponsesInput,
+        stream: Bool? = nil,
+        tools: [OpenResponsesTool]? = nil,
+        tool_choice: OpenResponsesToolChoice? = nil,
+        temperature: Float? = nil,
+        max_output_tokens: Int? = nil,
+        top_p: Float? = nil,
+        instructions: String? = nil,
+        previous_response_id: String? = nil,
+        metadata: [String: String]? = nil,
+        reasoning: OpenResponsesReasoningConfig? = nil
+    ) {
+        self.model = model
+        self.input = input
+        self.stream = stream
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
+        self.top_p = top_p
+        self.instructions = instructions
+        self.previous_response_id = previous_response_id
+        self.metadata = metadata
+        self.reasoning = reasoning
+    }
 }
 
 /// Input can be a string or array of input items

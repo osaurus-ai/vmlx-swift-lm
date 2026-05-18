@@ -19,6 +19,8 @@ import Foundation
 
 public class TTFTTrace: @unchecked Sendable {
 
+    public init() {}
+
     private struct Mark {
         let name: String
         let time: CFAbsoluteTime
